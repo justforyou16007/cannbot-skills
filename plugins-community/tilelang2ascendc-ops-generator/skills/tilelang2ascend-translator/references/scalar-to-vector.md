@@ -4,7 +4,7 @@
 > 1. **步骤 1（转译）编写 `op_kernel/<op_name>.cpp` 的 Compute 函数之前** —— 对照 7 种模式，确保生成的代码不落入标量反模式
 > 2. **步骤 1.5（标量残留自检）命中检查项时** —— 按命中编号查阅对应模式的向量化方案
 >
-> 本文档是 TileLang→AscendC 转译阶段性能正确性的核心参考。TileLang 设计中的标量循环如果直译为 C++ 标量 `for` 循环，会完全绕过 NPU Vector 单元，是转译残留中收益最大的反模式（实测 geomean 加速比 2x-11x）。
+> 本文档是 TileLang→AscendC 转译阶段性能正确性的核心参考。TileLang 设计中的标量循环如果直译为 C++ 标量 `for` 循环，会完全绕过 NPU Vector 单元，是转译残留中收益最大的反模式。
 
 ## 核心思想
 
@@ -456,15 +456,3 @@ PipeBarrier<PIPE_V>();
 | 7 | 除 AscendC API 外的 for 循环 | `grep -n "for\s*(" op_kernel/*.cpp` | 逐一审查是否可向量化（尾块处理、BLOCK 级循环除外） |
 
 **命中豁免**：模式 5 的混合调度是唯一合法的标量保留场景（单 tile 元素数 < 128）；命中检查项时若确认属于豁免场景，必须在代码注释中说明理由，否则必须修复。
-
-## 性能预期
-
-| 优化类型 | 典型加速比 | 风险等级 |
-|---------|-----------|---------|
-| 标量归约 → ReduceSum | 2-5x（归约维度） | 低（API 成熟） |
-| 标量逐元素 → Adds/Muls 链 | 3-10x（逐元素路径） | 低 |
-| 标量排序 → Sort32/MrgSort | 5-100x（n 较大时） | 中（需处理对齐和 buffer） |
-| 零拷贝 + 批量向量化 | 2-5x（相对于 gather+pad 版） | 中（需仔细计算 buffer 大小） |
-| 混合调度 | 消除退化 case（避免负优化） | 中（需 profiling 验证阈值） |
-| BroadCast + 批量向量运算 | gRows/2 倍（逐行→批量） | 低（需额外 UB buffer） |
-| GatherMask 替代 SetValue/GetValue | 5-20x（n 较大时） | 低（API 成熟，需 PipeBarrier） |

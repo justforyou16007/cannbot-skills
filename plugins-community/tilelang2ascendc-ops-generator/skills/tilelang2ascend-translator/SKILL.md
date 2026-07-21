@@ -63,7 +63,7 @@ argument-hint: >
 本 skill 提供以下参考资料：
 - `.claude/skills/tilelang2ascend-translator/references/dsl2Ascendc.md` — TileLang 转 AscendC 指南
 - `.claude/skills/tilelang2ascend-translator/references/TileLang-AscendC-API-Mapping.md` — TileLang 与 AscendC API 映射表
-- `.claude/skills/tilelang2ascend-translator/references/scalar-to-vector.md` — 标量计算向量化指南（7 种标量反模式 → Vector API 替代方案 + 生成后 grep 自检清单；编写 Compute 前必读，步骤 1.5 自检命中时按模式修复）
+- `.claude/skills/tilelang2ascend-translator/references/scalar-to-vector.md` — 标量计算向量化指南
 - `.claude/skills/tilelang2ascend-translator/references/AscendCVerification.md` — AscendC 验证指南
 - `.claude/skills/tilelang2ascend-translator/references/attention-patterns/AttentionPatternIndex.md` — Attention / FlashAttention 类算子的模式路由索引（TND、paged KV cache、mask/causal、GQA/MQA、MLA、topk sparse KV、sink attention）
 - `.claude/skills/tilelang2ascend-translator/scripts/evaluate_ascendc.sh` — AscendC 评测脚本

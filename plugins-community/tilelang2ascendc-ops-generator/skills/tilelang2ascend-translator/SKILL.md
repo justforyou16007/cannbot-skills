@@ -21,7 +21,7 @@ argument-hint: >
 ## 关键限制
 - 必须将核心计算融合成单个算子实现，不要拆分成多个独立算子。
 - `model_new_ascendc.py` 中禁止使用 torch 算子；只允许进行张量创建，张量变换以及调用你实现的自定义算子。
-- 在 AscendC 实现中应尽可能避免标量逐元素写法，优先使用块级或向量化操作；只有在确实无法避免时才使用标量逻辑。
+- 在 AscendC 实现中应尽可能避免标量逐元素写法，优先使用块级或向量化操作；只有在确实无法避免时才使用标量逻辑。🛑 编写 Compute 前必须对照 `.claude/skills/tilelang2ascend-translator/references/scalar-to-vector.md` 中的 7 种标量反模式，确认不落入标量写法；生成后必须执行步骤 1.5 的标量残留自检。
 - 只允许修改或新增 `{output_dir}/` 目录中的文件，不要改动其他目录中的文件。
 - 只允许读取当前工作区目录结构内的文件与子目录；禁止读取当前工作区之外的任何路径，包括父目录、兄弟目录、用户目录、绝对路径以及系统其他目录。
 - 禁止读取 `.claude/skills/tilelang2ascend-translator/references/TileLangAscendProgrammingGuide.md`；该文档是 TileLang 编程指南，仅供 TileLang 阶段使用，与本阶段无关。
@@ -63,6 +63,7 @@ argument-hint: >
 本 skill 提供以下参考资料：
 - `.claude/skills/tilelang2ascend-translator/references/dsl2Ascendc.md` — TileLang 转 AscendC 指南
 - `.claude/skills/tilelang2ascend-translator/references/TileLang-AscendC-API-Mapping.md` — TileLang 与 AscendC API 映射表
+- `.claude/skills/tilelang2ascend-translator/references/scalar-to-vector.md` — 标量计算向量化指南（7 种标量反模式 → Vector API 替代方案 + 生成后 grep 自检清单；编写 Compute 前必读，步骤 1.5 自检命中时按模式修复）
 - `.claude/skills/tilelang2ascend-translator/references/AscendCVerification.md` — AscendC 验证指南
 - `.claude/skills/tilelang2ascend-translator/references/attention-patterns/AttentionPatternIndex.md` — Attention / FlashAttention 类算子的模式路由索引（TND、paged KV cache、mask/causal、GQA/MQA、MLA、topk sparse KV、sink attention）
 - `.claude/skills/tilelang2ascend-translator/scripts/evaluate_ascendc.sh` — AscendC 评测脚本
@@ -182,6 +183,13 @@ argument-hint: >
       ⚠️ GetReduceSumMaxMinTmpSize → 同目录 GetReduceSumMaxMinTmpSize.md
     - Broadcast → asc-devkit/docs/api/SIMD-API/高阶API/张量变换/Broadcast.md
       ⚠️ 模板: <T, dim, axis, isReuseSource>, dim∈{1,2}, axis∈{0,1}
+    - Sort → asc-devkit/docs/api/SIMD-API/高阶API/排序操作/Sort.md
+      ⚠️ 降序需 Negate→Sort→Negate；元素数 pad 到 64 倍数；需索引 buffer + 临时 buffer
+    - MrgSort → asc-devkit/docs/api/SIMD-API/高阶API/排序操作/MrgSort-93.md
+      ⚠️ 需 MrgSortParams 参数结构体
+    - Sort32 → asc-devkit/docs/api/SIMD-API/基础API/Memory矢量计算/排序组合（ISASI）/Sort32.md
+    - GatherMask → asc-devkit/docs/api/SIMD-API/基础API/Memory矢量计算/比较与选择/GatherMask.md
+      ⚠️ 确认 deinterleave/repeatMaskParams 参数语义；调用后需 PipeBarrier<PIPE_V>
     - Cos → asc-devkit/docs/api/SIMD-API/高阶API/数学计算/Cos接口/Cos.md
       ⚠️ GetCosMaxMinTmpSize → 同目录 GetCosMaxMinTmpSize.md
     - Sin → asc-devkit/docs/api/SIMD-API/高阶API/数学计算/Sin接口/Sin.md
@@ -220,6 +228,7 @@ argument-hint: >
     │ Sin               │ GetSinMaxMinTmpSize       │ asc-devkit/docs/api/SIMD-API/高阶API/数学计算/Sin接口/GetSinMaxMinTmpSize.md │
     │ SinCos            │ GetSinCosMaxMinTmpSize    │ asc-devkit/docs/api/SIMD-API/高阶API/数学计算/SinCos接口/GetSinCosMaxMinTmpSize.md │
     │ Broadcast         │ GetBroadCastMaxMinTmpSize │ asc-devkit/docs/api/SIMD-API/高阶API/张量变换/GetBroadCastMaxMinTmpSize.md │
+    │ Sort              │ GetSortTmpSize / GetSortMaxMinTmpSize │ asc-devkit/docs/api/SIMD-API/高阶API/排序操作/GetSortTmpSize.md │
 
     **验证步骤 (每次编写 kernel 前强制执行)**:
     a. 列出本算子所有使用 work buffer 的 API
@@ -346,6 +355,35 @@ argument-hint: >
        m.impl("<op_name>", TORCH_FN(ascend_kernel::<op_name>));
    }
    ```
+
+### 🛑 步骤 1.5: 标量残留自检（每次生成/修改 op_kernel 后、编译前强制执行）
+
+`op_kernel/<op_name>.cpp` 生成或修改后，**必须**对照 `.claude/skills/tilelang2ascend-translator/references/scalar-to-vector.md` 末尾的「综合检查清单」逐项执行 grep 检查（共 7 项），确认没有标量反模式残留：
+
+```
+1.5.1 执行检查清单 7 条 grep（标量归约 / raw pointer / 嵌套比较交换 /
+      逐元素 gather-scatter / 逐行 GetValue+Muls / 逐元素 SetValue-GetValue / 其余 for 循环）
+
+1.5.2 命中任一检查项 → 按 scalar-to-vector.md 中对应编号的模式修复：
+      模式 1 标量归约 → ReduceSum/WholeReduceSum
+      模式 2 标量逐元素 → Adds/Muls 向量链
+      模式 3 标量排序 → Sort32/MrgSort
+      模式 4 逐元素标量算术 → 零拷贝子张量切片 + 批量向量运算
+      模式 5 混合调度（唯一豁免：单 tile 元素数 < 128，须在注释中说明理由）
+      模式 6 逐行 Muls → BroadCast + 批量向量
+      模式 7 逐元素 SetValue/GetValue → GatherMask
+
+1.5.3 修复涉及新 API（Sort/GatherMask/BroadCast 等）时，必须回到步骤 0-B.3
+      查阅对应 API 文档确认签名与 work buffer 需求（GetSortTmpSize 等），
+      禁止凭记忆使用
+
+1.5.4 全部检查项无命中（或命中项已修复/已注释豁免理由）→ 进入步骤 2
+```
+
+**门禁规则**：
+- 未完成 1.5.1-1.5.4 → **禁止**进入步骤 2 编译验证
+- 每次修复迭代中修改了 `op_kernel/*.cpp` 后，必须重新执行本自检
+- 尾块处理、BLOCK 级循环等合法 for 循环不属于残留，但需在思考中确认其不可向量化
 
 ### 步骤 2: 编写 model_new_ascendc.py + 编译验证
 

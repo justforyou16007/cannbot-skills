@@ -834,6 +834,8 @@ if _use_kwargs:
             _inputs_dict[_k] = _v.to(device)
         elif isinstance(_v, list):
             _inputs_dict[_k] = [_move(x) for x in _v]
+    # build positional list from dict values (preserving JSONL order) for fallback
+    _inputs_list = list(_inputs_dict.values())
 else:
     inputs = _move(inputs)
 
@@ -861,17 +863,37 @@ elif _init_args:
 else:
     model = cls().to(device).eval()
 
+_use_positional_fallback = 0  # 0=kargs, 1=spread, 2=tuple
 for _ in range({warmup}):
     with torch.no_grad():
         if _use_kwargs:
-            _ = model(**_inputs_dict)
+            try:
+                _ = model(**_inputs_dict)
+            except TypeError:
+                _use_positional_fallback = 1
+                try:
+                    _ = model(*_inputs_list)
+                except TypeError:
+                    _use_positional_fallback = 2
+                    _ = model(tuple(_inputs_list))
         else:
             _ = model(*inputs)
     torch.npu.synchronize()
 
 with torch.no_grad():
     if _use_kwargs:
-        _ = model(**_inputs_dict)
+        if _use_positional_fallback == 0:
+            try:
+                _ = model(**_inputs_dict)
+            except TypeError:
+                try:
+                    _ = model(*_inputs_list)
+                except TypeError:
+                    _ = model(tuple(_inputs_list))
+        elif _use_positional_fallback == 1:
+            _ = model(*_inputs_list)
+        else:
+            _ = model(tuple(_inputs_list))
     else:
         _ = model(*inputs)
 torch.npu.synchronize()

@@ -701,6 +701,10 @@ def _jsonl_scalar_value(inp):
             val = 1.0
 
     dtype_str = inp.get("dtype", "")
+    if dtype_str == "str" or isinstance(val, str):
+        return str(val)
+    if dtype_str == "list" or isinstance(val, list):
+        return list(val)
     if dtype_str == "bool":
         return bool(val)
     if dtype_str.startswith("complex"):
@@ -737,32 +741,44 @@ def _jsonl_tensor_code(shape, dtype_str: str) -> str:
     return f"inputs.append(torch.randn({shape_expr}, dtype={dtype}))"
 
 
+def _jsonl_tensor_expr(shape, dtype_str: str) -> str:
+    """返回构造 tensor 的表达式字符串（不带 ``inputs.append()`` 包装）。"""
+    code = _jsonl_tensor_code(shape, dtype_str)
+    # _jsonl_tensor_code returns "inputs.append(TORCH_EXPR)"
+    prefix = "inputs.append("
+    assert code.startswith(prefix) and code.endswith(")"), f"unexpected tensor code: {code}"
+    return code[len(prefix):-1]  # strip "inputs.append(" and trailing ")"
+
+
 def _serialize_jsonl_inputs(case):
-    import torch
-    lines = ["inputs = []"]
+    """Generate kwargs dict code from JSONL inputs, using 'name' fields as keys.
+
+    Uses named keyword arguments (``model(**kwargs)``) so that parameter binding
+    is independent of the order of inputs in the JSONL file.
+    """
+    lines = ["_inputs_dict = {}"]
     for inp in case.get("inputs", []):
+        name = inp.get("name", "")
         typ = inp.get("type", "tensor")
         if typ == "tensor":
             shape = inp.get("shape", [])
             dtype_str = inp.get("dtype", "float16")
-            lines.append(_jsonl_tensor_code(shape, dtype_str))
+            tensor_expr = _jsonl_tensor_expr(shape, dtype_str)
+            lines.append(f"_inputs_dict[{repr(name)}] = {tensor_expr}")
         elif typ in ("attr", "scalar"):
             val = _jsonl_scalar_value(inp)
-            if isinstance(val, str):
-                lines.append(f"inputs.append({repr(val)})")
-            else:
-                lines.append(f"inputs.append({repr(val)})")
+            lines.append(f"_inputs_dict[{repr(name)}] = {repr(val)}")
         elif typ == "tensor_list":
             lines.append("_tensors = []")
             for tinfo in inp.get("value", []):
                 shape = tinfo.get("shape", [])
                 dtype_str = tinfo.get("dtype", "float16")
-                lines.append(f"_tensors.append({_jsonl_tensor_code(shape, dtype_str)
-                                                .split('inputs.append(')[1].rstrip(')')})")
-            lines.append("inputs.append(_tensors)")
+                tensor_expr = _jsonl_tensor_expr(shape, dtype_str)
+                lines.append(f"_tensors.append({tensor_expr})")
+            lines.append(f"_inputs_dict[{repr(name)}] = _tensors")
         else:
             val = _jsonl_scalar_value(inp)
-            lines.append(f"inputs.append({repr(val)})")
+            lines.append(f"_inputs_dict[{repr(name)}] = {repr(val)}")
     return "\n".join(lines)
 
 
@@ -810,7 +826,16 @@ def _move(v):
     if isinstance(v, (list, tuple)):
         return type(v)(_move(x) for x in v)
     return v
-inputs = _move(inputs)
+
+_use_kwargs = {use_kwargs}
+if _use_kwargs:
+    for _k, _v in _inputs_dict.items():
+        if isinstance(_v, torch.Tensor):
+            _inputs_dict[_k] = _v.to(device)
+        elif isinstance(_v, list):
+            _inputs_dict[_k] = [_move(x) for x in _v]
+else:
+    inputs = _move(inputs)
 
 # ---- model construction (honour get_init_inputs if present) ----
 _init_args = []
@@ -838,17 +863,24 @@ else:
 
 for _ in range({warmup}):
     with torch.no_grad():
-        _ = model(*inputs)
+        if _use_kwargs:
+            _ = model(**_inputs_dict)
+        else:
+            _ = model(*inputs)
     torch.npu.synchronize()
 
 with torch.no_grad():
-    _ = model(*inputs)
+    if _use_kwargs:
+        _ = model(**_inputs_dict)
+    else:
+        _ = model(*inputs)
 torch.npu.synchronize()
 """
 
 
 def _build_wrapper_script_content(cfg, model_file, cls_name, inputs_code):
     """Build the wrapper script string from components."""
+    use_kwargs = cfg.jsonl_case is not None
     return _WRAPPER_SCRIPT_TEMPLATE.format(
         out_dir=cfg.out_dir,
         device_id=cfg.device_id,
@@ -857,6 +889,7 @@ def _build_wrapper_script_content(cfg, model_file, cls_name, inputs_code):
         model_file=model_file,
         cls_name=cls_name,
         inputs_code=inputs_code,
+        use_kwargs=use_kwargs,
     )
 
 
@@ -927,7 +960,7 @@ def _run_msprof_quick(wrapper_script: str, output_dir: str, device_id: int, warm
     """快速模式：只采集 1 轮（不采集 7 个 aic-metrics，只获取 kernel 时间）。
 
     直接调用 msprof 命令（不通过 msprof_profile_run.sh，避免循环调用）。
-    使用 msprof --task-time=on --ascendcl=on，不设置 --aic-metrics。
+    使用 msprof --ai-core=on --task-time=on --ascendcl=on，不设置 --aic-metrics。
 
     warmup 在 msprof 外部执行：先单独跑 warmup 次 wrapper 预热 NPU，
     msprof 只采集正式 timed run，确保 task_time.csv 不含预热数据。
@@ -948,6 +981,7 @@ def _run_msprof_quick(wrapper_script: str, output_dir: str, device_id: int, warm
     cmd = [
         "msprof",
         f"--output={output_dir}",
+        "--ai-core=on",
         "--task-time=on",
         "--ascendcl=on",
         sys.executable, wrapper_path
@@ -1016,14 +1050,23 @@ def _parse_msprof_duration(prof_group_dir: str):
 def _parse_msprof_duration_quick(prof_group_dir: str):
     """快速模式解析：从 PROF 目录中查找 task_time.csv 或 api_statistic.csv 并提取时间。
 
-    快速模式只跑 1 轮，不设置 --aic-metrics，因此没有 op_summary_*.csv。
+    快速模式只跑 1 轮（不采集 7 个 aic-metrics），因此没有 op_summary_*.csv。
     warmup 已在 msprof 外部执行，task_time.csv 只包含正式 timed run 的 kernel 时间，
     对单次采集中所有计算 kernel 的耗时直接累加即可。
+
+    兼容两种目录结构：
+      - 无 --aic-metrics: PROF_*/mindstudio_profiler_output/task_time_*.csv
+      - 有 --aic-metrics: PROF_*/PROF_PipeUtilization/mindstudio_profiler_output/task_time_*.csv
     """
-    # 1. 尝试从 task_time.csv 提取
-    task_time_pattern = os.path.join(prof_group_dir, "mindstudio_profiler_output/task_time_*.csv")
-    task_time_files = sorted(glob.glob(task_time_pattern))
-    if task_time_files:
+    # 1. 尝试从 task_time.csv 提取（两种可能路径）
+    task_time_patterns = [
+        os.path.join(prof_group_dir, "mindstudio_profiler_output", "task_time_*.csv"),
+        os.path.join(prof_group_dir, "PROF_*", "mindstudio_profiler_output", "task_time_*.csv"),
+    ]
+    for pattern in task_time_patterns:
+        task_time_files = sorted(glob.glob(pattern))
+        if not task_time_files:
+            continue
         try:
             with open(task_time_files[0], "r", encoding="utf-8", errors="replace") as f:
                 reader = csv.DictReader(f)
@@ -1051,10 +1094,15 @@ def _parse_msprof_duration_quick(prof_group_dir: str):
         except Exception:
             pass
 
-    # 2. 尝试从 api_statistic.csv 提取（launch 行）
-    api_pattern = os.path.join(prof_group_dir, "mindstudio_profiler_output/api_statistic_*.csv")
-    api_files = sorted(glob.glob(api_pattern))
-    if api_files:
+    # 2. 尝试从 api_statistic.csv 提取（launch 行），同样兼容两种路径
+    api_patterns = [
+        os.path.join(prof_group_dir, "mindstudio_profiler_output", "api_statistic_*.csv"),
+        os.path.join(prof_group_dir, "PROF_*", "mindstudio_profiler_output", "api_statistic_*.csv"),
+    ]
+    for api_pattern in api_patterns:
+        api_files = sorted(glob.glob(api_pattern))
+        if not api_files:
+            continue
         try:
             with open(api_files[0], "r", encoding="utf-8", errors="replace") as f:
                 reader = csv.DictReader(f)

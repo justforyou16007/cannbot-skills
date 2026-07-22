@@ -149,7 +149,7 @@ argument-hint: >
     workflows/templates/archive_tasks/rms_norm/kernel/op_host/rms_norm.cpp
     → 确认: 所有 tiling 参数必须是独立标量左值，禁止传 struct 指针
     → 确认: blockDim = usedCoreNum（多核统一分发），禁止 host 侧逐核循环
-    → 确认: 核数来源于平台 API 动态获取（GetCoreNumAic/Aiv），非硬编码常量
+	    → 确认: 核数来源于平台 API 动态获取（GetCoreNumAic/Aiv），非硬编码常量
 
 0.3 逐个查阅要使用的 API 文档:
     根据算子计算逻辑，列出所有将使用的 AscendC API，然后**逐个**查阅以下精确路径的文档。

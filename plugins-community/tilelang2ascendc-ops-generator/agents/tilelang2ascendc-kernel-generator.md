@@ -183,7 +183,7 @@ Phase 7: Trace 记录            (tilelang2ascend-trace-recorder)
 
 **Skill 参考资料**（各 skill 独立维护，位于 `plugins-community/tilelang2ascendc-ops-generator/skills/<skill-name>/`）：
 - `tilelang2ascend-tilelang-designer`：BlockLevelDesign.md、TileLangAscendProgrammingGuide.md、TileLangDebug.md、evaluate_tilelang.sh
-- `tilelang2ascend-translator`：dsl2Ascendc.md、TileLang-AscendC-API-Mapping.md、AscendC_knowledge/、AscendCVerification.md、evaluate_ascendc.sh
+- `tilelang2ascend-translator`：dsl2Ascendc.md、TileLang-AscendC-API-Mapping.md、scalar-to-vector.md、AscendC_knowledge/、AscendCVerification.md、evaluate_ascendc.sh
 - `tilelang2ascend-operator-project-init`：templates/ascend-kernel/（完整项目模板）、scripts/detect_ascend_kernel_project.sh
 - `ops-profiling`：msprof_profile_run.sh --quick / msprof_perf_summary.py --quick
 - `tilelang2ascend-trace-recorder`：evaluate_tilelang.sh、evaluate_ascendc.sh

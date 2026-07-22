@@ -3,6 +3,11 @@
 本文档适用于纯 Cube 算子，或设备侧包含独立 Cube 计算阶段的 AscendC 实现。
 概览与判断规则见 `@references/dsl2Ascendc.md`。
 
+实现模式补充见：
+
+- `@references/attention-impl-patterns/cube-impl-patterns.md`：Cube/Matmul 流水、L1/L0/CO1 搬运与计算模式
+- `@references/attention-impl-patterns/kernel-rules.md`：Attention 实现通用的 Kernel 组织与约束
+
 ---
 
 ## 第三章：Kernel 入口 `xxx.cpp`

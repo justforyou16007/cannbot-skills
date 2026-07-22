@@ -10,7 +10,9 @@ TBuf/TQue 选择、Double Buffer 流水线并行、批量搬运模式。
 2. [TQue 详解](#tque-详解)
 3. [TBuf 详解](#tbuf-详解)
 4. [Double Buffer 流水线并行](#double-buffer-流水线并行)
-5. [批量搬运 + 逐行计算模式](#批量搬运--逐行计算模式)
+5. [双缓冲决策矩阵（何时开 / 何时不开）](#双缓冲决策矩阵何时开--何时不开)
+6. [MIX (CV 融合) 模式下双缓冲与 SyncAll 的交互](#mix-cv-融合-模式下双缓冲与-syncall-的交互)
+7. [批量搬运 + 逐行计算模式](#批量搬运--逐行计算模式)
 
 ---
 
@@ -138,6 +140,38 @@ AscendC::LocalTensor<float> work = workBuf.Get<float>();
 // 无需 FreeTensor
 ```
 
+### TBuf 需要双缓冲时怎么办
+
+TBuf 没有内建双缓冲机制（无 EnQue/DeQue 事件管理）。两种手动方案：
+
+**方案一：两个独立 TBuf + 手动轮转**（推荐，语义清晰）
+
+```cpp
+AscendC::TBuf<AscendC::TPosition::VECCALC> bufA, bufB;
+pipe->InitBuffer(bufA, tileSize);
+pipe->InitBuffer(bufB, tileSize);
+
+for (int i = 0; i < N; i++) {
+    auto cur  = (i % 2 == 0) ? bufA.Get<float>() : bufB.Get<float>();
+    auto next = (i % 2 == 0) ? bufB.Get<float>() : bufA.Get<float>();
+    Prefetch(next, i + 1);   // 往另一块预取
+    Compute(cur, i);         // 用当前块计算
+}
+```
+
+**方案二：单 TBuf 按 offset 切半 + 奇偶索引**（省一次 InitBuffer，UB 紧张时用）
+
+```cpp
+AscendC::TBuf<AscendC::TPosition::VECCALC> buf;
+pipe->InitBuffer(buf, tileSize * 2);   // 一次申请两倍
+
+auto half0 = buf.Get<float>();                  // 前半
+auto half1 = buf.Get<float>()[tileElems];       // 后半（offset 切分）
+// 奇偶轮改用 half0/half1
+```
+
+> ⚠️ 手动轮转时同步责任在使用者：往 next 写入的 DMA 与从 cur 读取的计算之间需要 `PipeBarrier` 或 SetFlag/WaitFlag 保证，TBuf 不会像 TQue 那样自动插入事件依赖。
+
 ---
 
 ## Double Buffer 流水线并行
@@ -232,6 +266,58 @@ void CopyOut(int i) {
 | depth 模板参数控制 Double Buffer | Double Buffer 由 `InitBuffer` 的 `num` 参数控制 |
 | depth 越大越好 | 模板 depth 通常设为 1，性价比最高 |
 | 所有 buffer 都要 num=2 | 只有涉及 MTE 搬运的才需要 Double Buffer |
+| InitBuffer 可以放循环里按需调用 | **InitBuffer 必须在循环外一次性调用**；循环内反复 InitBuffer 会重置队列状态，导致数据错乱/行为异常 |
+
+---
+
+## 双缓冲决策矩阵（何时开 / 何时不开）
+
+双缓冲不是默认最优解。判断标准只有一条：**同类存储资源上是否存在连续迭代流，使"第 i+1 次搬运"能与"第 i 次计算"重叠**。不存在迭代流的 buffer 开 num=2 是纯浪费（UB/L1/L0 容量减半可用量）。
+
+### 决策表
+
+| Buffer 场景 | num | 理由 | 实证 |
+|-------------|-----|------|------|
+| 主循环 CopyIn 队列（VECIN/A1，逐 tile 迭代） | **2** | 经典场景：MTE2 与 Vector/Mmad 重叠 | flash_attention `queL0A_/queL0B_` num=2（matmul 内层 K-loop） |
+| 主循环 CopyOut 队列（VECOUT/CO1，逐 tile 迭代） | **2** | MTE3 与下一次计算重叠 | 标准 elementwise 流水线 |
+| **L0C 累加器** | **1（禁止 2）** | 链式 Mmad（`cmatrixInitVal=0`）依赖**同一块 L0C 驻留累加**；双缓冲破坏累加语义。且 L0C→GM 的 Fixpipe 在 stage 末尾才发生，无迭代流可隐藏 | flash_attention `queL0C_` num=1 |
+| 被全局 barrier 串行化的 stage 间队列 | **1** | `SyncAll` 冲刷整条流水，stage 之间不存在可重叠的迭代流 | gdr_cv（MIX CV 融合）AIC 侧 a1/b1/a2/b2/c1 **全部 num=1** |
+| 单次读写的 buffer（prologue 加载一次 / epilogue 写出一次） | **1** | 无第 i+1 次搬运，双缓冲无对象 | flash_attention `outputQue1_` num=1 |
+| tile 极小（搬运延迟 < EnQue/DeQue 事件开销） | **1** | 双缓冲的事件管理开销超过隐藏的搬运延迟，负收益 | 参考 P98 自适应 dispatch 思想 |
+
+### 反模式：全队列一律 num=2
+
+```cpp
+// ❌ 无脑全开：L0C 累加器也开双缓冲 → 链式 Mmad 结果错误 + L0 容量浪费
+pipe.InitBuffer(a1_, 2, SZ_A1);
+pipe.InitBuffer(b1_, 2, SZ_B1);
+pipe.InitBuffer(c1_, 2, SZ_C1);   // L0C 必须 num=1！
+
+// ✅ 按迭代流逐个判定（gdr_cv 实例：stage 被 SyncAll 串行 → 全部 num=1）
+pipe.InitBuffer(a1_, 1, SZ_A1);
+pipe.InitBuffer(b1_, 1, SZ_B1);
+pipe.InitBuffer(a2_, 1, SZ_A2);
+pipe.InitBuffer(b2_, 1, SZ_B2);
+pipe.InitBuffer(c1_, 1, SZ_C1);
+```
+
+---
+
+## MIX (CV 融合) 模式下双缓冲与 SyncAll 的交互
+
+MIX kernel 的重叠设计分**两个正交层级**，先考虑层 1 再考虑层 2：
+
+| 层级 | 机制 | 重叠对象 |
+|------|------|---------|
+| 层 1：核间重叠 | AIC/AIV 分工 + GM workspace 交接 | Cube 计算（AIC）与 Vector 计算（AIV）并行 |
+| 层 2：核内重叠 | 队列 num=2 双缓冲 | 同一核内相邻迭代的搬运与计算并行 |
+
+关键交互规则：
+
+1. **`SyncAll<false>()` 冲刷整条流水**：barrier 两侧的 stage 是严格串行的，跨 stage 的队列双缓冲**无任何重叠机会**——stage-serialized 的 MIX kernel（如 gdr_cv）所有队列 num=1 即可。
+2. **双缓冲只在 barrier 内部的连续迭代流里有意义**：典型是 AIC 侧 matmul 内层 K-loop（flash_attention 的 L0A/L0B num=2），该循环内没有 SyncAll。
+3. **不要在 SyncAll 两侧用同一队列的双缓冲"假装流水"**：AIC 在 stage N 写入的 buffer，AIV 在 stage N+1 读取，靠的是 barrier 保证可见性，与队列 num 无关；GM workspace 才是跨核交接的正确载体（见 [api-mix-mode.md](api-mix-mode.md) §7）。
+4. **UB/L1 预算联动**：MIX 下 AIC（L1/L0）与 AIV（UB）容量独立核算，双缓冲只放大对应侧的占用；AIV 侧 UB 预算紧张时优先砍双缓冲（num 2→1）而不是砍 tile。
 
 ---
 

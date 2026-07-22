@@ -22,6 +22,7 @@ description: Ascend C API 使用最佳实践。提供算术、归约、数据搬
 | **Buffer 管理** | TBuf, TQue | [api-buffer.md](references/api-buffer.md) | Double Buffer、内存规划 |
 | **精度转换** | Cast | [api-precision.md](references/api-precision.md) | FP16/FP32 混合精度 |
 | **流水线同步** | EnQue, DeQue, SetFlag | [api-pipeline.md](references/api-pipeline.md) | 多级流水线、事件同步 |
+| **MIX/CV 融合模式** | KERNEL_TYPE_MIX, ASCEND_IS_AIC/AIV, SyncAll, Mmad, Fixpipe | [api-mix-mode.md](references/api-mix-mode.md) | Cube+Vector 融合 kernel 开发 |
 | **Compare 256B对齐** | Compare | [api-restrictions.md](references/api-restrictions.md#21-compare-api-256字节对齐约束) | Padding 策略 |
 | **repeatTime 限制** | repeatTimes ≤ 255 | [api-repeat-limits.md](references/api-repeat-limits.md) | 分批处理 |
 | **API 限制** | - | [api-restrictions.md](references/api-restrictions.md) | 禁用 API、编译期限制 |
@@ -43,6 +44,7 @@ description: Ascend C API 使用最佳实践。提供算术、归约、数据搬
 | **非对齐数据** | [api-datacopy.md](references/api-datacopy.md) | DataCopyPad、32 字节对齐 |
 | **混合精度** | [api-precision.md](references/api-precision.md) | FP16 输入 FP32 计算 |
 | **流水线优化** | [api-pipeline.md](references/api-pipeline.md), [api-buffer.md](references/api-buffer.md) | Double Buffer、事件同步 |
+| **Cube+Vector 融合算子（MIX）** | [api-mix-mode.md](references/api-mix-mode.md) | 核类型守卫、队列归属、SyncAll\<false\>、Mmad 链、GM workspace 交换 |
 | **性能调优** | [api-buffer.md](references/api-buffer.md), [api-repeat-limits.md](references/api-repeat-limits.md) | Double Buffer、repeatTimes 优化 |
 | **遇到 API 限制** | [api-restrictions.md](references/api-restrictions.md) | 替代方案、避坑指南 |
 

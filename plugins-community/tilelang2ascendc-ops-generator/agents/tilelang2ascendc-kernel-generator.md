@@ -6,6 +6,8 @@ skills:
   - ascendc-api-best-practices
   - ascendc-docs-search
   - ascendc-tiling-design
+  - ascendc-crash-debug
+  - ascendc-perf-optimize
   - tilelang2ascend-operator-project-init
   - tilelang2ascend-translator
   - tilelang2ascend-case-simplifier

@@ -27,6 +27,7 @@ description: Ascend C 算子性能优化策略制定。结合 Tiling 建模与�
 ```
 给定：算子类型、计算流程（kernel 代码/伪代码）、profiling 数据、仿真图（可选）
 
+Step 0 — 架构级判定（前置，不满足则跳过） → scalar 模拟矩阵运算？→ CV 融合重写
 Step 1 — Tiling 理论建模 → 输出理想 tiling data
 Step 2 — 通信类算子？ → 通算演算优化策略（卡间流水分析 + tiling 修正）
 Step 3 — 多核间同步算子？ → 核间流水优化策略（核间流水分析 + tiling 修正）
@@ -34,6 +35,26 @@ Step 4 — 单核流水优化策略（核内流水分析 + tiling 修正）
 ```
 
 每步的"流水"分析包含**仿真图解读**和 **profiling 数据**分析报告。Step 2/3/4 的策略输出均包含对 Step 1 tiling 策略的修正建议。
+
+---
+
+## Step 0 — 架构级判定：scalar 模拟矩阵运算 → CV 融合重写
+
+**适用条件**（全部满足）：
+- profiling 显示 `scalar_compute` / `compute_bound` 瓶颈
+- kernel 存在标量循环或纯 Vector 指令**模拟矩阵运算**（嵌套 dot、伪 matmul `Mul+ReduceSum` 逐行、标量三角求解），且矩阵维度 ≥ 64
+
+**判定为是 → 架构级 MIX CV 融合重写优先于一切流水微调**（收益为数量级；流水微调在这种 kernel 上收益封顶）。
+
+实证（gated_delta_rule，910B2C）：scalar/VEC 实现优化到 3.3x 仍比参考慢 17x → `KERNEL_TYPE_MIX_AIC_1_1` 重写（Cube 全部 matmul + Neumann 三角求逆，Vector elementwise）后 **geomean 8.85x**。
+
+**路由**：
+- 重写决策 + 四阶段工作流（AIC_ONLY derisk → MIX 骨架 → 配对探针 → 逐 stage 增量）：evolution-strategies 卡 `P102_scalar_matmul_to_cv_fusion_rewrite.md`
+- 三角求解串行链上 Cube（Neumann 乘积式）：evolution-strategies 卡 `P103_cube_neumann_triangular_solve.md`
+- MIX API 规范（守卫/队列归属/SyncAll/Mmad 链）：`ascendc-api-best-practices/references/api-mix-mode.md`
+- MIX hang 排查：`ascendc-crash-debug/references/mix-hang-debug.md`
+
+重写完成后再进入 Step 1-4 的流水分析。判定为否 → 直接进 Step 1。
 
 ---
 

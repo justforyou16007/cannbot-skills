@@ -110,11 +110,17 @@ Pattern: {pattern_type} | Overlap: {overlap_status}
 
 Bottleneck-targeted guidance:
   memory_bound → increase tile size, enable double buffer, merge DMA transfers
-  scalar_bound → reduce GetValue calls, vectorize reductions, hoist loop-invariants
+  scalar_bound / scalar_compute / scalar_loop_around_vector / scalar_reduce_after_vector / scalar_matvec_driver (aiv_scalar_ratio > 40%) → FIRST apply scalar-to-vector strategies P94/P95/P99/P100; only if ratios remain high then consider family-specific tiling/core changes
   compute_bound → algorithm optimization, eliminate redundant compute
   mte2_stall → redesign data layout, enlarge transfer blocks, batch small DMAs
   tiling_imbalance → rebalance core workload, adjust block_dim partitioning
   no_overlap → restructure CopyIn/Compute/CopyOut stage boundaries for pipeline overlap
+
+Special rule for scalar subtypes: When profiling shows aiv_scalar_ratio > 40%, inspect outer loops for:
+  - scalar_loop_around_vector: for-loop contains Vector API calls (Axpy/Muls/ReduceSum)
+  - scalar_reduce_after_vector: GetValue from Vector Reduce result into scalar array, then scalar aggregate
+  - scalar_matvec_driver: GetValue per row to scale matrix rows (qRot / Pi × q patterns)
+Do not stop at "the kernel already uses ReduceSum/Axpy/Muls". These are exactly the scalar-shell-around-vector anti-patterns (scalar loop wrapping Vector API calls).
 
 Hardware: {hw_params_one_liner}
 

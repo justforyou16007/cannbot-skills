@@ -7,7 +7,7 @@ conflicts_with: []
 synergizes_with: [P67, P69, P84, P94]
 requires: []
 has_preconditions: true
-has_playbook: false
+has_playbook: true
 ---
 
 # P95: 标量逐元素运算向量化 (Scalar Element-wise → Adds/Muls Vector Chain)
@@ -28,7 +28,7 @@ for (int32_t i = 0; i < count_spatial; ++i) {
 }
 
 // === 改造后：Adds/Muls 标量-向量指令链（4 条指令） ===
-// Adds/Muls 直接接收标量参数，无需 Duplicate 广播
+// Adds/Muls 直接接收标量参数，无需 Duplicate 广播；中间结果全程留在 UB
 AscendC::Adds<float>(yLocal, xIn, -mean, count_spatial);       // y = x - mean
 AscendC::Muls<float>(yLocal, yLocal, inv_std, count_spatial);  // y = y * inv_std
 AscendC::Muls<float>(yLocal, yLocal, w_val, count_spatial);    // y = y * weight
@@ -43,53 +43,19 @@ AscendC::Adds<float>(yLocal, yLocal, b_val, count_spatial);    // y = y + bias
 | `Muls<T>(dst, src, scalar, len)` | dst[i] = src[i] * scalar | `y[i] = x[i] * c` |
 | `Subs<T>(dst, src, scalar, len)` | dst[i] = src[i] - scalar | `y[i] = x[i] - c` |
 
-## 多操作融合（UB 融合 Vector 链）
-
-```cpp
-// 多条向量指令的中间结果保留在 UB 上直通消费，不写回 GM
-// n 次 Vector 计算从 2n 次 GM 搬运减少到 2 次（首入 + 尾出）
-LocalTensor<float> xIn = inQueue.DeQue<float>();
-LocalTensor<float> yLocal = outQueue.AllocTensor<float>();
-
-// 向量链：全部在 UB 上执行，中间结果不离开 UB
-AscendC::Duplicate<float>(w0, cx1, bCnt);            // 广播
-AscendC::Max<float>(w0, w0, candX1, bCnt);           // element-wise max
-AscendC::Min<float>(w1, curX2, candX2, bCnt);        // element-wise min
-AscendC::SubRelu<float>(w0, w1, w0, bCnt);           // ReLU(a - b)
-AscendC::Mul<float>(w4, w0, w1, bCnt);               // multiply
-AscendC::Add<float>(w1, w0, subArea, bCnt);          // add
-AscendC::Sub<float>(w1, w1, w4, bCnt);               // subtract
-AscendC::Div<float>(w4, w4, w1, bCnt);               // divide
-
-outQueue.EnQue(yLocal);
-inQueue.FreeTensor(xIn);
-```
-
 ## 关键修改点
 
-1. **识别可融合链**：如果一个标量循环的每一次迭代计算 `y[i] = f_n(...f_2(f_1(x[i])))`，且中间结果不被其他地方使用，整条链可映射为 N 条向量指令
-2. **指令选择**：优先用标量-向量指令（`Adds`/`Muls`/`Subs`），避免 `Duplicate` 广播→`Add`/`Mul` 两步操作
-3. **UB 容量**：向量链越长，中间 tensor 生命周期越长。确保 UB 容量足够（链中每个中间 tensor 占 `count × sizeof(T)` 字节）
-4. **预期收益**：单次标量-向量转换 3-10x 加速；融合链消除 GM 往返额外 20-50%
-
-## 适用性检测 (grep)
-
-```bash
-# 检测逐元素标量算术循环
-grep -nE "for\s*\(.*\+\+.*y\[.*\]=.*x\[" op_kernel/*.cpp
-
-# 检测 raw pointer（标量计算前兆）
-grep -nE "reinterpret_cast.*float\*|reinterpret_cast.*half\*" op_kernel/*.cpp
-
-# 确认是否有可融合的运算符链
-grep -nE "y\[i\]\s*=" op_kernel/*.cpp
-```
+1. **识别可融合链**：如果标量循环每次迭代计算 `y[i] = f_n(...f_1(x[i]))` 且中间结果不被他用，整条链可映射为 N 条向量指令，中间结果保留 UB 直通消费（n 次计算从 2n 次 GM 搬运减到 2 次）
+2. **指令选择**：优先标量-向量指令（`Adds`/`Muls`/`Subs`），避免 `Duplicate` 广播→`Add`/`Mul` 两步操作
+3. **UB 容量**：链中每个中间 tensor 占 `count × sizeof(T)` 字节，链越长生命周期越长
+4. **隐蔽变体**：标量循环包裹向量 BLAS-like 调用（`for` 内 `Axpy`/`Muls` + `GetValue` 标量 scale），看到 `Axpy` 不代表已向量化，改造见 Playbook Step 3C 形态 ε
+5. **预期收益**：单次标量-向量转换 3-10x；融合链消除 GM 往返额外 20-50%
 
 ## 常见陷阱
 
 ⚠️ `Adds`/`Muls` 的 scalar 参数类型必须与 tensor 元素类型一致（FP32 tensor + float scalar）
 ⚠️ 向量链中间结果不可超出 UB 容量（每个中间 tensor = `count × sizeof(T)` 字节）
-⚠️ 连续 Vector 写同一 buffer 后如果需要 MTE3 搬运，必须加 `PipeBarrier<PIPE_V>()`
+⚠️ 连续 Vector 写同一 buffer 后如需 MTE3 搬运，必须加 `PipeBarrier<PIPE_V>()`
 ⚠️ 极小 count（< 128）时向量化开销可能超过标量，考虑混合调度（见 P98）
 
 ## 代码搜索关键词

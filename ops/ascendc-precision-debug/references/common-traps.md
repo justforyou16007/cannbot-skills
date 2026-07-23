@@ -476,61 +476,11 @@ ceil 偏移确保 `amax / decoded_scale ≤ quant_dtype_max`，Cast 不溢出。
 
 ---
 
-## 陷阱11：host 侧流竞争 — kernel 输出被 torch 算子覆盖 ⭐⭐
-
-### 症状
-
-- kernel 确认执行（核内 PRINTF 正常、参数正确），但输出全为 0
-- 用 `torch::zeros` 分配输出时必现；换 `torch::empty` 或 `aclrtMalloc` 后正常
-- 伴随大量 torch 预处理算子（transpose/cumsum/mask 等）时输出为非确定性垃圾
-
-### 原因
-
-host 用**裸 `aclrtlaunch_*`** 启动 kernel，与 torch 算子（fill/预处理）不在同一执行流上排队：`torch::zeros` 的 fill kernel 可能在自定义 kernel 写完输出**之后**才执行，把结果覆盖为 0。
-
-### 解决方案
-
-```cpp
-// ✅ 正确：OpCommand::RunOpApi 入队，与 torch 算子同流顺序
-EXEC_KERNEL_CMD(kernel_name, blockDim, args...);   // torch_kernel_helper.h
-
-// ⚠️ 若必须裸 aclrtlaunch_*：启动前显式全设备同步
-aclrtSynchronizeDevice();
-aclrtlaunch_kernel(blockDim, stream, ...);
-```
-
-工程建议：输出分配用 `torch::empty`（kernel 负责全量写出），预处理与启动统一走 RunOpApi。
-
----
-
-## 陷阱12：build 缓存导致"改了没生效" ⭐
-
-### 症状
-
-- 修改 kernel 代码重新构建后，行为/输出与修改前完全一致
-- 加 PRINTF 不打印、改常量无效果
-
-### 原因
-
-构建脚本（setup.py / build.sh）检测到 .so 已存在会跳过 cmake/make；或编译器 kernel cache 命中旧二进制。
-
-### 解决方案
-
-```bash
-rm -rf build/ $HOME/atc_data/kernel_cache/   # 改码后强制全量重编
-# 验证二进制确实更新
-sha256sum build/*.so
-```
-
----
-
 ## 陷阱排查清单
 
 当遇到精度问题时，按顺序检查：
 
 - [ ] **输出是否全为 0？**（检查 DataCopy 对齐 / GlobalTensor.SetValue）⭐⭐⭐
-- [ ] **kernel 执行了但输出被 host 覆盖？**（裸 aclrtlaunch 与 torch fill 流竞争 → RunOpApi 或启动前同步）⭐⭐
-- [ ] **改了代码行为完全不变？**（`rm -rf build/ $HOME/atc_data/kernel_cache/` 后重编）
 - [ ] 是否使用了 Cast API？（检查 RoundMode 是否正确） ⭐
 - [ ] 是否使用了 FP16 累加器？（改用 FP32）
 - [ ] 是否有 exp/log 操作？（检查溢出）

@@ -54,7 +54,7 @@ kernel 内层循环是以下形态之一？
 ### Phase 1 — MIX 骨架（只证明"MIX 不挂"）
 - 切 `KERNEL_TYPE_MIX_AIC_1_1`，加核类型守卫，AIV 路径留空，结尾一次 `SyncAll<false>()`。
 - **退出标准**：不 hang 且 AIC 结果与 Phase 0 完全一致。
-- 挂了 → 按 crash-debug 的 mix-hang-debug.md R1~R4 对照检查（几乎都是守卫缺失）。
+- 挂了 → 按 `references/mix-cv-fusion-guide.md` 的 R1~R4 对照检查（几乎都是守卫缺失）。
 
 ### Phase 2 — 配对与同步探针（证明"核对应关系"）
 - AIV 路径写 `GetBlockIdx()/GetBlockNum()` 到 GM，host 读回打印。
@@ -100,7 +100,7 @@ extern "C" __global__ __aicore__ void kernel_x(...) {
 4. **每个 Mmad 操作数完整走队列**：Alloc→Load→EnQue→DeQue→Mmad→Free；Mmad→Fixpipe、Fixpipe→下次 GM 读之间 `PipeBarrier<PIPE_ALL>`。
 5. **中间结果走 GM workspace 交换**（AIC Fixpipe 写 → barrier → AIV DataCopy 读，或反向），不要试图共享 L0/L1/UB。
 
-API 细节见 `ascendc-api-best-practices` 的 `references/api-mix-mode.md`；hang 排查见 `ascendc-crash-debug` 的 `references/mix-hang-debug.md`。
+API 规范、hang 根因分类（R1-R6）与四阶段开发流程详见本 skill 的 `references/mix-cv-fusion-guide.md`。
 
 ## 常见陷阱
 

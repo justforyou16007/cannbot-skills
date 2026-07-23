@@ -1,0 +1,31 @@
+strategy_id: P97
+description: 零拷贝子张量切片适用性检查 — 必须存在从大 tensor 逐元素取值或 gather 到临时 buffer 的模式
+
+checks:
+  - id: has_scalar_gather_loop
+    type: grep_count
+    pattern: "for\s*\([^)]*j[^)]*\+\+[^)]*\).*\w+\[.*j.*\].*=|for\s*\([^)]*j[^)]*\+\+[^)]*\).*GetValue\(\s*j\s*\)"
+    files: [kernel, header]
+    expected: ">= 1"
+    fail_msg: "未检测到逐元素 gather / 从大 tensor 取值 → P97 无改造对象。考虑 P95 向量链。"
+
+  - id: has_gather_copy_buffer
+    type: grep_count
+    pattern: "for.*gather|for.*collect|for.*copy.*buf|LocalTensor.*tmp.*Gather"
+    files: [kernel, header]
+    expected: ">= 1"
+    fail_msg: "未检测到 gather 到临时 buffer 的反模式 → 当前可能不需要零拷贝切片优化。"
+
+  - id: has_source_local_tensor
+    type: grep_count
+    pattern: "LocalTensor\s*<|TBuf\s*<|inQueue|outQueue"
+    files: [kernel, header]
+    expected: ">= 1"
+    fail_msg: "未检测到 UB LocalTensor / Queue 使用 → 零拷贝切片需要在 UB tensor 上操作，当前不适用。"
+
+  - id: has_batch_vector_opportunity
+    type: grep_count
+    pattern: "\b(Max|Min|SubRelu|Mul|Div|Duplicate)\s*\("
+    files: [kernel, header]
+    expected: ">= 1"
+    fail_msg: "未检测到批量向量运算机会（Max/Min/SubRelu/Mul/Div）→ 零拷贝切片后无向量链消费，收益有限。"

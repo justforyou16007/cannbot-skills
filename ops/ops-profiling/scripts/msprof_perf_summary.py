@@ -750,6 +750,32 @@ def _jsonl_tensor_expr(shape, dtype_str: str) -> str:
     return code[len(prefix):-1]  # strip "inputs.append(" and trailing ")"
 
 
+def _jsonl_tensor_dtype_repr(dtype_str: str) -> str:
+    """将 JSONL dtype 字符串映射为 torch dtype 表达式（用于 torch.tensor(..., dtype=...)）。"""
+    dtype_map = {
+        "fp16": "torch.float16", "float16": "torch.float16", "half": "torch.float16",
+        "fp32": "torch.float32", "float32": "torch.float32", "float": "torch.float32",
+        "fp64": "torch.float64", "float64": "torch.float64",
+        "bf16": "torch.bfloat16", "bfloat16": "torch.bfloat16",
+        "int8": "torch.int8", "int16": "torch.int16", "int32": "torch.int32",
+        "int": "torch.int32", "int64": "torch.int64", "long": "torch.int64",
+        "uint8": "torch.uint8", "uint16": "torch.uint16", "uint32": "torch.uint32", "uint64": "torch.uint64",
+        "bool": "torch.bool",
+        "complex64": "torch.complex64", "complex128": "torch.complex128",
+    }
+    return dtype_map.get(dtype_str, "torch.float32")
+
+
+# attr dtype=str 且值为 torch dtype 名称时，映射到 torch.xxx 表达式（而非字符串字面量）
+_TORCH_DTYPE_EXPR_MAP = {
+    "float16": "torch.float16", "bfloat16": "torch.bfloat16",
+    "float32": "torch.float32", "float64": "torch.float64",
+    "int8": "torch.int8", "int16": "torch.int16",
+    "int32": "torch.int32", "int64": "torch.int64",
+    "uint8": "torch.uint8", "bool": "torch.bool",
+}
+
+
 def _serialize_jsonl_inputs(case):
     """Generate kwargs dict code from JSONL inputs, using 'name' fields as keys.
 
@@ -761,12 +787,24 @@ def _serialize_jsonl_inputs(case):
         name = inp.get("name", "")
         typ = inp.get("type", "tensor")
         if typ == "tensor":
-            shape = inp.get("shape", [])
             dtype_str = inp.get("dtype", "float16")
-            tensor_expr = _jsonl_tensor_expr(shape, dtype_str)
-            lines.append(f"_inputs_dict[{repr(name)}] = {tensor_expr}")
+            # 优先使用显式 value（如 group_list / cumsum 等结构参数）
+            explicit_val = inp.get("value")
+            if explicit_val is not None:
+                dtype_repr = _jsonl_tensor_dtype_repr(dtype_str)
+                lines.append(f"_inputs_dict[{repr(name)}] = torch.tensor({repr(explicit_val)}, dtype={dtype_repr})")
+            else:
+                shape = inp.get("shape", [])
+                tensor_expr = _jsonl_tensor_expr(shape, dtype_str)
+                lines.append(f"_inputs_dict[{repr(name)}] = {tensor_expr}")
         elif typ in ("attr", "scalar"):
             val = _jsonl_scalar_value(inp)
+            # attr 的 dtype 为 str 且值是 torch dtype 名时，生成 torch.xxx 表达式而非字符串字面量
+            if inp.get("dtype") == "str" and isinstance(val, str):
+                dtype_expr = _TORCH_DTYPE_EXPR_MAP.get(val)
+                if dtype_expr is not None:
+                    lines.append(f"_inputs_dict[{repr(name)}] = {dtype_expr}")
+                    continue
             lines.append(f"_inputs_dict[{repr(name)}] = {repr(val)}")
         elif typ == "tensor_list":
             lines.append("_tensors = []")

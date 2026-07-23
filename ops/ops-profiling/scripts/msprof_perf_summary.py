@@ -1111,6 +1111,7 @@ def _parse_msprof_duration_quick(prof_group_dir: str):
     """快速模式解析：从 PROF 目录中查找 task_time.csv 或 api_statistic.csv 并提取时间。
 
     快速模式只跑 1 轮（不采集 7 个 aic-metrics），因此没有 op_summary_*.csv。
+
     warmup 已在 msprof 外部执行，task_time.csv 只包含正式 timed run 的 kernel 时间，
     对单次采集中所有计算 kernel 的耗时直接累加即可。
 
@@ -1131,57 +1132,36 @@ def _parse_msprof_duration_quick(prof_group_dir: str):
             with open(task_time_files[0], "r", encoding="utf-8", errors="replace") as f:
                 reader = csv.DictReader(f)
                 rows = list(reader)
-            # 汇总所有真实计算 kernel 的耗时
-            # 参考实现可能包含大量 PyTorch native kernel；AscendC 实现也可能拆分为多个 kernel。
-            # 只累加 kernel_type 为实际计算类型的行，排除 PROFILING_ENABLE / TASK_TIMEOUT_SET 等。
-            COMPUTE_KERNEL_TYPES = {"AI_VECTOR_CORE", "AI_CORE", "MIX_AIV", "MIX"}
-            compute_rows = []
+            # 收集所有非元事件的 kernel 行，按 kernel_name 分组
+            kernel_times: Dict[str, List[float]] = {}
             for r in rows:
                 kernel_type = r.get("kernel_type", "")
                 task_time = r.get("task_time(us)", "")
-                if kernel_type in COMPUTE_KERNEL_TYPES and task_time:
+                if kernel_type not in ("PROFILING_ENABLE", "PROFILING_DISABLE", "TASK_TIMEOUT_SET", "") and task_time:
                     try:
                         duration = float(task_time)
                         if duration > 0:
-                            compute_rows.append((duration, r.get("kernel_name", "unknown")))
+                            kernel_name = r.get("kernel_name", "unknown")
+                            kernel_times.setdefault(kernel_name, []).append(duration)
                     except ValueError:
                         continue
-            if compute_rows:
-                total_duration = sum(d for d, _ in compute_rows)
-                if total_duration > 0:
-                    kernel_name = compute_rows[0][1] if len(compute_rows) == 1 else "multiple_kernels"
-                    return total_duration, kernel_name, None
+
+            if kernel_times:
+                # 选择主要 kernel：优先总耗时最长、其次下发次数最多
+                main_kernel = max(
+                    kernel_times.items(),
+                    key=lambda kv: (sum(kv[1]), len(kv[1]))
+                )[0]
+                times = kernel_times[main_kernel]
+                if len(times) >= 3:
+                    sorted_t = sorted(times)
+                    filtered = sorted_t[1:-1]
+                    agg_duration = statistics.mean(filtered)
+                else:
+                    agg_duration = statistics.median(times)
+                return agg_duration, main_kernel, None
         except Exception:
             pass
-
-    # 2. 尝试从 api_statistic.csv 提取（launch 行），同样兼容两种路径
-    api_patterns = [
-        os.path.join(prof_group_dir, "mindstudio_profiler_output", "api_statistic_*.csv"),
-        os.path.join(prof_group_dir, "PROF_*", "mindstudio_profiler_output", "api_statistic_*.csv"),
-    ]
-    for api_pattern in api_patterns:
-        api_files = sorted(glob.glob(api_pattern))
-        if not api_files:
-            continue
-        try:
-            with open(api_files[0], "r", encoding="utf-8", errors="replace") as f:
-                reader = csv.DictReader(f)
-                rows = list(reader)
-            # 查找 Level=node, API Name=launch 的行
-            for r in rows:
-                level = r.get("Level", "")
-                api_name = r.get("API Name", "")
-                if level == "node" and api_name == "launch":
-                    time_us = r.get("Time(us)", "")
-                    if time_us:
-                        try:
-                            duration = float(time_us)
-                            if duration > 0:
-                                return duration, "launch", None
-                        except ValueError:
-                            continue
-        except Exception:
-            return None, None, "no task_time or api_statistic csv found"
 
     return None, None, "no task_time or api_statistic csv found"
 

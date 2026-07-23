@@ -159,6 +159,7 @@ def parse_yaml_preconditions(content: str) -> dict:
 # ---- 文件集解析 ----
 FILE_GROUPS = {
     "kernel": ["op_kernel/*.cpp", "op_kernel/*.h"],
+    "host": ["op_host/*.cpp", "op_host/*.h"],
     "header": ["op_kernel/*.h", "op_host/*.h"],
     "tiling": ["op_host/*_tiling.cpp", "op_host/*_tiling.h"],
     "all": ["op_kernel/*.cpp", "op_kernel/*.h", "op_host/*.cpp", "op_host/*.h"],

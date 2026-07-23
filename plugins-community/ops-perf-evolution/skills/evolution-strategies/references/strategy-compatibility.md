@@ -44,6 +44,7 @@
 | P83 | P53 | L1 多缓冲分区是 L1 常驻复用(P53)的扩展 |
 | P86 | P46 | Matmul 数据通路调优依赖 MatmulImpl API(P46) |
 | P87 | P46 | 手动 Mmad 时序控制依赖 MatmulImpl API(P46) |
+| P103 | P102 | Cube Neumann 三角求解依赖 MIX CV 融合架构，需先由 P102 完成 scalar/VEC → MIX 重写建立 Cube 通路 |
 
 ### 推荐搭配（非硬依赖，但组合效果显著优于单独使用）
 
@@ -56,6 +57,9 @@
 | P68 | P84 | 低延迟归约搭配 Vector 效率模式，归约指令+计算链联合优化 |
 | P71 | P83 | IBShare L1 共享搭配 L1 多缓冲分区，最大化 L1 利用率 |
 | P81 | P85 | 参数常驻搭配 buffer 分区复用，协同管理 UB 空间 |
+| P94 | P95 | 标量归约与逐元素链联合向量化（Norm 类 sum/sum_sq + 归一化链，GroupNorm 实测 geomean 1.84x/4.31x） |
+| P100 | P97 | GatherMask 的 src 用零拷贝偏移视图（src[offset]），避免显式拷贝 |
+| P101 | P100 | 同类 GatherMask 解交织策略：拆分发生在 Host 侧用 P101，发生在 kernel 内用 P100 |
 
 简化依赖图：
 
@@ -75,6 +79,7 @@ P79 ──→ P46
 P83 ──→ P53 ──→ P18
 P86 ──→ P46
 P87 ──→ P46
+P103 ──→ P102
 ```
 
 ## §3 推荐组合

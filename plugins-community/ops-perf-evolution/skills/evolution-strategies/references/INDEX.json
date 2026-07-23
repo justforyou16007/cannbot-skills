@@ -43,13 +43,13 @@
     ]
   },
   "stats": {
-    "cards": 95,
-    "active_cards": 95,
-    "deprecated": 0,
-    "preconditions": 95,
-    "playbooks": 95,
+    "cards": 118,
+    "active_cards": 105,
+    "deprecated": 13,
+    "preconditions": 104,
+    "playbooks": 103,
     "families": 4,
-    "discovered": 1
+    "discovered": 9
   },
   "cards": [
     {
@@ -343,6 +343,129 @@
       "quantified_gain": []
     },
     {
+      "source_key": "evolution-strategies#card/P100_gathermask_replacement",
+      "id": "P100",
+      "title": "P100: GatherMask 替代逐元素 SetValue/GetValue (GatherMask Replacement)",
+      "doc_path": "cards/P100_gathermask_replacement.md",
+      "complexity": "L1",
+      "op_families": [
+        "elementwise",
+        "special",
+        "index_scatter",
+        "attention"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "scalar_compute",
+          "scalar_loading",
+          "compute_bound"
+        ]
+      },
+      "conflicts_with": [],
+      "synergizes_with": [
+        "P97",
+        "P95",
+        "P101"
+      ],
+      "requires": [],
+      "has_preconditions": true,
+      "has_playbook": true,
+      "quantified_gain": []
+    },
+    {
+      "source_key": "evolution-strategies#card/P101_gathermask_host_column_split",
+      "id": "P101",
+      "title": "P101: GatherMask 替代 Host 侧列拆分 (GatherMask Replaces Host-Side Column Split)",
+      "doc_path": "cards/P101_gathermask_host_column_split.md",
+      "complexity": "L1",
+      "op_families": [
+        "elementwise",
+        "special",
+        "index_scatter",
+        "attention"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "mte2_stall",
+          "scalar_loading"
+        ]
+      },
+      "conflicts_with": [],
+      "synergizes_with": [
+        "P100",
+        "P95",
+        "P69"
+      ],
+      "requires": [],
+      "has_preconditions": false,
+      "has_playbook": true,
+      "quantified_gain": []
+    },
+    {
+      "source_key": "evolution-strategies#card/P102_scalar_matmul_to_cv_fusion_rewrite",
+      "id": "P102",
+      "title": "P102: 标量/向量模拟矩阵运算 → MIX CV 融合重写",
+      "doc_path": "cards/P102_scalar_matmul_to_cv_fusion_rewrite.md",
+      "complexity": "L1",
+      "op_families": [
+        "cv_fusion",
+        "matmul",
+        "attention",
+        "special"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "scalar_compute",
+          "compute_bound"
+        ]
+      },
+      "conflicts_with": [],
+      "synergizes_with": [
+        "P29",
+        "P46",
+        "P87",
+        "P92"
+      ],
+      "requires": [],
+      "has_preconditions": true,
+      "has_playbook": false,
+      "quantified_gain": [
+        "shape: \"GDR B=1,T=64,Hk=4,Hv=4,fp16\"",
+        "shape: \"GDR geomean over T=64..4096\""
+      ]
+    },
+    {
+      "source_key": "evolution-strategies#card/P103_cube_neumann_triangular_solve",
+      "id": "P103",
+      "title": "P103: Cube Neumann 乘积式三角求逆（替代标量 forward substitution）",
+      "doc_path": "cards/P103_cube_neumann_triangular_solve.md",
+      "complexity": "L1",
+      "op_families": [
+        "cv_fusion",
+        "attention",
+        "special"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "scalar_compute",
+          "compute_bound"
+        ]
+      },
+      "conflicts_with": [],
+      "synergizes_with": [
+        "P102",
+        "P87"
+      ],
+      "requires": [
+        "P102"
+      ],
+      "has_preconditions": true,
+      "has_playbook": false,
+      "quantified_gain": [
+        "shape: \"GDR triangular solve C=64 per chunk\""
+      ]
+    },
+    {
       "source_key": "evolution-strategies#card/P10_vectorized_copy",
       "id": "P10",
       "title": "P10: Vectorized Data Copy & Instructions (向量化数据与指令)",
@@ -406,6 +529,29 @@
       "has_preconditions": true,
       "has_playbook": true,
       "quantified_gain": []
+    },
+    {
+      "source_key": "evolution-strategies#card/P13_special_algorithms",
+      "id": "P13",
+      "title": "P13: Special Algorithms & High-Level AscendC APIs (特殊算法与高阶API)",
+      "doc_path": "cards/P13_special_algorithms.md",
+      "complexity": "L0",
+      "op_families": [
+        "special"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "compute_bound"
+        ]
+      },
+      "conflicts_with": [],
+      "synergizes_with": [],
+      "requires": [],
+      "has_preconditions": false,
+      "has_playbook": false,
+      "quantified_gain": [],
+      "deprecated": true,
+      "deprecated_reason": "Title is vague 'Special Algorithms'. Content is actually FakeQuant DAG scheduling (very specific, not L0 universal)."
     },
     {
       "source_key": "evolution-strategies#card/P14_cv_pipeline_preload",
@@ -1036,6 +1182,31 @@
       "quantified_gain": []
     },
     {
+      "source_key": "evolution-strategies#card/P42_workspace_zone_reuse",
+      "id": "P42",
+      "title": "P42: workspace buffer 多区域分时复用",
+      "doc_path": "cards/P42_workspace_zone_reuse.md",
+      "complexity": "L1",
+      "op_families": [
+        "datapath"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "ub_memory_pressure"
+        ]
+      },
+      "conflicts_with": [],
+      "synergizes_with": [
+        "P8"
+      ],
+      "requires": [],
+      "has_preconditions": false,
+      "has_playbook": false,
+      "quantified_gain": [],
+      "deprecated": true,
+      "deprecated_reason": "Code skeleton is identical copy-paste of P85. P85 has more general and accurate description."
+    },
+    {
       "source_key": "evolution-strategies#card/P43_grad_pingpong_deferred_scatter",
       "id": "P43",
       "title": "P43: 反向梯度 4路PingPong 常驻与 Scatter-Add 延迟写回",
@@ -1549,6 +1720,32 @@
       "quantified_gain": []
     },
     {
+      "source_key": "evolution-strategies#card/P62_sparse_dense_dual_path_dispatch_dra",
+      "id": "P62",
+      "title": "P62: Draft: Sparse/Dense Dual-Path Dispatch by Reachable Coverage（按可达覆盖度切换 sparse/dense 双路径，草稿）",
+      "doc_path": "cards/P62_sparse_dense_dual_path_dispatch_dra.md",
+      "complexity": "L1",
+      "op_families": [
+        "flash_attention"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "tiling_imbalance"
+        ]
+      },
+      "conflicts_with": [],
+      "synergizes_with": [
+        "P76",
+        "P80"
+      ],
+      "requires": [],
+      "has_preconditions": false,
+      "has_playbook": false,
+      "quantified_gain": [],
+      "deprecated": true,
+      "deprecated_reason": "Explicitly marked Draft in title. Insufficient evidence width for general application."
+    },
+    {
       "source_key": "evolution-strategies#card/P63_iterate_async_interface",
       "id": "P63",
       "title": "P63: Iterate 异步接口避免 AIC/AIV 同步依赖 (Iterate Async Interface)",
@@ -1718,6 +1915,29 @@
       "has_preconditions": true,
       "has_playbook": true,
       "quantified_gain": []
+    },
+    {
+      "source_key": "evolution-strategies#card/P6_multi_algo_selection",
+      "id": "P6",
+      "title": "P6: Multi-Algorithm Adaptive Selection (多算法自适应选择)",
+      "doc_path": "cards/P6_multi_algo_selection.md",
+      "complexity": "L0",
+      "op_families": [
+        "datapath"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "ub_memory_pressure"
+        ]
+      },
+      "conflicts_with": [],
+      "synergizes_with": [],
+      "requires": [],
+      "has_preconditions": false,
+      "has_playbook": false,
+      "quantified_gain": [],
+      "deprecated": true,
+      "deprecated_reason": "Title 'Multi-Algorithm Adaptive Selection' mismatches content (Welford algorithm = A2 duplicate)."
     },
     {
       "source_key": "evolution-strategies#card/P70_fp_buffer_inline_quant",
@@ -2022,6 +2242,31 @@
       "quantified_gain": []
     },
     {
+      "source_key": "evolution-strategies#card/P82_manual_multi_buffer_pipeline_policy",
+      "id": "P82",
+      "title": "P82: BufferPolicy Class for Multi-Stage Pipeline (手写 BufferPolicy 类替代 TQue 的多阶段流水策略)",
+      "doc_path": "cards/P82_manual_multi_buffer_pipeline_policy.md",
+      "complexity": "L1",
+      "op_families": [
+        "special"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "no_overlap"
+        ]
+      },
+      "conflicts_with": [
+        "P1"
+      ],
+      "synergizes_with": [],
+      "requires": [],
+      "has_preconditions": false,
+      "has_playbook": false,
+      "quantified_gain": [],
+      "deprecated": true,
+      "deprecated_reason": "Code skeleton is identical copy-paste of P19 (BuffersPolicyDB class). P19 has richer content."
+    },
+    {
       "source_key": "evolution-strategies#card/P83_l1_resident_reuse_partition",
       "id": "P83",
       "title": "P83: L1 Resident Reuse with Multi-Buffer Partitioning (L1 常驻复用与多 Buffer 分区)",
@@ -2320,6 +2565,184 @@
       "quantified_gain": []
     },
     {
+      "source_key": "evolution-strategies#card/P94_scalar_reduction_to_vector",
+      "id": "P94",
+      "title": "P94: 标量归约向量化 (Scalar Reduction → Vector Reduce API)",
+      "doc_path": "cards/P94_scalar_reduction_to_vector.md",
+      "complexity": "L1",
+      "op_families": [
+        "reduction",
+        "normalization",
+        "elementwise",
+        "softmax",
+        "optimizer"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "scalar_compute",
+          "compute_bound"
+        ]
+      },
+      "conflicts_with": [],
+      "synergizes_with": [
+        "P67",
+        "P68",
+        "P69",
+        "P84"
+      ],
+      "requires": [],
+      "has_preconditions": true,
+      "has_playbook": true,
+      "quantified_gain": []
+    },
+    {
+      "source_key": "evolution-strategies#card/P95_scalar_elementwise_to_vector",
+      "id": "P95",
+      "title": "P95: 标量逐元素运算向量化 (Scalar Element-wise → Adds/Muls Vector Chain)",
+      "doc_path": "cards/P95_scalar_elementwise_to_vector.md",
+      "complexity": "L1",
+      "op_families": [
+        "elementwise",
+        "normalization",
+        "reduction",
+        "broadcast_mask"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "scalar_compute",
+          "compute_bound"
+        ]
+      },
+      "conflicts_with": [],
+      "synergizes_with": [
+        "P67",
+        "P69",
+        "P84",
+        "P94"
+      ],
+      "requires": [],
+      "has_preconditions": true,
+      "has_playbook": true,
+      "quantified_gain": []
+    },
+    {
+      "source_key": "evolution-strategies#card/P96_hardware_sort_replacement",
+      "id": "P96",
+      "title": "P96: 硬件排序引擎替代标量排序/选择 (Hardware Sort Engine Replacement)",
+      "doc_path": "cards/P96_hardware_sort_replacement.md",
+      "complexity": "L2",
+      "op_families": [
+        "special",
+        "index_scatter"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "scalar_compute",
+          "compute_bound"
+        ]
+      },
+      "conflicts_with": [],
+      "synergizes_with": [
+        "P1",
+        "P7",
+        "P67"
+      ],
+      "requires": [],
+      "has_preconditions": true,
+      "has_playbook": true,
+      "quantified_gain": []
+    },
+    {
+      "source_key": "evolution-strategies#card/P97_zero_copy_subtensor",
+      "id": "P97",
+      "title": "P97: 零拷贝子张量切片 + 批量向量运算 (Zero-Copy Sub-Tensor Slicing)",
+      "doc_path": "cards/P97_zero_copy_subtensor.md",
+      "complexity": "L1",
+      "op_families": [
+        "elementwise",
+        "reduction",
+        "special",
+        "index_scatter"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "scalar_compute",
+          "scalar_loading",
+          "mte2_stall"
+        ]
+      },
+      "conflicts_with": [],
+      "synergizes_with": [
+        "P95",
+        "P69",
+        "P7"
+      ],
+      "requires": [],
+      "has_preconditions": true,
+      "has_playbook": true,
+      "quantified_gain": []
+    },
+    {
+      "source_key": "evolution-strategies#card/P98_hybrid_scalar_vector_dispatch",
+      "id": "P98",
+      "title": "P98: 混合标量/向量路径自适应调度 (Hybrid Scalar/Vector Dispatch)",
+      "doc_path": "cards/P98_hybrid_scalar_vector_dispatch.md",
+      "complexity": "L1",
+      "op_families": [
+        "reduction",
+        "normalization",
+        "elementwise",
+        "softmax"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "scalar_compute",
+          "compute_bound",
+          "near_optimal"
+        ]
+      },
+      "conflicts_with": [],
+      "synergizes_with": [
+        "P94",
+        "P95",
+        "P67"
+      ],
+      "requires": [],
+      "has_preconditions": true,
+      "has_playbook": true,
+      "quantified_gain": []
+    },
+    {
+      "source_key": "evolution-strategies#card/P99_broadcast_batch_vector_ops",
+      "id": "P99",
+      "title": "P99: BroadCast + 批量向量运算替代逐行标量循环 (BroadCast + Batch Vector Ops)",
+      "doc_path": "cards/P99_broadcast_batch_vector_ops.md",
+      "complexity": "L1",
+      "op_families": [
+        "normalization",
+        "elementwise",
+        "reduction",
+        "softmax"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "scalar_compute",
+          "scalar_loading",
+          "compute_bound"
+        ]
+      },
+      "conflicts_with": [],
+      "synergizes_with": [
+        "P94",
+        "P95",
+        "P69"
+      ],
+      "requires": [],
+      "has_preconditions": true,
+      "has_playbook": true,
+      "quantified_gain": []
+    },
+    {
       "source_key": "evolution-strategies#card/P9_deterministic_output",
       "id": "P9",
       "title": "P9: Deterministic Output via Workspace (确定性输出)",
@@ -2339,6 +2762,177 @@
       "has_preconditions": true,
       "has_playbook": true,
       "quantified_gain": []
+    },
+    {
+      "source_key": "evolution-strategies#card/R1_vf_fusion",
+      "id": "R1",
+      "title": "R1: VF 函数融合",
+      "doc_path": "cards/R1_vf_fusion.md",
+      "complexity": "L1",
+      "op_families": [
+        "datapath"
+      ],
+      "triggers": {
+        "bottleneck_labels": []
+      },
+      "conflicts_with": [],
+      "synergizes_with": [],
+      "requires": [],
+      "has_preconditions": false,
+      "has_playbook": false,
+      "quantified_gain": [],
+      "deprecated": true,
+      "deprecated_reason": "Uses fictional APIs (__simd_vf__, RegTensor) not present in AscendC. Overlaps with P-series. Zero references in operator lookup tables."
+    },
+    {
+      "source_key": "evolution-strategies#card/R2_register_reuse",
+      "id": "R2",
+      "title": "R2: 寄存器复用",
+      "doc_path": "cards/R2_register_reuse.md",
+      "complexity": "L1",
+      "op_families": [
+        "datapath"
+      ],
+      "triggers": {
+        "bottleneck_labels": []
+      },
+      "conflicts_with": [],
+      "synergizes_with": [],
+      "requires": [],
+      "has_preconditions": false,
+      "has_playbook": false,
+      "quantified_gain": [],
+      "deprecated": true,
+      "deprecated_reason": "Uses fictional RegTensor API. Register allocation is compiler-managed, not a manual kernel optimization strategy."
+    },
+    {
+      "source_key": "evolution-strategies#card/R3_dual_issue",
+      "id": "R3",
+      "title": "R3: 指令双发射",
+      "doc_path": "cards/R3_dual_issue.md",
+      "complexity": "L1",
+      "op_families": [
+        "datapath"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "compute_bound",
+          "no_overlap"
+        ]
+      },
+      "conflicts_with": [],
+      "synergizes_with": [],
+      "requires": [],
+      "has_preconditions": false,
+      "has_playbook": false,
+      "quantified_gain": [],
+      "deprecated": true,
+      "deprecated_reason": "Uses fictional APIs. Dual-issue is compiler/hardware behavior, not a manually applicable strategy."
+    },
+    {
+      "source_key": "evolution-strategies#card/R4_hw_loop",
+      "id": "R4",
+      "title": "R4: Hardware Loop 规范化",
+      "doc_path": "cards/R4_hw_loop.md",
+      "complexity": "L1",
+      "op_families": [
+        "datapath"
+      ],
+      "triggers": {
+        "bottleneck_labels": []
+      },
+      "conflicts_with": [],
+      "synergizes_with": [],
+      "requires": [],
+      "has_preconditions": false,
+      "has_playbook": false,
+      "quantified_gain": [],
+      "deprecated": true,
+      "deprecated_reason": "Minimal content (uint16_t vs uint32_t loop). Overlaps with P67 Counter Mode. Zero references in lookup tables."
+    },
+    {
+      "source_key": "evolution-strategies#card/R5_unalign_opt",
+      "id": "R5",
+      "title": "R5: 非对齐访问优化",
+      "doc_path": "cards/R5_unalign_opt.md",
+      "complexity": "L1",
+      "op_families": [
+        "datapath"
+      ],
+      "triggers": {
+        "bottleneck_labels": []
+      },
+      "conflicts_with": [],
+      "synergizes_with": [],
+      "requires": [],
+      "has_preconditions": false,
+      "has_playbook": false,
+      "quantified_gain": [],
+      "deprecated": true,
+      "deprecated_reason": "Uses fictional UnalignRegForLoad API. Overlaps with P7 (DataCopyPad) and P11 (Tail block). Zero references."
+    },
+    {
+      "source_key": "evolution-strategies#card/R6_low_latency_reduce",
+      "id": "R6",
+      "title": "R6: 低延迟归约",
+      "doc_path": "cards/R6_low_latency_reduce.md",
+      "complexity": "L1",
+      "op_families": [
+        "datapath"
+      ],
+      "triggers": {
+        "bottleneck_labels": []
+      },
+      "conflicts_with": [],
+      "synergizes_with": [],
+      "requires": [],
+      "has_preconditions": false,
+      "has_playbook": false,
+      "quantified_gain": [],
+      "deprecated": true,
+      "deprecated_reason": "Content fully duplicated by P68 (Low-Latency Reduction Instruction Combination). Zero references."
+    },
+    {
+      "source_key": "evolution-strategies#card/R7_simd_simt_hybrid",
+      "id": "R7",
+      "title": "R7: SIMD/SIMT 混合编程",
+      "doc_path": "cards/R7_simd_simt_hybrid.md",
+      "complexity": "L1",
+      "op_families": [
+        "datapath"
+      ],
+      "triggers": {
+        "bottleneck_labels": []
+      },
+      "conflicts_with": [],
+      "synergizes_with": [],
+      "requires": [],
+      "has_preconditions": false,
+      "has_playbook": false,
+      "quantified_gain": [],
+      "deprecated": true,
+      "deprecated_reason": "Uses fictional __simt_vf__ / threadIdx.x CUDA-style APIs not present in AscendC. Zero references."
+    },
+    {
+      "source_key": "evolution-strategies#card/R8_mutex_sync",
+      "id": "R8",
+      "title": "R8: Mutex 细粒度同步",
+      "doc_path": "cards/R8_mutex_sync.md",
+      "complexity": "L1",
+      "op_families": [
+        "datapath"
+      ],
+      "triggers": {
+        "bottleneck_labels": []
+      },
+      "conflicts_with": [],
+      "synergizes_with": [],
+      "requires": [],
+      "has_preconditions": false,
+      "has_playbook": false,
+      "quantified_gain": [],
+      "deprecated": true,
+      "deprecated_reason": "Uses fictional Mutex::Lock API. Overlaps with P28/P29/P30 sync strategies. Zero references."
     }
   ],
   "preconditions": [
@@ -2416,6 +3010,21 @@
       "source_key": "evolution-strategies#preconditions/P10",
       "id": "P10",
       "doc_path": "preconditions/P10.yaml"
+    },
+    {
+      "source_key": "evolution-strategies#preconditions/P100",
+      "id": "P100",
+      "doc_path": "preconditions/P100.yaml"
+    },
+    {
+      "source_key": "evolution-strategies#preconditions/P102",
+      "id": "P102",
+      "doc_path": "preconditions/P102.yaml"
+    },
+    {
+      "source_key": "evolution-strategies#preconditions/P103",
+      "id": "P103",
+      "doc_path": "preconditions/P103.yaml"
     },
     {
       "source_key": "evolution-strategies#preconditions/P11",
@@ -2816,6 +3425,36 @@
       "source_key": "evolution-strategies#preconditions/P93",
       "id": "P93",
       "doc_path": "preconditions/P93.yaml"
+    },
+    {
+      "source_key": "evolution-strategies#preconditions/P94",
+      "id": "P94",
+      "doc_path": "preconditions/P94.yaml"
+    },
+    {
+      "source_key": "evolution-strategies#preconditions/P95",
+      "id": "P95",
+      "doc_path": "preconditions/P95.yaml"
+    },
+    {
+      "source_key": "evolution-strategies#preconditions/P96",
+      "id": "P96",
+      "doc_path": "preconditions/P96.yaml"
+    },
+    {
+      "source_key": "evolution-strategies#preconditions/P97",
+      "id": "P97",
+      "doc_path": "preconditions/P97.yaml"
+    },
+    {
+      "source_key": "evolution-strategies#preconditions/P98",
+      "id": "P98",
+      "doc_path": "preconditions/P98.yaml"
+    },
+    {
+      "source_key": "evolution-strategies#preconditions/P99",
+      "id": "P99",
+      "doc_path": "preconditions/P99.yaml"
     }
   ],
   "playbooks": [
@@ -2883,6 +3522,16 @@
       "source_key": "evolution-strategies#playbook/D5_bf16_special_handling",
       "id": "D5",
       "doc_path": "playbooks/D5_bf16_special_handling.md"
+    },
+    {
+      "source_key": "evolution-strategies#playbook/P100_gathermask_replacement",
+      "id": "P100",
+      "doc_path": "playbooks/P100_gathermask_replacement.md"
+    },
+    {
+      "source_key": "evolution-strategies#playbook/P101_gathermask_host_column_split",
+      "id": "P101",
+      "doc_path": "playbooks/P101_gathermask_host_column_split.md"
     },
     {
       "source_key": "evolution-strategies#playbook/P10_vectorized_copy",
@@ -3290,6 +3939,36 @@
       "doc_path": "playbooks/P93_matmul_k_stagger_access.md"
     },
     {
+      "source_key": "evolution-strategies#playbook/P94_scalar_reduction_to_vector",
+      "id": "P94",
+      "doc_path": "playbooks/P94_scalar_reduction_to_vector.md"
+    },
+    {
+      "source_key": "evolution-strategies#playbook/P95_scalar_elementwise_to_vector",
+      "id": "P95",
+      "doc_path": "playbooks/P95_scalar_elementwise_to_vector.md"
+    },
+    {
+      "source_key": "evolution-strategies#playbook/P96_hardware_sort_replacement",
+      "id": "P96",
+      "doc_path": "playbooks/P96_hardware_sort_replacement.md"
+    },
+    {
+      "source_key": "evolution-strategies#playbook/P97_zero_copy_subtensor",
+      "id": "P97",
+      "doc_path": "playbooks/P97_zero_copy_subtensor.md"
+    },
+    {
+      "source_key": "evolution-strategies#playbook/P98_hybrid_scalar_vector_dispatch",
+      "id": "P98",
+      "doc_path": "playbooks/P98_hybrid_scalar_vector_dispatch.md"
+    },
+    {
+      "source_key": "evolution-strategies#playbook/P99_broadcast_batch_vector_ops",
+      "id": "P99",
+      "doc_path": "playbooks/P99_broadcast_batch_vector_ops.md"
+    },
+    {
       "source_key": "evolution-strategies#playbook/P9_deterministic_output",
       "id": "P9",
       "doc_path": "playbooks/P9_deterministic_output.md"
@@ -3322,6 +4001,46 @@
       "source_key": "evolution-strategies#discovered/disc_X1",
       "id": "X1",
       "doc_path": "discovered/disc_X1.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X2",
+      "id": "X2",
+      "doc_path": "discovered/disc_X2.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X3",
+      "id": "X3",
+      "doc_path": "discovered/disc_X3.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X4",
+      "id": "X4",
+      "doc_path": "discovered/disc_X4.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X5",
+      "id": "X5",
+      "doc_path": "discovered/disc_X5.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X6",
+      "id": "X6",
+      "doc_path": "discovered/disc_X6.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X7",
+      "id": "X7",
+      "doc_path": "discovered/disc_X7.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X8",
+      "id": "X8",
+      "doc_path": "discovered/disc_X8.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X9",
+      "id": "X9",
+      "doc_path": "discovered/disc_X9.md"
     }
   ]
 }

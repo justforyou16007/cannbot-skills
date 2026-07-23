@@ -7,7 +7,7 @@ conflicts_with: []
 synergizes_with: [P94, P95, P69]
 requires: []
 has_preconditions: true
-has_playbook: false
+has_playbook: true
 ---
 
 # P99: BroadCast + 批量向量运算替代逐行标量循环 (BroadCast + Batch Vector Ops)
@@ -36,50 +36,30 @@ for (int32_t i = 0; i < gRows; i++) {
     Mul(xF[gStart * UD], xF[gStart * UD], xSq, gRows * UD);
     //  ↑ 1 条 Mul 处理 gRows × UD 个元素
 }
-// 无 barrier: BroadCast 写 xSq，Mul 写 xF — 不同 buffer，天然无冲突
 ```
 
 ## BroadCast API 参数速查
 
 ```cpp
-BroadCast<T, NDIM, BROADCAST_DIM>(
-    dst,        // 输出 tensor，shape = dst_shape
-    src,        // 输入 tensor，shape = src_shape
-    dstShape,   // 目标 shape（数组指针），BROADCAST_DIM 维为目标大小
-    srcShape,   // 源 shape（数组指针），BROADCAST_DIM 维为 1
-    tmpBuf      // 临时 buffer
-);
-
+BroadCast<T, NDIM, BROADCAST_DIM>(dst, src, dstShape, srcShape, tmpBuf);
+// dstShape/srcShape 为 const uint32_t[NDIM] 数组；srcShape[BROADCAST_DIM] 必须为 1
 // 示例: rstd [3, 1] → [3, 128]，在 dim=1 上广播
 BroadCast<float, 2, 1>(dst, src, {3, 128}, {3, 1}, tmp);
 ```
 
 ## 关键修改点
 
-1. **shape 数组**：必须是 `const uint32_t[N]` 格式，`NDIM` 为维度数，`BROADCAST_DIM` 为被广播的维度（0-based）
-2. **Buffer 分配**：需要一个临时 buffer（`bcast_tmp`，大小 ≥ `gRows × UD × sizeof(T)` 字节），以及输出 buffer（`xSq`，同等大小）
-3. **PipeBarrier 放置**：BroadCast 写 xSq 后、Mul 读 xSq 前加 `PipeBarrier<PIPE_V>()`
-4. **buffer 冲突检查**：若 BroadCast 输出与 Mul 输出写入同一 buffer，需额外 barrier；不同 buffer 则无需（如示例中 xSq ≠ xF）
-5. **预期收益**：gRows 条 Vec 指令 → 2 条，提升约 gRows/2 倍。gRows=32 时约 16x 指令效率提升
-
-## 适用性检测 (grep)
-
-```bash
-# 检测逐行 GetValue + Muls/Adds 模式（原反模式）
-grep -nE "for.*GetValue.*Muls|for.*GetValue.*Adds" op_kernel/*.cpp
-
-# 检测小向量 × 大矩阵的缩放模式
-grep -nE "rstd|inv_std|scale.*\[.*\].*GetValue" op_kernel/*.cpp
-
-# 确认 BroadCast 是否已存在
-grep -nE "BroadCast" op_kernel/*.cpp
-```
+1. **shape 数组**：必须 `const uint32_t[N]` 格式；`NDIM` 为维度数，`BROADCAST_DIM` 为被广播维度（0-based），且 src_shape 中该维必须为 1
+2. **Buffer 分配**：输出 buffer（`xSq`）与临时 buffer（`bcast_tmp`）均需 ≥ `gRows × UD × sizeof(T)` 字节
+3. **PipeBarrier 放置**：BroadCast 写 xSq 后、Mul 读 xSq 前加 `PipeBarrier<PIPE_V>()`；若两者写不同 buffer（xSq ≠ xF）则天然无冲突
+4. **matvec 变体**：标量驱动的 `q @ Pi` 类 matvec 也可用 BroadCast + Mul + ReduceSum 实现，与 P94 形态 ε（复制-Mul-批量归约）互为替代方案，见 Playbook Step 3C
+5. **预期收益**：gRows 条 Vec 指令 → 2 条，约 gRows/2 倍指令效率提升（gRows=32 时约 16x）
 
 ## 常见陷阱
 
-⚠️ `BroadCast` 的 NDIM 和 BROADCAST_DIM 模板参数必须与 shape 数组维度严格匹配
+⚠️ `NDIM`/`BROADCAST_DIM` 模板参数必须与 shape 数组维度严格匹配
 ⚠️ src_shape 中 BROADCAST_DIM 维必须为 1（否则不是广播而是拷贝）
-⚠️ 广播后的中间 tensor（xSq）占用 `gRows × UD × sizeof(T)` 字节 UB，需确保 UB 容量足够
+⚠️ 广播后的中间 tensor 占用 `gRows × UD × sizeof(T)` 字节 UB，需确保容量足够
 ⚠️ gRows < 4 时 BroadCast + PipeBarrier 开销可能超过逐行 Muls，无需优化
 
 ## 代码搜索关键词
@@ -91,3 +71,4 @@ grep -nE "BroadCast|bcast_tmp|broadcast.*shape" op_kernel/*.cpp
 ## 来源
 
 - tmp.md 优化点1：BroadCast rstd + 批量缩放替代逐行 Muls
+- best_decode qrot kernel：标量驱动 matvec 场景，与 P94 形态 ε 互为替代实现

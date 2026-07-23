@@ -26,9 +26,6 @@ Step 1: 基线采集（性能 + 精度）
 
 - **优化指南**：[optimization-guide.md](references/optimization-guide.md)
 - **反模式清单**：[performance-antipatterns.md](references/performance-antipatterns.md)
-- **测量纪律**：[measurement_discipline.md](references/measurement_discipline.md)（A/B 口径、环境排除、bound 分类、上限分析）
-- **C/V 同步调试**：[cv_sync_debug.md](references/cv_sync_debug.md)（C/V 融合 kernel hang / 死锁 / 间歇性错误 / 锁步诊断）
-- **cube 高级策略**：[cube_advanced_strategies.md](references/cube_advanced_strategies.md)（pingpong/swat/streamk/fullload/scale_coalescing/mte2_preload 路由）
 - **API 用法**：[tilelang-api-best-practices](../tilelang-api-best-practices/SKILL.md)
 - **编程模式**：[tilelang-programming-model-guide](../tilelang-programming-model-guide/SKILL.md)
 - **cube最佳实践**：[cube_optimization_path.md](references/best-practices/cube_optimization_path.md)
@@ -45,10 +42,6 @@ msprof op --kernel-name="main_kernel" --output=./msprof_output python ./examples
 ```
 
 精度未通过 → 禁止后续步骤。
-
-**基线测量纪律（强制）**：按 [measurement_discipline.md](references/measurement_discipline.md)
-§1-§3 执行——采集前 `npu-smi info` 确认目标卡空闲；≥20 次取中位数；记录 NPU ID /
-时间戳 / shape / dtype；kernel time（msprof task duration）与 wall time 分开记录。
 
 ### Step 2: 算子类型判断
 
@@ -71,14 +64,7 @@ print(func.get_kernel_source())
 
 ### Step 3: 识别优化点（强制，禁止与 Step 4 合并）
 
-根据算子类型阅读 `optimization-guide.md` 对应章节 + `performance-antipatterns.md`，如果是 cube 核额外参考最佳实践 `best-practices/cube_optimization_path.md`；基线优化已完成但仍不达标时按 [cube_advanced_strategies.md](references/cube_advanced_strategies.md) 的路由表选下一层策略（先做 bound 分类，[measurement_discipline.md](references/measurement_discipline.md) §4）。
-
-**C/V 融合算子的两个补充动作**：
-
-- 优化前先确认不是锁步调度（Cube/Vector 串行乒乓各闲一半）——诊断方法见 [cv_sync_debug.md](references/cv_sync_debug.md) §4；锁步时第一优化是 C/V overlap，不是 tile 参数
-- 调优中如出现 hang / 间歇性错误结果，立即停止性能迭代，转 [cv_sync_debug.md](references/cv_sync_debug.md) 的诊断协议，排除同步 bug 后再回来
-
-在 `optimization_log.md` 中输出：
+根据算子类型阅读 `optimization-guide.md` 对应章节 + `performance-antipatterns.md`，如果是 cube 核额外参考最佳实践 `best-practices/cube_optimization_path.md`，在 `optimization_log.md` 中输出：
 
 **Part A 优化点清单**：逐条标注适用/不适用 + 原因 + 参考文件行号。`pass_configs` 不是独立优化点，是伴随修改。
 
@@ -125,26 +111,15 @@ print(func.get_kernel_source())
 |---------|------|-------------|
 | Vector 型 | [RoPE 优化](references/best-practices/rope-developer-mode.md) | NPU 内动态生成 Mask、Tile API 向量化、参数简化 |
 | Cube 型 | [GEMM Intrinsic](references/best-practices/gemm_intrinsic_optimize.md) | 多缓冲流水线、细粒度 Flag 同步、MMA intrinsic、L0 分块、负载均衡 |
-| Cube 型（进阶） | [cube 高级策略路由](references/cube_advanced_strategies.md) | pingpong/swat/streamk/fullload/scale_coalescing/mte2_preload 按 bound 分类选用 |
 | CV 融合型 | [Flash Attention](references/best-practices/flash_attn_optimize.md) | num_stages 流水线、批量 Softmax、Cross-core Semaphore、数据布局优化；**多 shape 适配**（BSND 免转置、Sq==1 decode 窄块、加性 mask 屏蔽变长 Skv） |
-| CV 融合型（GMM 族） | [GMM+融合 epilogue](references/best-practices/gmm_cv_fusion_optimize.md) | 单向数据流 + 背压深度调优、epilogue 三段式单 pass、多变体编译期分发、分组负载均衡 |
-| CV 融合型（排障） | [C/V 同步调试](references/cv_sync_debug.md) | hang/死锁分类树、组屏障对称参与、pipe 配对、GM 可见性、锁步诊断 |
 
 ### Step 5: 效果验证
 
 每个优化点后执行：精度验证 → `msprof op` → 记录 → 对比基线。精度失败时保持优化调试，不撤销。
 
-**对比口径（强制）**：按 [measurement_discipline.md](references/measurement_discipline.md)
-执行——同卡同 session 背靠背 A/B；kernel time 与 wall time 都报（不一致时先分解 wall
-再归因，禁止只看 wall 就回滚 kernel 层面真实有效的改动）；每组数字附 NPU ID /
-次数 / 中位数。
-
 调试手段：`T.printf`、`T.dump_tensor`、`get_kernel_source()`，详见 [Programming Guide](../../../docs/TileLang-Ascend%20Programming%20Guide.md)。
 
-迭代终止：达到目标或连续 3 次无提升则中断上报。**终止前必须先做上限分析**
-（[measurement_discipline.md](references/measurement_discipline.md) §5：算术强度拆解 +
-Amdahl 上限 + roofline 判定），确认剩余空间不足以支撑继续迭代；终止上报必须附带
-上限分析结论，不允许只报"连续无提升"。
+迭代终止：达到目标或连续 3 次无提升则中断上报。
 
 ---
 

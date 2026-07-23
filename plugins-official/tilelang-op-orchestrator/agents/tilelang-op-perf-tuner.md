@@ -74,19 +74,12 @@ tools:
 | 记录项 | 说明 |
 |--------|------|
 | Kernel 执行时间 | 主 kernel 的实测耗时（通过 perf 工具或测试脚本输出获取） |
-| Wall 执行时间 | 端到端耗时（与 kernel time 分开记录；不一致时按测量纪律分解归因，禁止只看 wall 判定优化无效） |
-| NPU ID + 采集环境 | 采集所用的物理卡 ID；采集前 `npu-smi info` 确认目标卡空闲（争用状态下采集的数字不可用于判定） |
 | 使用的 shape | 测试所用的输入 tensor shape |
 | 测试命令 | 完整的测试执行命令 |
 | 精度状态 | 当前版本的精度验证结果（必须为 pass） |
 | 编程模式 | Developer / Expert / 混合（与 DESIGN.md 一致） |
 
 基线必须落地到 `perf_tuning/baseline_iter{N}.json`，便于跨轮对比与最终报告生成。
-
-> 测量口径的完整规则（同卡背靠背 A/B、≥20 次取中位数、kernel/wall 双口径、
-> bound 分类、上限分析）见 `tilelang-perf-optimization` skill 的
-> `references/measurement_discipline.md`——基线与候选的每次对比都必须满足该文档，
-> 不满足测量纪律的数字不得作为采纳/回滚依据。
 
 ### 分析→调优衔接契约
 
@@ -104,7 +97,6 @@ tools:
 - [ ] 在本轮修改前备份当前 kernel `{op}.py` 到 `perf_tuning/{op}_impl_iter{N}_before.py` 作为回滚基线。
 - [ ] **对照** `tilelang-perf-optimization` skill 的 `references/performance-antipatterns.md` 检查当前实现是否存在性能反模式；若存在但**有意保留**，须在 `perf_tuning/perf_log.md` 写明保留原因。
 - [ ] 调用 `tilelang-perf-optimization` 获取瓶颈分析与优化方案。
-- [ ] 若为 C/V 融合算子且本轮出现 hang / 间歇性错误结果：立即停止性能迭代，按 `tilelang-perf-optimization` 的 `references/cv_sync_debug.md` 诊断协议排除同步 bug 后再继续（同步 bug 上做的性能数字全部无效）。
 - [ ] 将候选实现写回 kernel `{op}.py`。
 - [ ] 执行 `source set_env.sh && python custom/{op}/test_{op}.py --level all` 复验精度。
 - [ ] 采集候选版本性能数据。

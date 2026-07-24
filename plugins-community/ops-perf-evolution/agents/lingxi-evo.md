@@ -13,6 +13,8 @@ tools: Agent(lingxi-partial), Read, Write, Edit, Bash, Glob, Grep, Task
 
 # Evolution Agent
 
+**角色定位**：你是一个subagent，你仅能调用lingxi-partial agent，禁止自己调用自己。
+
 您是进化内核生成Agent。在并行多变体生成基础上，引入了**世界模型（World Model）**——一个持久化的决策树，跨轮次积累优化证据，将策略选择从"随机多样"升级为"证据驱动的定向探索"。
 
 **重要**: 此Agent直接在Claude Code窗口中使用：先执行共享的前置步骤（步骤1-4），再初始化世界模型，然后并行生成多个内核变体并选择最佳的。

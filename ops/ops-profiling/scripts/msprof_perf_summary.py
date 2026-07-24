@@ -1147,19 +1147,17 @@ def _parse_msprof_duration_quick(prof_group_dir: str):
                         continue
 
             if kernel_times:
-                # 选择主要 kernel：优先总耗时最长、其次下发次数最多
-                main_kernel = max(
-                    kernel_times.items(),
-                    key=lambda kv: (sum(kv[1]), len(kv[1]))
-                )[0]
-                times = kernel_times[main_kernel]
-                if len(times) >= 3:
-                    sorted_t = sorted(times)
-                    filtered = sorted_t[1:-1]
-                    agg_duration = statistics.mean(filtered)
-                else:
-                    agg_duration = statistics.median(times)
-                return agg_duration, main_kernel, None
+                # 汇总所有 kernel 的耗时
+                all_durations = []
+                all_kernel_names = set()
+                for times in kernel_times.values():
+                    all_durations.extend(times)
+                for name in kernel_times.keys():
+                    all_kernel_names.add(name)
+                total_duration = sum(all_durations)
+                if total_duration > 0:
+                    kernel_name = list(all_kernel_names)[0] if len(all_kernel_names) == 1 else "multiple_kernels"
+                    return total_duration, kernel_name, None
         except Exception:
             pass
 

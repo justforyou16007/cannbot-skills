@@ -1,17 +1,25 @@
 ---
 name: tilelang2ascend-tilelang-designer
 description: >
-  TileLang kernel 设计与实现专家 Skill。为 PyTorch Model 设计并实现自定义 TileLang kernel：
-  完成 block-level 设计、tile-level 设计，并生成 model_new_tilelang.py 调用自定义 TileLang kernel。
-  当需要为复杂算子设计 TileLang kernel 时，使用此 skill。
+  TileLang kernel 设计调度 Skill。协调 tilelang-op-design（设计方法论）和 tilelang-op-develop（编码规范），
+  完成 block-level 设计、tile-level 设计和 model_new_tilelang.py 生成。
+  产物对接下游 AscendC translator 算子生成流程。
 argument-hint: >
   输入：output_dir 目录路径（包含 model.py）。
   输出：block_level/ 设计、tile_level/ 设计、model_new_tilelang.py 实现。
 ---
 
-# TileLang Kernel 设计 Skill
+# TileLang Kernel 设计调度 Skill
 
-你是一名 TileLang kernel 设计与实现专家。你的目标是为 `{output_dir}/model.py` 中的**复杂算子** PyTorch Model 设计并实现自定义 TileLang kernel：完成 block-level 设计、tile-level 设计，并生成 `{output_dir}/model_new_tilelang.py` 调用自定义 TileLang kernel。TileLang 在本仓库中主要用于表达 kernel 设计，不作为实际 correctness / performance 的验证基准。
+你是一名 TileLang kernel 设计调度专家。你的目标是协调 `tilelang-op-design`（设计方法论）和 `tilelang-op-develop`（编码规范）两个 Skill 的能力，为 `{output_dir}/model.py` 中的**复杂算子** PyTorch Model 完成 TileLang kernel 设计，产出符合下游 AscendC translator 要求的产物。
+
+## 角色定位
+
+本 Skill 是**调度协调器**，不是端到端开发者：
+
+- **设计方法论** → 来自 `ops/tilelang-op-design` 的 references（技术约束检测、编程模式决策树、BlockLevelDesign、信息收集、质量自检）
+- **编码实现规范** → 来自 `ops/tilelang-op-develop` 的 references（TileLangAscendProgrammingGuide、编码规范、GEMM/CV 融合、V 核并行化、检查清单、疑难解答）
+- **本 Skill 负责**：流程编排、Attention 模式路由、产物格式适配（输出 block_level/ + tile_level/ + model_new_tilelang.py）、下游 AscendC translator 对接
 
 ## 适用场景
 
@@ -19,7 +27,6 @@ argument-hint: >
 - Attention: FlashAttention, SparseAttention, GQA 等
 - MatMul 变体: 带 fuse 的 MatMul (matmul+leakyrelu, quant_matmul 等)
 - Norm 变体: RMSNorm, LayerNorm (多 strategy)
-
 - Sort: Sort, TopK
 - 多输入融合: Concat, multi-tensor fused ops
 
@@ -32,7 +39,6 @@ argument-hint: >
 - 只允许修改或新增 `{output_dir}/` 目录中的文件，不要改动其他目录中的文件。
 - 只允许读取当前工作区目录结构内的文件与子目录；禁止读取当前工作区之外的任何路径，包括父目录、兄弟目录、用户目录、绝对路径以及系统其他目录。
 - 禁止读取 `asc-devkit/docs/` 目录及其下任何文件；该目录仅供 AscendC 阶段使用，与本阶段无关。
-- 禁止读取 `.claude/skills/tilelang2ascend-tilelang-designer/references/TileLang-AscendC-API-Mapping.md`；该文档是 TileLang 到 AscendC 的转译映射，仅供 AscendC 阶段使用，与本阶段无关。
 
 ## 任务目录结构
 ```text
@@ -50,15 +56,41 @@ argument-hint: >
 ```
 
 ## Skill 参考资料
-本 skill 提供以下参考资料（位于 `.claude/skills/tilelang2ascend-tilelang-designer/references/` 目录）：
-- `.claude/skills/tilelang2ascend-tilelang-designer/references/BlockLevelDesign.md` — Block 层级设计指南
-- `.claude/skills/tilelang2ascend-tilelang-designer/references/TileLangAscendProgrammingGuide.md` — TileLang Ascend 编程指南
-- `.claude/skills/tilelang2ascend-tilelang-designer/references/TileLangDebug.md` — TileLang 调试指南（仅在需要排查 DSL 表达问题时参考）
-- `.claude/skills/tilelang2ascend-tilelang-designer/references/attention-patterns/AttentionPatternIndex.md` — Attention / FlashAttention 类算子的模式路由索引（TND、paged KV cache、mask/causal、GQA/MQA、MLA、topk sparse KV、sink attention）
-- `.claude/skills/tilelang2ascend-tilelang-designer/scripts/evaluate_tilelang.sh` — TileLang 评测脚本（当前仅供可选调试，不作为流程 gate）
 
-除非用户明确指定其他目录，否则默认使用传入的 `output_dir` 作为当前任务目录。
-其他任务目录可以作为参考实现。
+### 本 skill 自带脚本
+
+- `.claude/skills/tilelang2ascend-tilelang-designer/scripts/evaluate_tilelang.sh` — TileLang 评测脚本（远程/本地执行，当前仅供可选调试，不作为流程 gate）
+- `.claude/skills/tilelang2ascend-tilelang-designer/scripts/validate_tilelang_impl.py` — TileLang 实现退化检测（检测 PyTorch 回退）
+- `.claude/skills/tilelang2ascend-tilelang-designer/scripts/verification_tilelang.py` — TileLang 精度验证
+
+### 设计方法论（ops/tilelang-op-design 贡献，不复制、只引用）
+
+> 路径以项目根目录为基准（即 `cannbot-skills/` 下的相对路径）。
+
+| 文档 | 用途 | 使用阶段 |
+|------|------|----------|
+| `ops/tilelang-op-design/references/BlockLevelDesign.md` | Block 级任务划分、流水骨架、workspace 与同步关系设计 | Step 1d |
+| `ops/tilelang-op-design/references/attention-patterns/AttentionPatternIndex.md` | Attention / FlashAttention 类算子的模式路由索引（TND、paged KV cache、mask/causal、GQA/MQA、MLA、topk sparse KV、sink attention） | Step 0 |
+| `ops/tilelang-op-design/references/ascend-constraints.md` | NPU 技术约束清单（三维 Kernel/threads/动态边界/L0C溢出）与强制检测规则 | Step 1a |
+| `ops/tilelang-op-design/references/decision-tree.md` | 编程模式决策树 + API 映射规则 + NPU 硬件约束 | Step 1b |
+| `ops/tilelang-op-design/references/info-sources.md` | 信息收集步骤与优先级（搜索 examples/、确认 API 可用性） | Step 1c |
+| `ops/tilelang-op-design/references/quality-checklist.md` | 设计质量 20 项自检清单 | Step 3a |
+
+### 编码方法论（ops/tilelang-op-develop 贡献，不复制、只引用）
+
+> 路径以项目根目录为基准（即 `cannbot-skills/` 下的相对路径）。
+
+| 文档 | 用途 | 使用阶段 |
+|------|------|----------|
+| `ops/tilelang-op-develop/references/TileLangAscendProgrammingGuide.md` | TileLang Ascend 编程指南：T.mma、T.tile.*、T.copy、内存分配、Scope/同步 API 完整参考 | Step 2d |
+| `ops/tilelang-op-develop/references/TileLangDebug.md` | TileLang 调试指南：T.printf、T.dump_tensor（仅在需要排查 DSL 表达问题时参考） | Step 3c |
+| `ops/tilelang-op-develop/references/coding-conventions.md` | Buffer 分配 / 索引 / 同步 / 广播 / 测试模板 | Step 2a |
+| `ops/tilelang-op-develop/references/gemm-cv-fusion.md` | GEMM + CV 融合 pass_configs、NPU 分形限制 | Step 2b |
+| `ops/tilelang-op-develop/references/vector-parallelism.md` | V 核并行化（Developer threads=2 / Expert 手动 vid 切分） | Step 2c |
+| `ops/tilelang-op-develop/references/checklist.md` | 22 项上库前检查清单 | Step 3b |
+| `ops/tilelang-op-develop/references/troubleshooting.md` | 编译 / 运行 / 精度错误排查手册 | Step 3d |
+
+---
 
 ## 流程
 
@@ -83,7 +115,7 @@ argument-hint: >
 
 ```
 0.1 🛑 读取 AttentionPatternIndex.md（必须，不可跳过）:
-    Read .claude/skills/tilelang2ascend-tilelang-designer/references/attention-patterns/AttentionPatternIndex.md
+    Read ops/tilelang-op-design/references/attention-patterns/AttentionPatternIndex.md
     
 0.2 🛑 逐条回答"生成前问题"中的 7 个诊断问题，记录命中的模式:
     1. 输入是标准 [B,H,S,D] 还是 (T,H,D) 拼接布局？
@@ -116,12 +148,111 @@ argument-hint: >
 
 ---
 
-1. `Block 层级设计`
-   生成 `{output_dir}/design/block_level/` 下的 block-level 设计，并同步生成 `{output_dir}/model_new_tilelang.py`。在这一步只确定 block 级任务划分、流水骨架、workspace 与同步关系，具体计算细节先标记为 `TODO(tile-level)`。
-   参考文档：`.claude/skills/tilelang2ascend-tilelang-designer/references/BlockLevelDesign.md`。block 级设计必须与步骤 0 命中的 pattern 文档中的地址公式、循环结构、数据流对齐。
-2. `Tile 层级设计`
-   在第一步基础上继续生成 `{output_dir}/design/tile_level/`。直接以 block-level 设计为骨架，在 tile-level 中补全各处 `TODO(tile-level)`，完成用于表达设计意图的 TileLang 设计与实现。
-   参考文档：`.claude/skills/tilelang2ascend-tilelang-designer/references/TileLangAscendProgrammingGuide.md`
-3. `TileLang 自检（可选）`
-   如用户明确要求，或为了排查 DSL 语法 / 编译问题，可调用 `.claude/skills/tilelang2ascend-tilelang-designer/scripts/evaluate_tilelang.sh {output_dir}` 做辅助检查；但 TileLang 结果当前不作为 correctness gate，也不作为性能测试输入。若遇到框架语义缺陷、尾块处理异常或其他 TileLang 自身 bug，应保留设计表达并在最终说明中明确记录，不要为了通过 TileLang 验证而扭曲设计。
-   参考文档：`.claude/skills/tilelang2ascend-tilelang-designer/references/TileLangDebug.md`
+### 步骤 1: Block 层级设计
+
+生成 `{output_dir}/design/block_level/` 下的 block-level 设计，并同步生成 `{output_dir}/model_new_tilelang.py` 骨架。在这一步只确定 block 级任务划分、流水骨架、workspace 与同步关系，具体计算细节先标记为 `TODO(tile-level)`。
+
+🛑 **在生成 block_level/ 代码前，必须先完成以下技术分析。**
+
+#### 1a. 技术约束检测（强制）
+
+Read `ops/tilelang-op-design/references/ascend-constraints.md`，对当前算子逐项检测 6 项：
+
+| 检测项 | 触发条件 |
+|--------|----------|
+| 三维 Kernel | 算子是否需要 >1 维 block 并行 |
+| threads 参数 | 是否需要 threads > 2 |
+| 动态循环边界 | 循环次数是否依赖 tensor 值 |
+| GPU 专用 API | 用户参考实现是否含 CUDA API |
+| GEMM 非整除 | M/N 是否不被 block size 整除 |
+| L0C 溢出 | block_M × block_N × 4 > 128KB |
+
+检测到违反 → 输出警告 + Ascend 替代方案后再继续。
+
+#### 1b. 编程模式决策（强制）
+
+Read `ops/tilelang-op-design/references/decision-tree.md`，按决策树判定：
+- 计算类型：纯 Vector / 纯 Cube / 混合（CV 融合）
+- 编程模式：Developer（推荐，threads=2 消 workspace/vid）/ Expert / 混合
+- API 选型：T.gemm_v0 vs T.mma、alloc_L1 vs alloc_shared
+
+#### 1c. 信息收集（强制）
+
+Read `ops/tilelang-op-design/references/info-sources.md`：
+- 搜索 examples/ 同类实现
+- 确认 API 可用性
+
+#### 1d. 生成 block_level/ + model_new_tilelang.py 骨架
+
+参考 `ops/tilelang-op-design/references/BlockLevelDesign.md`：
+- 任务划分：确定 block 间分工、block 内遍历顺序
+- 流水设计：C/V 分工与交错执行方案
+- 模版设计：必要时定义多个 `T.prim_func` 按 shape 选择
+- block 级设计必须与步骤 0 命中的 pattern 文档中的地址公式、循环结构、数据流对齐
+- `model_new_tilelang.py` 负责输入布局整理 + kernel 调用
+
+---
+
+### 步骤 2: Tile 层级设计
+
+在第一步基础上继续生成 `{output_dir}/design/tile_level/`。直接以 block-level 设计为骨架，在 tile-level 中补全各处 `TODO(tile-level)`，完成用于表达设计意图的 TileLang 设计与实现。
+
+#### 2a. 编码规范检查
+
+Read `ops/tilelang-op-develop/references/coding-conventions.md`：
+- Buffer 分配 shape 一致性
+- 数据搬运索引正确性（读/写/workspace 必须一致）
+- 同步策略匹配编程模式（Developer 自动/AUTO_SYNC，Expert 手动/barrier_all）
+
+#### 2b. GEMM/CV 融合专项（仅含 GEMM 或 CV 融合时）
+
+Read `ops/tilelang-op-develop/references/gemm-cv-fusion.md`：
+- gemm_v0 / T.mma 首次调用 init=True（语义上首次累加需初始化）
+- 4 pass_configs 完整（AUTO_SYNC + AUTO_CV_COMBINE + AUTO_CV_SYNC + MEMORY_PLANNING）
+- Developer 默认 threads=2 + 片上直连（消 workspace/vid）
+
+#### 2c. V 核并行化
+
+Read `ops/tilelang-op-develop/references/vector-parallelism.md`：
+- Developer：threads=2 自动并行，无 vid 偏移
+- Expert/回退：手动 vid 切分 + 索引一致性
+
+#### 2d. 生成 tile_level/ 代码
+
+参考 `ops/tilelang-op-develop/references/TileLangAscendProgrammingGuide.md`：
+- 内存分配：T.alloc_L1 / T.alloc_ub / T.alloc_L0A / T.alloc_L0B / T.alloc_L0C
+- 数据搬运：T.copy（含 layout annotation `make_zn_layout`）
+- 矩阵计算：T.mma（init 条件、L0 分形限制）
+- 向量计算：T.tile.*（math/logical/compare/select/cast/transpose/fill/reduce/sort/gather/broadcast）
+- Scope 与同步：T.Scope("C"/"V")、T.set_flag/wait_flag、T.set_cross_flag/wait_cross_flag、T.pipe_barrier
+
+---
+
+### 步骤 3: 自检（可选）
+
+如用户明确要求，或为了排查 DSL 语法 / 编译问题，可执行以下自检。
+
+#### 3a. 设计质量自检
+
+Read `ops/tilelang-op-design/references/quality-checklist.md`，按 20 项逐项检查设计产物。
+必须项（1,2,3,7,8,9,13,19,20）全部通过，推荐项 ≥ 4/9。
+
+#### 3b. 编码规范自检
+
+Read `ops/tilelang-op-develop/references/checklist.md`，按 22 项逐项检查代码产物。
+
+#### 3c. 可选 TileLang 评测
+
+调用 `.claude/skills/tilelang2ascend-tilelang-designer/scripts/evaluate_tilelang.sh {output_dir}` 做辅助检查；但 TileLang 结果当前不作为 correctness gate，也不作为性能测试输入。若遇到框架语义缺陷、尾块处理异常或其他 TileLang 自身 bug，应保留设计表达并在最终说明中明确记录，不要为了通过 TileLang 验证而扭曲设计。
+
+调试时如需排查 DSL 表达问题，参考 `ops/tilelang-op-develop/references/TileLangDebug.md`（T.printf / T.dump_tensor）。
+
+#### 3d. 疑难解答
+
+如遇编译/运行/精度错误，Read `ops/tilelang-op-develop/references/troubleshooting.md` 按错误类型排查：
+
+| 错误类型 | 排查方向 |
+|---------|---------|
+| 编译错误 | buffer 大小、API 参数、对齐 |
+| 运行错误 | 索引越界、同步缺失 |
+| 精度错误 | Golden 实现、输出形状 |

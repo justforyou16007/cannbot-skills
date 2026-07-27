@@ -90,6 +90,19 @@ argument-hint: >
 | `ops/tilelang-op-develop/references/checklist.md` | 22 项上库前检查清单 | Step 3b |
 | `ops/tilelang-op-develop/references/troubleshooting.md` | 编译 / 运行 / 精度错误排查手册 | Step 3d |
 
+### 性能方法论（ops/tilelang-perf-optimization 贡献，不复制、只引用）
+
+> 路径以项目根目录为基准（即 `cannbot-skills/` 下的相对路径）。
+> 以下文档用于**设计期性能避坑**——在 block/tile 设计阶段就避免引入常见性能劣化模式，
+> 而非等算子完成后才回头调优。完整性能调优流程见 `ops/tilelang-perf-optimization/SKILL.md`。
+
+| 文档 | 用途 | 使用阶段 |
+|------|------|----------|
+| `ops/tilelang-perf-optimization/references/performance-antipatterns.md` | 常见性能劣化模式清单：launch core 数不当、逐元素 for loop、冗余全局同步、指令未融合、tile size 过小、CV 未 overlap、AIV 未流水/双 buffer、多行 tile 循环内归约 | Step 1e, 2e |
+| `ops/tilelang-perf-optimization/references/optimization-guide.md` | 性能优化指南：Split-K、Double Buffer、Fixed Core、多行 Tile 粒度扩展、MTE2 预取、指令向量化/融合 | Step 1e（§一 算子类型对应）, 2e |
+| `ops/tilelang-perf-optimization/references/cube_advanced_strategies.md` | Cube 高级策略路由表：pingpong / swat / streamk / fullload / scale_coalescing / mte2_preload | Step 1e（仅 Cube/CV 融合型） |
+| `ops/tilelang-perf-optimization/references/cv_sync_debug.md` | C/V 融合 lockstep 诊断与避免（设计期预防 hang/死锁） | Step 1e（仅 CV 融合型） |
+
 ---
 
 ## 流程
@@ -191,6 +204,26 @@ Read `ops/tilelang-op-design/references/info-sources.md`：
 - block 级设计必须与步骤 0 命中的 pattern 文档中的地址公式、循环结构、数据流对齐
 - `model_new_tilelang.py` 负责输入布局整理 + kernel 调用
 
+#### 1e. 设计期性能初检（推荐）
+
+在 block 级设计确定后、进入 tile 级实现前，快速对照性能反模式清单检查设计骨架是否存在明显性能隐患。此步骤**推荐执行**，非硬性门禁，但可避免将性能问题固化到 tile 级代码中。
+
+Read `ops/tilelang-perf-optimization/references/performance-antipatterns.md`，重点关注以下与 block 级设计直接相关的项目：
+
+| 检查项 | 触发条件 | 设计期修正方向 |
+|--------|----------|---------------|
+| launch core 数 | `block_num` >> 24 物理核 → 按任务数 launch | 改用 Fixed Core 模式，按物理核数 launch，核内 `T.serial` 分配多任务 |
+| launch core 数 | `block_num` < 24 仍按 24 launch | 按 `min(block_num, 24)` launch |
+| CV 未 overlap | CV 融合型但主循环串行（Cube 写 workspace → Vector 读） | 改用 `T.Pipelined` + AUTO_CV_COMBINE/AUTO_CV_SYNC |
+| tile size 过小 | L0C/UB 实际使用量远小于容量 | 在不超限前提下成倍扩大 block_M/block_N |
+| AIV 未流水 | 纯 AIV 算子 GM→UB→Vector→GM 串行 | 改用 `T.Pipelined` 或手动双 buffer |
+
+Read `ops/tilelang-perf-optimization/references/optimization-guide.md` §一（算子类型对应），确认本算子的优化范围与优先级顺序。
+
+**Cube/CV 融合型补充**：Read `ops/tilelang-perf-optimization/references/cube_advanced_strategies.md` 的路由表，判断本算子是否需要预留 pingpong/swat/streamk 等高级策略的扩展空间（如在 block 级设计中预留 Split-K 切分维度）。
+
+**CV 融合型补充**：Read `ops/tilelang-perf-optimization/references/cv_sync_debug.md` §4（锁步诊断），确认设计的流水结构不会落入 Cube/Vector 串行乒乓（各闲一半）的 lockstep 调度。
+
 ---
 
 ### 步骤 2: Tile 层级设计
@@ -225,6 +258,25 @@ Read `ops/tilelang-op-develop/references/vector-parallelism.md`：
 - 矩阵计算：T.mma（init 条件、L0 分形限制）
 - 向量计算：T.tile.*（math/logical/compare/select/cast/transpose/fill/reduce/sort/gather/broadcast）
 - Scope 与同步：T.Scope("C"/"V")、T.set_flag/wait_flag、T.set_cross_flag/wait_cross_flag、T.pipe_barrier
+
+#### 2e. Tile 级性能反模式终检（推荐）
+
+在 tile 级代码完成后，对照性能反模式清单做最终扫描，确认 tile 级实现未引入新的性能劣化。此步骤**推荐执行**。
+
+Read `ops/tilelang-perf-optimization/references/performance-antipatterns.md`，重点扫描以下 tile 级容易引入的问题：
+
+| 检查项 | 识别特征 | 修正方向 |
+|--------|----------|---------|
+| 逐元素/逐行 for loop | Vector 侧 `for row in range(block_M): T.tile.sub(...)` | broadcast 到同 shape 后一次性向量化 |
+| 冗余全局同步 | 循环内频繁 `T.barrier_all()` / `T.sync_all()` | 改用 `T.set_flag`/`T.wait_flag` 精确依赖，或交给 AUTO_SYNC |
+| 指令未融合 | `mul + add` / `max(x,0)` / `sqrt + div` 连续出现 | 替换为 `mul_add_dst` / `relu` / `rsqrt` 等复合指令 |
+| 多行 tile 循环内归约 | 多行 tile 循环内每块调用 `reduce_sum` | 循环内累积到完整 buffer，循环外一次性归约 |
+| AIV 未流水/双 buffer | 纯 AIV 搬入→计算→搬出完全串行 | 改用 `T.Pipelined` 或手动双 buffer |
+
+Read `ops/tilelang-perf-optimization/references/optimization-guide.md`：
+- Cube 型：确认 Split-K 切分 + Double Buffer + Fixed Core 是否已纳入设计
+- Vector 型：确认 Double Buffer + 指令向量化/融合 + Fixed Core 是否已考虑
+- CV 融合型：确认核内优化后再检查核间流水（`T.Pipelined` num_stages、cross_interval）
 
 ---
 

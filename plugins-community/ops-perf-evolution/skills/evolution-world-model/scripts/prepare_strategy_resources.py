@@ -62,7 +62,7 @@ DATA_LOGGER.propagate = False
 DATA_LOGGER.setLevel(logging.INFO)
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = SCRIPT_DIR.parent.parent.parent.parent
+PROJECT_ROOT = SCRIPT_DIR.parent.parent.parent.parent.parent
 SKILL_SCRIPTS = PROJECT_ROOT / "plugins-community/ops-perf-evolution/skills/evolution-strategies/scripts"
 WM_OPS = SCRIPT_DIR / "wm_ops.py"
 STATE_OPS = SCRIPT_DIR / "state_ops.py"
@@ -230,6 +230,62 @@ def _format_filter_reasons(failed: list[dict]) -> str:
     return " | ".join(parts)
 
 
+def _load_strategy_index() -> dict:
+    """加载策略库 INDEX.json，失败返回空 dict。"""
+    idx_path = (
+        PROJECT_ROOT
+        / "plugins-community/ops-perf-evolution/skills/evolution-strategies/references/INDEX.json"
+    )
+    try:
+        with open(idx_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _category_from_external_ref(ref: str) -> str:
+    """从 ascendc-tiling-design 路径推断类别，如 matmul/reduction/...。"""
+    parts = ref.split("/")
+    marker = "ascendc-tiling-design"
+    if marker in parts:
+        idx = parts.index(marker)
+        if idx + 2 < len(parts):
+            return parts[idx + 2]
+    return "general"
+
+
+def _build_external_references_md(passed_ids: list[str]) -> str:
+    """把 passed 策略对应卡片中的 references 追加为 [External References] markdown。
+
+    references 指向 ascendc-tiling-design 文档，按类别分组列出。
+    """
+    idx = _load_strategy_index()
+    refs_by_cat: dict[str, set[str]] = {}
+    for pid in passed_ids:
+        for card in idx.get("cards", []):
+            if card.get("id") != pid:
+                continue
+            for ref in card.get("references") or []:
+                cat = _category_from_external_ref(ref)
+                refs_by_cat.setdefault(cat, set()).add(ref)
+    if not refs_by_cat:
+        return ""
+
+    lines = [
+        "",
+        "---",
+        "",
+        "## External References（策略卡片关联的 ascendc-tiling-design 文档）",
+        "",
+        "以下文档为当前策略组合提供了系统化的 Tiling 设计背景知识，子 agent 可在此基础上更准确地实现优化。",
+    ]
+    for cat in sorted(refs_by_cat):
+        lines.append(f"\n### {cat}")
+        for ref in sorted(refs_by_cat[cat]):
+            lines.append(f"- `{ref}`")
+    return "\n".join(lines) + "\n"
+
+
 @dataclass
 class RenderContext:
     """render_block 的输入封装。"""
@@ -265,7 +321,10 @@ def _render_guided_block(ctx: RenderContext, parts: list[str]):
         parts.append("")
         parts.append(ctx.playbook_md)
 
-
+    # 追加 ascendc-tiling-design 外部参考（来自 INDEX.json card references）
+    external_md = _build_external_references_md(ctx.passed)
+    if external_md:
+        parts.append(external_md)
 def _render_exploration_block(ctx: RenderContext, parts: list[str]):
     """所有策略被过滤：开放探索分支。"""
     original_ids = [f.get("id", "?") for f in ctx.failed]

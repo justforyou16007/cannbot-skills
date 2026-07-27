@@ -84,6 +84,48 @@ If Mode=strategy_guided:
 - 没有 Playbook 的策略不强制 Step 段落
 - "Playbook Step" 必须是中文/英文标点之间合法的 markdown header (### 开头)
 
+[TILING DESIGN CHECKLIST]
+若算子属于 ascendc-tiling-design 已覆盖族，在实现优化前必须逐项确认对应类别的 Tiling 设计要点：
+
+- **MatMul 类** (P104-P108)
+  - [ ] Host tiling 使用 `MatmulApiTiling::GetTiling(TCubeTiling&)`，正确覆写 singleCoreM/N/Ka/Kb、baseM/N/K、usedCoreNum
+  - [ ] 当 `totalBlock < aicCoreNum` 时执行多核切分扩展，保持 `ALIGNED_H=16` 且不低于 baseM/baseN
+  - [ ] Kernel 端按 `(mIdx==mTotalCnt-1 ? mBaseTail : singleCoreM)` 调用 `SetSingleShape`，尾块有越界守卫
+  - [ ] `TCubeTiling` 以阻塞拷贝方式写入 TilingHeader；CMake 链接 `torch torch_python c10`
+  - [ ] 平台路由：按芯片/平台选择 `MatmulImpl` / `Blaze` / `tensor_api` 实现
+
+- **FlashAttention 类** (P115)
+  - [ ] 按 Roofline 估算确定 tile 大小，优先保证 Q/K 块在 L1/UB 复用
+  - [ ] 多核切分覆盖 batch/head/seq 维度，softmax 变体正确选择 online-softmax 或分块归约路径
+  - [ ] CopyIn/Compute/CopyOut 流水边界清晰，避免 Vector/Cube 单元空泡
+
+- **Reduction 类** (P109-P110)
+  - [ ] 合轴后得到 A/R 交替序列，按 A0 判断走 AR（尾轴）或 ARA（非尾轴）模式
+  - [ ] 多轴归约逐级处理，每步输出 shape 降维；`alignedCols` 按 32B 对齐
+  - [ ] UB accumulator 复用：减少中间 GM 回写，注意 `rLength` vs `rLengthAlign` 用途
+
+- **Sort 类** (P111)
+  - [ ] 采用两级归并（Sort32 + MrgSort）或 `alg-two-level-mrgsort` 推荐流程
+  - [ ] 行长度按 64 元素倍数填充，索引 buffer 大小与对齐满足 API 要求
+  - [ ] 批量行并行时 `repeat` 参数正确，避免跨行数据污染
+
+- **Elementwise 类** (P112)
+  - [ ] 选择向量化 tile size（如 fp16 128B 对齐），连续内存访问优先
+  - [ ] 尾块使用 DataCopyPad 或 masked vector 处理，避免标量回退
+  - [ ] 多核按输出张量均匀切分，避免冗余 DMA
+
+- **Broadcast 类** (P113)
+  - [ ] 识别 broadcast 轴，对齐小维度到 32B，使用 vectorized 连续搬运
+  - [ ] 输入形状不同时优先合并 strides，避免逐元素标量索引
+  - [ ] 输出 tile 与 broadcast 源 tile 的 offset 计算保证对齐
+
+- **Conversion 类** (P114)
+  - [ ] 建立输入→输出轴映射，按 32B 对齐分块搬运
+  - [ ] ND transpose 使用多维 tiling，非连续维度通过 DataCopyPad 处理
+  - [ ] 当前仅 Transpose 部分支持；其他 conversion 算子按 elementwise/broadcast 处理
+
+完成 checklist 后，在 `implementation_note.txt` 中说明本算子属于哪一族、应用了哪些 Tiling 要点。
+
 [CONTEXT]
 Node: {node_id} | Parent: {parent_solution_ref} | Best: {best_solution_ref}
 

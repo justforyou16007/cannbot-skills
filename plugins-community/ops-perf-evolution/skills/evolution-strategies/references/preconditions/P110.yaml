@@ -1,0 +1,31 @@
+strategy_id: P110
+description: Reduction UB 累加器复用适用性检查 — 算子存在分 chunk 归约或 FullLoad 场景，且未合理使用 UB accumulator / tmpBuf。
+
+checks:
+  - id: has_reduce_api
+    type: grep_count
+    pattern: "\\bReduceSum|ReduceMax|ReduceMin\\s*\\("
+    files: [kernel]
+    expected: ">= 1"
+    fail_msg: "未检测到 Reduce API → P110 不适用。"
+
+  - id: has_split_or_fullload_candidate
+    type: grep_count
+    pattern: "chunk|ColSplit|RowSplit|FullLoad|rLength|rLengthAlign"
+    files: [kernel, header]
+    expected: ">= 1"
+    fail_msg: "未检测到 Split / FullLoad 相关代码 → 无需 accumulator 复用优化。"
+
+  - id: no_ub_accumulator
+    type: grep_count
+    pattern: "accLocal|accumulator|tmpBuf|tmpLocal|TBuf\\s*<\\s*VECCALC\\s*>"
+    files: [kernel]
+    expected: "== 0"
+    fail_msg: "算子已使用 UB accumulator / tmpBuf → P110 主要价值已发挥。"
+
+  - id: is_vector_core
+    type: grep_count
+    pattern: "AI_VECTOR_CORE|TaskType::AI_VECTOR|aiv"
+    files: [all]
+    expected: ">= 1"
+    fail_msg: "未检测到 AIV kernel 证据 → P110 面向 Vector 单元 reduction。"

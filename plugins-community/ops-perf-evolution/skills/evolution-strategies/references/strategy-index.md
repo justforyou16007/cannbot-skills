@@ -218,6 +218,25 @@ P67-P69 为 Vector 计算效率基础策略（Counter 模式、低延迟归约�
 | P92 | Matmul base block compute-to-memory ratio | L1 | matmul, cv_fusion | 优化 baseM/baseN/baseK 最大化 Cube 计算访存比 | playbooks/P92_matmul_block_compute_ratio.md |
 | P93 | Matmul K-axis staggered memory access | L1 | matmul | 多核 Matmul K 轴错峰访问缓解 GM 地址冲突 | playbooks/P93_matmul_k_stagger_access.md |
 
+## 性能优化策略 — Ascend C Tiling 系统化设计 (P104-P115) [Layer: L1]
+
+这些策略来自 `ascendc-tiling-design` skill 的系统化 Tiling 方法论，聚焦现有 P 系列未覆盖的 Tiling 设计维度（多核扩展、L2 切分、Batch 合并、Serpentine、平台路由、归约/排序/逐元素/广播/转置/FlashAttention 的 Tiling 流程）。
+
+| ID | Strategy | Layer | Tags | When to Apply | Detail File |
+|----|----------|-------|------|---------------|-------------|
+| P104 | Matmul multi-core tiling expansion | L1 | matmul, tiling | `MatmulApiTiling::GetTiling` 返回 `totalBlock < aicCoreNum`，需手动缩小 singleCoreM/N 以充分利用多核 | playbooks/P104_matmul_multi_core_tiling_expansion.md |
+| P105 | Matmul L2 cache tile sizing | L1 | matmul, tiling | 大算子启用 L2 级切分，设置 `mTileBlock×nTileBlock` 并配合 Serpentine 反向遍历 | playbooks/P105_matmul_l2_cache_tile_sizing.md |
+| P106 | Matmul batch-merge-to-M tiling | L1 | matmul, tiling | `batchB==1 && !transA` 时将 batch 维度合并到 M，提升数据局部性 | playbooks/P106_matmul_batch_merge_to_m.md |
+| P107 | Matmul serpentine traversal scheduling | L1 | matmul, tiling | L2 Tile 内 base 块 serpentine 反向遍历，提升 A/B 数据复用 | playbooks/P107_matmul_serpentine_traversal.md |
+| P108 | Matmul platform routing | L1 | matmul, tiling | 根据 NpuArch 选择 `MatmulImpl`+`MatmulApiTiling`（DAV_2201）或 Blaze/tensor_api（DAV_3510） | cards/P108_matmul_platform_routing.md |
+| P109 | Reduction multi-axis tiling | L1 | reduction, tiling | 多轴归约场景下的轴合序、AR/ARA 分阶段 Tiling 设计 | playbooks/P109_reduction_multi_axis_tiling.md |
+| P110 | Reduction UB accumulator reuse | L1 | reduction, tiling | 归约累加器在 UB 中常驻复用，减少中间结果搬运 | playbooks/P110_reduction_ub_accumulator_reuse.md |
+| P111 | Sort two-level merge tiling | L1 | sort, tiling | Sort/TopK 多级归并 Tiling，边界填充与索引 buffer 规划 | playbooks/P111_sort_two_level_merge_tiling.md |
+| P112 | Elementwise vectorized tile sizing | L1 | elementwise, tiling | 逐元素算子的向量化 tile 大小选择、内存合并与多核分发 | playbooks/P112_elementwise_vectorized_tile_sizing.md |
+| P113 | Broadcast aligned tiling | L1 | broadcast, tiling | 广播算子的对齐 Tiling、向量化加载与内存合并 | playbooks/P113_broadcast_aligned_tiling.md |
+| P114 | Transpose ND tiling with alignment | L1 | conversion, tiling | ND 转置的轴映射、对齐填充与 32B/512B 对齐搬运 | playbooks/P114_transpose_nd_tiling_with_alignment.md |
+| P115 | FlashAttention tiling routing | L1 | flash_attention, tiling | FlashAttention 类算子的 Tiling 模式路由（标准/GQA/MLA/paged 等） | playbooks/P115_flashattention_tiling_routing.md |
+
 ## 精度优化策略 (A1-A8) [Layer: L0]
 
 | ID | Strategy | Layer | Tags | When to Apply | Detail File |

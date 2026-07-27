@@ -8,6 +8,7 @@ skills:
   - ascendc-tiling-design
   - ascendc-crash-debug
   - ascendc-perf-optimize
+  - tilelang-perf-optimization
   - tilelang2ascend-operator-project-init
   - tilelang2ascend-translator
   - tilelang2ascend-case-simplifier
@@ -846,6 +847,13 @@ class ModelNew(nn.Module):
 ## Phase 5: 性能分析
 
 调用 `ops-profiling` skill（--quick 模式），对已通过正确性验证的算子实现进行快速性能测试（只跑 1 轮 msprof，只获取 kernel 时间，不采集 7 个 aic-metrics）。
+
+> **TileLang 路径的性能调优迭代**：本 Phase 只做测量，不做调优。若性能未达标且需要对
+> TileLang 实现做调优迭代（瓶颈定位 → 优化 → 复验），使用 `tilelang-perf-optimization`
+> skill。该 skill 文档中的项目布局假设按以下映射理解：
+> `examples/{op}/` → `{output_dir}/`，`test_{op}.py` → 本项目的评测入口
+> （`evaluate_ascendc.sh` / `model_new_tilelang.py` 对应的测试脚本）。
+> AscendC（direct-invoke）路径的调优仍走 `ascendc-perf-optimize` skill，两者不要混用。
 
 **前置条件**：
 - `{output_dir}/model.py` 已存在（必有）

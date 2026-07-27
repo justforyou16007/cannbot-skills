@@ -124,3 +124,13 @@ MIX hang?  → ① 守卫（AIC/AIV 各碰各的） ② barrier 两侧同数 ③
 验证纪律   → 单 chunk 不算验证；stage 中间张量逐个对参考；改码必 rm -rf build
 NaN 判别   → 位置逐 run 变化 = 设备 sync 污染（换卡）；固定位置系统性错误 = kernel bug
 ```
+
+---
+
+## 8. 相关文档
+
+- **TileLang DSL 层的 C/V 同步问题**：`tilelang-perf-optimization` skill 的
+  `references/cv_sync_debug.md`——DSL 原语（`T.Pipelined` / cross flag /
+  自动 CV 同步失效）、组屏障 AND 归约的子块参与、GM 可见性 fence、
+  竞态放大、"正确但慢"的锁步调度诊断。分工约定：kernel 是 TileLang 写的先查
+  该文档；生成的 AscendC 代码结构本身有错（守卫/barrier/队列事件）回到本文档 R1-R6。

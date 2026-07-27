@@ -290,8 +290,86 @@ argument-hint: >
 
 ---
 
+### 🛑 步骤 0-T: AscendC Tiling 路由（ascendc-tiling-design 已覆盖类别强制执行）
+
+**触发条件**（属于以下任一类别即触发）：
+- `matmul`：读取 `{output_dir}/model.py` 的 forward() 后发现 `torch.matmul`、`F.linear`、`@`、`torch.mm`、`torch.bmm` 等；或文件名/类名含 `Matmul`/`MatMul`/`BatchMatMul`/`GroupedMatmul`
+- `flashattention`：文件名/类名含 `Attention`/`FlashAttention`/`SDPA`；forward 中出现 `scaled_dot_product_attention`、`softmax(Q @ K^T / sqrt(d)) @ V`
+- `reduction`：文件名/类名含 `Reduce`/`Softmax`/`LayerNorm`/`RMSNorm`/`ArgMax`/`ArgMin`/`ReduceSum`/`ReduceMean`；forward 中出现 `torch.sum`、`torch.mean`、`torch.softmax`、`F.softmax`、`F.layer_norm`、`F.rms_norm`
+- `sort`：文件名/类名含 `Sort`/`TopK`/`ArgSort`；forward 中出现 `torch.sort`、`torch.topk`
+- `elementwise`：单输入/多输入逐元素运算且无广播；文件名/类名含 `ReLU`/`Sigmoid`/`SiLU`/`GELU`/`SwiGLU`/`Sin`/`Cos`/`Abs`/`Exp`
+- `broadcast`：多输入逐元素运算且输入 shape 不同需广播对齐
+- `conversion`：文件名/类名含 `Transpose`；forward 中出现 `tensor.transpose`、`tensor.permute`、`torch.transpose`
+
+如果触发条件满足，必须逐个完成以下 checklist：
+
+```
+0-T.1 🛑 读取 ascendc-tiling-design 分类表与对应文档（必须，不可跳过）:
+    Read .claude/skills/ascendc-tiling-design/SKILL.md 的算子分类表
+    按类别 Read 对应的 patterns.md：
+    - matmul → references/matmul/patterns.md
+    - flashattention → references/flashattention/patterns.md
+    - reduction → references/reduction/patterns.md
+    - sort → references/sort/patterns.md
+    - elementwise → references/elewise/patterns.md
+    - broadcast → references/broadcast/patterns.md
+    - conversion → references/conversion/patterns.md
+
+0-T.2 🛑 按类别读取深度设计文档（必须，不可跳过）:
+    - matmul:
+        * Read .claude/skills/ascendc-tiling-design/references/matmul/ascendc-api-matmul-tiling.md
+        * GroupedMatmul 额外 Read ascendc-api-gmm-tiling.md
+        * Read ascendc-api-best-practices skill 中的 references/api-matmul.md
+        * 在思考中确认目标平台 NpuArch（调用 npu-arch skill）：
+          - DAV_2201 (A2/A3) → 使用 MatmulImpl + MatmulApiTiling 路径
+          - DAV_3510 (A5) → 禁止使用 MatmulImpl，必须走 Blaze/tensor_api 路径
+    - reduction → Read .claude/skills/ascendc-tiling-design/references/reduction/algorithms.md
+    - sort → Read .claude/skills/ascendc-tiling-design/references/sort/alg-two-level-mrgsort.md
+    - 其他类别 → 视 patterns.md 中指引继续阅读
+
+0-T.3 🛑 在思考中确认 Tiling 实现约束:
+    通用约束（所有类别）：
+    - 多核切分、UB 切分、Buffer 规划、分支覆盖必须与 ascendc-tiling-design 对应类别指南一致
+    - 核数通过 platform_ascendc 或 npu-arch 动态获取，禁止硬编码
+    - blockDim 与多核切分结果一致，kernel 内部通过 GetBlockIdx() 计算工作范围
+
+    matmul 额外约束：
+    - Host 侧调用 MatmulApiTiling::GetTiling(TCubeTiling&) 后，强制覆写 M/N/Ka/Kb
+    - 计算 mTotalCnt / nTotalCnt / totalBlock
+    - 若 totalBlock < aicCoreNum，执行多核切分扩展（保持 ALIGNED_H=16 对齐）
+    - usedCoreNum = min(totalBlock, aicCoreNum)；blockDim 取该值
+    - Kernel 入口必须有 if (GetBlockIdx() >= totalBlock) return; 越界守卫
+    - Kernel 端按 blockIdx → (mIdx, nIdx) 计算偏移和尾块尺寸，调用 SetSingleShape
+    - TilingHeader 通过 blocking copy 下发到 device（tilingHost.to(at::kPrivateUse1)）
+    - BatchMatMul 必须填充 MultiBatchInfo
+    - A 的转置优先使用 SetAType(..., isTrans=true) 或 SetTensorA(..., true)，禁止 host 侧额外 transpose+contiguous
+
+    reduction 额外约束：
+    - 明确归约轴、算法选择（tree/sequential/online）、精度保持策略
+    - 大 shape 分块归约时考虑 workspace 累加
+
+    sort 额外约束：
+    - 多级归并 tiling、边界填充到 64 倍数、索引 buffer 规划
+
+    elementwise / broadcast 额外约束：
+    - 向量化 tile 大小、广播对齐、内存合并访问
+
+    conversion 额外约束：
+    - 转置轴映射、对齐填充、32B/512B 对齐搬运
+
+0-T.4 🛑 查阅历史成功任务（可选但强烈建议）:
+    - 若存在 workflows/templates/archive_tasks/ 下与本算子形态最接近的参考实现，优先阅读其 host/kernel 代码
+```
+
+**门禁规则**：
+- 触发条件满足但 0-T.1-0-T.3 未完成 → **禁止**进入步骤 1 编写任何 kernel/ 代码
+- 禁止凭记忆或经验跳过 `ascendc-tiling-design` 文档直接转译
+- 此门禁在**每次修复迭代**中若涉及 Tiling 相关修改，都需重新检查
+
+---
+
 ## 流程
-执行以下各步骤前，必须先完成 **步骤 0-A（如触发）、步骤 0-B 和步骤 0-C（如触发）的全部查阅**，再开始实现、验证与迭代。
+执行以下各步骤前，必须先完成 **步骤 0-A（如触发）、步骤 0-B、步骤 0-C（如触发）和步骤 0-T（如触发）的全部查阅**，再开始实现、验证与迭代。
 
 ### 步骤 1: TileLang 转译成 AscendC
 
@@ -304,7 +382,7 @@ argument-hint: >
 - `{output_dir}/kernel/CMakeLists.txt` — CMake 编译配置
 - `{output_dir}/kernel/utils/kernel_common.h` — CopyTiling 等公共工具
 参考文档：`.claude/skills/tilelang2ascend-translator/references/dsl2Ascendc.md`
-**🛑 实施转译前必须先完成步骤 0-A（如触发）、步骤 0-B 和步骤 0-C（如触发）的全部查阅，然后阅读 `.claude/skills/tilelang2ascend-translator/references/TileLang-AscendC-API-Mapping.md` 逐一确认 API 映射。禁止跳过 Mapping 直接编写 AscendC 代码。**
+**🛑 实施转译前必须先完成步骤 0-A（如触发）、步骤 0-B、步骤 0-C（如触发）和步骤 0-T（如触发）的全部查阅，然后阅读 `.claude/skills/tilelang2ascend-translator/references/TileLang-AscendC-API-Mapping.md` 逐一确认 API 映射。禁止跳过 Mapping 直接编写 AscendC 代码。**
 
 **op_host/<op_name>.cpp** 模式：
 - include `torch_kernel_helper.h` + `tiling/platform/platform_ascendc.h`
@@ -329,12 +407,26 @@ argument-hint: >
 - blockDim = usedCoreNum（多核统一分发），kernel 内部通过 `GetBlockIdx()` 计算工作范围
 - `EXEC_KERNEL_CMD` 所有参数必须为**左值**（具名变量），禁止传入临时变量/右值/字面量。`double` 先转 `float` 局部变量，`bool` 用 `int64_t` 替代，表达式先赋给局部变量再传入
 
+**MatMul 类算子额外要求**（当触发步骤 0-T 且类别为 matmul 时）：
+- 必须包含 `matmul_trans_a_tiling.h` 风格的 TilingHeader，内含 `TCubeTiling cubeTiling` 和派生计数字段
+- 使用 `AscendC::tiling::TCubeTiling` 类型，禁止错误 `reinterpret_cast` 为 `optiling::TCubeTiling&`
+- 工作区大小使用 `MatmulGetTmpBufSizeV2(tilingPtr->cubeTiling, bufSize)` 查询
+- CMakeLists.txt 需链接 `torch torch_python c10`，确保 .so 加载符号解析成功
+
 **op_kernel/<op_name>.cpp** 模式：
 - template class `Kernel<OpName>` 含 Init/Process/CopyIn/Compute/CopyOut
 - BUFFER_NUM = 2 (double buffer)；如算子需要在循环中同时持有多个 queue tensor，需相应增大 BUFFER_NUM
 - DataCopyPad 用于 GM↔UB 搬运
 - FP16/BF16 升精度到 FP32 计算
 - 整核/尾核偏移和尾块对齐处理
+
+**MatMul 类算子额外要求**（当触发步骤 0-T 且类别为 matmul 时）：
+- 使用 `AscendC::MatmulType<TPosition::GM, CubeFormat::ND, T, isTrans>` 声明 A/B 类型
+- `Init()` 中调用 `mm_.Init(&header_.cubeTiling, pipe)` 和 `mm_.SetHF32(false, 0)`
+- `Process()` 中按 `blockIdx → (mIdx, nIdx)` 分发，计算 `curSingleM / curSingleN`
+- 调用 `mm_.SetSingleShape(curSingleM, curSingleN, header_.K)`
+- 调用 `mm_.SetTensorA(aGm_[offsetA], transA)` 和 `mm_.SetTensorB(bGm_[offsetB], transB)`
+- 调用 `mm_.IterateAll(cGm_[offsetC], 0)`，之后视需要 `PipeBarrier<PIPE_ALL>()`
 
    **ops.h** 模式：
    ```cpp

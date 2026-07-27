@@ -161,6 +161,4 @@ python custom/{op}/test_{op}.py --level l0
 - [references/gemm-cv-fusion.md](references/gemm-cv-fusion.md) — GEMM 与 CV 融合 pass_configs（含 GEMM 或融合算子时查）
 - [references/checklist.md](references/checklist.md) — 22 项上库前检查清单（生成代码后逐项过）
 - [references/troubleshooting.md](references/troubleshooting.md) — 编译 / 运行 / 精度错误排查手册（遇到具体错误时查）
-- [references/TileLangAscendProgrammingGuide.md](references/TileLangAscendProgrammingGuide.md) — TileLang Ascend 编程指南：T.mma、T.tile.*、T.copy、内存分配、Scope/同步 API 完整参考
-- [references/TileLangDebug.md](references/TileLangDebug.md) — TileLang 调试指南：T.printf、T.dump_tensor
 - [examples/code-skeleton.md](examples/code-skeleton.md) — `{op}.py`（kernel）+ `test_{op}.py`（测试）文件结构骨架

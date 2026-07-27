@@ -18,7 +18,7 @@ argument-hint: >
 本 Skill 是**调度协调器**，不是端到端开发者：
 
 - **设计方法论** → 来自 `ops/tilelang-op-design` 的 references（技术约束检测、编程模式决策树、BlockLevelDesign、信息收集、质量自检）
-- **编码实现规范** → 来自 `ops/tilelang-op-develop` 的 references（TileLangAscendProgrammingGuide、编码规范、GEMM/CV 融合、V 核并行化、检查清单、疑难解答）
+- **编码实现规范** → 来自 `ops/tilelang-op-develop` 的 references（编码规范、GEMM/CV 融合、V 核并行化、检查清单、疑难解答）
 - **本 Skill 负责**：流程编排、Attention 模式路由、产物格式适配（输出 block_level/ + tile_level/ + model_new_tilelang.py）、下游 AscendC translator 对接
 
 ## 适用场景
@@ -77,13 +77,12 @@ argument-hint: >
 | `ops/tilelang-op-design/references/quality-checklist.md` | 设计质量 20 项自检清单 | Step 3a |
 
 ### 编码方法论（ops/tilelang-op-develop 贡献，不复制、只引用）
-
+- **API 用法**：查阅 [tilelang-api-best-practices SKILL.md](../tilelang-api-best-practices/SKILL.md) 及其 references 目录
+- **编程模式和 pass_configs**：查阅 [tilelang-programming-model-guide SKILL.md](../tilelang-programming-model-guide/SKILL.md) 及其 references 目录
 > 路径以项目根目录为基准（即 `cannbot-skills/` 下的相对路径）。
 
 | 文档 | 用途 | 使用阶段 |
 |------|------|----------|
-| `ops/tilelang-op-develop/references/TileLangAscendProgrammingGuide.md` | TileLang Ascend 编程指南：T.mma、T.tile.*、T.copy、内存分配、Scope/同步 API 完整参考 | Step 2d |
-| `ops/tilelang-op-develop/references/TileLangDebug.md` | TileLang 调试指南：T.printf、T.dump_tensor（仅在需要排查 DSL 表达问题时参考） | Step 3c |
 | `ops/tilelang-op-develop/references/coding-conventions.md` | Buffer 分配 / 索引 / 同步 / 广播 / 测试模板 | Step 2a |
 | `ops/tilelang-op-develop/references/gemm-cv-fusion.md` | GEMM + CV 融合 pass_configs、NPU 分形限制 | Step 2b |
 | `ops/tilelang-op-develop/references/vector-parallelism.md` | V 核并行化（Developer threads=2 / Expert 手动 vid 切分） | Step 2c |
@@ -252,12 +251,9 @@ Read `ops/tilelang-op-develop/references/vector-parallelism.md`：
 
 #### 2d. 生成 tile_level/ 代码
 
-参考 `ops/tilelang-op-develop/references/TileLangAscendProgrammingGuide.md`：
-- 内存分配：T.alloc_L1 / T.alloc_ub / T.alloc_L0A / T.alloc_L0B / T.alloc_L0C
-- 数据搬运：T.copy（含 layout annotation `make_zn_layout`）
-- 矩阵计算：T.mma（init 条件、L0 分形限制）
-- 向量计算：T.tile.*（math/logical/compare/select/cast/transpose/fill/reduce/sort/gather/broadcast）
-- Scope 与同步：T.Scope("C"/"V")、T.set_flag/wait_flag、T.set_cross_flag/wait_cross_flag、T.pipe_barrier
+- **API 用法**：查阅 [tilelang-api-best-practices SKILL.md](../tilelang-api-best-practices/SKILL.md) 及其 references 目录
+- **编程模式和 pass_configs**：查阅 [tilelang-programming-model-guide SKILL.md](../tilelang-programming-model-guide/SKILL.md) 及其 references 目录
+
 
 #### 2e. Tile 级性能反模式终检（推荐）
 

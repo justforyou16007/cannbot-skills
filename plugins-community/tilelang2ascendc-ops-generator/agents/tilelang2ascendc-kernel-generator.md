@@ -9,6 +9,8 @@ skills:
   - ascendc-crash-debug
   - ascendc-perf-optimize
   - tilelang-perf-optimization
+  - tilelang-op-design
+  - tilelang-op-develop
   - tilelang2ascend-operator-project-init
   - tilelang2ascend-translator
   - tilelang2ascend-case-simplifier
@@ -182,8 +184,11 @@ Phase 7: Trace 记录            (tilelang2ascend-trace-recorder)
 └── performance.json             # 性能汇总
 ```
 
-**Skill 参考资料**（各 skill 独立维护，位于 `plugins-community/tilelang2ascendc-ops-generator/skills/<skill-name>/`）：
-- `tilelang2ascend-tilelang-designer`：BlockLevelDesign.md、TileLangAscendProgrammingGuide.md、TileLangDebug.md、evaluate_tilelang.sh
+**Skill 参考资料**：
+- `tilelang2ascend-tilelang-designer`（位于 `plugins-community/.../skills/`）：设计调度流程，引用以下 ops/ skill 的 references 文档
+- `ops/tilelang-op-design`：技术约束检测、编程模式决策树、信息收集、Block 级设计（Phase 3 Step 1）
+- `ops/tilelang-op-develop`：编码规范、GEMM/CV 融合、V 核并行化、TileLang 编程指南（Phase 3 Step 2）
+- `ops/tilelang-perf-optimization`：性能反模式清单、优化指南、CV 同步调试、Cube 高级策略（Phase 3 Step 1e/2e + Phase 5 调优）
 - `tilelang2ascend-translator`：dsl2Ascendc.md、TileLang-AscendC-API-Mapping.md、scalar-to-vector.md、AscendC_knowledge/、AscendCVerification.md、evaluate_ascendc.sh
 - `tilelang2ascend-operator-project-init`：templates/ascend-kernel/（完整项目模板）、scripts/detect_ascend_kernel_project.sh
 - `ops-profiling`：msprof_profile_run.sh --quick / msprof_perf_summary.py --quick
@@ -475,7 +480,13 @@ tl_conductor_suggestion = ""
 首轮（tl_iteration == 0）执行一次性设计步骤，后续迭代不再重复：
 
 1. **Block 层级设计**：调用 `tilelang2ascend-tilelang-designer` skill，生成 `{output_dir}/design/block_level/`
+   - Step 1a-1d: 技术约束检测 + 编程模式决策 + 信息收集 + 生成 block_level/ 骨架
+   - Step 1e: 设计期性能初检（反模式扫描 + 算子类型对应的优化范围确认）
+   - Skill 依赖: `tilelang-op-design`（约束/决策/信息收集）、`tilelang-perf-optimization`（性能反模式）
 2. **Tile 层级设计**：调用 `tilelang2ascend-tilelang-designer` skill，生成 `{output_dir}/design/tile_level/`
+   - Step 2a-2d: 编码规范 + GEMM/CV 融合 + V 核并行化 + 生成 tile_level/
+   - Step 2e: Tile 级性能反模式终检（逐元素 loop/冗余同步/指令融合/流水缺失扫描）
+   - Skill 依赖: `tilelang-op-develop`（编码规范/融合/并行化）、`tilelang-perf-optimization`（优化指南）
 3. **可选自检**：生成 `{output_dir}/model_new_tilelang.py`。如用户明确要求，或为了排查 DSL 语法 / 编译问题，可调用 `tilelang2ascend-tilelang-designer` skill 自带的验证脚本做辅助检查；但 TileLang 结果不作为 correctness gate。若遇到 TileLang 框架 bug、尾块语义异常或其他执行问题，应保留设计表达并记录原因，不要为了通过 TileLang 验证而扭曲设计
 
 #### 迭代循环

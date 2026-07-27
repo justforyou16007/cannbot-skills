@@ -15,6 +15,9 @@ skills:
   - tilelang2ascend-tilelang-designer
   - tilelang2ascend-translator
   - tilelang2ascend-trace-recorder
+  - tilelang-op-design
+  - tilelang-op-develop
+  - tilelang-perf-optimization
 permission:
   external_directory: allow
 ---
@@ -104,7 +107,12 @@ Phase 1: 环境准备 + 工程初始化  (复制算子文件 + 初始化 kernel 
 Phase 2: Case 精简           (tilelang2ascend-case-simplifier)
 Phase 3: 设计表达            (分支)
   ├─ 简单算子: 架构设计 + 设计串讲 (ops-direct-invoke: DESIGN.md + PLAN.md + WALKTHROUGH.md)
-  └─ 复杂算子: TileLang 设计  (tilelang2ascend-tilelang-designer + 退化检测 + 迭代)
+  └─ 复杂算子: TileLang 设计  (tilelang2ascend-tilelang-designer)
+       ├─ Step 0: Attention 模式路由 (仅 Attention/FlashAttention 类)
+       ├─ Step 1: Block 层级设计 (技术约束检测 + 编程模式决策 + 信息收集 + 性能初检)
+       ├─ Step 2: Tile 层级设计 (编码规范 + GEMM/CV融合 + V核并行化 + 性能反模式终检)
+       └─ Step 3: 自检 + 退化检测 + 迭代
+       Skill 依赖: tilelang-op-design + tilelang-op-develop + tilelang-perf-optimization
 Phase 4: AscendC 生成与验证   (分支)
   ├─ 简单算子: 开发实现 + 代码审查 + 修复循环 (ops-direct-invoke: 渐进式开发 + REVIEW.md + 最多3轮修复)
   └─ 复杂算子: 转译          (tilelang2ascend-translator + 退化检测 + 迭代)
@@ -243,3 +251,13 @@ Subagent 返回
 | 精度调试 Skill | `/tilelang2ascend-precision-tuning` | 仲裁精度争议时参考 |
 | 性能采集 Skill | `/ops-profiling` | 仲裁性能争议时参考 |
 | 历史成功任务 | `workflows/templates/archive_tasks/` | 仲裁开发模式争议时参考 |
+
+### TileLang 设计阶段 Skill 依赖（复杂算子路径）
+
+> 以下 Skill 由 `tilelang2ascend-tilelang-designer` 在设计阶段引用，提供设计方法论、编码规范和性能避坑指导。
+
+| Skill | 用途 | 使用阶段 |
+|-------|------|----------|
+| `ops/tilelang-op-design/SKILL.md` | 算子设计文档生成：技术约束检测、编程模式决策树、信息收集、Block 级设计 | Phase 3 Step 1 |
+| `ops/tilelang-op-develop/SKILL.md` | 算子代码生成：编码规范、GEMM/CV 融合、V 核并行化、TileLang 编程指南 | Phase 3 Step 2 |
+| `ops/tilelang-perf-optimization/SKILL.md` | 性能优化：反模式清单、优化指南、CV 同步调试、Cube 高级策略 | Phase 3 Step 1e, 2e |

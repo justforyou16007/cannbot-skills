@@ -13,6 +13,8 @@
 | P1 (Double Buffer) | P20 (Triple Buffer) | P20 是 P1 的超集（depth=3 vs depth=2），不可叠加 |
 | P52 (L2 Cache Hint) | P74 (Selective L2 Disable) | 两者都控制 L2 cache 行为但机制冲突：P52 用 hint 引导缓存，P74 直接禁用 |
 | P72 (Split-K) | P9 (Deterministic) | P72 使用 AtomicAdd 跨核累加，结果非确定性，与 P9 的确定性输出要求冲突 |
+| P104 (Multi-core tiling expansion) | P72 (Split-K) | P104 扩展 M/N 并行度，P72 切 K 并行；当 K ≫ M*N 时 P72 更优，二者互斥选择 |
+| P105 (L2 tile sizing) | P74 (Selective L2 disable) | 两者都控制 L2 行为，机制冲突 |
 
 ### 条件性约束（非硬互斥，需注意协调）
 
@@ -24,6 +26,19 @@
 | P67 (Counter Mode) | P84 (Vector Efficiency) | P84 包含 Counter 模式作为子模式；若同时选中，以 P84 为准，P67 的独立 counter 逻辑不再单独应用 |
 | P81 (Resident UB/TBuf) | P85 (Buffer Zone Reuse) | P81 管理参数级常驻，P85 管理区域级复用；可共存但需协调 UB 地址分配避免冲突 |
 | P71 (IBShare L1) | P78 (On-chip Cache Matmul) | 两者都优化 Matmul 的 L1 使用；P71 侧重 B 矩阵共享，P78 侧重全局缓存加速，需确认 L1 容量足够 |
+| P104 (Multi-core expansion) | P105 (L2 tile sizing) | P104 改变单核形状，会影响 P105 的 L2 tile 大小计算；需按扩展后的 singleCoreM/N 重新计算 |
+| P104 (Multi-core expansion) | P46/P92 | P104 与 MatmulImpl/base block 调优正交，扩展后应重新评估 base block 选择 |
+| P105 (L2 tile sizing) | P52/P61 | P105 系统化 L2 切分可替代或增强 P52/P61 的 L2 hint/cache 控制；需避免同时使用 |
+| P106 (Batch-merge-to-M) | P72 (Split-K) | Batch 合并改变 M 维度，可能影响 Split-K 的触发条件；合并后重新判断 K ≫ M*N |
+| P107 (Serpentine) | P105 (L2 tile sizing) | P107 是 P105 的遍历方式补充，必须配合 L2 tile 使用 |
+| P108 (Platform routing) | P46/P86/P87 | DAV_3510 平台下 P46/P86/P87 等 MatmulImpl 相关策略不适用；DAV_2201 下可叠加 |
+| P109 (Reduction multi-axis) | P94/P95/P99 | P109 是 Tiling 层面设计，P94/P95/P99 是标量向量化；二者正交可叠加 |
+| P110 (Reduction UB acc reuse) | P81/P85 | UB 常驻累加器需与 UB 分区复用策略协调地址 |
+| P111 (Sort two-level merge) | P96 | P111 是 Tiling 设计，P96 是硬件排序引擎替代；二者正交 |
+| P112 (Elementwise tile sizing) | P67/P84 | P112 确定 tile 大小，P67/P84 优化 tile 内向量执行；正交 |
+| P113 (Broadcast aligned tiling) | P12 | P113 系统化广播 Tiling，P12 是广播与掩码操作；可叠加 |
+| P114 (Transpose tiling) | P26/P59 | P114 系统化转置 Tiling，P26/P59 是具体搬运优化；可叠加 |
+| P115 (FlashAttention tiling routing) | P14/P53/P57-P61 | P115 决定 FA Tiling 模式，其他策略在选定模式下优化；正交或依赖 |
 
 ## §2 依赖关系
 
@@ -45,6 +60,18 @@
 | P86 | P46 | Matmul 数据通路调优依赖 MatmulImpl API(P46) |
 | P87 | P46 | 手动 Mmad 时序控制依赖 MatmulImpl API(P46) |
 | P103 | P102 | Cube Neumann 三角求解依赖 MIX CV 融合架构，需先由 P102 完成 scalar/VEC → MIX 重写建立 Cube 通路 |
+| P104 | P46 | 多核切分扩展基于 MatmulImpl API；需先确认使用 P46 路径 |
+| P105 | P46 | L2 切分在 MatmulImpl 路径下生效；需先确认 P46 |
+| P106 | P46 | Batch 合并到 M 在 MatmulImpl 路径下生效；需先确认 P46 |
+| P107 | P105 | Serpentine 遍历依赖 L2 tile 结构；需先启用 P105 |
+| P108 | — | 平台路由是前置决策，无依赖 |
+| P109 | P94/P95 | 多轴归约 Tiling 后通常需要向量化实现 |
+| P110 | P109 | UB 累加器复用依赖多轴归约 Tiling 结构 |
+| P111 | P96 | 两级归并 Tiling 后通常使用硬件排序引擎实现 |
+| P112 | P67/P84 | 向量化 tile 大小需配合 Vector 效率模式 |
+| P113 | P12 | 广播对齐 Tiling 后可叠加 P12 的广播与掩码操作 |
+| P114 | P26 | 转置 Tiling 后可叠加 P26 的 stride 搬运 |
+| P115 | P14/P53/P57-P61 | FA Tiling 路由选定具体模式后，可叠加对应优化策略 |
 
 ### 推荐搭配（非硬依赖，但组合效果显著优于单独使用）
 
@@ -60,6 +87,16 @@
 | P94 | P95 | 标量归约与逐元素链联合向量化（Norm 类 sum/sum_sq + 归一化链，GroupNorm 实测 geomean 1.84x/4.31x） |
 | P100 | P97 | GatherMask 的 src 用零拷贝偏移视图（src[offset]），避免显式拷贝 |
 | P101 | P100 | 同类 GatherMask 解交织策略：拆分发生在 Host 侧用 P101，发生在 kernel 内用 P100 |
+| P104 | P46 + P92 | MatmulImpl + base block 调优 + 多核扩展 |
+| P105 | P46 + P52/P61 | MatmulImpl + L2 切分 + L2 cache 控制 |
+| P106 | P46 + P104 | MatmulImpl + 多核扩展 + Batch 合并 |
+| P107 | P105 + P46 | L2 切分 + Serpentine + MatmulImpl |
+| P109 | P94 + P110 | 多轴归约 Tiling + 向量化 + UB 累加器复用 |
+| P111 | P96 + P7 | 两级归并 Tiling + 硬件排序 + 对齐填充 |
+| P112 | P67 + P84 | 向量化 tile + Counter 模式 + Vector 效率 |
+| P113 | P12 + P99 | 广播 Tiling + 广播掩码 + 批量向量 |
+| P114 | P26 + P7 | 转置 Tiling + stride 搬运 + 对齐 |
+| P115 | P14 + P53 + P57 | FA Tiling 路由 + CV 预加载 + L1 常驻 + G 分区 |
 
 简化依赖图：
 
@@ -80,6 +117,17 @@ P83 ──→ P53 ──→ P18
 P86 ──→ P46
 P87 ──→ P46
 P103 ──→ P102
+P104 ──→ P46
+P105 ──→ P46
+P106 ──→ P46
+P107 ──→ P105
+P109 ──→ P94/P95
+P110 ──→ P109
+P111 ──→ P96
+P112 ──→ P67/P84
+P113 ──→ P12
+P114 ──→ P26
+P115 ──→ P14/P53/P57-P61
 ```
 
 ## §3 推荐组合

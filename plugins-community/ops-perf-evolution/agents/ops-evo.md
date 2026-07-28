@@ -61,6 +61,16 @@ skills:
 - **策略选择协议（分层检索）**: 读取 `plugins-community/ops-perf-evolution/skills/evolution-strategies/references/strategy-index.md` 后，按以下顺序选择策略：
   · **Step 1 — L0 通用策略 (必选)**: 查"按算子类型快速查表"的 L0 列，选择所有匹配的 D/P/A 策略
   · **Step 2 — L1 高级策略 (按需)**: 根据算子特征判断：Cube+Vector 融合（matmul+vector 后处理）→ 查 CV Matmul 行；Flash Attention 模式 → 查 Flash Attention 行；量化/反量化 → 查 Quantization 行 + P48/P49；MoE 专家并行 → 查 CV FFN (MoE) 行 + P50；多核 M×N 分块 → P47（对角线调度）；AIC/AIV 混合 → P51（动态核配比）
+
+  对于 ascendc-tiling-design 已覆盖族，Init 阶段默认将以下系统化 Tiling 策略纳入候选池（若族匹配）：
+  · matmul → P104, P105, P106, P107, P108
+  · reduction → P109, P110
+  · sort → P111
+  · elementwise → P112
+  · broadcast → P113
+  · conversion → P114
+  · flashattention → P115
+  这些策略与 L0/L1 其他策略组合时需遵守 strategy-compatibility.md 的依赖/互斥约束。
   · **Step 3 — 瓶颈驱动 (Refine 阶段)**: profiling_evidence 可用时，查"按瓶颈类型查表"追加/替换策略
   · **原则**: L0 保证基本正确性和性能，L1 针对特定场景提供 2-5x 额外提升。Init 阶段优先用 L0 + 少量 L1，Refine 阶段按 profiling 证据精准追加 L1
   · **ops 仓特别说明**: ops-nn/cv 仓算子更可能需要 L1（CV 融合、量化），ops-math/transformer 仓算子更多用 L0
@@ -294,10 +304,20 @@ python3 plugins-community/ops-perf-evolution/skills/ops-evaluation/scripts/evalu
    - 写入 `world_model.json` 顶层 `hw_params` 字段：`{ chip_model, ub_size_bytes, core_num, peak_bw_gbps, peak_vector_tflops_per_core, alignment_bytes, max_tile_fp16_double_buf }`
    - hw_params 为 null 时节点描述缺少硬件参数指导（tile_size 建议值等），严重影响优化质量。仅在查询报错时才允许 hw_params = null。
 2. **必读知识库**: 读取 `plugins-community/ops-perf-evolution/skills/evolution-knowledge/references/a3/hardware/guide.md` 和 `optimization_patterns/guide.md`；算子匹配特定族（attention/reduction/elementwise）时额外读 `algorithm_insights/{family}.md`；`proven_solutions/INDEX.md` 中有同类算子方案时读对应条目
+   - 若算子属于 ascendc-tiling-design 已覆盖族（matmul / flashattention / reduction / sort / elementwise / broadcast / conversion），必须读取对应的 ascendc-tiling-design 族指南和 patterns：
+     · matmul: 读 `ops/ascendc-tiling-design/references/matmul/patterns.md` 和 `ops/ascendc-tiling-design/references/matmul/ascendc-api-matmul-tiling.md`
+     · flashattention: 读 `ops/ascendc-tiling-design/references/flashattention/patterns.md`
+     · reduction: 读 `ops/ascendc-tiling-design/references/reduction/patterns.md` 和 `algorithms.md`
+     · sort: 读 `ops/ascendc-tiling-design/references/sort/patterns.md` 和 `alg-two-level-mrgsort.md`
+     · elementwise: 读 `ops/ascendc-tiling-design/references/elewise/patterns.md`
+     · broadcast: 读 `ops/ascendc-tiling-design/references/broadcast/patterns.md`
+     · conversion: 读 `ops/ascendc-tiling-design/references/conversion/patterns.md`
+     同时读取 `plugins-community/ops-perf-evolution/skills/evolution-strategies/references/families/<category>_guide.md` 作为策略库族指南。
 3. 读取 shared/original/ 下的算子代码，分析算子特性（计算模式、数据类型、形状特征）：内存密集型 vs 计算密集型？尾块对齐问题（形状非32字节整数倍）？数据类型特殊处理（FP16/BF16精度）？
 4. 读取 `plugins-community/ops-perf-evolution/skills/evolution-strategies/references/strategy-index.md`，识别最相关策略
 5. 设计节点：`parallel_num × 2` 个策略导向节点（`mode="strategy_guided"`）+ `max(1, ⌈parallel_num / 4⌉)` 个开放探索节点（`mode="open_exploration"`），确保:
    - 策略多样性（各 strategy_guided 节点 strategy_combination 不完全相同）、难度梯度（difficulty 2-4 均有覆盖）、类型覆盖（P性能/D数据类型/A精度，按需）
+   - 若算子族匹配 ascendc-tiling-design 覆盖范围，至少为 1 个 strategy_guided 节点分配对应的 P104-P115 策略（例如 matmul 族分配 P104+P108），确保系统化 Tiling 设计有机会进入进化。
    - 每个节点必须包含 optimization_type 字段（bandwidth/tiling/algorithm），三类各至少有 1 个节点，确保 Select 保底轮有候选
    - **若 hw_params 非 null**：利用硬件参数增强节点描述（如"tile_size 建议 {max_tile_fp16_double_buf//2}，最大可达 {max_tile_fp16_double_buf}"），并做 Roofline 定性分析（算术强度 vs 拐点）确认内存/计算密集判断
 

@@ -1,0 +1,31 @@
+strategy_id: P109
+description: Reduction 多轴 Tiling 适用性检查 — 算子必须是多维归约语义，且未完整实现 A/R 合轴与 AR/ARA 路由。
+
+checks:
+  - id: has_reduction_semantics
+    type: grep_count
+    pattern: "reduce|Reduce|sum|max|mean|variance|softmax"
+    files: [kernel, header]
+    expected: ">= 1"
+    fail_msg: "未检测到归约语义 → P109 不适用。"
+
+  - id: has_shape_or_axes
+    type: grep_count
+    pattern: "shape|axes|axis|dim"
+    files: [header]
+    expected: ">= 1"
+    fail_msg: "未检测到 shape/axes 字段 → 无法执行多轴合轴。"
+
+  - id: no_ar_ara_routing
+    type: grep_count
+    pattern: "Pattern::Reduce::RA|isARA|A0|arFlags|CollapseShape"
+    files: [kernel, header]
+    expected: "== 0"
+    fail_msg: "算子已实现 AR/ARA 路由或多轴合轴 → P109 主要价值已发挥。"
+
+  - id: has_multi_dim_loop
+    type: grep_count
+    pattern: "for\\s*\\(.*for\\s*\\("
+    files: [kernel]
+    expected: ">= 1"
+    fail_msg: "未检测到多维循环 → 多轴 Tiling 收益有限。"

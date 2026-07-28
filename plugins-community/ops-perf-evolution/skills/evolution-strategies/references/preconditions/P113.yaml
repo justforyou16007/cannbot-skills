@@ -1,0 +1,31 @@
+strategy_id: P113
+description: Broadcast 对齐 Tiling 适用性检查 — 算子存在广播语义，输入 shape 不同，且未完整实现 DimensionCollapse 与广播方式选择。
+
+checks:
+  - id: has_broadcast_semantics
+    type: grep_count
+    pattern: "broadcast|Broadcast|BRC|NDDMA"
+    files: [kernel, header]
+    expected: ">= 1"
+    fail_msg: "未检测到广播语义 → P113 不适用。"
+
+  - id: different_shapes
+    type: grep_count
+    pattern: "inputShape|outputShape|numInputs|num_dims"
+    files: [header]
+    expected: ">= 2"
+    fail_msg: "未检测到多输入 shape 信息 → 无法判断广播。"
+
+  - id: no_dimension_collapse
+    type: grep_count
+    pattern: "Collapse|collapsed|flag|stride\\s*=\\s*0"
+    files: [kernel, header]
+    expected: "== 0"
+    fail_msg: "算子已实现 DimensionCollapse / stride 置 0 → P113 主要价值已发挥。"
+
+  - id: has_vector_unit
+    type: grep_count
+    pattern: "AI_VECTOR_CORE|TaskType::AI_VECTOR|aiv"
+    files: [all]
+    expected: ">= 1"
+    fail_msg: "未检测到 AIV kernel → P113 面向 Vector 广播路径。"

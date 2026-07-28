@@ -49,7 +49,8 @@ argument-hint: >
 │   ├── <op_name>.json.bak# 原始 .json 备份
 │   ├── design/           # TileLang DSL 用于表达 kernel 设计
 │   │   ├── block_level/  # TileLang block-level 设计
-│   │   └── tile_level/   # TileLang tile-level 设计，用于表达完整 kernel 设计
+│   │   ├── tile_level/   # TileLang tile-level 设计，用于表达完整 kernel 设计
+│   │   └── PERF_DESIGN.md# 性能设计检查结论（步骤 1e/2e 强制产物）
 │   ├── kernel/           # AscendC kernel（本阶段不涉及）
 │   └── model_new_tilelang.py # 你的 TileLang 优化实现，调用 tile_level/ 下的 TileLang kernel
 └── <other_tasks>/        # 其他历史任务，可作为参考实现
@@ -94,6 +95,7 @@ argument-hint: >
 > 路径以项目根目录为基准（即 `cannbot-skills/` 下的相对路径）。
 > 以下文档用于**设计期性能避坑**——在 block/tile 设计阶段就避免引入常见性能劣化模式，
 > 而非等算子完成后才回头调优。完整性能调优流程见 `ops/tilelang-perf-optimization/SKILL.md`。
+> **步骤 1e / 2e 为强制门禁**：以下文档必须实际 Read 并产出 `design/PERF_DESIGN.md`，禁止凭记忆跳过。
 
 | 文档 | 用途 | 使用阶段 |
 |------|------|----------|
@@ -203,9 +205,15 @@ Read `ops/tilelang-op-design/references/info-sources.md`：
 - block 级设计必须与步骤 0 命中的 pattern 文档中的地址公式、循环结构、数据流对齐
 - `model_new_tilelang.py` 负责输入布局整理 + kernel 调用
 
-#### 1e. 设计期性能初检（推荐）
+#### 1e. 设计期性能初检（强制）
 
-在 block 级设计确定后、进入 tile 级实现前，快速对照性能反模式清单检查设计骨架是否存在明显性能隐患。此步骤**推荐执行**，非硬性门禁，但可避免将性能问题固化到 tile 级代码中。
+```
+⚠️ 本步骤是硬性门禁。block 级设计确定后、进入 tile 级实现前，必须完成以下检查
+   并将结论写入 {output_dir}/design/PERF_DESIGN.md。未完成本步骤前，禁止生成
+   tile_level/ 下的任何代码。禁止凭记忆或经验跳过本步骤。
+```
+
+在 block 级设计确定后、进入 tile 级实现前，对照性能反模式清单检查设计骨架是否存在明显性能隐患，避免将性能问题固化到 tile 级代码中。
 
 Read `ops/tilelang-perf-optimization/references/performance-antipatterns.md`，重点关注以下与 block 级设计直接相关的项目：
 
@@ -222,6 +230,13 @@ Read `ops/tilelang-perf-optimization/references/optimization-guide.md` §一（�
 **Cube/CV 融合型补充**：Read `ops/tilelang-perf-optimization/references/cube_advanced_strategies.md` 的路由表，判断本算子是否需要预留 pingpong/swat/streamk 等高级策略的扩展空间（如在 block 级设计中预留 Split-K 切分维度）。
 
 **CV 融合型补充**：Read `ops/tilelang-perf-optimization/references/cv_sync_debug.md` §4（锁步诊断），确认设计的流水结构不会落入 Cube/Vector 串行乒乓（各闲一半）的 lockstep 调度。
+
+**🛑 PERF_DESIGN.md 必须包含以下内容（缺项视为未完成 1e）**：
+
+1. 算子类型判定（纯 Cube / 纯 Vector / CV 融合）及 optimization-guide §一 对应的优化范围与优先级
+2. 上表中与本算子相关的检查项逐项结论（命中 / 未命中 / 不适用 + 一句理由）
+3. Cube / CV 融合型：cube_advanced_strategies.md 路由结论——选用的高级策略，或在 block 级设计中预留的扩展空间（如 Split-K 切分维度、pingpong/swat 适配点）
+4. CV 融合型：cv_sync_debug.md §4 锁步风险结论（流水结构如何避免 C/V 串行乒乓）
 
 ---
 
@@ -255,9 +270,14 @@ Read `ops/tilelang-op-develop/references/vector-parallelism.md`：
 - **编程模式和 pass_configs**：查阅 [tilelang-programming-model-guide SKILL.md](../tilelang-programming-model-guide/SKILL.md) 及其 references 目录
 
 
-#### 2e. Tile 级性能反模式终检（推荐）
+#### 2e. Tile 级性能反模式终检（强制）
 
-在 tile 级代码完成后，对照性能反模式清单做最终扫描，确认 tile 级实现未引入新的性能劣化。此步骤**推荐执行**。
+```
+⚠️ 本步骤是硬性门禁。tile 级代码完成后，必须完成以下终检，并把结论追加到
+   {output_dir}/design/PERF_DESIGN.md。未完成本步骤前，禁止进入步骤 3。
+```
+
+在 tile 级代码完成后，对照性能反模式清单做最终扫描，确认 tile 级实现未引入新的性能劣化。
 
 Read `ops/tilelang-perf-optimization/references/performance-antipatterns.md`，重点扫描以下 tile 级容易引入的问题：
 
@@ -274,11 +294,13 @@ Read `ops/tilelang-perf-optimization/references/optimization-guide.md`：
 - Vector 型：确认 Double Buffer + 指令向量化/融合 + Fixed Core 是否已考虑
 - CV 融合型：确认核内优化后再检查核间流水（`T.Pipelined` num_stages、cross_interval）
 
+**🛑 终检结论必须追加到 PERF_DESIGN.md**，包含：上表逐项扫描结论（命中 / 未命中 / 不适用 + 一句理由）、命中的反模式及对应修正、optimization-guide 三类确认项的勾选结果。
+
 ---
 
-### 步骤 3: 自检（可选）
+### 步骤 3: 自检
 
-如用户明确要求，或为了排查 DSL 语法 / 编译问题，可执行以下自检。
+🛑 **强制项**：确认 `{output_dir}/design/PERF_DESIGN.md` 存在，且包含 1e（block 级初检）与 2e（tile 级终检）两轮完整结论；缺失或缺项则返回对应步骤补齐，禁止直接交付。其余自检项为可选——如用户明确要求，或为了排查 DSL 语法 / 编译问题，可执行以下自检。
 
 #### 3a. 设计质量自检
 
@@ -292,6 +314,8 @@ Read `ops/tilelang-op-develop/references/checklist.md`，按 22 项逐项检查�
 #### 3c. 可选 TileLang 评测
 
 调用 `.claude/skills/tilelang2ascend-tilelang-designer/scripts/evaluate_tilelang.sh {output_dir}` 做辅助检查；但 TileLang 结果当前不作为 correctness gate，也不作为性能测试输入。若遇到框架语义缺陷、尾块处理异常或其他 TileLang 自身 bug，应保留设计表达并在最终说明中明确记录，不要为了通过 TileLang 验证而扭曲设计。
+
+**框架侧问题的处理约定**（与主流程一致）：若通过对照实验确认属 TileLang 框架侧问题（如特定 dtype 的 cube MMA 不支持、框架 bug，需有证据，例如同结构 fp16 通过 / fp32 失败），允许跳过 TileLang 功能验证并继续进入下游 AscendC 转译阶段（Phase 4），但必须在最终说明中记录跳过原因与对照实验证据。条件允许时，建议先用框架支持的 dtype（如 fp16/bf16）做代理验证，确认设计逻辑正确后再跳过——代理验证不通过则说明设计本身有问题，不得以"框架问题"为由放行。
 
 调试时如需排查 DSL 表达问题，参考 `ops/tilelang-op-develop/references/TileLangDebug.md`（T.printf / T.dump_tensor）。
 

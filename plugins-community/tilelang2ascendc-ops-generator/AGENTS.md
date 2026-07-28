@@ -109,8 +109,8 @@ Phase 3: 设计表达            (分支)
   ├─ 简单算子: 架构设计 + 设计串讲 (ops-direct-invoke: DESIGN.md + PLAN.md + WALKTHROUGH.md)
   └─ 复杂算子: TileLang 设计  (tilelang2ascend-tilelang-designer)
        ├─ Step 0: Attention 模式路由 (仅 Attention/FlashAttention 类)
-       ├─ Step 1: Block 层级设计 (技术约束检测 + 编程模式决策 + 信息收集 + 性能初检)
-       ├─ Step 2: Tile 层级设计 (编码规范 + GEMM/CV融合 + V核并行化 + 性能反模式终检)
+       ├─ Step 1: Block 层级设计 (技术约束检测 + 编程模式决策 + 信息收集 + 性能初检[强制门禁,产出 design/PERF_DESIGN.md])
+       ├─ Step 2: Tile 层级设计 (编码规范 + GEMM/CV融合 + V核并行化 + 性能反模式终检[强制门禁,追加 PERF_DESIGN.md])
        └─ Step 3: 自检 + 退化检测 + 迭代
        Skill 依赖: tilelang-op-design + tilelang-op-develop + tilelang-perf-optimization
 Phase 4: AscendC 生成与验证   (分支)
@@ -260,4 +260,4 @@ Subagent 返回
 |-------|------|----------|
 | `ops/tilelang-op-design/SKILL.md` | 算子设计文档生成：技术约束检测、编程模式决策树、信息收集、Block 级设计 | Phase 3 Step 1 |
 | `ops/tilelang-op-develop/SKILL.md` | 算子代码生成：编码规范、GEMM/CV 融合、V 核并行化、TileLang 编程指南 | Phase 3 Step 2 |
-| `ops/tilelang-perf-optimization/SKILL.md` | 性能优化：反模式清单、优化指南、CV 同步调试、Cube 高级策略 | Phase 3 Step 1e, 2e |
+| `ops/tilelang-perf-optimization/SKILL.md` | 性能优化：反模式清单、优化指南、CV 同步调试、Cube 高级策略 | Phase 3 Step 1e, 2e（强制门禁） |

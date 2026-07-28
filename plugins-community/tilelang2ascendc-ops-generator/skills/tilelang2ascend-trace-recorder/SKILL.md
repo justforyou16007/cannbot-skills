@@ -30,6 +30,7 @@ argument-hint: >
 补充约定：
 - TileLang 当前主要用于设计表达，不默认作为 correctness / performance gate
 - 若未执行 TileLang 验证，或因 TileLang 自身 bug 明确跳过验证，应如实记录为“跳过”并写明原因
+  （含框架侧问题的对照实验证据，如 fp16 通过 / fp32 失败；若做了 fp16/bf16 代理验证，记录其结论）
 
 ## 输出格式
 
@@ -61,6 +62,12 @@ argument-hint: >
 - 结果: 通过 / 失败 / 跳过
 - evaluate_tilelang.sh 执行次数: {n}
 - 关键错误信息: {评测脚本返回的错误，原文引用}
+- 性能设计检查（1e/2e 强制项，依据 design/PERF_DESIGN.md 记录）:
+  - 算子类型判定: {纯 Cube / 纯 Vector / CV 融合}
+  - 1e block 级初检: {命中的反模式与设计期修正；无命中则写"全部未命中/不适用"}
+  - 2e tile 级终检: {命中的反模式与设计期修正；无命中则写"全部未命中/不适用"}
+  - 高级策略路由结论: {Cube 型写 cube_advanced_strategies 选用/预留策略；其余写"不适用"}
+  - PERF_DESIGN.md 缺失或缺项 → 在"走偏点"中记录为流程违规
 - Agent 行为记录:
   - 第 1 轮: {agent 做了什么，结果如何}
   - 第 2 轮: {修改了什么，结果如何}

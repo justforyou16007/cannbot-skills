@@ -2,11 +2,12 @@
 name: tilelang2ascend-tilelang-designer
 description: >
   TileLang kernel 设计调度 Skill。协调 tilelang-op-design（设计方法论）和 tilelang-op-develop（编码规范），
-  完成 block-level 设计、tile-level 设计和 model_new_tilelang.py 生成。
+  完成 block-level 设计、tile-level 设计和 model_new_tilelang.py 生成，
+  并通过步骤 4（tilelang-perf-optimization 本体）完成测量驱动的性能迭代。
   产物对接下游 AscendC translator 算子生成流程。
 argument-hint: >
   输入：output_dir 目录路径（包含 model.py）。
-  输出：block_level/ 设计、tile_level/ 设计、model_new_tilelang.py 实现。
+  输出：block_level/ 设计、tile_level/ 设计、model_new_tilelang.py 实现、perf_tuning/ 性能迭代记录。
 ---
 
 # TileLang Kernel 设计调度 Skill
@@ -50,7 +51,9 @@ argument-hint: >
 │   ├── design/           # TileLang DSL 用于表达 kernel 设计
 │   │   ├── block_level/  # TileLang block-level 设计
 │   │   ├── tile_level/   # TileLang tile-level 设计，用于表达完整 kernel 设计
-│   │   └── PERF_DESIGN.md# 性能设计检查结论（步骤 1e/2e 强制产物）
+│   │   └── PERF_DESIGN.md# 性能设计检查结论（步骤 1e/2e 强制产物，含「性能迭代待验证清单」）
+│   ├── perf_tuning/      # 性能迭代产物（步骤 4 强制）：baseline.json / optimization_log.md /
+│   │                     # final_report.md，或合法跳过时为 SKIPPED.md
 │   ├── kernel/           # AscendC kernel（本阶段不涉及）
 │   └── model_new_tilelang.py # 你的 TileLang 优化实现，调用 tile_level/ 下的 TileLang kernel
 └── <other_tasks>/        # 其他历史任务，可作为参考实现
@@ -60,7 +63,7 @@ argument-hint: >
 
 ### 本 skill 自带脚本
 
-- `.claude/skills/tilelang2ascend-tilelang-designer/scripts/evaluate_tilelang.sh` — TileLang 评测脚本（远程/本地执行，当前仅供可选调试，不作为流程 gate）
+- `.claude/skills/tilelang2ascend-tilelang-designer/scripts/evaluate_tilelang.sh` — TileLang 功能验证脚本（步骤 3c 强制使用；精度通过是步骤 4 性能迭代的强制前置）
 - `.claude/skills/tilelang2ascend-tilelang-designer/scripts/validate_tilelang_impl.py` — TileLang 实现退化检测（检测 PyTorch 回退）
 - `.claude/skills/tilelang2ascend-tilelang-designer/scripts/verification_tilelang.py` — TileLang 精度验证
 
@@ -93,16 +96,17 @@ argument-hint: >
 ### 性能方法论（ops/tilelang-perf-optimization 贡献，不复制、只引用）
 
 > 路径以项目根目录为基准（即 `cannbot-skills/` 下的相对路径）。
-> 以下文档用于**设计期性能避坑**——在 block/tile 设计阶段就避免引入常见性能劣化模式，
-> 而非等算子完成后才回头调优。完整性能调优流程见 `ops/tilelang-perf-optimization/SKILL.md`。
-> **步骤 1e / 2e 为强制门禁**：以下文档必须实际 Read 并产出 `design/PERF_DESIGN.md`，禁止凭记忆跳过。
+> 以下文档有两个用途：①**设计期性能避坑**（步骤 1e/2e，强制门禁）——在 block/tile 设计阶段就避免引入常见性能劣化模式；
+> ②**步骤 4 性能迭代**——调用 `ops/tilelang-perf-optimization/SKILL.md` 本体（Step 1-5 闭环）做测量驱动的调优。
+> **步骤 1e / 2e / 4 均为强制门禁**：1e/2e 必须实际 Read 并产出 `design/PERF_DESIGN.md`，步骤 4 必须产出 `perf_tuning/`，禁止凭记忆跳过。
 
 | 文档 | 用途 | 使用阶段 |
 |------|------|----------|
-| `ops/tilelang-perf-optimization/references/performance-antipatterns.md` | 常见性能劣化模式清单：launch core 数不当、逐元素 for loop、冗余全局同步、指令未融合、tile size 过小、CV 未 overlap、AIV 未流水/双 buffer、多行 tile 循环内归约 | Step 1e, 2e |
-| `ops/tilelang-perf-optimization/references/optimization-guide.md` | 性能优化指南：Split-K、Double Buffer、Fixed Core、多行 Tile 粒度扩展、MTE2 预取、指令向量化/融合 | Step 1e（§一 算子类型对应）, 2e |
-| `ops/tilelang-perf-optimization/references/cube_advanced_strategies.md` | Cube 高级策略路由表：pingpong / swat / streamk / fullload / scale_coalescing / mte2_preload | Step 1e（仅 Cube/CV 融合型） |
-| `ops/tilelang-perf-optimization/references/cv_sync_debug.md` | C/V 融合 lockstep 诊断与避免（设计期预防 hang/死锁） | Step 1e（仅 CV 融合型） |
+| `ops/tilelang-perf-optimization/references/performance-antipatterns.md` | 常见性能劣化模式清单：launch core 数不当、逐元素 for loop、冗余全局同步、指令未融合、tile size 过小、CV 未 overlap、AIV 未流水/双 buffer、多行 tile 循环内归约 | Step 1e, 2e, 4c |
+| `ops/tilelang-perf-optimization/references/optimization-guide.md` | 性能优化指南：Split-K、Double Buffer、Fixed Core、多行 Tile 粒度扩展、MTE2 预取、指令向量化/融合 | Step 1e（§一 算子类型对应）, 2e, 4c |
+| `ops/tilelang-perf-optimization/references/cube_advanced_strategies.md` | Cube 高级策略路由表：pingpong / swat / streamk / fullload / scale_coalescing / mte2_preload | Step 1e（仅 Cube/CV 融合型）, 4c |
+| `ops/tilelang-perf-optimization/references/cv_sync_debug.md` | C/V 融合 lockstep 诊断与避免（设计期预防 hang/死锁） | Step 1e（仅 CV 融合型）, 4c |
+| `ops/tilelang-perf-optimization/references/measurement_discipline.md` | 测量纪律：A/B 口径、环境排除、bound 分类、上限分析 | Step 4b, 4c, 4d |
 
 ---
 
@@ -237,6 +241,15 @@ Read `ops/tilelang-perf-optimization/references/optimization-guide.md` §一（�
 2. 上表中与本算子相关的检查项逐项结论（命中 / 未命中 / 不适用 + 一句理由）
 3. Cube / CV 融合型：cube_advanced_strategies.md 路由结论——选用的高级策略，或在 block 级设计中预留的扩展空间（如 Split-K 切分维度、pingpong/swat 适配点）
 4. CV 融合型：cv_sync_debug.md §4 锁步风险结论（流水结构如何避免 C/V 串行乒乓）
+5. `## 性能迭代待验证清单` 章节（见下方格式；1e 阶段无待验证项时写"暂无"，章节本身不可缺）
+
+**性能迭代待验证清单（标准化格式，供步骤 4 消费）**：所有"设计期保留、待实测验证"的项（如保留的疑似冗余同步、暂不启用的高级策略、可扩大的 tile 配置）必须结构化为下表，禁止散落在正文描述中：
+
+```
+| # | 待验证项 | 假设 | 验证方法 | 命中时的修改点 |
+|---|---------|------|---------|---------------|
+| V1 | K-loop 内 barrier_all 冗余 | AUTO_SYNC 下可移除 | msprof 同步开销占比 | 移除手写 barrier，复验精度+性能 |
+```
 
 ---
 
@@ -294,13 +307,13 @@ Read `ops/tilelang-perf-optimization/references/optimization-guide.md`：
 - Vector 型：确认 Double Buffer + 指令向量化/融合 + Fixed Core 是否已考虑
 - CV 融合型：确认核内优化后再检查核间流水（`T.Pipelined` num_stages、cross_interval）
 
-**🛑 终检结论必须追加到 PERF_DESIGN.md**，包含：上表逐项扫描结论（命中 / 未命中 / 不适用 + 一句理由）、命中的反模式及对应修正、optimization-guide 三类确认项的勾选结果。
+**🛑 终检结论必须追加到 PERF_DESIGN.md**，包含：上表逐项扫描结论（命中 / 未命中 / 不适用 + 一句理由）、命中的反模式及对应修正、optimization-guide 三类确认项的勾选结果。**2e 阶段新产生的"保留待实测"项（如与权威示例一致而暂留的 barrier、记录为后续优化点的策略）必须追加到 `## 性能迭代待验证清单` 表中。**
 
 ---
 
 ### 步骤 3: 自检
 
-🛑 **强制项**：确认 `{output_dir}/design/PERF_DESIGN.md` 存在，且包含 1e（block 级初检）与 2e（tile 级终检）两轮完整结论；缺失或缺项则返回对应步骤补齐，禁止直接交付。其余自检项为可选——如用户明确要求，或为了排查 DSL 语法 / 编译问题，可执行以下自检。
+🛑 **强制项**：确认 `{output_dir}/design/PERF_DESIGN.md` 存在，且包含 1e（block 级初检）与 2e（tile 级终检）两轮完整结论及 `## 性能迭代待验证清单` 章节（无待验证项时写"暂无"）；缺失或缺项则返回对应步骤补齐，禁止直接交付。其余自检项为可选——如用户明确要求，或为了排查 DSL 语法 / 编译问题，可执行以下自检。
 
 #### 3a. 设计质量自检
 
@@ -311,11 +324,18 @@ Read `ops/tilelang-op-design/references/quality-checklist.md`，按 20 项逐项
 
 Read `ops/tilelang-op-develop/references/checklist.md`，按 22 项逐项检查代码产物。
 
-#### 3c. 可选 TileLang 评测
+#### 3c. TileLang 功能验证（强制）
 
-调用 `.claude/skills/tilelang2ascend-tilelang-designer/scripts/evaluate_tilelang.sh {output_dir}` 做辅助检查；但 TileLang 结果当前不作为 correctness gate，也不作为性能测试输入。若遇到框架语义缺陷、尾块处理异常或其他 TileLang 自身 bug，应保留设计表达并在最终说明中明确记录，不要为了通过 TileLang 验证而扭曲设计。
+调用 `.claude/skills/tilelang2ascend-tilelang-designer/scripts/evaluate_tilelang.sh {output_dir}` 执行功能验证。**本步骤默认必须执行、且精度必须通过**——它是步骤 4 性能迭代的强制前置条件（`tilelang-perf-optimization` 的核心约束：精度未通过，禁止性能优化；3c 不过则步骤 4 不会触发）。
 
-**框架侧问题的处理约定**（与主流程一致）：若通过对照实验确认属 TileLang 框架侧问题（如特定 dtype 的 cube MMA 不支持、框架 bug，需有证据，例如同结构 fp16 通过 / fp32 失败），允许跳过 TileLang 功能验证并继续进入下游 AscendC 转译阶段（Phase 4），但必须在最终说明中记录跳过原因与对照实验证据。条件允许时，建议先用框架支持的 dtype（如 fp16/bf16）做代理验证，确认设计逻辑正确后再跳过——代理验证不通过则说明设计本身有问题，不得以"框架问题"为由放行。
+**唯一的跳过条件**：通过对照实验确认属 **TileLang 编译器/框架底层不支持**（如特定 dtype 的 cube MMA 不支持、框架 bug），必须持有证据（例如同结构 fp16 通过 / fp32 失败）。满足时允许跳过，但必须在最终说明中记录跳过原因与对照实验证据；条件允许时，应先用框架支持的 dtype（如 fp16/bf16）做代理验证确认设计逻辑正确——代理验证不通过则说明设计本身有问题，不得以"框架问题"为由放行。
+
+**禁止事项**：
+- 禁止以"评测可选""不作为 gate"为由不执行 evaluate_tilelang.sh
+- 禁止无对照实验证据就以"框架问题"跳过；验证失败且不属于编译器底层不支持时，必须按 3d 排查并回到步骤 1/2 迭代修复
+- 禁止为了通过 TileLang 验证而扭曲设计（如改用降精度路径规避）
+
+TileLang 精度结果不作为交付的 correctness gate（交付精度以 Phase 4 AscendC 验证为准）。TileLang 性能数据的使用口径：**作为步骤 4（Phase 3 内部性能迭代）的测量输入**，但不进入 Phase 5 的对比报告、不作为交付的性能结论。
 
 调试时如需排查 DSL 表达问题，参考 `ops/tilelang-op-develop/references/TileLangDebug.md`（T.printf / T.dump_tensor）。
 
@@ -328,3 +348,59 @@ Read `ops/tilelang-op-develop/references/checklist.md`，按 22 项逐项检查�
 | 编译错误 | buffer 大小、API 参数、对齐 |
 | 运行错误 | 索引越界、同步缺失 |
 | 精度错误 | Golden 实现、输出形状 |
+
+---
+
+### 步骤 4: TileLang 性能迭代（强制门禁，p_retry ≤ 3）
+
+```
+⚠️ 本步骤是硬性门禁。未完成本步骤（含合法跳过）前，禁止交付 Phase 3 产物、
+   禁止进入下游 AscendC 转译（Phase 4）。
+```
+
+本步骤调用 `ops/tilelang-perf-optimization` skill **本体**（Step 1-5 迭代闭环），对 TileLang 实现做测量驱动的性能迭代。skill 文档中的项目布局按以下映射理解：`examples/{op}/` → `{output_dir}/`，测试入口 → 本项目的 TileLang 测试脚本（`evaluate_tilelang.sh` 的 python 入口或等效脚本）。达标线：**geomean ≥ 0.6x**（TileLang kernel 时间 vs PyTorch reference kernel 时间，msprof 采集）。
+
+#### 4a. 前置判定（能否测量）
+
+- **3c 功能验证通过（精度达标）→ 进入 4b**。精度未通过时不允许进入 4b/4c（tilelang-perf-optimization 核心约束：精度未通过禁止性能优化）
+- TileLang 编译器/框架底层不支持导致无法执行：必须满足 3c 的对照实验证据标准（如同结构 fp16 通过 / fp32 失败）且代理验证通过 → 写 `{output_dir}/perf_tuning/SKIPPED.md`（跳过原因 + 对照实验证据 + 代理验证结果）→ 本步骤完成，允许交付
+- **无对照实验证据的"不可执行"不允许跳过**，按 3d 排查并返回步骤 1/2 修复
+
+#### 4b. 基线采集
+
+用 `ops-profiling` 的 `msprof_profile_run.sh` 标准模式（`--` 包任意可执行文件）分别采集 reference 与 TileLang 实现的 kernel 时间：
+
+```bash
+bash msprof_profile_run.sh --warm-up=3 --output=./msprof_ref -- python <reference 测试入口>
+bash msprof_profile_run.sh --warm-up=3 --output=./msprof_tl  -- python <tilelang 测试入口>
+```
+
+- 采集纪律按 `measurement_discipline.md` §1-§3：`npu-smi info` 确认目标卡空闲、≥20 次取中位数、记录 NPU ID / shape / dtype
+- 计算 `geomean_speedup = geomean(ref_kernel_us / tl_kernel_us)`，写入 `{output_dir}/perf_tuning/baseline.json`
+- **geomean ≥ 0.6 → 基线即达标**：记录到 `optimization_log.md`，跳到 4d 产出 final_report.md 后交付
+
+#### 4c. 迭代循环（p_retry = 0..2）
+
+调用 `ops/tilelang-perf-optimization` skill 的 Step 3-5：
+
+1. **Step 3 识别优化点**：在 `{output_dir}/perf_tuning/optimization_log.md` 输出 Part A 优化点清单 + `[ORDER-PLAN]`。**清单必须以 PERF_DESIGN.md「性能迭代待验证清单」为强制种子**（逐条判定适用/不适用 + 原因），再补充反模式扫描新发现项
+2. **Step 4 逐项实施**：每个优化点走 6 子步骤（`[ORDER-CHECK]` → Read 文档 → Edit `design/tile_level/` + `model_new_tilelang.py` → msprof 复测 → `[RESULT-#N]` → 失败重读修复）；每次 Edit 只改一个优化点；**精度复验不过的改动禁止计入性能收益**（回退或修复后再计）
+3. **Step 5 效果验证**：全 case 复测，geomean ≥ 0.6 → break
+4. 连续 3 个优化点无提升 → 提前终止本轮循环
+
+#### 4d. 终止与上报
+
+- 达标 / p_retry 耗尽 / 连续无提升 → **必须先做上限分析**（`measurement_discipline.md` §5：算术强度拆解 + Amdahl 上限 + roofline 判定），确认剩余空间不足以支撑继续迭代；禁止只报"连续无提升"
+- 产出 `{output_dir}/perf_tuning/final_report.md`：基线 vs 最终 geomean、已实施优化点列表及各自收益、上限分析结论、未达标原因（若未达标）
+
+#### 🛑 交付门禁
+
+`{output_dir}/perf_tuning/` 下必须存在以下产物组合之一，缺失视为步骤 4 未完成，禁止交付：
+
+| 情形 | 必需产物 |
+|------|---------|
+| 合法跳过（4a） | `SKIPPED.md` |
+| 基线即达标（4b） | `baseline.json` + `optimization_log.md` + `final_report.md` |
+| 迭代完成/预算耗尽（4c→4d） | `baseline.json` + `optimization_log.md`（含 `[ORDER-PLAN]` 与逐项 `[RESULT-#N]`）+ `final_report.md`（含上限分析） |
+
+性能迭代完成后，优化定稿的 `design/tile_level/` 与 `model_new_tilelang.py` 即为 Phase 4 转译输入；若迭代中修改了设计结构（如任务划分、tile 配置），同步更新 PERF_DESIGN.md 对应结论。

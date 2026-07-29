@@ -24,6 +24,14 @@ ascend-kernel-developer Subagent
     ├── Phase 4: AscendC 生成与验证（分支）
     │     ├─ 简单: ops-direct-invoke 开发实现 + 代码审查 + 修复循环（3轮上限）
     │     └─ 复杂: AscendC 转译 (tilelang2ascend-translator) ← 迭代循环（3轮上限）
+    │              [ascendc-tiling-design 已覆盖类别转译必须遵循对应类别 Tiling 策略，
+    │               所有相关算子都要先阅读对应 Tiling 指南：MatMul 阅读 matmul_guide.md
+    │               并关注 MatmulApiTiling、多核扩展、尾块处理；FlashAttention 阅读
+    │               flashattention_guide.md 并关注 Roofline、多核切分、Softmax 变体与
+    │               流水设计；Reduction/Sort/Elementwise/Broadcast/Conversion 分别阅读
+    │               reduction_guide.md / sort_guide.md / elementwise_guide.md /
+    │               broadcast_guide.md / conversion_guide.md 并关注对应 patterns.md 的
+    │               多核/UB/Buffer/分支/对齐设计]
     ├── Phase 5: 性能分析 (ops-profiling --compare 模式)
     ├── Phase 6: 全量验证
     └── Phase 7: Trace 记录 (tilelang2ascend-trace-recorder)

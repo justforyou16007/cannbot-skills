@@ -34,6 +34,13 @@ Phase 3: 设计表达（分支）
 Phase 4: AscendC 生成与验证（分支）
   ├─ 简单算子: ops-direct-invoke 开发实现 + 代码审查 + 修复循环（REVIEW.md + 最多3轮修复）
   └─ 复杂算子: AscendC 转译 — 调用 tilelang2ascend-translator，迭代验证（最多 3 轮）
+              （ascendc-tiling-design 已覆盖类别的算子转译必须遵循对应类别的 Tiling 策略，
+               所有相关算子都要先阅读对应 Tiling 指南：MatMul 阅读 matmul_guide.md 并关注
+               MatmulApiTiling::GetTiling、多核扩展、尾块处理；FlashAttention 阅读
+               flashattention_guide.md 并关注 Roofline、多核切分、Softmax 变体与流水设计；
+               Reduction / Sort / Elementwise / Broadcast / Conversion 分别阅读
+               reduction_guide.md / sort_guide.md / elementwise_guide.md / broadcast_guide.md /
+               conversion_guide.md 并关注对应 patterns.md 的多核/UB/Buffer/分支/对齐设计）
 Phase 5: 性能分析 — 调用 ops-profiling（--compare 模式）
 Phase 6: 全量验证 — 恢复全量用例，最终验证
 Phase 7: Trace 记录 — 调用 tilelang2ascend-trace-recorder 生成 trace.md

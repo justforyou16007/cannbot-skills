@@ -63,3 +63,87 @@
 
 - ✅ P1, P5, P10, P67 已有 Playbook
 - ❌ P69, P84, D2, A1, A4 待 Phase C 补
+
+---
+
+## Ascend C Elementwise Tiling 系统化设计
+
+> 来源：[`ops/ascendc-tiling-design/references/elewise/patterns.md`](../../../../../ops/ascendc-tiling-design/references/elewise/patterns.md)
+>
+> 本章节沉淀 Elementwise 族在 Ascend C 上的 Tiling 设计方法论。
+
+### 1. 场景判定流程
+
+```
+给定: N 个输入 shape + M 个输出 shape
+Step 1 — Shape 判定:
+  所有输入输出 shape 完全相同？
+    ├─ YES → EleWise，展平为 dim0，1D 线性处理 → Step 2
+    └─ NO  → Broadcast → 参考 broadcast_guide.md
+
+Step 2 — dtype × 运算 判定:
+  运算为 Add/Sub / 以加减为主的累加链路 AND dtype ∈ {FP16, BF16} AND spec 未声明"输入同量级"？
+    ├─ YES → 升精度分支：Cast→FP32 计算→Cast，需额外 K 份 FP32 中间 Buffer
+    └─ NO  → 原 dtype 直接计算分支
+```
+
+### 2. 通用规则
+
+- **多核对齐**：元素数对齐到 512 的倍数（`ELEM_ALIGN_FACTOR`），每个核至少 4KB 数据。
+- **UB 对齐**：按 256B 对齐，确保 Vector 指令效率。
+- **区分首/尾 block**：尾 block 数据量可能小于首 block，循环次数和 tail 大小不同。
+
+### 3. UB 切分
+
+从最内轴向外累乘，找到第一个放不下的轴作为 `ubSplitAxis`：
+
+```python
+curProduct = 1
+ubSplitAxis = 0
+allFit = true
+for i = shapeLen-1 downto 0:
+    curProduct *= dims[i]
+    if curProduct > maxElemNum:
+        ubSplitAxis = i
+        curProduct /= dims[i]
+        allFit = false
+        break
+
+if allFit:
+    curProduct /= dims[0]
+
+if shapeLen == 1:
+    ubFormer = maxElemNum
+else:
+    ubFormer = maxElemNum / curProduct
+
+ubOuter = ceil(dims[ubSplitAxis] / ubFormer)
+ubTail  = dims[ubSplitAxis] - (ubOuter-1) * ubFormer
+```
+
+其中：
+
+```python
+maxElemNum = (ubSize - extraSize) * 8 / (bufferNum * maxDtypeBits)
+maxElemNum = floor_align(maxElemNum, 256 * 8 / minDtypeBits)
+```
+
+### 4. 多核切分
+
+```python
+fusedProduct = ubOuter × (ubSplitAxis 之前所有轴乘积)
+blockFormer  = ceil(fusedProduct / coreNum)
+blockNum     = ceil(fusedProduct / blockFormer)
+blockTail    = fusedProduct - (blockNum - 1) * blockFormer
+```
+
+核利用率不足时，循环缩小 `maxElemNum`（每次减 `CACHE_LINE`），重算 `ubFormer/ubOuter/fusedProduct`，直到能喂满更多核。
+
+### 5. 设计检查清单
+
+- [ ] 输入输出 shape 是否完全相同？否则应走 Broadcast 路径。
+- [ ] FP16/BF16 加减链路是否考虑升精度分支？
+- [ ] 元素数是否对齐到 512（多核）和 256B（UB）？
+- [ ] 是否区分首 block 与 tail block？
+- [ ] `maxElemNum` 是否按 `bufferNum × maxDtypeBits` 计算并向下对齐？
+- [ ] 核利用率不足时是否尝试缩小 `maxElemNum` 重新切分？

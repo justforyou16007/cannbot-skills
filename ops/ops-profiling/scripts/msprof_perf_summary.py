@@ -701,6 +701,10 @@ def _jsonl_scalar_value(inp):
             val = 1.0
 
     dtype_str = inp.get("dtype", "")
+    if dtype_str == "str" or isinstance(val, str):
+        return str(val)
+    if dtype_str == "list" or isinstance(val, list):
+        return list(val)
     if dtype_str == "bool":
         return bool(val)
     if dtype_str.startswith("complex"):
@@ -737,32 +741,101 @@ def _jsonl_tensor_code(shape, dtype_str: str) -> str:
     return f"inputs.append(torch.randn({shape_expr}, dtype={dtype}))"
 
 
+def _jsonl_tensor_expr(shape, dtype_str: str) -> str:
+    """返回构造 tensor 的表达式字符串（不带 ``inputs.append()`` 包装）。"""
+    code = _jsonl_tensor_code(shape, dtype_str)
+    # _jsonl_tensor_code returns "inputs.append(TORCH_EXPR)"
+    prefix = "inputs.append("
+    assert code.startswith(prefix) and code.endswith(")"), f"unexpected tensor code: {code}"
+    return code[len(prefix):-1]  # strip "inputs.append(" and trailing ")"
+
+
+def _jsonl_tensor_dtype_repr(dtype_str: str) -> str:
+    """将 JSONL dtype 字符串映射为 torch dtype 表达式（用于 torch.tensor(..., dtype=...)）。"""
+    dtype_map = {
+        "fp16": "torch.float16", "float16": "torch.float16", "half": "torch.float16",
+        "fp32": "torch.float32", "float32": "torch.float32", "float": "torch.float32",
+        "fp64": "torch.float64", "float64": "torch.float64",
+        "bf16": "torch.bfloat16", "bfloat16": "torch.bfloat16",
+        "int8": "torch.int8", "int16": "torch.int16", "int32": "torch.int32",
+        "int": "torch.int32", "int64": "torch.int64", "long": "torch.int64",
+        "uint8": "torch.uint8", "uint16": "torch.uint16", "uint32": "torch.uint32", "uint64": "torch.uint64",
+        "bool": "torch.bool",
+        "complex64": "torch.complex64", "complex128": "torch.complex128",
+    }
+    return dtype_map.get(dtype_str, "torch.float32")
+
+
+# attr dtype=str 且值为 torch dtype 名称时，映射到 torch.xxx 表达式（而非字符串字面量）
+_TORCH_DTYPE_EXPR_MAP = {
+    "float16": "torch.float16", "bfloat16": "torch.bfloat16",
+    "float32": "torch.float32", "float64": "torch.float64",
+    "int8": "torch.int8", "int16": "torch.int16",
+    "int32": "torch.int32", "int64": "torch.int64",
+    "uint8": "torch.uint8", "bool": "torch.bool",
+}
+
+
+# 名称提示为 offsets/cumsum 类结构性整型参数的集合（随机合成时保证单调不减）
+_OFFSETS_LIKE_NAMES = frozenset({
+    "offs", "offsets", "group_list", "group_offsets", "cumsum",
+    "cu_seqlens", "cu_seqlens_q", "cu_seqlens_k", "seqlens", "seq_lens",
+})
+
+
 def _serialize_jsonl_inputs(case):
-    import torch
-    lines = ["inputs = []"]
+    """Generate kwargs dict code from JSONL inputs, using 'name' fields as keys.
+
+    Uses named keyword arguments (``model(**kwargs)``) so that parameter binding
+    is independent of the order of inputs in the JSONL file.
+    """
+    lines = ["_inputs_dict = {}"]
     for inp in case.get("inputs", []):
+        name = inp.get("name", "")
         typ = inp.get("type", "tensor")
         if typ == "tensor":
-            shape = inp.get("shape", [])
             dtype_str = inp.get("dtype", "float16")
-            lines.append(_jsonl_tensor_code(shape, dtype_str))
-        elif typ in ("attr", "scalar"):
-            val = _jsonl_scalar_value(inp)
-            if isinstance(val, str):
-                lines.append(f"inputs.append({repr(val)})")
+            # 优先使用显式 value（如 group_list / cumsum 等结构参数）
+            explicit_val = inp.get("value")
+            if explicit_val is not None:
+                dtype_repr = _jsonl_tensor_dtype_repr(dtype_str)
+                lines.append(f"_inputs_dict[{repr(name)}] = torch.tensor({repr(explicit_val)}, dtype={dtype_repr})")
             else:
-                lines.append(f"inputs.append({repr(val)})")
+                shape = inp.get("shape", [])
+                # offsets/cumsum 类结构性整型参数：完全随机的值几乎必然违反
+                # 单调性约束导致被测实现直接抛异常，退化为单调不减序列更稳妥
+                if name.lower() in _OFFSETS_LIKE_NAMES and dtype_str.startswith(("int", "uint")):
+                    dtype_repr = _jsonl_tensor_dtype_repr(dtype_str)
+                    lines.append(f"_inputs_dict[{repr(name)}] = "
+                                 f"torch.randint(0, 100, {shape}, dtype=torch.int64).cumsum(0).to({dtype_repr})")
+                    continue
+                tensor_expr = _jsonl_tensor_expr(shape, dtype_str)
+                lines.append(f"_inputs_dict[{repr(name)}] = {tensor_expr}")
+        elif typ in ("attr", "scalar"):
+            # 显式 "value": null 表示可选参数未启用（如 offsets=None），
+            # 必须生成 None 而不是默认标量，否则会把 None 语义错传成 1.0/1
+            if "value" in inp and inp.get("value") is None:
+                lines.append(f"_inputs_dict[{repr(name)}] = None")
+                continue
+            val = _jsonl_scalar_value(inp)
+            # attr 的 dtype 为 str 且值是 torch dtype 名时，生成 torch.xxx 表达式而非字符串字面量
+            if inp.get("dtype") == "str" and isinstance(val, str):
+                dtype_expr = _TORCH_DTYPE_EXPR_MAP.get(val)
+                if dtype_expr is not None:
+                    lines.append(f"_inputs_dict[{repr(name)}] = {dtype_expr}")
+                    continue
+            lines.append(f"_inputs_dict[{repr(name)}] = {repr(val)}")
         elif typ == "tensor_list":
             lines.append("_tensors = []")
             for tinfo in inp.get("value", []):
                 shape = tinfo.get("shape", [])
                 dtype_str = tinfo.get("dtype", "float16")
-                lines.append(f"_tensors.append({_jsonl_tensor_code(shape, dtype_str)
-                                                .split('inputs.append(')[1].rstrip(')')})")
-            lines.append("inputs.append(_tensors)")
+                tensor_expr = _jsonl_tensor_expr(shape, dtype_str)
+                lines.append(f"_tensors.append({tensor_expr})")
+            lines.append(f"_inputs_dict[{repr(name)}] = _tensors")
         else:
             val = _jsonl_scalar_value(inp)
-            lines.append(f"inputs.append({repr(val)})")
+            lines.append(f"_inputs_dict[{repr(name)}] = {repr(val)}")
     return "\n".join(lines)
 
 
@@ -791,6 +864,12 @@ os.environ["ASCEND_RT_VISIBLE_DEVICES"] = "{device_id}"
 sys.path.insert(0, str(out_dir / "kernel" / "build"))
 sys.path.insert(0, str(out_dir))
 
+torch.manual_seed({seed})
+try:
+    torch.npu.manual_seed_all({seed})
+except Exception:
+    pass
+
 def _load(path, name):
     spec = importlib.util.spec_from_file_location(name, path)
     m = importlib.util.module_from_spec(spec)
@@ -810,7 +889,18 @@ def _move(v):
     if isinstance(v, (list, tuple)):
         return type(v)(_move(x) for x in v)
     return v
-inputs = _move(inputs)
+
+_use_kwargs = inputs is None
+if _use_kwargs:
+    for _k, _v in _inputs_dict.items():
+        if isinstance(_v, torch.Tensor):
+            _inputs_dict[_k] = _v.to(device)
+        elif isinstance(_v, list):
+            _inputs_dict[_k] = [_move(x) for x in _v]
+    # build positional list from dict values (preserving JSONL order) for fallback
+    _inputs_list = list(_inputs_dict.values())
+else:
+    inputs = _move(inputs)
 
 # ---- model construction (honour get_init_inputs if present) ----
 _init_args = []
@@ -836,13 +926,39 @@ elif _init_args:
 else:
     model = cls().to(device).eval()
 
+_use_positional_fallback = 0  # 0=kargs, 1=spread, 2=tuple
 for _ in range({warmup}):
     with torch.no_grad():
-        _ = model(*inputs)
+        if _use_kwargs:
+            try:
+                _ = model(**_inputs_dict)
+            except TypeError:
+                _use_positional_fallback = 1
+                try:
+                    _ = model(*_inputs_list)
+                except TypeError:
+                    _use_positional_fallback = 2
+                    _ = model(tuple(_inputs_list))
+        else:
+            _ = model(*inputs)
     torch.npu.synchronize()
 
 with torch.no_grad():
-    _ = model(*inputs)
+    if _use_kwargs:
+        if _use_positional_fallback == 0:
+            try:
+                _ = model(**_inputs_dict)
+            except TypeError:
+                try:
+                    _ = model(*_inputs_list)
+                except TypeError:
+                    _ = model(tuple(_inputs_list))
+        elif _use_positional_fallback == 1:
+            _ = model(*_inputs_list)
+        else:
+            _ = model(tuple(_inputs_list))
+    else:
+        _ = model(*inputs)
 torch.npu.synchronize()
 """
 
@@ -854,10 +970,31 @@ def _build_wrapper_script_content(cfg, model_file, cls_name, inputs_code):
         device_id=cfg.device_id,
         case_idx=cfg.case_idx,
         warmup=cfg.warmup,
+        seed=cfg.seed,
         model_file=model_file,
         cls_name=cls_name,
         inputs_code=inputs_code,
     )
+
+
+# 优先从 model.py 自带的输入生成器取真实输入（保证 offsets/cumsum 等结构性
+# 参数合法，且与 evaluate 输入同源）；取不到时 inputs 保持 None，回退到
+# JSONL 随机合成的 _inputs_dict kwargs 路径。
+_REAL_INPUTS_CODE = """\
+# Prefer real inputs from model.py's own generator (valid structural params,
+# same source as evaluate); fall back to serialized kwargs when unavailable.
+inputs = None
+try:
+    _ref_mod = _load(out_dir / "model.py", "ref_for_inputs")
+    _gen = getattr(_ref_mod, "get_input_groups", getattr(_ref_mod, "get_inputs", None))
+    if _gen is not None:
+        _all_input_groups = _gen()
+        if 0 <= {case_idx} < len(_all_input_groups):
+            _entry = _all_input_groups[{case_idx}]
+            inputs = list(_entry) if isinstance(_entry, (list, tuple)) else [_entry]
+except Exception:
+    inputs = None
+"""
 
 
 def _generate_wrapper_script(cfg: _WrapperConfig):
@@ -869,14 +1006,15 @@ def _generate_wrapper_script(cfg: _WrapperConfig):
         cls_name = "ModelNew"
 
     if cfg.jsonl_case is not None:
-        inputs_code = _serialize_jsonl_inputs(cfg.jsonl_case)
+        # 先准备 JSONL 随机合成的 kwargs 作为兜底，再尝试真实输入覆盖
+        inputs_code = (_serialize_jsonl_inputs(cfg.jsonl_case) + "\n\n"
+                       + _REAL_INPUTS_CODE.format(case_idx=cfg.case_idx))
     else:
-        inputs_code = f"""
-    ref_mod = _load(out_dir / "model.py", "ref_for_inputs")
-    input_groups = getattr(ref_mod, "get_input_groups",
-                           getattr(ref_mod, "get_inputs", lambda: [[]]))()
-    inputs = input_groups[{cfg.case_idx}]
-"""
+        # 无 JSONL case 时只能依赖 model.py 的输入生成器
+        inputs_code = (_REAL_INPUTS_CODE.format(case_idx=cfg.case_idx) + """
+if inputs is None:
+    raise RuntimeError("failed to obtain inputs from model.py get_input_groups()/get_inputs()")
+""")
     return _build_wrapper_script_content(cfg, model_file, cls_name, inputs_code)
 
 
@@ -886,6 +1024,32 @@ def _find_msprof_script():
     if candidate.exists():
         return str(candidate)
     return "msprof_profile_run.sh"
+
+
+def _save_app_output(output_dir: str, stdout: str, stderr: str) -> str:
+    """把被测 app 的输出落盘，便于采集失败时回溯真实原因。返回日志路径。"""
+    log_path = os.path.join(output_dir, "app_output.log")
+    try:
+        with open(log_path, "w", encoding="utf-8", errors="replace") as f:
+            f.write("=== stdout ===\n" + (stdout or "") + "\n=== stderr ===\n" + (stderr or ""))
+    except OSError:
+        pass
+    return log_path
+
+
+def _extract_app_crash(stdout: str, stderr: str):
+    """从 msprof 输出中检测被测 app 的 Python 异常。
+
+    msprof 在 app 崩溃时仍返回退出码 0（只打 WARNING），若不主动检测，
+    上层只能看到 "no csv found" 这类误导性错误。返回最后一行异常信息或 None。
+    """
+    text = (stdout or "") + "\n" + (stderr or "")
+    if "Traceback" not in text and "An exception has occurred in process App" not in text:
+        return None
+    exc_lines = re.findall(r"^(\w[\w.]*(?:Error|Exception|Interrupt)\b[^\n]*)", text, re.M)
+    if exc_lines:
+        return exc_lines[-1].strip()[:200]
+    return "app raised an exception during profiling"
 
 
 def _run_msprof_standard(wrapper_script: str, output_dir: str, device_id: int, warmup: int = 3):
@@ -914,12 +1078,18 @@ def _run_msprof_standard(wrapper_script: str, output_dir: str, device_id: int, w
     except OSError:
         pass
 
+    app_log = _save_app_output(output_dir, result.stdout, result.stderr)
+
     if result.returncode != 0:
-        return None, f"msprof failed: {result.stderr[-500:]}"
+        return None, f"msprof failed: {result.stderr[-500:]}\n(app log: {app_log})"
+
+    app_crash = _extract_app_crash(result.stdout, result.stderr)
+    if app_crash:
+        return None, f"profiled app crashed: {app_crash} (app log: {app_log})"
 
     prof_dirs = sorted(Path(output_dir).glob("PROF_GROUP_*"))
     if not prof_dirs:
-        return None, "no PROF_GROUP directory found"
+        return None, f"no PROF_GROUP directory found (app log: {app_log})"
     return str(prof_dirs[-1]), None
 
 
@@ -927,7 +1097,7 @@ def _run_msprof_quick(wrapper_script: str, output_dir: str, device_id: int, warm
     """快速模式：只采集 1 轮（不采集 7 个 aic-metrics，只获取 kernel 时间）。
 
     直接调用 msprof 命令（不通过 msprof_profile_run.sh，避免循环调用）。
-    使用 msprof --task-time=on --ascendcl=on，不设置 --aic-metrics。
+    使用 msprof --ai-core=on --task-time=on --ascendcl=on，不设置 --aic-metrics。
 
     warmup 在 msprof 外部执行：先单独跑 warmup 次 wrapper 预热 NPU，
     msprof 只采集正式 timed run，确保 task_time.csv 不含预热数据。
@@ -940,14 +1110,18 @@ def _run_msprof_quick(wrapper_script: str, output_dir: str, device_id: int, warm
     env = os.environ.copy()
 
     # Warmup: 在 msprof 外部执行，不采集
+    warmup_crash = None
     for _ in range(warmup):
-        subprocess.run([sys.executable, wrapper_path],
-                       capture_output=True, text=True, env=env)
+        w = subprocess.run([sys.executable, wrapper_path],
+                           capture_output=True, text=True, env=env)
+        if w.returncode != 0 and warmup_crash is None:
+            warmup_crash = _extract_app_crash(w.stdout, w.stderr) or (w.stderr or "")[-200:]
 
     # Measurement: msprof 只采集正式 timed run
     cmd = [
         "msprof",
         f"--output={output_dir}",
+        "--ai-core=on",
         "--task-time=on",
         "--ascendcl=on",
         sys.executable, wrapper_path
@@ -959,12 +1133,20 @@ def _run_msprof_quick(wrapper_script: str, output_dir: str, device_id: int, warm
     except OSError:
         pass
 
+    app_log = _save_app_output(output_dir, result.stdout, result.stderr)
+
     if result.returncode != 0:
-        return None, f"msprof failed: {result.stderr[-500:]}"
+        return None, f"msprof failed: {result.stderr[-500:]}\n(app log: {app_log})"
+
+    # msprof 在 app 崩溃时仍返回 0，必须主动检测，否则只能看到误导性的
+    # "no task_time csv found"
+    app_crash = _extract_app_crash(result.stdout, result.stderr) or warmup_crash
+    if app_crash:
+        return None, f"profiled app crashed: {app_crash} (app log: {app_log})"
 
     prof_dirs = sorted(Path(output_dir).glob("PROF_*"))
     if not prof_dirs:
-        return None, "no PROF directory found"
+        return None, f"no PROF directory found (app log: {app_log})"
     return str(prof_dirs[-1]), None
 
 
@@ -1016,64 +1198,56 @@ def _parse_msprof_duration(prof_group_dir: str):
 def _parse_msprof_duration_quick(prof_group_dir: str):
     """快速模式解析：从 PROF 目录中查找 task_time.csv 或 api_statistic.csv 并提取时间。
 
-    快速模式只跑 1 轮，不设置 --aic-metrics，因此没有 op_summary_*.csv。
+    快速模式只跑 1 轮（不采集 7 个 aic-metrics），因此没有 op_summary_*.csv。
+
     warmup 已在 msprof 外部执行，task_time.csv 只包含正式 timed run 的 kernel 时间，
     对单次采集中所有计算 kernel 的耗时直接累加即可。
+
+    兼容两种目录结构：
+      - 无 --aic-metrics: PROF_*/mindstudio_profiler_output/task_time_*.csv
+      - 有 --aic-metrics: PROF_*/PROF_PipeUtilization/mindstudio_profiler_output/task_time_*.csv
     """
-    # 1. 尝试从 task_time.csv 提取
-    task_time_pattern = os.path.join(prof_group_dir, "mindstudio_profiler_output/task_time_*.csv")
-    task_time_files = sorted(glob.glob(task_time_pattern))
-    if task_time_files:
+    # 1. 尝试从 task_time.csv 提取（两种可能路径）
+    task_time_patterns = [
+        os.path.join(prof_group_dir, "mindstudio_profiler_output", "task_time_*.csv"),
+        os.path.join(prof_group_dir, "PROF_*", "mindstudio_profiler_output", "task_time_*.csv"),
+    ]
+    for pattern in task_time_patterns:
+        task_time_files = sorted(glob.glob(pattern))
+        if not task_time_files:
+            continue
         try:
             with open(task_time_files[0], "r", encoding="utf-8", errors="replace") as f:
                 reader = csv.DictReader(f)
                 rows = list(reader)
-            # 汇总所有真实计算 kernel 的耗时
-            # 参考实现可能包含大量 PyTorch native kernel；AscendC 实现也可能拆分为多个 kernel。
-            # 只累加 kernel_type 为实际计算类型的行，排除 PROFILING_ENABLE / TASK_TIMEOUT_SET 等。
-            COMPUTE_KERNEL_TYPES = {"AI_VECTOR_CORE", "AI_CORE", "MIX_AIV", "MIX"}
-            compute_rows = []
+            # 收集所有非元事件的 kernel 行，按 kernel_name 分组
+            kernel_times: Dict[str, List[float]] = {}
             for r in rows:
                 kernel_type = r.get("kernel_type", "")
                 task_time = r.get("task_time(us)", "")
-                if kernel_type in COMPUTE_KERNEL_TYPES and task_time:
+                if kernel_type not in ("PROFILING_ENABLE", "PROFILING_DISABLE", "TASK_TIMEOUT_SET", "") and task_time:
                     try:
                         duration = float(task_time)
                         if duration > 0:
-                            compute_rows.append((duration, r.get("kernel_name", "unknown")))
+                            kernel_name = r.get("kernel_name", "unknown")
+                            kernel_times.setdefault(kernel_name, []).append(duration)
                     except ValueError:
                         continue
-            if compute_rows:
-                total_duration = sum(d for d, _ in compute_rows)
+
+            if kernel_times:
+                # 汇总所有 kernel 的耗时
+                all_durations = []
+                all_kernel_names = set()
+                for times in kernel_times.values():
+                    all_durations.extend(times)
+                for name in kernel_times.keys():
+                    all_kernel_names.add(name)
+                total_duration = sum(all_durations)
                 if total_duration > 0:
-                    kernel_name = compute_rows[0][1] if len(compute_rows) == 1 else "multiple_kernels"
+                    kernel_name = list(all_kernel_names)[0] if len(all_kernel_names) == 1 else "multiple_kernels"
                     return total_duration, kernel_name, None
         except Exception:
             pass
-
-    # 2. 尝试从 api_statistic.csv 提取（launch 行）
-    api_pattern = os.path.join(prof_group_dir, "mindstudio_profiler_output/api_statistic_*.csv")
-    api_files = sorted(glob.glob(api_pattern))
-    if api_files:
-        try:
-            with open(api_files[0], "r", encoding="utf-8", errors="replace") as f:
-                reader = csv.DictReader(f)
-                rows = list(reader)
-            # 查找 Level=node, API Name=launch 的行
-            for r in rows:
-                level = r.get("Level", "")
-                api_name = r.get("API Name", "")
-                if level == "node" and api_name == "launch":
-                    time_us = r.get("Time(us)", "")
-                    if time_us:
-                        try:
-                            duration = float(time_us)
-                            if duration > 0:
-                                return duration, "launch", None
-                        except ValueError:
-                            continue
-        except Exception:
-            return None, None, "no task_time or api_statistic csv found"
 
     return None, None, "no task_time or api_statistic csv found"
 
@@ -1323,7 +1497,7 @@ def _measure_one_impl(mi: _MeasureInput):
             duration, _op_name, parse_err = _parse_msprof_duration(prof_dir)
             if duration is not None:
                 return duration, None, prof_dir
-            err = parse_err
+            err = f"{parse_err} (app log: {tmpdir}/app_output.log)"
         time.sleep(0.5)
     return None, err, prof_dir
 
@@ -1354,7 +1528,7 @@ def _measure_one_impl_quick(mi: _MeasureInput):
 
         duration, _op_name, parse_err = _parse_msprof_duration_quick(prof_dir)
         if duration is None:
-            err = parse_err
+            err = f"{parse_err} (app log: {tmpdir}/app_output.log)"
             continue
 
         # msprof 采集了 repeats 次 timed run，除以 repeats 得到单次耗时

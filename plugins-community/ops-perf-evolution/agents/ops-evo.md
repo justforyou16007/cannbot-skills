@@ -61,6 +61,16 @@ skills:
 - **策略选择协议（分层检索）**: 读取 `plugins-community/ops-perf-evolution/skills/evolution-strategies/references/strategy-index.md` 后，按以下顺序选择策略：
   · **Step 1 — L0 通用策略 (必选)**: 查"按算子类型快速查表"的 L0 列，选择所有匹配的 D/P/A 策略
   · **Step 2 — L1 高级策略 (按需)**: 根据算子特征判断：Cube+Vector 融合（matmul+vector 后处理）→ 查 CV Matmul 行；Flash Attention 模式 → 查 Flash Attention 行；量化/反量化 → 查 Quantization 行 + P48/P49；MoE 专家并行 → 查 CV FFN (MoE) 行 + P50；多核 M×N 分块 → P47（对角线调度）；AIC/AIV 混合 → P51（动态核配比）
+
+  对于 ascendc-tiling-design 已覆盖族，Init 阶段默认将以下系统化 Tiling 策略纳入候选池（若族匹配）：
+  · matmul → P104, P105, P106, P107, P108
+  · reduction → P109, P110
+  · sort → P111
+  · elementwise → P112
+  · broadcast → P113
+  · conversion → P114
+  · flashattention → P115
+  这些策略与 L0/L1 其他策略组合时需遵守 strategy-compatibility.md 的依赖/互斥约束。
   · **Step 3 — 瓶颈驱动 (Refine 阶段)**: profiling_evidence 可用时，查"按瓶颈类型查表"追加/替换策略
   · **原则**: L0 保证基本正确性和性能，L1 针对特定场景提供 2-5x 额外提升。Init 阶段优先用 L0 + 少量 L1，Refine 阶段按 profiling 证据精准追加 L1
   · **ops 仓特别说明**: ops-nn/cv 仓算子更可能需要 L1（CV 融合、量化），ops-math/transformer 仓算子更多用 L0
@@ -75,7 +85,7 @@ skills:
 
 ## 工作流程
 
-**[注意] 工具调用纪律**: 步骤1-3 必须严格串行执行（每步完成后再执行下一步），每条消息最多发出 5 个并行工具调用。禁止将多个步骤的检查操作一次性并行发出。只有步骤4.3 中启动 ops-partial 子 agent 时才使用大规模并行（parallel_num 个 Task 调用）。
+**[注意] 工具调用纪律**: 步骤1-3 必须严格串行执行（每步完成后再执行下一步），每条消息最多发出 5 个并行工具调用。禁止将多个步骤的检查操作一次性并行发出。只有步骤4.3 中启动 ops-partial 子 agent 时才使用大规模并行（parallel_num 个 Agent 调用）。
 
 ### [关键] 重入与状态游标 (state.json)
 
@@ -294,10 +304,20 @@ python3 plugins-community/ops-perf-evolution/skills/ops-evaluation/scripts/evalu
    - 写入 `world_model.json` 顶层 `hw_params` 字段：`{ chip_model, ub_size_bytes, core_num, peak_bw_gbps, peak_vector_tflops_per_core, alignment_bytes, max_tile_fp16_double_buf }`
    - hw_params 为 null 时节点描述缺少硬件参数指导（tile_size 建议值等），严重影响优化质量。仅在查询报错时才允许 hw_params = null。
 2. **必读知识库**: 读取 `plugins-community/ops-perf-evolution/skills/evolution-knowledge/references/a3/hardware/guide.md` 和 `optimization_patterns/guide.md`；算子匹配特定族（attention/reduction/elementwise）时额外读 `algorithm_insights/{family}.md`；`proven_solutions/INDEX.md` 中有同类算子方案时读对应条目
+   - 若算子属于 ascendc-tiling-design 已覆盖族（matmul / flashattention / reduction / sort / elementwise / broadcast / conversion），必须读取对应的 ascendc-tiling-design 族指南和 patterns：
+     · matmul: 读 `ops/ascendc-tiling-design/references/matmul/patterns.md` 和 `ops/ascendc-tiling-design/references/matmul/ascendc-api-matmul-tiling.md`
+     · flashattention: 读 `ops/ascendc-tiling-design/references/flashattention/patterns.md`
+     · reduction: 读 `ops/ascendc-tiling-design/references/reduction/patterns.md` 和 `algorithms.md`
+     · sort: 读 `ops/ascendc-tiling-design/references/sort/patterns.md` 和 `alg-two-level-mrgsort.md`
+     · elementwise: 读 `ops/ascendc-tiling-design/references/elewise/patterns.md`
+     · broadcast: 读 `ops/ascendc-tiling-design/references/broadcast/patterns.md`
+     · conversion: 读 `ops/ascendc-tiling-design/references/conversion/patterns.md`
+     同时读取 `plugins-community/ops-perf-evolution/skills/evolution-strategies/references/families/<category>_guide.md` 作为策略库族指南。
 3. 读取 shared/original/ 下的算子代码，分析算子特性（计算模式、数据类型、形状特征）：内存密集型 vs 计算密集型？尾块对齐问题（形状非32字节整数倍）？数据类型特殊处理（FP16/BF16精度）？
 4. 读取 `plugins-community/ops-perf-evolution/skills/evolution-strategies/references/strategy-index.md`，识别最相关策略
 5. 设计节点：`parallel_num × 2` 个策略导向节点（`mode="strategy_guided"`）+ `max(1, ⌈parallel_num / 4⌉)` 个开放探索节点（`mode="open_exploration"`），确保:
    - 策略多样性（各 strategy_guided 节点 strategy_combination 不完全相同）、难度梯度（difficulty 2-4 均有覆盖）、类型覆盖（P性能/D数据类型/A精度，按需）
+   - 若算子族匹配 ascendc-tiling-design 覆盖范围，至少为 1 个 strategy_guided 节点分配对应的 P104-P115 策略（例如 matmul 族分配 P104+P108），确保系统化 Tiling 设计有机会进入进化。
    - 每个节点必须包含 optimization_type 字段（bandwidth/tiling/algorithm），三类各至少有 1 个节点，确保 Select 保底轮有候选
    - **若 hw_params 非 null**：利用硬件参数增强节点描述（如"tile_size 建议 {max_tile_fp16_double_buf//2}，最大可达 {max_tile_fp16_double_buf}"），并做 Roofline 定性分析（算术强度 vs 拐点）确认内存/计算密集判断
 
@@ -400,7 +420,7 @@ while should_continue and r <= max_rounds:
 
   **若可介入（触发条件成立 且 通过冷却和硬上限）**：不立即终止，准备 Supervisor 输入：运行 `python3 plugins-community/ops-perf-evolution/skills/evolution-world-model/scripts/wm_ops.py summary --path {world_model_path}` 获取世界模型概览；汇总每轮节点ID、策略组合、状态、得分为 `per_round_summary`；读取最优内核 profiling 数据（profiling_one_liner 和 profiling_evidence 摘要）。
 
-  使用 Task 工具启动 1 个 Supervisor Agent（`subagent_type="general-purpose"`，`description="Supervisor: analyze stagnation round {r}"`，`run_in_background=false`，prompt 见下方 **[Supervisor Agent Prompt 模板]**）。
+  使用 Agent 工具启动 1 个 Supervisor Agent（`subagent_type="general-purpose"`，`description="Supervisor: analyze stagnation round {r}"`，`run_in_background=false`，prompt 见下方 **[Supervisor Agent Prompt 模板]**）。
 
   根据 Supervisor 返回结果决策：
   - `verdict="continue"` 且 `new_nodes` 非空：为每个 new_node 生成节点ID（如 "sv1","sv2"），parent_id 按 Supervisor 建议（默认 "root"），写入 `world_model.json` 的 decision_tree.nodes；`analysis.bottleneck` 追加到 open_questions；`supervisor_analysis` 写入 `reflection` 字段；`stagnation_count = 0`，`supervisor_used_count += 1`，`last_supervisor_round = r`；输出「[分析] Supervisor 分析完成：发现 {len(new_nodes)} 个新方向，继续进化」，继续进化
@@ -476,12 +496,12 @@ for p in 0..parallel_num-1:
 
 **4.3.2 并行启动 ops-partial 子agent（全流程）**
 
-**[注意] 关键: 必须在同一条消息中发送所有 parallel_num 个 Task 调用以实现真正的并行，不要逐个发送。**
-**[注意] 禁止: 不要通过 Bash 运行任何 Python 脚本来启动子agent。ops-partial 是 Claude Code 内置的 agent 类型，只能通过 Task 工具启动。**
+**[注意] 关键: 必须在同一条消息中发送所有 parallel_num 个 Agent 调用以实现真正的并行，不要逐个发送。**
+**[注意] 禁止: 不要通过 Bash 运行任何 Python 脚本来启动子agent。ops-partial 是 Claude Code 内置的 agent 类型，只能通过 Agent 工具启动。**
 
-示例（parallel_num=2 时，在一条消息中同时发送 2 个 Task 工具调用）:
-- Task(subagent_type="ops-partial", description="Build & eval variant 0 (node: n1)", run_in_background=true, prompt="<填充 ops-partial-prompt.md 模板>")
-- Task(subagent_type="ops-partial", description="Build & eval variant 1 (node: n2)", run_in_background=true, prompt="<填充 ops-partial-prompt.md 模板>")
+示例（parallel_num=2 时，在一条消息中同时发送 2 个 Agent 工具调用）:
+- Agent(subagent_type="ops-partial", description="Build & eval variant 0 (node: n1)", run_in_background=true, prompt="<填充 ops-partial-prompt.md 模板>")
+- Agent(subagent_type="ops-partial", description="Build & eval variant 1 (node: n2)", run_in_background=true, prompt="<填充 ops-partial-prompt.md 模板>")
 
 启动所有子agent后，使用 TaskOutput 工具逐个收集结果：`TaskOutput(task_id=<返回的task_id>, block=true, timeout=1800000)`。
 
@@ -742,7 +762,7 @@ python3 plugins-community/ops-perf-evolution/skills/evolution-world-model/script
 
 **触发条件**（同时满足）：本轮有 `mode="profiling_driven"` 节点被执行；所有 profiling_driven 节点均 `status="failed"`；`r - last_supervisor_round ≥ 2`（冷却）；`supervisor_used_count < max_rounds`（硬上限）。**若不满足**：跳过，检查 4.5.2。
 
-**执行逻辑**：Profiling 诊断出了瓶颈方向，但 agent 无法在该方向产出可用代码，需要 Supervisor 从不同角度给出更可行的方案。使用 Task 工具启动 Supervisor Agent（`subagent_type="general-purpose"`，`description="Supervisor: profiling_driven all failed round {r}"`，`run_in_background=false`），prompt 使用 **[Supervisor Agent Prompt 模板]**，在 `[CONTEXT]` 中额外注入：
+**执行逻辑**：Profiling 诊断出了瓶颈方向，但 agent 无法在该方向产出可用代码，需要 Supervisor 从不同角度给出更可行的方案。使用 Agent 工具启动 Supervisor Agent（`subagent_type="general-purpose"`，`description="Supervisor: profiling_driven all failed round {r}"`，`run_in_background=false`），prompt 使用 **[Supervisor Agent Prompt 模板]**，在 `[CONTEXT]` 中额外注入：
   ```
   [SPECIAL SITUATION]
   本轮所有 profiling_driven 节点均失败。
@@ -763,7 +783,7 @@ Supervisor 返回结果处理（4.5.1/4.5.2 共用，仅输出标签不同）：
 
 **触发条件**（同时满足）：本轮刚执行完深度 Profiling（4.4.4）；其 `profiling_evidence.bottleneck_type` 为 `"near_optimal"` 或 `"balanced"`；`best_score < target_speedup × 0.7`（性能距目标仍有较大差距）；`r - last_supervisor_round ≥ 2`（冷却）；`supervisor_used_count < max_rounds`（硬上限）。**若不满足**：跳过，检查 4.5.3。
 
-**执行逻辑**：CSV 级和指令级 Profiling 都无法给出明确瓶颈方向，但性能仍远不达标，说明瓶颈可能在更高层次（算法、数据流、架构），需要 Supervisor 提供算法级/架构级外部视角。使用 Task 工具启动 Supervisor Agent（`subagent_type="general-purpose"`，`description="Supervisor: profiling blind spot round {r}"`，`run_in_background=false`），prompt 使用 **[Supervisor Agent Prompt 模板]**，在 `[CONTEXT]` 中额外注入：
+**执行逻辑**：CSV 级和指令级 Profiling 都无法给出明确瓶颈方向，但性能仍远不达标，说明瓶颈可能在更高层次（算法、数据流、架构），需要 Supervisor 提供算法级/架构级外部视角。使用 Agent 工具启动 Supervisor Agent（`subagent_type="general-purpose"`，`description="Supervisor: profiling blind spot round {r}"`，`run_in_background=false`），prompt 使用 **[Supervisor Agent Prompt 模板]**，在 `[CONTEXT]` 中额外注入：
   ```
   [SPECIAL SITUATION]
   CSV 级和指令级 Profiling 均显示 bottleneck="{bottleneck_type}"（无明确瓶颈），
@@ -979,7 +999,7 @@ python3 plugins-community/ops-perf-evolution/skills/evolution-report/scripts/gen
 
 世界模型与 lingxi-evo 完全相同，参考 `plugins-community/ops-perf-evolution/skills/evolution-world-model/references/schema.md` 和 `operations.md`。
 
-ops-partial 子 agent 的并行启动与结果收集规则见 §4.3.2（同一条消息发送所有 Task 调用；TaskOutput 逐个收集；超时 TaskStop）。某轮所有子agent均失败（编译失败或精度不通过）时 `stagnation_count += 1`。
+ops-partial 子 agent 的并行启动与结果收集规则见 §4.3.2（同一条消息发送所有 Agent 调用；TaskOutput 逐个收集；超时 TaskStop）。某轮所有子agent均失败（编译失败或精度不通过）时 `stagnation_count += 1`。
 
 ## 错误处理
 

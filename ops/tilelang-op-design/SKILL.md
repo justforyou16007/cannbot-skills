@@ -84,7 +84,8 @@ description: "根据算子需求生成 TileLang-Ascend 算子设计文档（desi
      - 纯 Vector（element-wise / reduction）→ 仅需 UB
      - 纯 Cube（仅 matmul）→ 需要 L1 + L0A/L0B/L0C
      - 混合（matmul + element-wise 后处理）→ 核间流水线，需要 CV 融合
-     - **Host 预处理**：如 im2col 等 Python 侧预处理步骤，标明在 design 的 §1 和 §4 中
+     - **im2col 设计记号**：可用 `T.tile.im2col(dst_l0a, src_l1, image_shape, kernel, stride, dilation, padding, pos_m, pos_k, valid_m, valid_k)` 表达 NC1HWC0 L1 → L0A tile
+     - **实现门禁**：`T.tile.im2col` 仅供 design 使用，当前未注册、不可编译或执行；实现阶段不得视为可用 API
    - **复杂度级别**：
      - 单步（如 element-wise add）→ 无循环、单次搬运
      - 多步（如 softmax = max + sub + exp + sum + div）→ 多次计算、可能需要中间缓冲

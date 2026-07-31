@@ -300,6 +300,7 @@ argument-hint: >
 - `elementwise`：单输入/多输入逐元素运算且无广播；文件名/类名含 `ReLU`/`Sigmoid`/`SiLU`/`GELU`/`SwiGLU`/`Sin`/`Cos`/`Abs`/`Exp`
 - `broadcast`：多输入逐元素运算且输入 shape 不同需广播对齐
 - `conversion`：文件名/类名含 `Transpose`；forward 中出现 `tensor.transpose`、`tensor.permute`、`torch.transpose`
+- `conv`：文件名/类名含 `Conv`/`Conv2d`/`Convolution`；forward 中出现 `nn.Conv1d`/`nn.Conv2d`/`nn.Conv3d`、`F.conv1d`/`F.conv2d`/`F.conv3d`
 
 如果触发条件满足，必须逐个完成以下 checklist：
 
@@ -314,6 +315,9 @@ argument-hint: >
     - elementwise → references/elewise/patterns.md
     - broadcast → references/broadcast/patterns.md
     - conversion → references/conversion/patterns.md
+    - conv → 本 skill 内路由（conv 不在 ascendc-tiling-design 分类表，改查本 skill references）：
+        * Read .claude/skills/tilelang2ascend-translator/references/dsl2Ascendc_compute_conv.md（必须全文）
+        * Read .claude/skills/tilelang2ascend-translator/references/dsl2Ascendc_compute_cube.md
 
 0-T.2 🛑 按类别读取深度设计文档（必须，不可跳过）:
     - matmul:
@@ -325,6 +329,9 @@ argument-hint: >
           - DAV_3510 (A5) → 禁止使用 MatmulImpl，必须走 Blaze/tensor_api 路径
     - reduction → Read .claude/skills/ascendc-tiling-design/references/reduction/algorithms.md
     - sort → Read .claude/skills/ascendc-tiling-design/references/sort/alg-two-level-mrgsort.md
+    - conv → Read workflows/templates/archive_tasks/conv2d_base/kernel/op_kernel/ 的
+      im2col / wrepack / conv / epilogue 四类 kernel（至少 fp16 版本全文），
+      确认其零标量（无 SetValue/GetValue 逐元素访问）、xtrans + fused 布局结构
     - 其他类别 → 视 patterns.md 中指引继续阅读
 
 0-T.3 🛑 在思考中确认 Tiling 实现约束:
@@ -356,6 +363,26 @@ argument-hint: >
 
     conversion 额外约束：
     - 转置轴映射、对齐填充、32B/512B 对齐搬运
+
+    conv 额外约束（🛑 性能结构铁律，依据 dsl2Ascendc_compute_conv.md 第五章实测清单）：
+    - GEMM 模式必须按 compute_conv.md 第二章三模式（normal / direct 1x1 /
+      fused img2col LoadData3D 随路展开）显式选型；满足 fused 条件却退回 normal
+      必须在思考中说明理由
+    - 禁止默认标量逐元素 gather 实现 im2col（archive conv2d_base 全部 kernel 零
+      SetValue/GetValue）；标量豁免仅限偶发小尾块（如 <32B k' 尾块）——
+      主数据路径（im2col k' gather 主体、epilogue 主写出、wrepack 主存储）
+      不属于豁免范围，占比 <5% 的偶发路径才可豁免且须注释说明理由
+    - 复用/移植历史任务实现时，0-T.3 逐条核对不得省略；历史实现的性能结构缺陷
+      （标量主路径、无缓存 wrepack、host 侧布局变换）不得以"精度已验证"为由继承
+      ——性能结构与功能正确性独立判定
+    - weight repack 结果是（weight 内容, shape, dtype）的确定函数，host 侧必须设计
+      LRU 缓存（key = data_ptr + sizes + dtype + version，条目持有 weight 强引用），
+      命中时跳过整个 wrepack 发射
+    - dtype 适配（fp32 hi/lo fp16 拆分、bf16 等）时必须声明「保留的优化结构清单」：
+      fused/normal 模式、零标量、TransDataTo5HD 批量转置、epilogue 跨行块处理
+      逐项确认保留或说明丢弃理由
+    - 声称"与 archive conv2d_base 同结构"时必须附证据（SetValue/GetValue grep
+      计数、xtrans/fused 标志存在性对照），无证据视为未验证
 
 0-T.4 🛑 查阅历史成功任务（可选但强烈建议）:
     - 若存在 workflows/templates/archive_tasks/ 下与本算子形态最接近的参考实现，优先阅读其 host/kernel 代码

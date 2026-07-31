@@ -86,6 +86,11 @@ description: "根据算子需求生成 TileLang-Ascend 算子设计文档（desi
      - 混合（matmul + element-wise 后处理）→ 核间流水线，需要 CV 融合
      - **im2col 设计记号**：可用 `T.tile.im2col(dst_l0a, src_l1, image_shape, kernel, stride, dilation, padding, pos_m, pos_k, valid_m, valid_k)` 表达 NC1HWC0 L1 → L0A tile
      - **实现门禁**：`T.tile.im2col` 仅供 design 使用，当前未注册、不可编译或执行；实现阶段不得视为可用 API
+     - **Conv 类算子（conv2d / img2col+GEMM）强制分支**：
+       - **结构选型优先级**：fused img2col（LoadData3D 随路展开，用 `T.tile.im2col` 设计记号表达）> direct 1x1 flipped GEMM（1x1 conv 的 im2col 是恒等变换，x NCHW 本身即 `[K=Ci, M=H*W]` 操作数）> normal im2col 物化；满足 fused/direct 条件却退回 normal 时，必须在 design.md「风险点」中写明理由
+       - **禁止默认标量逐元素 gather** 的 im2col 设计；k'=(ci,kh,kw) 解码必须按段连续块/向量化表达，标量仅限平台限制豁免场景且须注明理由
+       - **dtype 适配强制声明**：fp32 走 hi/lo fp16 拆分、bf16 替代等适配时，design.md 必须含「保留的优化结构清单」——fused/normal 模式、零标量、批量转置、epilogue 跨行块处理逐项标注 保留/丢弃+理由；该清单是 AscendC 转译阶段的强制输入
+       - **权重 repack 可缓存**：repack 结果是（weight 内容, shape, dtype）的确定函数，design.md 中标注可由 host 侧 LRU 缓存，推理场景跳过重复 repack
    - **复杂度级别**：
      - 单步（如 element-wise add）→ 无循环、单次搬运
      - 多步（如 softmax = max + sub + exp + sum + div）→ 多次计算、可能需要中间缓冲

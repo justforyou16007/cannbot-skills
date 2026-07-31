@@ -4,12 +4,12 @@ Source: 43 production-grade operators + 6 CV fused operator expert implementatio
 
 ## 编号说明
 P 系列编号中存在间隙（P15, P23, P27, P31, P36, P39），这些编号为预留位，当前无对应策略文件。
-P53-P88 为 fork-B 增量补充的高级策略，已纳入本索引。P94-P100 为标量计算向量化替代策略（2026-07 补充）。P102-P103 为 MIX CV 融合架构重写策略（2026-07 补充，gated_delta_rule 实例：scalar/VEC → MIX_AIC_1_1，geomean 8.85x）。
+P53-P88 为 fork-B 增量补充的高级策略，已纳入本索引。P94-P100 为标量计算向量化替代策略（2026-07 补充）。P102-P103 为 MIX CV 融合架构重写策略（2026-07 补充，gated_delta_rule 实例：scalar/VEC → MIX_AIC_1_1，geomean 8.85x）。P104-P115 为 Ascend C Tiling 系统化设计策略（2026-07 补充，来自 `ascendc-tiling-design` skill 方法论）。P116-P119 为 GQA/FlashAttention 实战优化策略（2026-07 补充，来自 Z-Search 实战：G→M 维合并、host 端 matmul tiling 配方、mask 预生成剥离、online softmax 改写）。
 所有有效策略 ID 均在下方表格中列出。Agent 在 strategy_combination 中只应使用下方表格中的 ID。
 
 ## Layer 定义
 - **L0 (Universal)**: 适用于几乎所有算子的通用策略（D1-D5, P1-P12, A1-A8）
-- **L1 (Advanced)**: 适用于特定类别算子的高级策略（P14-P103）
+- **L1 (Advanced)**: 适用于特定类别算子的高级策略（P14-P119）
 - **L2 (Discovered)**: 进化过程中发现的新策略（X1+）
 
 ## Tags 体系
@@ -237,6 +237,17 @@ P67-P69 为 Vector 计算效率基础策略（Counter 模式、低延迟归约�
 | P114 | Transpose ND tiling with alignment | L1 | conversion, tiling | ND 转置的轴映射、对齐填充与 32B/512B 对齐搬运 | playbooks/P114_transpose_nd_tiling_with_alignment.md |
 | P115 | FlashAttention tiling routing | L1 | flash_attention, tiling | FlashAttention 类算子的 Tiling 模式路由（标准/GQA/MLA/paged 等） | playbooks/P115_flashattention_tiling_routing.md |
 
+## 性能优化策略 — GQA/FlashAttention 实战优化 (P116-P119) [Layer: L1-L2]
+
+这些策略覆盖 attention 类算子（尤其 GQA decode）的四个结构性优化点：G→M 维合并、host 端 matmul tiling 配方、mask 预生成剥离、online softmax 改写。
+
+| ID | Strategy | Layer | Tags | When to Apply | Detail File |
+|----|----------|-------|------|---------------|-------------|
+| P116 | GQA grouped-M head merge | L1 | flash_attention, gqa, tiling | GQA decode（Sq≤4, G>1）时把 G 个 query head 零拷贝重解释进 matmul M 维，消除 G 个 M=1 小 matmul | playbooks/P116_gqa_grouped_m_head_merge.md |
+| P117 | MatmulApiTiling host recipe | L1 | attention, matmul, tiling | QK^T/PV 双 BMM 链 host 端接入 MatmulApiTiling：SetBufferSpace + d∈(64,128] SetFixSplit + depthA1 2→3 | playbooks/P117_matmul_api_tiling_host_recipe.md |
+| P118 | Mask precompute parallel AIV | L1 | flash_attention, mask | causal mask 下沉独立 AIV kernel 全核并行预生成；按需 dense right-down 替代通用 2048×2048 压缩表 | playbooks/P118_mask_precompute_parallel_aiv.md |
+| P119 | Two-pass to online softmax | L2 | flash_attention, softmax | 两遍/逐 token softmax 改写为 online 单遍 KV 流式（running max/sum/acc rescale），K/V GM 读取减半 | playbooks/P119_two_pass_to_online_softmax.md |
+
 ## 精度优化策略 (A1-A8) [Layer: L0]
 
 | ID | Strategy | Layer | Tags | When to Apply | Detail File |
@@ -263,6 +274,13 @@ P67-P69 为 Vector 计算效率基础策略（Counter 模式、低延迟归约�
 | X7 | Token Block Size (TB) Tuning for Pure-Vector Attention | L2 | decode-attention, pure-vector, tiling | 纯 Vector attention 的 token block 尺寸调优（同窗口 mean_asc -4.2%，case 级最高 -42.6%） | discovered/disc_X7.md |
 | X8 | Host-Side Precomputation of Constant Offset Tables | L2 | host-precompute, offset-table, latency-bound | 常量偏移表（如 Pi 转置）移到 Host 预计算，kernel 内零重复计算（mean_asc 149.58→125.64us，-16.0%） | discovered/disc_X8.md |
 | X9 | Deferred Scaling (反量化仿射代数重排/延迟缩放) | L2 | dequant, affine, vector-efficiency | 反量化仿射结构代数重排，延迟缩放减少逐元素乘加链（单核 aiv_time -33%，task_duration 18.23→12.91us） | discovered/disc_X9.md |
+| X10 | Device-side Grouped Scheduling + NZ Plane Weight Cache | L2 | moe, matmul, cube, grouped | Grouped matmul（group_list cumsum）Cube 化：AIC 设备侧自建分组调度（empty group 跳过），weight NZ plane 静态缓存 + m-fastest tile 排序多核共享 strip，fixpipe NZ 步长=orgM×16 原始值（level4_grouped_matmul_swiglu_quant 0.0026x→4.82x vs PyTorch） | discovered/disc_X10.md |
+| X11 | ND-drain + L0B-feed-driven baseM Scaling | L2 | matmul, quantization, cube, c220 | 量化 matmul Cube 利用率修复：多 fragment NZ drain 为芯片缺陷（与 orgM 对齐无关）→ CType 路由 ND；瓶颈是 L0B-fill:mad 比而非 L2 refetch → baseM 扩至 L0C 上限（int32 128@256）；重叠尾 strip 解 singleM<baseM/singleN≤16 崩溃；AIV 反量化 strip 化（strip 所有权+per-strip 向量+TQue 双缓冲+单条 2D DataCopyPad）（level3_quant_matmul 0.1999x→0.8274x vs 官方 QuantBatchMatmulV3） | discovered/disc_X11.md |
+| X12 | Pure-VEC Streaming Weight-Quant GEMV (小 M 分流) | L2 | weight-quant matmul, GEMV, small-M, c220 | 量化 GEMV 纯 VEC 流式路径：scale 提出 K 循环 + mixed-precision Axpy + 确定性两阶段 K-split（c220 SetAtomicAdd 丢更新禁用原子加）+ occupancy makespan tiling；小 M(1-8) 3.3-8.8x，大 M 须分流 cube（level3_weight_quant_batch_matmul 0.98x geomean，小 M case 最高 8.77x） | discovered/disc_X12.md |
+| X13 | Shape 自适应双引擎分流 (M-Threshold Hybrid Routing) | L2 | weight-quant matmul, skinny-GEMM, GEMV+GEMM mixed shapes | Host 侧按 M 路由两条完整 kernel 路径（小 M 纯 VEC streaming 吃带宽极限 / 中大 M cube 吃 MAC），中间区间按 K*N 流量摊销固定开销做实测校准二级阈值；路由只换引擎不改数值（共享精确代数分解）（level3_weight_quant_batch_matmul VEC 0.98x / cube 1.51x → 混合 2.03x geomean） | discovered/disc_X13.md |
+| X14 | Mix-Kernel 跨核生产者/消费者融合 (Pairwise AIV-Producer/AIC-Consumer) | L2 | weight-quant matmul, multi-kernel pipeline, dequant-pass elimination, c220 | 硬件 int8-cube 路径证伪后，将独立 VEC dequant pass 与 cube kernel 融合为单 mix kernel：AIC ci 与 AIV(2ci,2ci+1) 配对按 strip 序生产/消费 write-once workspace，GM-flag 协议同步（128B 步长 + MTE3 DataCopyPad 发布 + __gm__ volatile 有界轮询 + DCCI）；launch 3→2、cast 与 cube 重叠（level3_weight_quant_batch_matmul 2.03x→2.44x，dequant kernel launch=0） | discovered/disc_X14.md |
+| X15 | 递归拆分-并行投影外提 (Recurrent Split: Hoist Parallel Projection) | L2 | rnn, lstm, gru, scan, recurrent, dataflow | 含串行循环算子将非递归投影（全部时间步 x@W_ih）合并为单次 host 侧大 GEMM 外提走 Cube，自定义内核只保留严格串行的递归残差（h@W_hh+门激活+状态更新），递归权重 UB 常驻+超规格回退；串行链计算量 O(seq×(I+H)×4H)→O(seq×H×4H)（LSTM 0.202x→0.852x mean） | discovered/disc_X15.md |
+| X16 | 循环算子 H-slice 多核切分 (Recurrent H-Slice Multi-Core Split) | L2 | rnn, lstm, gru, scan, recurrent, multi-core, small-batch | 时间维不可并行时按 hidden 维切多核：每核独占 [hStart,hEnd) 及 4 门控列、W_hh 切片 UB 常驻跨时间步复用、c/h 切片独立更新零核间通信；host tiling 按 shape 在 batch-parallel/H-slice 间调度（batchNum≤4 或 H≥256&&batchNum≤32 走 H-slice）；**禁忌：门控列为 {j,H+j,2H+j,3H+j} 跨步取，禁连续 [4hStart,4hEnd) 切**；与 X15 正交可组合（纯 kernel 0.335x→0.799x，移植进 X15 架构 0.852x→2.12x mean） | discovered/disc_X16.md |
 
 ---
 
@@ -280,16 +298,19 @@ P67-P69 为 Vector 计算效率基础策略（Counter 模式、低延迟归约�
 |---------------|---------------|---------------|
 | LayerNorm / RMSNorm / GroupNorm | D1, D2, P1, P2, P3, A1, A2, A6 | P19, P55, P68, P69, P81, P84, P94, P95, P98, P99 |
 | Quantization ops | D1, D4, D3, P2, P4, A3, A8 | P48, P49, P70 |
-| Element-wise (foreach) | D1, D2, P1, P2, A1, A4 | P67, P69, P84, P89, P95, P97, P100, P101 |
-| Softmax / Attention | D1, P1, P5, A3, A4, A5 | P14, P18, P38, P55, P68, P81, P94, P100 |
+| Element-wise (foreach) | D1, D2, P1, P2, A1, A4 | P67, P69, P84, P89, P95, P97, P100, P101, P112 |
+| Softmax / Attention | D1, P1, P5, A3, A4, A5 | P14, P18, P38, P55, P68, P81, P94, P100, P119 |
 | Pooling / Gather | D1, P1, P2, P11, A7 | P33, P56, P59 |
 | Optimizer ops | D1, P1, P2, P9, A1 | P81, P84, P94, P95 |
-| Broadcast / Mask ops | D1, P1, P12, A5 | P67, P99 |
+| Broadcast / Mask ops | D1, P1, P12, A5 | P67, P99, P113, P118 |
 | Index / Scatter ops | D1, P1, P7, A7 | P32, P64, P100 |
 | Special / Complex ops | D2, D3 | P85, P88, P96, P102 |
-| CV Matmul (Cube+Vector) | D1, D3, P1, P4, P7, A3 | P14, P17, P46, P47, P49, P51, P52, P63, P70, P71, P72, P73, P78, P79, P83, P86, P87, P90, P92, P93, P102, P103 |
+| CV Matmul (Cube+Vector) | D1, D3, P1, P4, P7, A3 | P14, P17, P46, P47, P49, P51, P52, P63, P70, P71, P72, P73, P78, P79, P83, P86, P87, P90, P92, P93, P102, P103, P104, P105, P106, P107, P108, P117 |
 | CV FFN (MoE) | D1, D3, P1, P4, A1 | P46, P48, P49, P50, P73, P75, P88 |
-| Flash Attention | D1, P1, P5, A4, A5 | P14, P16, P17, P18, P29, P38, P53, P57, P58, P60, P61, P76, P77, P80, P90, P91 |
+| Flash Attention | D1, P1, P5, A4, A5 | P14, P16, P17, P18, P29, P38, P53, P57, P58, P60, P61, P76, P77, P80, P90, P91, P115, P116, P117, P118, P119 |
+| Reduction (mean/sum/max/min) | D1, P1, P2, A1, A2 | P68, P69, P109, P110 |
+| Sort / TopK | D1, P1, P2, A7 | P96, P111 |
+| Transpose / Layout Conversion | D1, P1, P7, P10 | P26, P114 |
 | Data Path (通用数据通路) | D1, D5, P1, P8, P10, P20, P25, P40, P54, P65, P66, P74 | — |
 
 ### 按瓶颈类型查表 (Bottleneck-Driven Strategy Selection)
@@ -298,17 +319,22 @@ P67-P69 为 Vector 计算效率基础策略（Counter 模式、低延迟归约�
 
 | Bottleneck Type | Primary | Secondary | Anti |
 |-----------------|---------|-----------|------|
-| mte2_stall | P1, P10 | P2, P7, P19, P18, P56, P59, P66, P92, P93, P101 | P3 |
+| mte2_stall | P1, P10 | P2, P7, P19, P18, P56, P59, P66, P92, P93, P101, P112, P113, P114, P118, P119 | P3 |
 | mte3_stall | P1 | P8, P19, P40, P56, P59 | — |
-| tiling_imbalance | P4, P2 | P11, P47, P51, P58, P72, P73, P75 | P3 |
+| tiling_imbalance | P4, P2 | P11, P47, P51, P58, P72, P73, P75, P104, P106, P116 | P3 |
 | scalar_loading | P5, P67 | P2, P54, P90, P97, P99, P100, P101 | — |
-| scalar_compute | P5, P67, P94, P95, P98, P99, P100, P102 | P84, P103 | — |
+| scalar_compute | P5, P67, P94, P95, P98, P99, P100, P102 | P84, P103, P111 | — |
 | compute_bound | D1, P46, P94, P95, P96, P102 | A1, P47, P68, P69, P79, P84, P91, P92, P103 | — |
 | near_optimal | P98 | — | — |
-| no_overlap | P1 | P10, P19, P63 | — |
+| no_overlap | P1 | P10, P19, P63, P118, P119 | — |
 | partial_overlap | P1, P2 | P8, P18, P26, P53, P83, P90 | — |
 | undersize_transfer | P2, P10 | P7, P25, P45, P66 | — |
 | icache_miss | — | — | — |
 | bus_contention | P8, P65 | P1, P28, P64, P93 | — |
-| l2_cache_thrash | P52, P74 | P61, P78 | — |
-| ub_memory_pressure | P8, P85 | P81, P88, P89 | P20 |
+| l2_cache_thrash | P52, P74 | P61, P78, P105, P107 | — |
+| ub_memory_pressure | P8, P85 | P81, P88, P89, P110, P111 | P20 |
+| tiling_mismatch | P104, P108 | P105, P106, P107, P115 | — |
+| cube_underutilization | P104, P106 | P102, P115, P116, P117 | — |
+| sync_overhead | P4, A4 | P111, P115 | — |
+| vec_underutilization | P112 | P67, P69 | — |
+| tail_block | P11 | P112, P113, P114 | — |

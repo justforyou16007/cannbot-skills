@@ -3,6 +3,7 @@
 > 算子族：`attention` / `flash_attention`
 > 适用算子：`FlashAttention`, `FlashAttention-2`, `GQA`, `MHA`, `MLA`, `SparseAttention`, `ChunkedPrefill` 等
 > 关联设计：[knowledge-strategy-architecture-v3.2](../../../../../docs/design/knowledge-strategy-architecture-v3.2.md) §3.2
+> **路径约定**：本文档中 `subfamilies/`、`foundation/`、`design/`、`specialization/`、`patterns.md` 等相对路径均基于仓库根下 `ops/ascendc-tiling-design/references/flashattention/`（例：`subfamilies/base_design.md` = `ops/ascendc-tiling-design/references/flashattention/subfamilies/base_design.md`）
 
 ## 选型决策树
 
@@ -122,7 +123,7 @@ Architect 设计阶段按以下顺序推进：
 - [ ] 是否已确认基础 FA 形态（GQA / MHA / MLA）？
 - [ ] 是否识别了正交 trait（量化 / 稀疏 / feature flags）？
 - [ ] 是否按 G→N12 顺序推进设计节点？
-- [ ] 是否在 `composition.md` 校核 trait 组合可行性？
+- [ ] 是否在 `foundation/composition.md` 校核 trait 组合可行性？
 - [ ] 常量语义是否分离（跨核槽 / L1 rotation 槽 / V2 自读自写槽）？
 - [ ] 是否根据 Roofline 选择基本块大小与并行策略？
 - [ ] 是否按变体文件补充 dtype 路径与平台差异？

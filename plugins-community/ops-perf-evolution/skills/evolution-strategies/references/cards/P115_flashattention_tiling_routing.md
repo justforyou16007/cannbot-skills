@@ -44,7 +44,7 @@ N10 流水编排:  slot / SyncAll / HardEvent
 1. **基础形态三选一**：默认 GQA；`G=1` 退化到 MHA；含 latent absorption 走 MLA。
 2. **正交 trait 叠加**：量化（MXFP8/INT8/AntiQuant）、稀疏、PSE/RoPE/Sink 等 feature flag 按需加载。
 3. **按节点推进**：必须 G→N12 顺序执行，不可跳过。
-4. **组合可行性校核**：未验证组合（如量化 × 稀疏）需先在 `composition.md` 确认。
+4. **组合可行性校核**：未验证组合（如量化 × 稀疏）需先在 `ops/ascendc-tiling-design/references/flashattention/foundation/composition.md` 确认。
 5. **常量语义分离**：跨核握手槽、L1 rotation 槽、V2 自读自写槽用不同常量。
 
 ## 常见陷阱

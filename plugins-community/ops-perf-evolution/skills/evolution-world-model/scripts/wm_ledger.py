@@ -69,11 +69,13 @@ def _load_strategies_index_for_ledger():
     if _LEDGER_INDEX_CACHE is not None:
         return _LEDGER_INDEX_CACHE
 
-    # 多路径搜寻
+    # 多路径搜寻（兼容 lingxi-evo 在 repo 根目录或 skills 子目录下启动）
     here = os.path.dirname(os.path.abspath(__file__))
     candidates = [
+        os.path.join(os.getcwd(), "skills/evolution-strategies/references/INDEX.json"),
         os.path.join(os.getcwd(), "plugins-community/ops-perf-evolution/skills/"
                                  "evolution-strategies/references/INDEX.json"),
+        os.path.join(here, "..", "..", "evolution-strategies/references/INDEX.json"),
         os.path.join(here, "..", "..", "plugins-community/ops-perf-evolution/skills/"
                                      "evolution-strategies/references/INDEX.json"),
         os.path.join(here, "..", "..", "..", "plugins-community/ops-perf-evolution/skills/"

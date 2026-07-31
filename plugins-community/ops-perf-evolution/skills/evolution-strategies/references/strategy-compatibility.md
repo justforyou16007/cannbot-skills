@@ -39,6 +39,10 @@
 | P113 (Broadcast aligned tiling) | P12 | P113 系统化广播 Tiling，P12 是广播与掩码操作；可叠加 |
 | P114 (Transpose tiling) | P26/P59 | P114 系统化转置 Tiling，P26/P59 是具体搬运优化；可叠加 |
 | P115 (FlashAttention tiling routing) | P14/P53/P57-P61 | P115 决定 FA Tiling 模式，其他策略在选定模式下优化；正交或依赖 |
+| P116 (GQA Grouped-M head merge) | P57/P106/P115 | P116 合并 G 提升单 task M；P57 拆 G 提升并行度——方向相反，先 P116 后评估 P57，勿同时应用；P106 是 matmul 族同类思路 |
+| P117 (MatmulApiTiling host recipe) | P46/P86/P92 | P117 在 host 生成 bmm tiling，P46 在 kernel 消费；P86/P92 在配方落地后继续调优 |
+| P118 (Mask precompute parallel AIV) | P14/P116 | P118 剥离 mask 到独立 AIV kernel；与 P116 组合时 mask 行数需 ×G |
+| P119 (Two-pass to online softmax) | P38/A5/P115 | P119 是结构改写，P38 组织改写后的状态 buffer；A5 保证数值稳定；与逐 token Kahan 互斥（须删除） |
 
 ## §2 依赖关系
 
@@ -72,6 +76,10 @@
 | P113 | P12 | 广播对齐 Tiling 后可叠加 P12 的广播与掩码操作 |
 | P114 | P26 | 转置 Tiling 后可叠加 P26 的 stride 搬运 |
 | P115 | P14/P53/P57-P61 | FA Tiling 路由选定具体模式后，可叠加对应优化策略 |
+| P116 | P46 | G→M 合并在 cube matmul 路径下生效；纯 vector 实现先走 P13/P46 |
+| P117 | P46 | host 生成的 bmm tiling 由 kernel 侧 MatmulImpl(P46) 消费 |
+| P118 | — | 独立 mask kernel，无硬依赖；GQA 场景建议配合 P116 |
+| P119 | P38 | online 改写后的 max/sum/acc 状态按 P38 常驻组织 |
 
 ### 推荐搭配（非硬依赖，但组合效果显著优于单独使用）
 
@@ -128,6 +136,9 @@ P112 ──→ P67/P84
 P113 ──→ P12
 P114 ──→ P26
 P115 ──→ P14/P53/P57-P61
+P116 ──→ P46
+P117 ──→ P46
+P119 ──→ P38
 ```
 
 ## §3 推荐组合
@@ -149,6 +160,7 @@ P115 ──→ P14/P53/P57-P61
 | Matmul 深度调优 | P46 + P71 + P83 + P86 | MatmulImpl API + IBShare + L1 分区 + 数据通路调优 |
 | 多核访存优化 | P64 + P65 + P66 | GM 冲突规避 + UB bank 冲突规避 + 512B 对齐 |
 | CV 并行全套 | P73 + P75 + P16 + P51 | AIC:AIV 配比 + 双 AIV 拆分 + 代价模型 + 动态核配比 |
+| GQA decode 实战链 | P116 + P117 + P118 + P119 | G 头合并进 M + MatmulApiTiling 配方 + mask 独立预生成 + online softmax |
 
 ## §4 UB 内存压力指南
 

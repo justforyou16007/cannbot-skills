@@ -43,13 +43,13 @@
     ]
   },
   "stats": {
-    "cards": 130,
-    "active_cards": 117,
+    "cards": 134,
+    "active_cards": 121,
     "deprecated": 13,
-    "preconditions": 115,
-    "playbooks": 115,
+    "preconditions": 119,
+    "playbooks": 119,
     "families": 8,
-    "discovered": 9
+    "discovered": 16
   },
   "cards": [
     {
@@ -3302,6 +3302,116 @@
         "ops/ascendc-tiling-design/references/flashattention/design/_governance.md",
         "ops/ascendc-tiling-design/references/flashattention/subfamilies/base_design.md"
       ]
+    },
+    {
+      "source_key": "evolution-strategies#card/P116_gqa_grouped_m_head_merge",
+      "id": "P116",
+      "title": "P116: GQA Grouped-M 头合并（G 个 Query Head 合并进 Matmul M 维）",
+      "doc_path": "cards/P116_gqa_grouped_m_head_merge.md",
+      "complexity": "L1",
+      "op_families": [
+        "attention",
+        "flash_attention"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "cube_underutilization",
+          "tiling_imbalance"
+        ]
+      },
+      "conflicts_with": [],
+      "synergizes_with": [
+        "P57",
+        "P106",
+        "P115"
+      ],
+      "requires": [],
+      "has_preconditions": true,
+      "has_playbook": true,
+      "quantified_gain": []
+    },
+    {
+      "source_key": "evolution-strategies#card/P117_matmul_api_tiling_host_recipe",
+      "id": "P117",
+      "title": "P117: 双 BMM 链 MatmulApiTiling Host 配方（SetBufferSpace + SetFixSplit + depthA1 流水微调）",
+      "doc_path": "cards/P117_matmul_api_tiling_host_recipe.md",
+      "complexity": "L1",
+      "op_families": [
+        "attention",
+        "flash_attention",
+        "matmul",
+        "cv_fusion"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "cube_underutilization"
+        ]
+      },
+      "conflicts_with": [],
+      "synergizes_with": [
+        "P46",
+        "P86",
+        "P92"
+      ],
+      "requires": [],
+      "has_preconditions": true,
+      "has_playbook": true,
+      "quantified_gain": []
+    },
+    {
+      "source_key": "evolution-strategies#card/P118_mask_precompute_parallel_aiv",
+      "id": "P118",
+      "title": "P118: Causal Mask 独立 AIV Kernel 并行预生成（按需 Dense 替代通用压缩表）",
+      "doc_path": "cards/P118_mask_precompute_parallel_aiv.md",
+      "complexity": "L1",
+      "op_families": [
+        "attention",
+        "flash_attention",
+        "broadcast_mask"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "no_overlap",
+          "mte2_stall"
+        ]
+      },
+      "conflicts_with": [],
+      "synergizes_with": [
+        "P14",
+        "P116"
+      ],
+      "requires": [],
+      "has_preconditions": true,
+      "has_playbook": true,
+      "quantified_gain": []
+    },
+    {
+      "source_key": "evolution-strategies#card/P119_two_pass_to_online_softmax",
+      "id": "P119",
+      "title": "P119: Two-Pass Softmax → Online Softmax 单遍 KV 流式改写",
+      "doc_path": "cards/P119_two_pass_to_online_softmax.md",
+      "complexity": "L2",
+      "op_families": [
+        "attention",
+        "flash_attention",
+        "softmax"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "mte2_stall",
+          "no_overlap"
+        ]
+      },
+      "conflicts_with": [],
+      "synergizes_with": [
+        "P38",
+        "P115",
+        "A5"
+      ],
+      "requires": [],
+      "has_preconditions": true,
+      "has_playbook": true,
+      "quantified_gain": []
     }
   ],
   "preconditions": [
@@ -3879,6 +3989,26 @@
       "source_key": "evolution-strategies#preconditions/P115",
       "id": "P115",
       "doc_path": "preconditions/P115.yaml"
+    },
+    {
+      "source_key": "evolution-strategies#preconditions/P116",
+      "id": "P116",
+      "doc_path": "preconditions/P116.yaml"
+    },
+    {
+      "source_key": "evolution-strategies#preconditions/P117",
+      "id": "P117",
+      "doc_path": "preconditions/P117.yaml"
+    },
+    {
+      "source_key": "evolution-strategies#preconditions/P118",
+      "id": "P118",
+      "doc_path": "preconditions/P118.yaml"
+    },
+    {
+      "source_key": "evolution-strategies#preconditions/P119",
+      "id": "P119",
+      "doc_path": "preconditions/P119.yaml"
     }
   ],
   "playbooks": [
@@ -4456,6 +4586,26 @@
       "source_key": "evolution-strategies#playbook/P115_flashattention_tiling_routing",
       "id": "P115",
       "doc_path": "playbooks/P115_flashattention_tiling_routing.md"
+    },
+    {
+      "source_key": "evolution-strategies#playbook/P116_gqa_grouped_m_head_merge",
+      "id": "P116",
+      "doc_path": "playbooks/P116_gqa_grouped_m_head_merge.md"
+    },
+    {
+      "source_key": "evolution-strategies#playbook/P117_matmul_api_tiling_host_recipe",
+      "id": "P117",
+      "doc_path": "playbooks/P117_matmul_api_tiling_host_recipe.md"
+    },
+    {
+      "source_key": "evolution-strategies#playbook/P118_mask_precompute_parallel_aiv",
+      "id": "P118",
+      "doc_path": "playbooks/P118_mask_precompute_parallel_aiv.md"
+    },
+    {
+      "source_key": "evolution-strategies#playbook/P119_two_pass_to_online_softmax",
+      "id": "P119",
+      "doc_path": "playbooks/P119_two_pass_to_online_softmax.md"
     }
   ],
   "families": [

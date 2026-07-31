@@ -45,7 +45,11 @@ DATA_LOGGER.addHandler(_DATA_HANDLER)
 DATA_LOGGER.propagate = False
 DATA_LOGGER.setLevel(logging.INFO)
 
-PLAYBOOK_DIR = "plugins-community/ops-perf-evolution/skills/evolution-strategies/references/playbooks"
+# 默认 Playbook 目录按脚本位置解析（skills/evolution-strategies/references/playbooks），
+# 不依赖调用方 cwd——主 agent 的工作目录可能是仓库根或 plugins-community/ops-perf-evolution，
+# cwd 相对路径会在后者下静默加载 0 个 Playbook（仅 stderr 一行 warning，子 agent 裸奔）。
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PLAYBOOK_DIR = os.path.normpath(os.path.join(SCRIPT_DIR, os.pardir, "references", "playbooks"))
 
 
 def find_playbook(strategy_id: str, playbook_dir: str) -> str | None:

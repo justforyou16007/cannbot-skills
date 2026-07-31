@@ -54,6 +54,7 @@ design.md 可能很长，**只提取以下字段，忽略其余内容**：
 | 归约运算（reduce_sum/max/min） | `examples/reduce/` |
 | 归一化（softmax/layernorm/rmsnorm） | `examples/softmax/`、`examples/normalization/` |
 | GEMM | `examples/gemm/`、`examples/developer_mode/gemm_developer.py` |
+| 卷积（conv2d/img2col+GEMM） | 以 design.md 的 Conv 强制分支结构选型为准；`T.tile.im2col` 未注册不可执行（仅设计记号），TileLang 侧按 normal 结构表达，但 k'=(ci,kh,kw) 解码必须段连续块/向量化表达，**禁止默认标量逐元素 gather**；fused img2col 优化由 AscendC 转译阶段落实 |
 | 融合算子 | `examples/flash_attention/`、`examples/pipeline/`、`examples/developer_mode/matmul_add_developer.py` |
 | Developer 模式 | `examples/developer_mode/` |
 
@@ -109,6 +110,8 @@ design.md 可能很长，**只提取以下字段，忽略其余内容**：
 基于 design.md 的 API 映射 + 参考示例的代码风格，生成**两个文件**：`{op}.py`（纯 kernel）与 `test_{op}.py`（golden + L0 + main，L1/L2/Boundary 留桩，从 `{op}.py` import kernel）。完整文件结构骨架与融合算子注意事项见 [examples/code-skeleton.md](examples/code-skeleton.md)。
 
 > **写代码时遇到**具体编码规范问题（Buffer 分配 / 索引一致性 / 同步 / 广播 / 测试模板）查 [references/coding-conventions.md](references/coding-conventions.md)。
+>
+> **Conv 类算子**：严格遵循 design.md 的 Conv 强制分支结构选型与「保留的优化结构清单」；k' 解码禁止退化为标量逐元素 gather（标量仅限平台限制豁免且须注释理由）。
 >
 > **V 核并行化**（按行切分、中间 buffer 索引一致性、CV 融合 V 核切分）查 [references/vector-parallelism.md](references/vector-parallelism.md)。
 >

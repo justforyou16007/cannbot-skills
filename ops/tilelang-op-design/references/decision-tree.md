@@ -2,10 +2,13 @@
 
 ## 目录
 
-- [1. 函数设计原则](#1-函数设计原则)
-- [2. 决策树](#2-决策树)
-- [3. NPU 硬件约束](#3-npu-硬件约束)
-- [4. API 映射规则](#4-api-映射规则)
+- [算子特征分析决策树（Ascend 版）](#算子特征分析决策树ascend-版)
+  - [目录](#目录)
+  - [1. 函数设计原则](#1-函数设计原则)
+  - [2. 决策树](#2-决策树)
+  - [3. NPU 硬件约束](#3-npu-硬件约束)
+  - [4. API 映射规则](#4-api-映射规则)
+  - [5. Conv 类算子结构选型（conv2d / img2col+GEMM 强制分支）](#5-conv-类算子结构选型conv2d--img2colgemm-强制分支)
 
 > 本项目为 TileLang-Ascend，与 GPU 版 TileLang 在 Kernel 维度、threads、循环边界、GEMM API、内存分配等方面有显著差异。完整对比与约束清单见 SKILL 子目录索引下的 `ascend-constraints.md`。外部参考实现仅用于理解数学逻辑，API 映射必须查阅本项目。
 
@@ -105,3 +108,20 @@
 | Kernel | `T.Kernel(一维, is_npu=True)` | `T.Kernel(三维)` ❌ |
 | 同步 | `T.barrier_all()`, `T.Scope("C")` | 自动同步（Developer 模式） |
 | 循环 | `T.serial`, `T.unroll` | `T.Pipelined(动态边界)` ❌ |
+
+## 5. Conv 类算子结构选型（conv2d / img2col+GEMM 强制分支）
+
+Conv 类算子（`nn.Conv*` / `F.conv*`）必须按以下三模式显式选型，并在设计文档中记录结论：
+
+| 模式 | 适用条件 | 省去 |
+|------|---------|------|
+| fused img2col（LoadData3D 随路展开，用 `T.tile.im2col` 设计记号表达） | Ci%16==0 且 xNz+B 面板 ≤ L1 预算 | im2col GM 物化（最大收益） |
+| direct 1x1 flipped GEMM（x NCHW 本身即 `[K=Ci, M=H*W]` 操作数） | kH=kW=1, s=1, p=0, Ci%16==0 | wrepack + im2col 两级发射 |
+| normal（im2col 物化 + K-major wrepack） | 通用回退 | — |
+
+约束：
+- 满足 fused/direct 条件却退回 normal 时，必须在设计文档「风险点」中写明理由
+- **禁止默认标量逐元素 gather** 的 im2col 设计；k'=(ci,kh,kw) 解码按段连续块/向量化表达；标量豁免仅限占比 <5% 的偶发小尾块（主数据路径不可豁免）
+- dtype 适配（fp32 走 hi/lo fp16 拆分、bf16 替代）时必须声明「保留的优化结构清单」：fused/normal 模式、零标量、批量转置、epilogue 跨行块处理逐项标注 保留/丢弃+理由
+- 权重 repack 结果是（weight 内容, shape, dtype）的确定函数，设计中标注可由 host 侧 LRU 缓存
+- AscendC 侧实现细节与实测收益见 `plugins-community/tilelang2ascendc-ops-generator/skills/tilelang2ascend-translator/references/dsl2Ascendc_compute_conv.md`

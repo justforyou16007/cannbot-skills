@@ -9,15 +9,17 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # ----------------------------------------------------------------------------------------------------------
 
-"""Block-level TileLang design for flash_attention_gqa.
+"""Block-level TileLang design for GQA flash attention.
 
-Migrated verbatim from the new-source MHA block-level design
-(design/block_level/flash_attention.py). Only the entry function name has been
-renamed (flash_attention_fwd -> flash_attention_gqa_fwd); the block decomposition
-and stage boundaries are left unchanged.
+GQA (Grouped Query Attention): O = softmax(Q @ K^T / sqrt(D)) @ V over
+[B, Hq, Sq, D] queries and [B, Hkv, Skv, D] key/value tensors, where each KV
+head is shared by a group of Hq/Hkv query heads.
 
-For GQA the host packs the data into an equivalent "MHA with heads = 1" problem,
-so the same block-level decomposition applies unmodified (see model_new_tilelang.py).
+One kernel instance handles a (batch, q-block) tile.  The pipeline runs
+C stages (S = QK^T on cube, P@V on cube) and V stages (online softmax + merge
+on vector) over KV blocks with a ring buffer; the block boundaries and stage
+ownership are captured here, the fine-grained math lives in the tile-level
+design.
 """
 
 import tilelang

@@ -10,8 +10,9 @@
 # ----------------------------------------------------------------------------------------------------------
 
 # GQA (Grouped Query Attention) flash attention golden reference.
-# Logic taken from the new-source model.py:
-#   q.view(B, nkv, group, Sq, D) + einsum + softmax -> [B, nq, Sq, D].
+# O = softmax(Q @ K^T / sqrt(D)) @ V over [B, Hq, Sq, D] queries and
+# [B, Hkv, Skv, D] key/value tensors, each KV head shared by Hq/Hkv query
+# heads:  q.view(B, nkv, group, Sq, D) + einsum + softmax -> [B, nq, Sq, D].
 import csv
 from pathlib import Path
 

@@ -11,17 +11,13 @@
 
 # Tile-level TileLang design for GQA flash attention.
 #
-# This file is migrated verbatim from the new-source MHA flash-attention kernel
-# (design/tile_level/flash_attention.py). The kernel body is left logically
-# unchanged: only the entry function name has been renamed from
-# flash_attention_fwd to flash_attention_gqa_fwd.
-#
-# GQA defers only the q_head -> kv_head mapping to the host side and packs the
-# data into an equivalent "MHA with heads = 1" problem (see model_new_tilelang.py):
-#   * Q is packed from [B, Hq, Sq, D] -> [B*Hkv, group*Sq, D]
-#   * K/V are flattened from [B, Hkv, Skv, D] -> [B*Hkv, Skv, D]
-# and the kernel is launched with batch = B*Hkv, heads = 1, q-seq = group*Sq,
-# kv-seq = Skv.
+# GQA is expressed as an MHA problem with heads = 1 by packing the group
+# dimension into the query sequence (see model_new_tilelang.py):
+#   * Q: [B, Hq, Sq, D] -> [B*Hkv, group*Sq, D]
+#   * K/V: [B, Hkv, Skv, D] -> [B*Hkv, Skv, D]
+# The kernel is launched with batch = B*Hkv, heads = 1, q_seq = group*Sq,
+# kv_seq = Skv and runs the standard flash-attention ring pipeline
+# (S = QK^T on cube, online softmax on vector, P@V on cube).
 
 import tilelang
 from tilelang import DataType, language as T

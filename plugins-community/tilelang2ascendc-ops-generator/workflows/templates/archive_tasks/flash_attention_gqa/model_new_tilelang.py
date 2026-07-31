@@ -61,7 +61,7 @@ class ModelNew(nn.Module):
         flat_k = k.reshape(n_kv, k.shape[2], dim)
         flat_v = v.reshape(n_kv, v.shape[2], dim)
 
-        # The migrated kernel declares K/V as [batch, heads, kv_seq_len_padded, dim]
+        # The kernel declares K/V as [batch, heads, kv_seq_len_padded, dim]
         # (kv_seq_len padded up to a whole 64-wide block).  When Skv is not a
         # multiple of 64, the input must be padded to that length so the kernel's
         # tail-block reads stay in bounds (zeros), letting the tail mask work.

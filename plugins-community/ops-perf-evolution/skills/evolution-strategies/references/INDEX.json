@@ -47,7 +47,7 @@
     "active_cards": 117,
     "deprecated": 13,
     "preconditions": 115,
-    "playbooks": 114,
+    "playbooks": 115,
     "families": 8,
     "discovered": 9
   },
@@ -428,7 +428,7 @@
       ],
       "requires": [],
       "has_preconditions": true,
-      "has_playbook": false,
+      "has_playbook": true,
       "quantified_gain": [
         "shape: \"GDR B=1,T=64,Hk=4,Hv=4,fp16\"",
         "shape: \"GDR geomean over T=64..4096\""
@@ -4396,6 +4396,11 @@
       "source_key": "evolution-strategies#playbook/P9_deterministic_output",
       "id": "P9",
       "doc_path": "playbooks/P9_deterministic_output.md"
+    },
+    {
+      "source_key": "evolution-strategies#playbook/P102_scalar_matmul_to_cv_fusion_rewrite",
+      "id": "P102",
+      "doc_path": "playbooks/P102_scalar_matmul_to_cv_fusion_rewrite.md"
     },
     {
       "source_key": "evolution-strategies#playbook/P104_matmul_multi_core_tiling_expansion",

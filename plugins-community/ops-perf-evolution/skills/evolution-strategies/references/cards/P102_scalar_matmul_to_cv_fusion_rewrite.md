@@ -7,7 +7,7 @@ conflicts_with: []
 synergizes_with: [P29, P46, P87, P92]
 requires: []
 has_preconditions: true
-has_playbook: false
+has_playbook: true
 quantified_gain:
   - shape: "GDR B=1,T=64,Hk=4,Hv=4,fp16"
     baseline_us: 3650.0
@@ -44,63 +44,23 @@ kernel 内层循环是以下形态之一？
     └─ 否（纯 elementwise/归约）→ P94/P95
 ```
 
-## 四阶段重写工作流（每阶段有明确退出标准，不可跳步）
+## 执行入口（SOP 在 Playbook，调试手册在 references）
 
-### Phase 0 — 纯 AIC 单路径 derisk（Cube 链路先对）
-- 用 `KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIC_ONLY)` 写最小 matmul（一个 Mmad），验证 Nd2Nz → LoadData → Mmad → Fixpipe 的 shape/stride 配置。
-- **退出标准**：单 matmul 数值与 torch 参考一致。
-- 常见坑：Nd2Nz `srcDValue` 是 GM 行步长（**元素**单位）；Fixpipe NZ2ND（默认 CFG_ROW_MAJOR）`dstStride` 单位是**元素**，非 NZ 模式是 32B。
+- **完整实操 SOP（Step 0-6，强制执行）**：`playbooks/P102_scalar_matmul_to_cv_fusion_rewrite.md`
+  - Step 0：必读 mix-cv-fusion-guide.md
+  - Step 1-2：定位 + 改造计划表
+  - Step 3：**Phase 0 纯 AIC 单路径 derisk（禁止跳过直接写 MIX）** + canonical template + 自检
+  - Step 4：MIX 骨架 + 配对探针（五条铁律）
+  - Step 5：逐 stage 增量 + 端到端验证
+  - Step 6：失败归因纪律（R1-R6 分类 + "平台不支持"结论的证据标准）
+- **MIX 机制与 hang 排查手册**：`references/mix-cv-fusion-guide.md`（R1-R6 根因分类、四阶段流程、双缓冲决策矩阵、调试工具箱）
 
-### Phase 1 — MIX 骨架（只证明"MIX 不挂"）
-- 切 `KERNEL_TYPE_MIX_AIC_1_1`，加核类型守卫，AIV 路径留空，结尾一次 `SyncAll<false>()`。
-- **退出标准**：不 hang 且 AIC 结果与 Phase 0 完全一致。
-- 挂了 → 按 `references/mix-cv-fusion-guide.md` 的 R1~R4 对照检查（几乎都是守卫缺失）。
+## 关键约束（节点描述必带）
 
-### Phase 2 — 配对与同步探针（证明"核对应关系"）
-- AIV 路径写 `GetBlockIdx()/GetBlockNum()` 到 GM，host 读回打印。
-- **退出标准**：确认 pairing（MIX_AIC_1_1 下 AIV idx == AIC idx）与实际核数。此后 AIC/AIV 可用相同的 work→core 分配逻辑各算各的。
-
-### Phase 3 — 逐 stage 增量（一次一个 stage，各自对参考）
-- 每个 stage：AIC 写中间矩阵到 GM workspace → `SyncAll<false>()` → AIV 处理 → `SyncAll<false>()` → ...
-- **每个 stage 落地即验证**：host 临时 return workspace 张量，与 torch 参考逐 stage 对比。
-- **必须测多 chunk / 多迭代（T≥128）**：单 chunk 会掩盖状态依赖路径的 bug（GDR 实例连踩两次：decay mask inclusive vs strict、漏乘 scale，单 chunk 均恰好正确）。
-- **退出标准**：全 stage 对齐后，端到端精度 PASS。
-
-## 守卫代码骨架（可直接套用）
-
-```cpp
-class KernelX {
-public:
-    __aicore__ inline void Init(...) {
-        if ASCEND_IS_AIC {
-            pipe_.InitBuffer(a1_, 1, SZ_A1);   // A1/B1/A2/B2/CO1 — AIC 专属
-            pipe_.InitBuffer(b1_, 1, SZ_B1);
-            pipe_.InitBuffer(a2_, 1, SZ_A2);
-            pipe_.InitBuffer(b2_, 1, SZ_B2);
-            pipe_.InitBuffer(c1_, 1, SZ_C1);
-        } else {
-            pipe_.InitBuffer(ub_, UB_SIZE);    // VECCALC — AIV 专属
-        }
-    }
-    __aicore__ inline void Process() {
-        if ASCEND_IS_AIC { ProcessAIC(); } else { ProcessAIV(); }
-        // 两侧 SyncAll<false>() 调用次数/顺序严格一致
-    }
-};
-extern "C" __global__ __aicore__ void kernel_x(...) {
-    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_1);   // 函数体内
-    KernelX k; k.Init(...); k.Process();
-}
-```
-
-**五条铁律**（违反即 hang，无报错只有 100% AICore 空转）：
-1. **AIV 永不触碰 A1/B1/A2/B2/CO1；AIC 永不触碰 UB**——包括 InitBuffer。
-2. **两侧 `SyncAll<false>()` 计数一致**——每改一侧，数另一侧。无参模板默认 `isAIVOnly=true` 只同步 AIV，MIX 全局 barrier 必须显式 `<false>`。
-3. **所有核循环次数一致**——`slots = ceil(work/cores)` padded loop，越界核只走 barrier 不做工（`valid` 守卫工作体）。
-4. **每个 Mmad 操作数完整走队列**：Alloc→Load→EnQue→DeQue→Mmad→Free；Mmad→Fixpipe、Fixpipe→下次 GM 读之间 `PipeBarrier<PIPE_ALL>`。
-5. **中间结果走 GM workspace 交换**（AIC Fixpipe 写 → barrier → AIV DataCopy 读，或反向），不要试图共享 L0/L1/UB。
-
-API 规范、hang 根因分类（R1-R6）与四阶段开发流程详见本 skill 的 `references/mix-cv-fusion-guide.md`。
+- **四阶段不可跳步**：AIC_ONLY 单 matmul 验证 → MIX 骨架 → 配对探针 → 逐 stage 增量。直接写全双工 MIX 是最高频失败模式。
+- **hang/NaN ≠ 平台不支持**：MIX 在 910B2C 已实证可行（8.85x）。下"环境不支持"结论前必须满足 playbook Step 6 的四条证据标准（最小探针失败 + 清 build 缓存 + 换干净 NPU + 具体报错原文）。
+- **build 缓存陷阱**：改代码必须 `rm -rf build`，否则"改了没生效"造成假诊断。
+- **单 chunk 不算验证**：状态依赖路径必须 T≥128 多 chunk 用例。
 
 ## 常见陷阱
 
@@ -114,12 +74,12 @@ API 规范、hang 根因分类（R1-R6）与四阶段开发流程详见本 skill
 
 ```bash
 # 检测标量/向量模拟矩阵运算（P102 适用信号）
-grep -nE "for\s*\(.*\+\+.*\)\s*\{?\s*for\s*\(" op_kernel/*.cpp          # 嵌套标量循环
-grep -nE "reinterpret_cast.*GetPhyAddr|\.GetPhyAddr\(\)" op_kernel/*.cpp  # raw pointer 标量计算
-grep -nE "Mul\(.*\).*ReduceSum|ReduceSum" op_kernel/*.cpp                  # Vector 拼伪 matmul
+grep -nE "for\s*\(.*\+\+.*\)\s*\{?\s*for\s*\(" kernel/*.cpp          # 嵌套标量循环
+grep -nE "reinterpret_cast.*GetPhyAddr|\.GetPhyAddr\(\)" kernel/*.cpp  # raw pointer 标量计算
+grep -nE "Mul\(.*\).*ReduceSum|ReduceSum" kernel/*.cpp                  # Vector 拼伪 matmul
 
 # 检测是否已是 MIX 架构（已重写则不适用）
-grep -nE "KERNEL_TYPE_MIX|ASCEND_IS_AIC|Mmad" op_kernel/*.cpp
+grep -nE "KERNEL_TYPE_MIX|ASCEND_IS_AIC|Mmad" kernel/*.cpp
 ```
 
 ## 来源

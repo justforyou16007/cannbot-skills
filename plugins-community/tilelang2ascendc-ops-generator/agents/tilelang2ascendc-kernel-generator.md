@@ -280,6 +280,28 @@ npu-smi info -t board -i ${npu} 2>/dev/null || npu-smi info 2>/dev/null
 - 简单算子后续走 ops-direct-invoke 工作流（Architect 设计 → Developer 实现 → Reviewer 审查）
 - 复杂算子后续走 TileLang → tilelang2ascend-translator 路径
 
+#### Tiling 设计类别标记
+
+读取 `model.py` 后，若算子属于 `ascendc-tiling-design` skill 已覆盖的算子类别，设置 `tiling_design_category = "<category>"`。具体判定规则如下：
+
+| 类别 | 关键词 / 特征 | 对应 ascendc-tiling-design 文档 |
+|------|--------------|--------------------------------|
+| `matmul` | 文件名/类名含 `Matmul`/`MatMul`/`BatchMatMul`/`GroupedMatmul`；forward 中出现 `torch.matmul`、`F.linear`、`@`、`torch.mm`、`torch.bmm`、`torch.addmm`；融合形态如 `matmul+leakyrelu`、`quant_matmul`、`matmul_bias` | `references/matmul/patterns.md` + `references/matmul/ascendc-api-matmul-tiling.md` |
+| `flashattention` | 文件名/类名含 `Attention`/`FlashAttention`/`SDPA`；forward 中出现 `scaled_dot_product_attention`、`softmax(Q @ K^T / sqrt(d)) @ V` | `references/flashattention/patterns.md` |
+| `reduction` | 文件名/类名含 `Reduce`、`Softmax`、`LayerNorm`、`RMSNorm`、`ArgMax`、`ArgMin`、`ReduceSum`、`ReduceMean`；forward 中出现 `torch.sum`、`torch.mean`、`torch.softmax`、`F.softmax`、`F.layer_norm`、`F.rms_norm` | `references/reduction/patterns.md` + `references/reduction/algorithms.md` |
+| `sort` | 文件名/类名含 `Sort`/`TopK`/`ArgSort`；forward 中出现 `torch.sort`、`torch.topk` | `references/sort/patterns.md` + `references/sort/alg-two-level-mrgsort.md` |
+| `elementwise` | 文件名/类名含 `ReLU`/`Sigmoid`/`SiLU`/`GELU`/`SwiGLU`/`Sin`/`Cos`/`Abs`/`Exp`；forward 中为单输入/多输入逐元素运算且无广播 | `references/elewise/patterns.md` |
+| `broadcast` | forward 中为多输入逐元素运算且输入 shape 不同需广播对齐；文件名/类名含 `Add`/`Mul`/`Sub`/`Div` 且带广播 | `references/broadcast/patterns.md` |
+| `conversion` | 文件名/类名含 `Transpose`；forward 中出现 `tensor.transpose`、`tensor.permute`、`torch.transpose` | `references/conversion/patterns.md`（当前仅 Transpose 部分支持） |
+
+- 若算子同时命中多个类别（如 `MatMul` + `Bias` 融合），以**主计算类别**为准，通常 `matmul` > `flashattention` > `reduction` > `sort` > `broadcast` > `elementwise` > `conversion`。
+- 若不属于上述任何类别，`tiling_design_category = null`，跳过 Tiling 路由门禁。
+
+当 `tiling_design_category != null` 时：
+- Phase 3-C 必须执行「步骤 0-T：Tiling 设计路由」
+- Phase 4-C 必须执行「步骤 0-T：AscendC Tiling 路由」
+- 后续 TileLang 设计和 AscendC 转译必须遵循 `ascendc-tiling-design` skill 中对应类别的 Tiling 指南
+
 ---
 
 ## Phase 1: 环境准备 + 工程初始化
@@ -476,6 +498,59 @@ tl_conductor_suggestion = ""
 p_retry = 0            # 性能迭代轮次（3.5 使用）
 max_p_retries = 3      # 性能迭代预算上限
 ```
+
+#### 🛑 步骤 0-T: Tiling 设计路由（当 `tiling_design_category != null` 时强制执行）
+
+```text
+⚠️ 本步骤是硬性门禁。如果 model.py 被标记为 ascendc-tiling-design 已覆盖类别
+   （tiling_design_category != null），必须逐个完成以下 checklist 后才能进入
+   Block/Tile 层级设计。禁止跳过。
+```
+
+**0-T.1 🛑 读取 ascendc-tiling-design 分类表（必须，不可跳过）**:
+- Read `.claude/skills/ascendc-tiling-design/SKILL.md` 的算子分类表，确认本算子对应类别的参考文档路径
+
+**0-T.2 🛑 读取对应类别的场景路由文档（必须，不可跳过）**:
+- `matmul` → Read `.claude/skills/ascendc-tiling-design/references/matmul/patterns.md`
+- `flashattention` → Read `.claude/skills/ascendc-tiling-design/references/flashattention/patterns.md`
+- `reduction` → Read `.claude/skills/ascendc-tiling-design/references/reduction/patterns.md`
+- `sort` → Read `.claude/skills/ascendc-tiling-design/references/sort/patterns.md`
+- `elementwise` → Read `.claude/skills/ascendc-tiling-design/references/elewise/patterns.md`
+- `broadcast` → Read `.claude/skills/ascendc-tiling-design/references/broadcast/patterns.md`
+- `conversion` → Read `.claude/skills/ascendc-tiling-design/references/conversion/patterns.md`
+
+**0-T.3 🛑 按类别读取深度设计文档（必须，不可跳过）**:
+- `matmul`：
+  - DAV_2201 → Read `.claude/skills/ascendc-tiling-design/references/matmul/ascendc-api-matmul-tiling.md`
+  - DAV_3510 → Read `ascendc-blaze-best-practice` 中的对应 tiling 文档
+  - GroupedMatmul → 额外 Read `.claude/skills/ascendc-tiling-design/references/matmul/ascendc-api-gmm-tiling.md`
+- `reduction` → Read `.claude/skills/ascendc-tiling-design/references/reduction/algorithms.md`
+- `sort` → Read `.claude/skills/ascendc-tiling-design/references/sort/alg-two-level-mrgsort.md`
+- 其他类别 → 视 patterns.md 中指引继续阅读
+
+**0-T.4 🛑 在思考中确认并记录 Tiling 策略摘要**:
+- 多核切分策略：按哪个维度切、每个核处理多少、核数如何确定
+- UB 切分策略：单次处理数据量、是否需要分 chunk、chunk 大小公式
+- Buffer 规划：输入/输出/中间 buffer 列表及大小、是否使用 double buffer
+- 分支场景覆盖：dtype、shape 大小、对齐、边界情况
+- 平台路由：DAV_2201 还是 DAV_3510，对应开发路径
+- 类别特定要点：
+  - matmul：transA/transB、Batch 处理、多核扩展、L2 Tiling、Split-K
+  - reduction：归约轴、算法选择（tree/sequential/online）、精度保持
+  - sort：多级归并、TopK 阈值、边界填充
+  - elementwise/broadcast：向量化 tile 大小、广播对齐、内存合并
+  - conversion：转置轴映射、对齐填充
+
+**0-T.5 🛑 将 Tiling 策略摘要作为上下文传递**:
+- 调用 `tilelang2ascend-tilelang-designer` skill 时，在 prompt 中显式说明：
+  - 本算子的 `tiling_design_category` 及对应类别
+  - 必须遵循 `ascendc-tiling-design` 中该类别的 Tiling 指南
+  - 提供 0-T.4 中确认的 Tiling 策略摘要
+
+**门禁规则**：
+- 如果 `tiling_design_category != null` 但 0-T.1-0-T.5 未完成 → **禁止**进入 Block/Tile 层级设计，**禁止**生成任何 `design/` 下的代码
+- 如果 `tiling_design_category == null` → 跳过步骤 0-T，进入原有流程
+- 禁止凭记忆或经验跳过 `ascendc-tiling-design` 文档直接设计
 
 #### 前置：Block / Tile 层级设计（仅首次）
 
@@ -683,6 +758,56 @@ elif op_type == "complex":
 ### Phase 4-C: 复杂算子 — TileLang → AscendC 转译
 
 ### 迭代执行
+
+#### 🛑 步骤 0-T: AscendC Tiling 路由（当 `tiling_design_category != null` 时强制执行）
+
+```text
+⚠️ 本步骤是硬性门禁。如果 model.py 被标记为 ascendc-tiling-design 已覆盖类别
+   （tiling_design_category != null），必须逐个完成以下 checklist 后才能开始
+   AscendC 转译。禁止跳过。
+```
+
+**0-T.1 🛑 重新确认类别与 Tiling 策略（必须，不可跳过）**:
+- Read `.claude/skills/ascendc-tiling-design/SKILL.md` 的算子分类表，确认 `tiling_design_category` 对应的参考文档
+- Read 对应类别的 `references/<category>/patterns.md`
+- 若类别为 `matmul`：
+  - Read `.claude/skills/ascendc-tiling-design/references/matmul/ascendc-api-matmul-tiling.md`
+  - GroupedMatmul 额外读取 `ascendc-api-gmm-tiling.md`
+  - 调用 `npu-arch` skill 确认目标平台 NpuArch
+- 若类别为 `reduction`：Read `.claude/skills/ascendc-tiling-design/references/reduction/algorithms.md`
+- 若类别为 `sort`：Read `.claude/skills/ascendc-tiling-design/references/sort/alg-two-level-mrgsort.md`
+
+**0-T.2 🛑 按类别确认转译约束（必须，不可跳过）**:
+- 通用约束（所有类别）：
+  - 多核切分、UB 切分、Buffer 规划、分支覆盖必须与 `ascendc-tiling-design` 中对应类别指南一致
+  - 核数必须通过 `npu-arch` / `platform_ascendc` 动态获取，禁止硬编码
+  - `blockDim` 必须与多核切分结果一致，kernel 内部通过 `GetBlockIdx()` 计算工作范围
+- `matmul` 额外约束：
+  - Host 侧使用 `MatmulApiTiling::GetTiling(TCubeTiling&)` 并强制覆写 `M / N / Ka / Kb`
+  - 若 `totalBlock < aicCoreNum`，执行多核切分扩展（保持 ALIGNED_H=16 对齐）
+  - Kernel 入口必须有 `if (GetBlockIdx() >= totalBlock) return;` 越界守卫
+  - Kernel 端按 `blockIdx → (mIdx, nIdx)` 计算偏移和尾块尺寸，调用 `SetSingleShape`
+  - TilingHeader 通过 blocking copy 下发到 device
+  - BatchMatMul 必须填充 `MultiBatchInfo`
+- `reduction` 额外约束：
+  - 明确归约轴、算法选择、精度保持策略
+  - 大 shape 分块归约时考虑 workspace 累加
+- `sort` 额外约束：
+  - 多级归并 tiling、边界填充到 64 倍数、索引 buffer 规划
+- `elementwise` / `broadcast` 额外约束：
+  - 向量化 tile 大小、广播对齐、内存合并访问
+- `conversion` 额外约束：
+  - 转置轴映射、对齐填充、32B/512B 对齐搬运
+
+**0-T.3 🛑 将约束注入 translator 调用**:
+- 调用 `tilelang2ascend-translator` skill 时，在 prompt 中显式说明：
+  - 本算子的 `tiling_design_category` 及对应类别
+  - 必须遵循 `ascendc-tiling-design` 中该类别的指南和 0-T.2 的约束
+  - 要求生成的 `op_host/<op>.cpp` 和 `op_kernel/<op>.cpp` 满足上述 checklist
+
+**门禁规则**：
+- 如果 `tiling_design_category != null` 但 0-T.1-0-T.3 未完成 → **禁止**调用 `tilelang2ascend-translator`，**禁止**编写任何 `kernel/` 下的代码
+- 如果 `tiling_design_category == null` → 跳过步骤 0-T，进入原有流程
 
 ---
 

@@ -106,8 +106,6 @@ mkdir -p build/input build/output
 | **BF16 通过但 FP16/FP32 失败** | (1) 部分 API 不支持 BF16，BF16 走了更简单的 fallback 路径反而正确；(2) BF16 与 FP16/FP32 精度特性不同（BF16 mantissa 7bit vs FP16 10bit），精度阈值或溢出行为差异 | 先排查 API fallback 分支差异，再检查精度阈值（rtol/atol）是否适配各 dtype |
 | **FP32 通过但 FP16/BF16 失败** | 半精度中间计算精度不足 | 升精度：Cast → FP32 计算 → Cast 回半精度 |
 | **修改代码后输出完全不变** | 二进制未更新 / 编译器缓存 | 清理 build/ 和 $HOME/atc_data/kernel_cache/ 后重试 |
-| **MIX 模式输出全 0/NaN，位置逐 run 变化** | 带病 NPU（前次 hang 残留致 cross-core barrier 失效）或 AIC/AIV barrier 失配 | 先换干净 NPU 重跑：同 binary PASS ⇒ 卡问题；仍现则数两侧 SyncAll\<false\> 次数（见 ascendc-crash-debug 的 [mix-hang-debug.md](../ascendc-crash-debug/references/mix-hang-debug.md)） |
-| **kernel 已执行但输出被覆盖为全 0（host 侧）** | torch fill/预处理算子与裸 aclrtlaunch 启动**流竞争**（实例：torch::zeros 的 fill 在 kernel 写完后执行） | 启动改用 `OpCommand::RunOpApi`（EXEC_KERNEL_CMD）入队保证同流顺序，或启动前显式 `aclrtSynchronizeDevice` |
 
 ### 诊断模式："FP32 通过但 FP16/BF16 失败"
 

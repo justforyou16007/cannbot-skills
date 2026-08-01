@@ -9,33 +9,45 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # ----------------------------------------------------------------------------------------------------------
 
-"""Block-level 设计：Stage3 — chunk 内贡献累加。
+"""Block-level 设计：Stage3 — chunk 内贡献累加（V4 / C4）。
 
-对应 AscendC：`kernel/op_kernel/chunk_gated_delta_rule_stage3.h` 的 `Stage3` 类。
-消费 Stage1 产出的 qkt / gCumExp / vInner 与 Stage2 写好的 out，对组内每个 chunk：
+对应 AscendC `Stage3`（stage3.h）。消费 Stage1 的 qkt/gCumExp/vInner 与 Stage2 写好的
+out（attn_inter 部分），对当前 chunk：
 
-  attn_c = mask(qkt * decay)          # qkt 乘 decay 并施加因果 mask（j<=i 保留），
-                                      # 再乘 scale（AIV：Muls + Cast，AIC 用 masked 矩阵）
-  out   += attn_c @ v_new             # cube matmul，累加到 Stage2 已写的 attn_inter 上
+    V4  attn_c = mask(qkt * decay) * scale     # decay[i][j]=g_exp[i]*g_exp_neg[j] (j<=i)
+                                                # 因果 mask 保留 j<=i（含对角）
+    C4  out += attn_c @ v_new                  # (C,C) @ (C,Dv)，累加到 out_slice
 
 说明：
-- `attn_c` 是 chunk 内的因果注意力矩阵（只对 j<=i 生效，含对角线），对应 golden 的
-  `(q*scale @ k^T * decay).tril()`。
-- `out = attn_inter + attn_c @ v_new` 的两部分由 Stage2（attn_inter）与 Stage3
-  （attn_c @ v_new）分工完成，最终写回 out 的 bf16 输出。
-- 本阶段不再依赖历史状态，只做 chunk 内矩阵乘；与 Stage2 之间通过全核同步保证
-  out 的 attn_inter 部分已就绪。
+- v_new 由 Stage2 在 v_inner 缓冲区内完成（v_inner - v_prime），此处直接读。
+- out 最终 = Stage2 的 attn_inter + Stage3 的 attn_c@v_new，两部分分工完成。
+- 本阶段不依赖历史状态；C/V 交接经 workspace/UB。
+
+## C/V 子阶段（块内）
+
+    V4  attn_c = mask(qkt*decay)*scale（qkt 来自 ws_qkt，decay 由 ws_gcumexp 折叠）
+    C4  out_slice += attn_c @ v_new（v_new 在 v_inner 缓冲区内）
 """
 
+import tilelang.language as T
 
-def stage3(
-    qkt,           # (Nv, group_len, C)   bf16，Stage1 产出（原始 q@k^T）
-    g_cum_exp,     # (Nv, group_len)      fp32，Stage1 产出
-    v_inner,       # (Nv, group_len, Dv)  bf16，Stage1 产出（含 v_prime 贡献，见 Stage2）
-    scale,         # q 缩放因子
-    out,           # (T, Nv, Dv)          bf16，累加 attn_c @ v_new
+
+def run_stage3(
+    ws_qkt,           # (C, C) bf16，Stage1 产物（原始 q@k^T）
+    ws_gcumexp,       # (C,)   fp32，Stage1 产物（exp(g_cum)）
+    ws_vinner,        # (C, Dv) bf16，含 Stage2 的 v_prime 贡献（即 v_new）
+    scale, valid, C, dk, dv,
+    out_slice,        # out[s0:s0+valid, h, :]，累加 attn_c @ v_new
 ):
-    """对组内每个 chunk 把 chunk 内贡献 attn_c @ v_new 累加到 out（见顶部公式）。"""
-    # AIV：attn_c = mask(qkt * decay) * scale（decay 由 g_cum_exp 折叠）
-    # AIC：out += attn_c @ v_new（v_new 在 v_inner 缓冲区内，含 Stage2 的 v_prime 贡献）
-    raise NotImplementedError("Stage3 计算细节见 tile_level 设计与 golden（model.py）")
+    """把当前 chunk 的 chunk 内贡献 attn_c@v_new 累加到 out_slice（见顶部公式）。"""
+    # ---- V4：attn_c = mask(qkt*decay)*scale ----
+    with T.Scope("V"):
+        # TODO(tile-level): 由 ws_qkt 与 ws_gcumexp 折叠出 decay，施加因果 mask（j<=i），乘 scale
+        pass
+
+    # ---- C4：out += attn_c @ v_new ----
+    with T.Scope("C"):
+        # TODO(tile-level): T.gemm(累加, attn_c, v_new) -> out_slice
+        pass
+
+    T.barrier_all()

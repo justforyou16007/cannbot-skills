@@ -9,43 +9,57 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # ----------------------------------------------------------------------------------------------------------
 
-"""Block-level 设计：Stage2 — 跨 chunk 递推（状态依赖的部分）。
+"""Block-level 设计：Stage2 — 跨 chunk 递推（C3 / V2 / V3）。
 
-对应 AscendC：`kernel/op_kernel/chunk_gated_delta_rule_stage2.h` 的 `Stage2` 类。
-消费 Stage1 产出的 workspace（kCumDecay / vInner / qPrime / gCum / kg）与当前状态
-S（首组用 initial_state，后续用上一组 final_state），对组内每个 chunk：
+对应 AscendC `Stage2`（stage2.h）。消费 Stage1 workspace（kCumDecay/vInner/qPrime/gCum/kg）
+与当前状态 S（首组=initial_state，后续=上一 chunk 更新后的 S），对当前 chunk：
 
-  g_last    = exp(g_cum[last])                          # CalGCumExp：本 chunk 末尾衰减
-  v_prime   = k_cumdecay @ S                            # cube matmul（CalVPrime）
-  v_new     = v_inner - v_prime                          # 减法在 vInner 上完成
-  attn_inter = qPrime @ S                               # cube matmul -> 写入 out（CalAttnInter）
-  S         = g_last * S + kg^T @ v_new                 # CalStateNew：状态更新 -> final_state
+    C3  v_prime    = k_cumdecay @ S            （C×Dk @ Dk×Dv -> C×Dv）
+        attn_inter = qPrime @ S               （C×Dk @ Dk×Dv -> C×Dv）-> 写 out
+    V2  v_new      = v_inner - v_prime        （逐元素，v_inner 来自 Stage1）
+    V3  S'         = g_last*S + kg^T @ v_new  （g_last=exp(g_cum[last])；kg 来自 Stage1）
+                  -> 写 final_state[b,h]（块内 UB 状态更新）
 
 说明：
-- `v_new = v_inner - v_prime`：v_inner 是 chunk 内反演值，减掉「历史状态对本 chunk
-  的贡献」v_prime 得到真正的增量。AscendC 里通过 CalVPrime 把 `k_cumdecay@S` 累加到
-  vInner 缓冲区（符号经 k_cumdecay 约定吸收）。
-- `attn_inter` 是 out 的第一部分（历史状态贡献），直接写 `out`；本 chunk 内部
-  的贡献 `attn_c @ v_new` 由 Stage3 再累加。
-- 状态 S 更新为 `g_last*S + kg^T@v_new`（kg = k*exp(g_last-g_cum)，Stage1 产出），
-  写回 final_state，供下一 chunk-group 使用。
-- 一个 chunk-group 内各 chunk 的 S 是串行递推的；跨 chunk-group 通过 GM final_state
-  携带 + 全核同步。
+- out 本阶段只写 attn_inter（历史状态对本 chunk 的贡献）；chunk 内贡献 attn_c@v_new
+  由 Stage3 累加。
+- 状态 S 更新为 `g_last*S + kg^T@v_new`，写回 final_state，并保留在块内 UB 供下一 chunk。
+- C3 的 matmul 在 C 侧；V2/V3 的逐元素与状态更新在 V 侧；C/V 经 workspace/UB 交接。
+
+## C/V 子阶段（块内）
+
+    C3  v_prime = k_cumdecay @ S；attn_inter = qPrime @ S
+    V2  v_new = v_inner - v_prime
+    V3  S = g_last*S + kg^T @ v_new（kg^T @ v_new 是 (Dk,C)@(C,Dv)，也可放 C 侧 matmul）
 """
 
+import tilelang.language as T
 
-def stage2(
-    k_cumdecay,      # (Nv, group_len, Dk)  bf16，Stage1 产出
-    v_inner,         # (Nv, group_len, Dv)  bf16，Stage1 产出
-    q_prime,         # (Nv, group_len, Dk)  bf16，Stage1 产出
-    g_cum,           # (Nv, group_len)      fp32，Stage1 产出
-    kg,              # (Nv, group_len, Dk)  bf16，Stage1 产出
-    state_in,        # (Nv, Dv, Dk)         首组=initial_state，后续=final_state
-    out,             # (T, Nv, Dv)          bf16，写 attn_inter
-    final_state,     # (B, Nv, Dv, Dk)      bf16，写更新后状态
+
+def run_stage2(
+    ws_gcumexp, ws_kcumdecay, ws_vinner, ws_qprime, ws_kg,
+    state,            # (Dv, Dk) fp32 块内 UB，跨 chunk 携带
+    valid, C, dk, dv,
+    out_slice,        # out[s0:s0+valid, h, :]，写 attn_inter
+    final_state_slice,  # final_state[b, h, :, :]，写更新后状态
 ):
-    """对组内每个 chunk 用当前状态 S 计算 out 的状态部分 + 更新 S（见顶部公式）。"""
-    # AIC：v_prime = k_cumdecay @ S；attn_inter = qPrime @ S -> out；
-    #      S = g_last*S + kg^T @ v_new -> final_state
-    # AIV：g_last = exp(g_cum[-1])；v_new = v_inner - v_prime
-    raise NotImplementedError("Stage2 计算细节见 tile_level 设计与 golden（model.py）")
+    """当前 chunk 的跨 chunk 递推（依赖状态 S），更新 S 并写 out 的状态部分。"""
+    # ---- C3：v_prime / attn_inter ----
+    with T.Scope("C"):
+        # TODO(tile-level): T.gemm(v_prime, k_cumdecay, state)
+        #                    T.gemm(attn_inter, qPrime, state) -> out_slice
+        pass
+
+    # ---- V2：v_new = v_inner - v_prime ----
+    with T.Scope("V"):
+        # TODO(tile-level): v_new = v_inner - v_prime（逐元素）
+        pass
+
+    # ---- V3：S = g_last*S + kg^T @ v_new ----
+    with T.Scope("V"):
+        # TODO(tile-level): g_last = exp(ws_gcumexp[C-1])
+        #                    state = g_last*state + kg^T @ v_new
+        #                    T.copy(state 降型, final_state_slice)
+        pass
+
+    T.barrier_all()

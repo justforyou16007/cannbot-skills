@@ -14,7 +14,7 @@ has_playbook: true
 
 ## 核心思想
 
-**识别信号**：kernel 内层循环用 `Mul + ReduceSum` 逐 `(qi, kj)` 对算 QK^T 点积、用标量 `Muls + Add` 逐元素累加 PV、逐元素 `GetValue` 读 score——这是用 Vector 单元模拟矩阵运算，性能在架构层面被封顶（Cube 的 fp16 算力比 Vector 高一个数量级以上）。若同时把 Q/K/V 先 `Cast` 成 fp32 再算，UB 流量还要翻倍。
+kernel 内层循环用 `Mul + ReduceSum` 逐 `(qi, kj)` 对算 QK^T 点积、用标量 `Muls + Add` 逐元素累加 PV、逐元素 `GetValue` 读 score——这是用 Vector 单元模拟矩阵运算，性能在架构层面被封顶（Cube 的 fp16 算力比 Vector 高一个数量级以上）。若同时把 Q/K/V 先 `Cast` 成 fp32 再算，UB 流量还要翻倍。
 
 重写为 Cube mmad 的四个关键决策：
 

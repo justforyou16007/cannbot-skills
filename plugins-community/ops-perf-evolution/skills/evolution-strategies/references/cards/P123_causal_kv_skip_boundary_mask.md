@@ -14,7 +14,7 @@ has_playbook: true
 
 ## 核心思想
 
-**识别信号**：causal 的实现是"全量 KV 循环 + 逐元素兜底"——KV 循环永远跑满 `kvLen/BN` 轮，每轮对 score 逐元素判断可见性并填 `-inf`。下三角以外的 tile 被完整地"算一遍再扔掉"，causal 场景近一半的 QK^T/PV 计算和 K/V 搬运是纯浪费。
+causal 的朴素实现是"全量 KV 循环 + 逐元素兜底"：KV 循环永远跑满 `kvLen/BN` 轮，每轮对 score 逐元素判断可见性并填 `-inf`。下三角以外的 tile 被完整地"算一遍再扔掉"，causal 场景近一半的 QK^T/PV 计算和 K/V 搬运是纯浪费。
 
 三级优化：
 

@@ -3,12 +3,12 @@
 Source: 43 production-grade operators + 6 CV fused operator expert implementations (IdeaPool). Select all applicable strategies for your operator, then **Read each referenced detail file** before writing AscendC code.
 
 ## 编号说明
-策略卡共 138 张：P 系列（性能，P1-P123）/ D 系列（数据类型，D1-D5）/ A 系列（精度，A1-A8）/ R 系列（A5 架构，R1-R8）。P 系列编号存在间隙（P15, P23, P27, P31, P36, P39），为预留位。
+策略卡共 141 张：P 系列（性能，P1-P126）/ D 系列（数据类型，D1-D5）/ A 系列（精度，A1-A8）/ R 系列（A5 架构，R1-R8）。P 系列编号存在间隙（P15, P23, P27, P31, P36, P39），为预留位。
 所有有效策略 ID 均在下方表格中列出。Agent 在 strategy_combination 中只应使用下方表格中的 ID。
 
 ## Layer 定义
 - **L0 (Universal)**: 适用于几乎所有算子的通用策略（D1-D5, P1-P12, A1-A8）
-- **L1 (Advanced)**: 适用于特定类别算子的高级策略（P14-P123）
+- **L1 (Advanced)**: 适用于特定类别算子的高级策略（P14-P126）
 - **L2 (Discovered)**: 进化过程中发现的新策略（X1+）
 
 ## Tags 体系
@@ -258,6 +258,16 @@ P67-P69 为 Vector 计算效率基础策略（Counter 模式、低延迟归约�
 | P122 | KV stack large tile + L1 adaptive | L1 | flash_attention, matmul | KV tile ≤128 或 L1 划分硬编码时：KV 堆叠 512 摊薄握手 + nDyn/kDyn 按 L1 预算公式自适应 | playbooks/P122_kv_stack_large_tile_l1_adaptive.md |
 | P123 | Causal KV skip + boundary mask | L1 | flash_attention, mask | causal/sparse 全量循环 + 逐元素 mask 兜底时：noSkipKvS 循环界裁剪 + 边界 tile mask 特化 + dtype×mask 编译期 4 入口分发 | playbooks/P123_causal_kv_skip_boundary_mask.md |
 
+## 性能优化策略 — MLA Decode 实战优化 (P124-P126) [Layer: L1-L2]
+
+这三张卡覆盖 MLA decode 的三个增量优化点：K 维拼接、任务边界流水、变长调度。依赖顺序：P124 要求 P120 已建立 cube 路径；P125 要求 P121 已铺 CV 流水；P126 独立可先行。
+
+| ID | Strategy | Layer | Tags | When to Apply | Detail File |
+|----|----------|-------|------|---------------|-------------|
+| P124 | MLA nope+rope concat GEMM K | L1 | flash_attention | QK^T 的 nope/rope 两段独立计算再相加时：拼成单 GEMM K 维（embed-split 128 分段流水 + Q 拼接常驻 L1 + 单 L0C 累加一次写回） | playbooks/P124_mla_nope_rope_concat_gemm_k.md |
+| P125 | Cross-task cube prefetch | L2 | flash_attention, cv_fusion | CV 流水多任务 kernel 任务边界断流时：KV 循环尾部一拍预读下一任务 tiling 并预发射其首块 QK^T（含 Q→L1），pingpongIdx 跨任务连续 | playbooks/P125_cross_task_cube_prefetch.md |
+| P126 | GM tiling table task schedule | L1 | flash_attention | decode 变长 kvSeqlen 仍按 totalQ 均匀切分 + 除法反解坐标时：host 拍平任务表（kvSeqlen 降序）+ kernel process 轮询领取，一次 launch 跑全 batch | playbooks/P126_gm_tiling_table_task_schedule.md |
+
 ## 精度优化策略 (A1-A8) [Layer: L0]
 
 | ID | Strategy | Layer | Tags | When to Apply | Detail File |
@@ -321,7 +331,7 @@ P67-P69 为 Vector 计算效率基础策略（Counter 模式、低延迟归约�
 | Special / Complex ops | D2, D3 | P85, P88, P96, P102 |
 | CV Matmul (Cube+Vector) | D1, D3, P1, P4, P7, A3 | P14, P17, P46, P47, P49, P51, P52, P63, P70, P71, P72, P73, P78, P79, P83, P86, P87, P90, P92, P93, P102, P103, P104, P105, P106, P107, P108, P117, P120 |
 | CV FFN (MoE) | D1, D3, P1, P4, A1 | P46, P48, P49, P50, P73, P75, P88 |
-| Flash Attention | D1, P1, P5, A4, A5 | P14, P16, P17, P18, P29, P38, P53, P57, P58, P60, P61, P76, P77, P80, P90, P91, P115, P116, P117, P118, P119, P120, P121, P122, P123 |
+| Flash Attention | D1, P1, P5, A4, A5 | P14, P16, P17, P18, P29, P38, P53, P57, P58, P60, P61, P76, P77, P80, P90, P91, P115, P116, P117, P118, P119, P120, P121, P122, P123, P124, P125, P126 |
 | Reduction (mean/sum/max/min) | D1, P1, P2, A1, A2 | P68, P69, P109, P110 |
 | Sort / TopK | D1, P1, P2, A7 | P96, P111 |
 | Transpose / Layout Conversion | D1, P1, P7, P10 | P26, P114 |
@@ -333,22 +343,22 @@ P67-P69 为 Vector 计算效率基础策略（Counter 模式、低延迟归约�
 
 | Bottleneck Type | Primary | Secondary | Anti |
 |-----------------|---------|-----------|------|
-| mte2_stall | P1, P10 | P2, P7, P19, P18, P56, P59, P66, P92, P93, P101, P112, P113, P114, P118, P119 | P3 |
+| mte2_stall | P1, P10 | P2, P7, P19, P18, P56, P59, P66, P92, P93, P101, P112, P113, P114, P118, P119, P124 | P3 |
 | mte3_stall | P1 | P8, P19, P40, P56, P59 | — |
-| tiling_imbalance | P4, P2 | P11, P47, P51, P58, P72, P73, P75, P104, P106, P116 | P3 |
+| tiling_imbalance | P4, P2 | P11, P47, P51, P58, P72, P73, P75, P104, P106, P116, P126 | P3 |
 | scalar_loading | P5, P67 | P2, P54, P90, P97, P99, P100, P101 | — |
-| scalar_compute | P5, P67, P94, P95, P98, P99, P100, P102 | P84, P103, P111, P120 | — |
+| scalar_compute | P5, P67, P94, P95, P98, P99, P100, P102 | P84, P103, P111, P120, P126 | — |
 | compute_bound | D1, P46, P94, P95, P96, P102 | A1, P47, P68, P69, P79, P84, P91, P92, P103, P120, P123 | — |
 | near_optimal | P98 | — | — |
-| no_overlap | P1 | P10, P19, P63, P118, P119, P121, P122 | — |
-| partial_overlap | P1, P2 | P8, P18, P26, P53, P83, P90 | — |
+| no_overlap | P1 | P10, P19, P63, P118, P119, P121, P122, P125 | — |
+| partial_overlap | P1, P2 | P8, P18, P26, P53, P83, P90, P125 | — |
 | undersize_transfer | P2, P10 | P7, P25, P45, P66 | — |
 | icache_miss | — | — | — |
 | bus_contention | P8, P65 | P1, P28, P64, P93 | — |
 | l2_cache_thrash | P52, P74 | P61, P78, P105, P107 | — |
 | ub_memory_pressure | P8, P85 | P81, P88, P89, P110, P111 | P20 |
 | tiling_mismatch | P104, P108 | P105, P106, P107, P115 | — |
-| cube_underutilization | P104, P106 | P102, P115, P116, P117, P122, P123 | — |
+| cube_underutilization | P104, P106 | P102, P115, P116, P117, P122, P123, P124 | — |
 | sync_overhead | P4, A4 | P111, P115 | — |
 | vec_underutilization | P112 | P67, P69 | — |
 | tail_block | P11 | P112, P113, P114 | — |

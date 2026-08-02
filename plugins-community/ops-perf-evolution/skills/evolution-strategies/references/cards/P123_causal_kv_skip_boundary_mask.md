@@ -14,9 +14,9 @@ has_playbook: true
 
 ## 核心思想
 
-老版 MHA 的 causal 处理是**纯元素级兜底**：KV 循环永远跑满 `kvLen/BN` 轮，每轮对 score 逐元素判断 `ks+kj > gq+off` 并 `Duplicate(NEG)` 填充——下三角以外的 tile 被完整地"算一遍再扔掉"，causal 场景近一半的 QK^T/PV 计算和 K/V 搬运是纯浪费。
+**识别信号**：causal 的实现是"全量 KV 循环 + 逐元素兜底"——KV 循环永远跑满 `kvLen/BN` 轮，每轮对 score 逐元素判断可见性并填 `-inf`。下三角以外的 tile 被完整地"算一遍再扔掉"，causal 场景近一半的 QK^T/PV 计算和 K/V 搬运是纯浪费。
 
-FIA SplitFuse 的三级跳：
+三级优化：
 
 1. **循环界跳过（tile 级）**：causal 时直接把 KV 循环上界裁到可见范围——
    `noSkipKvS = min(kvSeqlen, (qSBlockIdx+1)*qSTile + max(kvSeqlen-qSeqlen, 0))`，

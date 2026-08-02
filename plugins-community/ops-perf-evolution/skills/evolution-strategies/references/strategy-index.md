@@ -3,8 +3,7 @@
 Source: 43 production-grade operators + 6 CV fused operator expert implementations (IdeaPool). Select all applicable strategies for your operator, then **Read each referenced detail file** before writing AscendC code.
 
 ## 编号说明
-P 系列编号中存在间隙（P15, P23, P27, P31, P36, P39），这些编号为预留位，当前无对应策略文件。
-P53-P88 为 fork-B 增量补充的高级策略，已纳入本索引。P94-P100 为标量计算向量化替代策略（2026-07 补充）。P102-P103 为 MIX CV 融合架构重写策略（2026-07 补充，gated_delta_rule 实例：scalar/VEC → MIX_AIC_1_1，geomean 8.85x）。P104-P115 为 Ascend C Tiling 系统化设计策略（2026-07 补充，来自 `ascendc-tiling-design` skill 方法论）。P116-P119 为 GQA/FlashAttention 实战优化策略（2026-07 补充，来自 Z-Search 实战：G→M 维合并、host 端 matmul tiling 配方、mask 预生成剥离、online softmax 改写）。P120-P123 为 MHA Cube 化实战优化策略（2026-08 补充，来自 Z-Search 实战：向量点积→Cube mmad 重写、SplitFuse CV 流水、KV 堆叠大块化、causal 跳过边界特化）。
+策略卡共 138 张：P 系列（性能，P1-P123）/ D 系列（数据类型，D1-D5）/ A 系列（精度，A1-A8）/ R 系列（A5 架构，R1-R8）。P 系列编号存在间隙（P15, P23, P27, P31, P36, P39），为预留位。
 所有有效策略 ID 均在下方表格中列出。Agent 在 strategy_combination 中只应使用下方表格中的 ID。
 
 ## Layer 定义
@@ -250,7 +249,7 @@ P67-P69 为 Vector 计算效率基础策略（Counter 模式、低延迟归约�
 
 ## 性能优化策略 — MHA Cube 化实战优化 (P120-P123) [Layer: L1-L2]
 
-这些策略来自 MHA 算子老版（纯向量 Mul+ReduceSum 点积 + 标量 GetValue + 全量 fp32 Cast）→ 新版（官方 FIA SplitFuse cube 移植）实现的性能对比提炼，覆盖纯向量 attention 到 cube 流水的完整改造链：mmad 重写 → CV 流水 → tile 大块化 → causal 跳过。
+这些策略覆盖纯向量 attention 到 cube 流水的完整改造链：mmad 重写 → CV 流水 → tile 大块化 → causal 跳过。四张卡存在依赖顺序：先 P120 建立 cube 路径，再 P121/P122 铺流水与大块化，P123 随时可叠加。
 
 | ID | Strategy | Layer | Tags | When to Apply | Detail File |
 |----|----------|-------|------|---------------|-------------|

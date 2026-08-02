@@ -14,13 +14,13 @@ has_playbook: true
 
 ## 核心思想
 
-老版 MHA（纯向量 v46，910B3）用 `Mul + ReduceSum` 逐 `(qi, kj)` 对做 QK^T 点积、用标量 `Muls + Add` 逐元素累加 PV——**用 Vector 单元模拟矩阵运算，性能在架构层面被封顶**（Cube 的 fp16 算力比 Vector 高一个数量级以上）。同时它把 Q/K/V 全部 `Cast` 成 fp32 再算，UB 流量翻倍；tile 只有 BM=16/BN=32。
+**识别信号**：kernel 内层循环用 `Mul + ReduceSum` 逐 `(qi, kj)` 对算 QK^T 点积、用标量 `Muls + Add` 逐元素累加 PV、逐元素 `GetValue` 读 score——这是用 Vector 单元模拟矩阵运算，性能在架构层面被封顶（Cube 的 fp16 算力比 Vector 高一个数量级以上）。若同时把 Q/K/V 先 `Cast` 成 fp32 再算，UB 流量还要翻倍。
 
-重写为 Cube mmad 的四个关键决策（新版 FIA SplitFuse 移植路线）：
+重写为 Cube mmad 的四个关键决策：
 
 1. **输入 dtype 直接进 Cube**：Q/K/V 保持 fp16/bf16 进 mmad，**不要先 Cast fp32**；fp32 只出现在 L0C 输出 S、online softmax 状态和 O 累加链。
 2. **K 按 ColumnMajor 读取 = 免转置 K^T**：QK^T 的 B 矩阵就是 K 的转置。GM 上 K 以行主序存储，按列主序视图读取，经 `Nd2NzParams` 一次 DMA 转为 nZ 分形进 L1，L1→L0B `ifTranspose=false` 直送——零显式 transpose。
-3. **Q preload 常驻 L1**：每个 task 开头 `loadQGM` 把 Q tile（128 行）一次性搬入 L1 并常驻，KV 循环只搬 K/V；L0A/L0B/L0C 全部双缓冲。
+3. **Q preload 常驻 L1**：每个 task 开头一次性把 Q tile（128 行）搬入 L1 并常驻，KV 循环只搬 K/V；L0A/L0B/L0C 全部双缓冲。
 4. **P 回写输入 dtype 喂第二级 mmad**：online softmax 输出的 P 从 fp32 `DownCast` 回 fp16/bf16（bf16 用 `CAST_RINT`、fp16 用 `CAST_NONE`）写 GM workspace，PV mmad 直接消费，O 以 fp32 在 L0C/GM 累加。
 
 与 P13 的关系：P13 是"标量/向量模拟矩阵运算 → MIX CV 重写"的**通用判定卡**；本卡是判定通过后在 **attention 场景的具体落地配方**（layout 选型、分形搬运、精度链路、tile 基准值）。
@@ -28,7 +28,7 @@ has_playbook: true
 ## 代码骨架
 
 ```cpp
-// === 改造前（老版 v46：向量点积 + 全量 fp32 Cast）===
+// === 改造前（向量点积 + 全量 fp32 Cast 形态）===
 for (int32_t qi = 0; qi < qr; qi++)
     for (int32_t kj = 0; kj < kr; kj++) {
         Mul(rw, qf[qi*Df], kf[kj*Df], Df);          // 逐对向量乘

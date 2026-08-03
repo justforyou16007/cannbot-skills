@@ -1,7 +1,8 @@
 # Block-level 设计质量自检清单
 
 > 仿 `ops/tilelang-op-design/references/quality-checklist.md`，针对 **block-level 设计**（对应
-> `BlockLevelDesign.md`）的自检清单。生成/修改 `design/block_level/*.py` 后逐项检查。
+> `BlockLevelDesign.md`）的自检清单。**适用于所有算子的 block-level 设计**，生成/修改
+> 任意 `design/block_level/*.py` 后逐项检查。
 
 | # | 检查项 | 是否必须通过 |
 |---|--------|-------------|

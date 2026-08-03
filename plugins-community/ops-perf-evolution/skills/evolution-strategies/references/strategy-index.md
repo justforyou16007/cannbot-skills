@@ -316,6 +316,16 @@ P67-P69 为 Vector 计算效率基础策略（Counter 模式、低延迟归约�
 4. Apply the selected patterns in `tiling_pass`, `init_pass`, `process_pass`, `process_nonaligned_pass`
 5. **Check compatibility**: Read `strategy-compatibility.md` to verify no mutual exclusions and all dependencies are met
 
+### 族判定快速路由（选策略前先归族）
+
+**不要靠算子名字判族**（EMSA / BAM / CoT / CrissCross / Window / Axial / BigBird / Linformer 等变体名字不含标准词）。按结构判据：
+
+- **FA 族**：model.py / kernel 满足以下任一 → 直接走下方"FA 算子族优化 SOP"按阶段选卡，不要平铺选卡：
+  1. 计算主干为 `Q@K^T → (scale + mask) → softmax → @V`（含 online softmax 变体）
+  2. kernel 含 online softmax 状态机（running max/sum/rescale）或 FA 特征参数（`preTokens`/`nextTokens`/sink/paged KV cache）
+  3. head 数关系命中 MHA/MQA/GQA（`num_q_heads` vs `num_kv_heads`，判据见 `../../evolution-knowledge/references/a3/algorithm_insights/attention_family.md`）
+- 其余族按算子结构对号下方查表行。
+
 ### 按算子类型快速查表 (Quick Reference by Operator Type)
 
 | Operator Type | L0 Strategies | L1 Strategies |

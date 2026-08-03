@@ -343,7 +343,7 @@ P67-P69 为 Vector 计算效率基础策略（Counter 模式、低延迟归约�
 
 | 阶段 | 目标 | 策略（按优先级） | 跳过条件 |
 |---|---|---|---|
-| S0 形态判定 | 确定基础形态（MHA/GQA/MLA）与正交 trait（稀疏/量化/decode/paged） | P115（Tiling 路由） | 每次必做，决定后续各阶段适用卡 |
+| S0 形态判定 | 按 head 数关系定基础形态（MHA/MQA/GQA/MLA，判据见 `../../evolution-knowledge/references/a3/algorithm_insights/attention_family.md`）+ 正交 trait（稀疏/量化/decode/paged，见 `families/flashattention_guide.md`） | P115（Tiling 路由） | 每次必做，决定后续各阶段适用卡 |
 | S1 结构改写 | 消除算法级浪费（收益最大） | P119（two-pass→online softmax）、P120（向量点积→cube mmad）、P124（MLA nope/rope 拼 K 维） | 已是 online softmax + cube 路径（如官方 FIA 移植实现）则整阶段跳过 |
 | S2 CV 流水 | AIC/AIV 生产者-消费者重叠 | P121（SplitFuse 流水，依赖 P120）、P14（CV 预发射）、P125（跨任务预取，依赖 P121）、P29（跨核同步） | 仍在纯 Vector 路径时先回 S1 完成 P120 |
 | S3 内存与搬运 | 摊薄握手/启动开销，L1/L2 常驻 | P122（KV 大块化 + L1 预算公式）、P18/P53（L1 常驻）、P38（softmax 状态常驻）、P60（decode KV NZ）、P61（L2 cache） | mte2_stall 非主瓶颈且 L1/UB 预算已达标 |

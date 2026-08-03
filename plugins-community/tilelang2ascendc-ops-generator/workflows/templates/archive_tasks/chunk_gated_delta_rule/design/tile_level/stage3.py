@@ -9,121 +9,80 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # ----------------------------------------------------------------------------------------------------------
 
-"""Tile-level 设计：Stage3 — chunk 内贡献累加（独立 jit kernel）。
+"""Tile-level Stage3 - chunk 内贡献累加（单 kernel 内的函数，非独立 jit）。
 
-Mirrors block_level/stage3.py / AscendC `Stage3`.  One standalone kernel that,
-for chunk column `ci`, adds the within-chunk part onto out (which Stage2 already
-seeded with attn_inter), for every unit in parallel:
+Mirrors block_level/stage3.py / AscendC `Stage3`, *inlined* into the single
+`chunk_gated_delta_rule` prim_func (no separate kernel).  For one `unit` and one
+chunk it adds the within-chunk contribution onto `out` (which Stage2 already
+seeded with attn_inter) for every unit:
 
     V4  attn_c = mask(qkt * decay) * scale     # decay=g_exp[i]*g_exp_neg[j], j<=i
-    C4  out   += attn_c @ v_new                # (C,C)@(C,Dv) cube, accumulate
+    C4  out_cont = attn_c @ v_new              # (C,C)@(C,Dv) cube
+    V5  out  += out_cont
 
-A standalone kernel launch is a hard host-level barrier.  All matmuls cube
-(T.gemm_v0), vector ops in T.Scope("V"); C<->V handoff via GM + cross-flag (6..7).
+UB reuse (学 AscendC `tmpBuff_`): `T.alloc_ub` temporaries are declared inside
+this function so the planner overlaps them with stage1/2 temporaries on the same
+physical UB.
+
+C<->V handoff per chunk via GM + cross-flag IDs 6,7, re-armed each iteration.
 """
 
-import tilelang
 import tilelang.language as T
 
-from design.chunk_gated_delta_rule_common import (
-    CHUNK_SIZE,
-    NUM_PHYSICAL_CORES,
-    pass_configs,
-)
 
+@T.macro(hygienic=False)
+def run_stage3(nk, nv, dk, dv, C, scale,
+               unit, b, h, s0, valid,
+               out, ws_qkt, ws_v_new, ws_g_exp, ws_g_exp_neg,
+               ws_attn_c, ws_out_cont):
+    # ---- V4 : attn_c = mask(qkt*decay)*scale ----
+    with T.Scope("V"):
+        qkt_bf_s3 = T.alloc_ub((C, C), "bfloat16")
+        qkt_ub_s3 = T.alloc_ub((C, C), "float32")
+        T.copy(ws_qkt[unit, 0, 0], qkt_bf_s3)
+        T.copy(qkt_bf_s3, qkt_ub_s3)
+        g_exp_s3 = T.alloc_ub((C,), "float32")
+        g_exp_neg_s3 = T.alloc_ub((C,), "float32")
+        T.copy(ws_g_exp[unit, 0], g_exp_s3)
+        T.copy(ws_g_exp_neg[unit, 0], g_exp_neg_s3)
+        # attn_c computed in-place over qkt_ub_s3 (masked + decayed), drops a
+        # separate (C,C) fp32 working buffer.
+        for i in T.serial(C):
+            for j in T.serial(C):
+                if j <= i:
+                    qkt_ub_s3[i, j] = qkt_ub_s3[i, j] * g_exp_s3[i] * g_exp_neg_s3[j] * scale
+                else:
+                    qkt_ub_s3[i, j] = 0.0
+        attn_bf_s3 = T.alloc_ub((C, C), "bfloat16")
+        T.copy(qkt_ub_s3, attn_bf_s3)
+        T.copy(attn_bf_s3, ws_attn_c[unit, 0, 0])
+        T.set_cross_flag("MTE3", 6)         # V -> C
 
-def key_head(h, nk, nv):
-    return (h * nk) // nv
+    # ---- C4 : out_cont = attn_c @ v_new ----
+    with T.Scope("C"):
+        T.wait_cross_flag(6)
+        ac_l1 = T.alloc_L1((C, C), "bfloat16")
+        vn_l1_s3 = T.alloc_L1((C, dv), "bfloat16")
+        T.copy(ws_attn_c[unit, 0, 0], ac_l1)
+        T.copy(ws_v_new[unit, 0, 0], vn_l1_s3)
+        oc_l0 = T.alloc_L0C((C, dv), "float32")
+        T.gemm_v0(ac_l1, vn_l1_s3, oc_l0, init=True)
+        T.copy(oc_l0, ws_out_cont[unit, 0, 0])
+        T.set_cross_flag("FIX", 7)         # C -> V
 
-
-@tilelang.jit(
-    out_idx=[],
-    workspace_idx=[],
-    pass_configs=pass_configs,
-)
-def stage3_ker(batch, seq_len, nk, nv, dk, dv, chunk_size=CHUNK_SIZE, scale=1.0):
-    C = chunk_size
-    total_units = batch * nv
-    used_core_num = min(NUM_PHYSICAL_CORES, max(1, total_units))
-    tasks_per_core = T.ceildiv(total_units, used_core_num)
-
-    @T.prim_func
-    def main(
-        out: T.Tensor((seq_len, nv, dv), "bfloat16"),              # 0
-        ws_qkt: T.Tensor((total_units, C, C), "bfloat16"),         # 1
-        ws_v_new: T.Tensor((total_units, C, dv), "bfloat16"),      # 2
-        ws_g_exp: T.Tensor((total_units, C), "float32"),           # 3
-        ws_g_exp_neg: T.Tensor((total_units, C), "float32"),       # 4
-        ws_attn_c: T.Tensor((total_units, C, C), "bfloat16"),      # 5
-        ws_out_cont: T.Tensor((total_units, C, dv), "bfloat16"),   # 6
-        actual_seq_lengths: T.Tensor((batch,), "int32"),           # 7
-        ci: T.Tensor((1,), "int32"),                               # 8  current chunk column
-        bb: T.Tensor((1,), "int32"),                               # 9  current batch
-    ):
-        with T.Kernel(used_core_num, is_npu=True) as (cid, vid):
-            for local_idx in T.serial(tasks_per_core):
-                unit = cid * tasks_per_core + local_idx
-                if unit < total_units:
-                    b = unit // nv
-                    h = unit % nv
-                    base = T.alloc_ub((1,), "int32")
-                    base[0] = 0
-                    for bbz in T.serial(b):
-                        base[0] += actual_seq_lengths[bbz]
-                    Lb = actual_seq_lengths[b]
-                    if b == bb[0] and ci[0] * C < Lb:
-                        s0 = base[0] + ci[0] * C
-                        valid = T.if_then_else(Lb - ci[0] * C < C, Lb - ci[0] * C, C)
-
-                        # ---- V4 : attn_c = mask(qkt*decay)*scale ----
-                        with T.Scope("V"):
-                            qkt_bf = T.alloc_ub((C, C), "bfloat16")
-                            qkt_ub = T.alloc_ub((C, C), "float32")
-                            T.copy(ws_qkt[unit, 0, 0], qkt_bf)
-                            T.copy(qkt_bf, qkt_ub)
-                            g_exp = T.alloc_ub((C,), "float32")
-                            g_exp_neg = T.alloc_ub((C,), "float32")
-                            T.copy(ws_g_exp[unit, 0], g_exp)
-                            T.copy(ws_g_exp_neg[unit, 0], g_exp_neg)
-                            attn_ub = T.alloc_ub((C, C), "float32")
-                            for i in T.serial(C):
-                                for j in T.serial(C):
-                                    if j <= i:
-                                        attn_ub[i, j] = qkt_ub[i, j] * g_exp[i] * g_exp_neg[j] * scale
-                                    else:
-                                        attn_ub[i, j] = 0.0
-                            attn_bf = T.alloc_ub((C, C), "bfloat16")
-                            T.copy(attn_ub, attn_bf)
-                            T.copy(attn_bf, ws_attn_c[unit, 0, 0])
-                            T.set_cross_flag("MTE3", 6)         # V -> C
-
-                        # ---- C4 : out_cont = attn_c @ v_new ----
-                        with T.Scope("C"):
-                            T.wait_cross_flag(6)
-                            ac_l1 = T.alloc_L1((C, C), "bfloat16")
-                            vn_l1 = T.alloc_L1((C, dv), "bfloat16")
-                            oc_l0 = T.alloc_L0C((C, dv), "float32")
-                            T.copy(ws_attn_c[unit, 0, 0], ac_l1)
-                            T.copy(ws_v_new[unit, 0, 0], vn_l1)
-                            T.gemm_v0(ac_l1, vn_l1, oc_l0, init=True)
-                            T.copy(oc_l0, ws_out_cont[unit, 0, 0])
-                            T.set_cross_flag("FIX", 7)         # C -> V
-
-                        # ---- V5 : out += attn_c @ v_new ----
-                        with T.Scope("V"):
-                            T.wait_cross_flag(7)
-                            out_bf = T.alloc_ub((C, dv), "bfloat16")
-                            out_ub = T.alloc_ub((C, dv), "float32")
-                            T.copy(out[s0:s0 + valid, h, 0:dv], out_bf)
-                            T.copy(out_bf, out_ub)
-                            ac_bf = T.alloc_ub((C, dv), "bfloat16")
-                            ac_ub = T.alloc_ub((C, dv), "float32")
-                            T.copy(ws_out_cont[unit, 0, 0], ac_bf)
-                            T.copy(ac_bf, ac_ub)
-                            for t in T.serial(C):
-                                for d in T.serial(dv):
-                                    out_ub[t, d] = out_ub[t, d] + ac_ub[t, d]
-                            T.copy(out_ub, out_bf)
-                            T.copy(out_bf[0:valid, 0:dv], out[s0:s0 + valid, h, 0:dv])
-
-    return main
+    # ---- V5 : out += attn_c @ v_new ----
+    with T.Scope("V"):
+        T.wait_cross_flag(7)
+        out_bf_s3 = T.alloc_ub((C, dv), "bfloat16")
+        out_ub_s3 = T.alloc_ub((C, dv), "float32")
+        T.copy(out[s0:s0 + valid, h, 0:dv], out_bf_s3)
+        T.copy(out_bf_s3, out_ub_s3)
+        ac_bf_s3 = T.alloc_ub((C, dv), "bfloat16")
+        ac_ub_s3 = T.alloc_ub((C, dv), "float32")
+        T.copy(ws_out_cont[unit, 0, 0], ac_bf_s3)
+        T.copy(ac_bf_s3, ac_ub_s3)
+        for t in T.serial(C):
+            for d in T.serial(dv):
+                out_ub_s3[t, d] = out_ub_s3[t, d] + ac_ub_s3[t, d]
+        T.copy(out_ub_s3, out_bf_s3)
+        T.copy(out_bf_s3[0:valid, 0:dv], out[s0:s0 + valid, h, 0:dv])

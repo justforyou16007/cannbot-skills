@@ -9,46 +9,68 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # ----------------------------------------------------------------------------------------------------------
 
-"""Block-level 设计：Stage3 — chunk 内贡献累加（V4 / C4）。
+"""Block-level 设计：Stage3 — chunk 内贡献累加（独立 jit kernel，对应 tile-level `stage3_ker`）。
 
-对应 AscendC `Stage3`（stage3.h）与 **tile-level 的 `stage3_ker`**（`design/tile_level/stage3.py`，
-独立 jit kernel）。消费 Stage1 的 qkt/gCumExp/vInner 与 Stage2 写好的
-out（attn_inter 部分），对当前 chunk：
+对应 AscendC `Stage3`（stage3.h）。消费 Stage1 的 qkt/gCumExp/vInner 与 Stage2 写好的
+out（attn_inter 部分），把 chunk 内贡献累加进 out。**不依赖状态，无串行**。
+满足 `BlockLevelDesign-quality-checklist.md`。
 
-    V4  attn_c = mask(qkt * decay) * scale     # decay[i][j]=g_exp[i]*g_exp_neg[j] (j<=i)
-                                                # 因果 mask 保留 j<=i（含对角）
-    C4  out += attn_c @ v_new                  # (C,C) @ (C,Dv)，累加到 out_slice
+## C/V 子阶段（checklist #4）
 
-说明：
-- v_new 由 Stage2 在 v_inner 缓冲区内完成（v_inner - v_prime），此处直接读。
-- out 最终 = Stage2 的 attn_inter + Stage3 的 attn_c@v_new，两部分分工完成。
-- 本阶段不依赖历史状态；C/V 交接经 workspace/UB。
+    V4  attn_c = mask(qkt · decay) · scale    （AIV 生成 masked qkt，写 tmpGM）
+    C4  out += attn_c @ v_new                 （cube，T.gemm_v0，累加到 out）
 
-## C/V 子阶段（块内）
+## workspace 读/写（checklist #6）
 
-    V4  attn_c = mask(qkt*decay)*scale（qkt 来自 ws_qkt，decay 由 ws_gcumexp 折叠）
-    C4  out_slice += attn_c @ v_new（v_new 在 v_inner 缓冲区内）
+    读：ws_qkt / ws_gcumexp / ws_vinner（含 Stage2 的 v_prime 贡献，即 v_new）
+    写：out（累加 attn_c@v_new）
+
+## 块内遍历（checklist #2）
+
+    with T.Kernel(used_core_num):
+        for unit in 分给本 kernel 的 (b, head) 集合:
+            if b == 当前 batch 且 属于本 chunk:
+                # 每单元：V4 -> C4
 """
 
+import tilelang
 import tilelang.language as T
 
+from design.chunk_gated_delta_rule_common import CHUNK_SIZE, pass_configs
 
-def stage3_ker(
-    ws_qkt,           # (C, C) bf16，Stage1 产物（原始 q@k^T）
-    ws_gcumexp,       # (C,)   fp32，Stage1 产物（exp(g_cum)）
-    ws_vinner,        # (C, Dv) bf16，含 Stage2 的 v_prime 贡献（即 v_new）
-    scale, valid, C, dk, dv,
-    out_slice,        # out[s0:s0+valid, h, :]，累加 attn_c @ v_new
-):
-    """把当前 chunk 的 chunk 内贡献 attn_c@v_new 累加到 out_slice（见顶部公式）。"""
-    # ---- V4：attn_c = mask(qkt*decay)*scale ----
-    with T.Scope("V"):
-        # TODO(tile-level): 由 ws_qkt 与 ws_gcumexp 折叠出 decay，施加因果 mask（j<=i），乘 scale
-        pass
 
-    # ---- C4：out += attn_c @ v_new ----
-    with T.Scope("C"):
-        # TODO(tile-level): T.gemm(累加, attn_c, v_new) -> out_slice
-        pass
+@tilelang.jit(out_idx=[], workspace_idx=[], pass_configs=pass_configs)
+def stage3_ker(batch, seq_len, nk, nv, dk, dv, chunk_size=CHUNK_SIZE, scale=1.0):
+    C = chunk_size
+    total_units = batch * nv
+    used_core_num = min(20, total_units)
 
-    T.barrier_all()
+    @T.prim_func
+    def main(
+        ws_qkt: T.Tensor((C, C), "bfloat16"),
+        ws_gcumexp: T.Tensor((C,), "float32"),
+        ws_vinner: T.Tensor((C, dv), "bfloat16"),
+        ci: T.Tensor((1,), "int32"),
+        bb: T.Tensor((1,), "int32"),
+        Lb: T.Tensor((1,), "int32"),
+        out: T.Tensor((seq_len, nv, dv), "bfloat16"),
+    ):
+        with T.Kernel(used_core_num, is_npu=True) as (cid, vid):
+            # TODO(tile-level): unit 分配；`h=unit%nv, s0=base[b]+ci[0]*C`
+            #                   `valid=T.if_then_else(...)`；`if b==bb[0]:`
+
+            # V4：attn_c = mask(qkt·decay)·scale
+            with T.Scope("V"):
+                # TODO(tile-level):
+                #   attn_c[i][j] = ws_qkt[i][j]*g_exp[i]*g_exp_neg[j]*scale (j<=i，因果含对角)
+                #   T.copy(attn_c, tmpGM)  # 供 C4 cube 读
+                pass
+
+            # C4：out += attn_c @ v_new（累加到 Stage2 写的 out）
+            with T.Scope("C"):
+                # TODO(tile-level):
+                #   T.gemm_v0(attn_c, v_new, out_acc)   # v_new = ws_vinner（含 v_prime 贡献）
+                #   T.copy 降型(out_acc) -> out[s0:s0+valid, h, 0:dv] 累加
+                pass
+
+    return main

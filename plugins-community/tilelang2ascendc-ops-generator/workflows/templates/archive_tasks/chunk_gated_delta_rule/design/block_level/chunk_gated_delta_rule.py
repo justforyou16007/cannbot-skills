@@ -73,14 +73,6 @@ from design.block_level.stage1 import run_stage1
 from design.block_level.stage2 import run_stage2
 from design.block_level.stage3 import run_stage3
 
-# workspace 索引常量（与 AscendC tiling 对齐）
-WS_GCUMEXP = 0    # (block_num, C)      fp32   g_cum 的 exp
-WS_KCUMDECAY = 1  # (block_num, C, Dk)  bf16
-WS_VINNER = 2     # (block_num, C, Dv)  bf16
-WS_QPRIME = 3     # (block_num, C, Dk)  bf16
-WS_QKT = 4        # (block_num, C, C)   bf16
-WS_KG = 5         # (block_num, C, Dk)  bf16
-
 
 @tilelang.jit(out_idx=[7, 8], workspace_idx=[9, 10, 11, 12, 13, 14], pass_configs=pass_configs)
 def chunk_gated_delta_rule(batch, seq_len, nk, nv, dk, dv, chunk_size=CHUNK_SIZE, scale=1.0):

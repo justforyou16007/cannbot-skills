@@ -33,16 +33,16 @@ grep -nE "block|tile|task|splitKV|mEff|Bk" \
 | 稀疏 trait | 无 / 有 | BlockSparse / SlidingWindow / 无 | op_host/*_tiling.cpp:L? |
 | feature flags | 无 / 有 | PSE / RoPE / Sink / ... | op_host/*_tiling.cpp:L? |
 | 设计节点 | 缺失 | G→N12 逐步落地 | design/ 文档 |
-| 组合校核 | 未做 | 在 composition.md 确认 | implementation_note.txt |
+| 组合校核 | 未做 | 在 `ops/ascendc-tiling-design/references/flashattention/foundation/composition.md` 确认 | implementation_note.txt |
 
 ## Step 3: 代码改造
 
 ### 3A. 形态识别
 
-- **形态 α — 标准 GQA/MHA**：按 `base_design.md` §1-§10 落地。
-- **形态 β — MLA**：latent absorption，走 `base_design.md` §11。
-- **形态 γ — 量化 FA**：叠加 `quantization_design.md`，需处理 scale 轴与 P-scale 回传。
-- **形态 δ — 稀疏 FA**：叠加 `sparse_design.md`（当前占位），需先确认可行性。
+- **形态 α — 标准 GQA/MHA**：按 `ops/ascendc-tiling-design/references/flashattention/subfamilies/base_design.md` §1-§10 落地。
+- **形态 β — MLA**：latent absorption，走 `ops/ascendc-tiling-design/references/flashattention/subfamilies/base_design.md` §11。
+- **形态 γ — 量化 FA**：叠加 `ops/ascendc-tiling-design/references/flashattention/subfamilies/quantization_design.md`，需处理 scale 轴与 P-scale 回传。
+- **形态 δ — 稀疏 FA**：叠加 `ops/ascendc-tiling-design/references/flashattention/specialization/sparse_design.md`（当前占位），需先确认可行性。
 
 声明 `form: alpha | beta | gamma | delta`。
 
@@ -70,8 +70,8 @@ N12: DESIGN.md output
 
 - **形态 β（MLA）**：KV 经 latent compression，`kvHeadNum=1`，注意 split-KV 未验证。
 - **形态 γ（量化）**：MXFP8 需修正 Roofline AI；scale 字段加入 Host Tiling。
-- **形态 δ（稀疏）**：当前 `sparse_design.md` 为占位骨架，落地前需先补全契约。
-- **feature flags**：PSE/RoPE/Sink 等按 `feature_flags.md` 叠加，不可与基础形态冲突。
+- **形态 δ（稀疏）**：当前 `ops/ascendc-tiling-design/references/flashattention/specialization/sparse_design.md` 为占位骨架，落地前需先补全契约。
+- **feature flags**：PSE/RoPE/Sink 等按 `ops/ascendc-tiling-design/references/flashattention/specialization/feature_flags.md` 叠加，不可与基础形态冲突。
 
 ## Step 4: 约束复核
 
@@ -82,7 +82,7 @@ P115 约束核查：
   1. 基础形态 = GQA / MHA / MLA，依据？ ___
   2. Hq = ___, Hkv = ___, G = ___
   3. 正交 trait：量化=___ 稀疏=___ feature flags=___
-  4. 组合是否在 composition.md 已验证？ yes/no / 未验证需说明
+  4. 组合是否在 ops/ascendc-tiling-design/references/flashattention/foundation/composition.md 已验证？ yes/no / 未验证需说明
   5. 是否按 G→N12 顺序推进？ yes/no
   6. 跨核槽 / L1 rotation 槽 / V2 自读自写槽是否使用不同常量？ yes/no
 ```

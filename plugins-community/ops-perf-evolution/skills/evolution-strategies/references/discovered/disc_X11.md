@@ -1,45 +1,43 @@
 ---
 id: X11
 origin: discovered
-discovered_round: 4
-discovered_from: level3_conv_2d-cannbench-web-submit (P4/P5)
-base_speedup: fp32 geomean 0.000 → 0.50（单 case 最高 0.60，标量兜底 ~21000x 慢 → 0.5x）
+discovered_round: 1
+discovered_from: round_1/parallel_1 (level3_quant_matmul_evo_r3)
+base_speedup: 0.8274x (vs 官方 QuantBatchMatmulV3, 基线 0.1999x → 4.14x)
 ---
 
-# Strategy X11: FP32-via-BF16 Hi/Lo 拆分 3-GEMM（Cube 不吃 fp32 时的保精度路径）
+# Strategy X11: ND-drain + L0B 喂给率驱动 baseM 扩升（量化 Matmul Cube 利用率修复）
 
 ## 核心思路
-910B Cube 的 Mmad 不直接消费 fp32 输入。将 fp32 操作数拆分为 bf16 双分量
-`x ≈ hi + lo`（hi = cast_bf16(x)，lo = cast_bf16(x − hi)），用 3 个 bf16 GEMM
-`hi·hi + hi·lo + lo·hi`（fp32 累加）逼近 fp32 GEMM，获得 Cube 级吞吐 + 接近
-fp32 的精度（~1e-4 相对误差，远小于 torch fp32 conv 自身的 ~1e-3）。
-
-关键配套：**单趟 split-xtrans**——一个 AIV kernel 从 fp32 源直接产出 hi/lo 双份
-目标布局（如 bf16 xT），省掉独立的 split kernel 和第二趟 im2col/转置物化。
+c220 (910B) 上 MatmulImpl 的多 fragment NZ drain 是芯片缺陷（与 orgM 对齐无关，已证伪对齐假说），
+而 ND int32 多行 drain 完全正确——Cube 输出格式应路由到 ND。真正的 AIC 瓶颈不是 B 的 L2
+refetch（scM 扩 16x 时间纹丝不动），而是 **L0B-fill:mad 比**：baseM=16 时每个 base tile 把
+K×baseN 灌入 L0B 只做 16 行 MAC（~15 MAC/B），喂不饱 cube 阵列。把 baseM 扩升到
+L0C 容量上限（int32: 128KB → baseM=128 @ baseN=256），AIC 时间可降 4x+，直至撞上
+L2→L1 ~1.9TB/s 硬墙。
 
 ## 适用场景
-- **算子类型**: fp32 输入的 GEMM 类计算（conv、matmul），Cube 仅支持 fp16/bf16
-- **瓶颈类型**: compute-domain，fp32 被困在 Vector/标量路径
-- **前提条件**: 容差允许 ~1e-4 相对误差（cann-bench 级别通常可过）；
-  **±inf/NaN 特殊值必须验证**——hi=±inf 时 lo=NaN，感受野含 inf 则累加 NaN，
-  与 golden 的 NaN 图样天然逐位匹配（无需显式 NaN 掩码逻辑）
-- **预期收益**: 相对标量 fp32 兜底 3~4 个数量级；相对标杆 0.3→0.5×
-  （3 倍 cube 工作量是固有下限）
+- int8/int4 量化 Matmul（Cube 累加 int32），输出需反量化 epilogue 的算子
+- 大 M×N 形状下 Cube 利用率低（小 baseM / 单 fragment）且疑似受 drain quirk 限制
+- 评估口径为 Σ kernel Duration（AIC/AIV 重叠对此口径无效，不要投入双流方向）
 
 ## 实现要点
-1. 拆分：`hi = Cast_bf16(x, CAST_RINT)`，`lo = Cast_bf16(x − hi, CAST_RINT)`，
-   两级 Cast + Sub，无 NaN fixup（fixup 反而破坏 inf 语义）
-2. **2-GEMM（舍 lo·hi 项）经精度分析否决**：~2e-3 相对误差贴容差边缘且存在
-   误差抵消风险；3-GEMM 是精度安全下限
-3. GEMM 组织：hi/lo 双 L1 面板 + hi/lo 双 ws，每 k tile 2 次展开 + 3 Mmad；
-   **A2/B2 队列深度按每 chunk 的 tile 数定**：双 tile（hi+lo）需 depth-4
-   （4×16KB=64KB L0 占满）让展开与 Mmad 重叠，实测 conv 段再提速 ~30%；
-   单 tile 用 depth-2 即可（depth-4 在单面板几何上挂死设备）
-4. 4 加载变体（Ahi/Alo/Bhi/Blo 各载一次省流量）已证**回退**——失去跨面板
-   预取的损失 > 省 33% 流量的收益；保留 6 虚拟面板 + 预取为默认
-5. 验证纪律：±inf case 不能用于验证 kExtension 类展开改动（"双 NaN 巧合"
-   会掩盖错误），必须用实数有限值 case
+1. **ND drain 路由**：CType 从 NZ 改 ND（TPosition::GM, CubeFormat::ND, int32），
+   消除 NZ 全局分形组 stride 推导；配 epilogue 直接读 ND 连续行，免 NZ→ND 重排。
+2. **baseM 扩升**：候选 {64, 128} 实测扫描，L0C=128KB → int32 baseM×baseN≤32K elems
+   （128×256 恰好占满）；depthA1/B1=4 后收益饱和（L2 带宽墙，非流水深度问题）。
+   硬约束：**baseM ≤ 每个 tile 的 singleM**（singleM<baseM 直接 AIC 崩溃）；
+   singleN≤16 尾 tile 崩溃 → **重叠尾 strip**：末 strip 从 N-baseN（M 轴对称 M-scM）
+   起算全宽 tile，重叠区两 core 写相同值（幂等，bit-exact 安全）。
+3. **AIV 反量化 epilogue strip 化**（750µs→34µs, 22x 的关键）：
+   strip 所有权（每 AIV 连续 fragment 区间）+ per-N 向量（scale/bias/offset 展开为
+   [16][256] 模式）**每 strip 构建一次**而非每 fragment 重建 + TQue 双缓冲
+   （load/cast/store 跨 fragment 流水，稳态零 PipeBarrier<PIPE_ALL>）+
+   单条 2D DataCopyPad 完成 16 行加载与存储 + pertoken strip 级预载。
+4. **Host 侧隐式开销排查**：torch::empty 在 torch_npu 上隐式零初始化
+   （每分配一次 = 一个 aclnnInplaceZero 内核）→ 内部 workspace 改全局 scratch 缓存；
+   非对齐 N 触发 impl 全局 B 加载慢路径（orgN%256!=0，与 32B 对齐无关）→ align256 补齐。
 
 ## 来源
-发现于 cann-bench conv_2d fp32 7 case（含 ±inf 特殊值 case）。
-fp32 geomean 0.363（直接 3-GEMM）→ 0.50（单趟 split-xtrans + depth-4 L0）。
+自动发现于 level3_quant_matmul Round-3 进化第 1 轮（x0 open_exploration），
+Ascend910B2C，geomean 0.1999x → 0.8274x vs 官方 QuantBatchMatmulV3（20/20 bit-exact）。

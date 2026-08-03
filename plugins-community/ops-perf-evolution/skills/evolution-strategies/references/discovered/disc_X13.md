@@ -1,38 +1,28 @@
 ---
 id: X13
 origin: discovered
-discovered_round: 3
-discovered_from: level3_conv_2d-cannbench-web-submit (P2) + conv2d_base (tilelang2ascendc-ops-generator)
-base_speedup: cann-bench 1×1 case 1.98× 标杆（54.02us 标杆 vs 54.20/74.28us 实测，kernel 级反超近 2×）
+discovered_round: 2
+discovered_from: round_2/parallel_1
+base_speedup: 2.03x
 ---
 
-# Strategy X13: 1×1 Conv 翻转 GEMM（原始布局即操作数，免 wrepack/im2col）
+# Strategy X13: Shape 自适应双引擎分流 (M-Threshold Hybrid Routing)
 
 ## 核心思路
-1×1 卷积的 im2col 是恒等变换：NCHW 原始布局的 x 本身就是 `[K=Ci, M=H*W]` 的
-GEMM B 操作数。把 GEMM **翻转**——A = 原始权重 [Co, Ci]（跨图共享，免 wrepack）、
-B = 原始 x [Ci, H*W]（免 im2col 发射）、acc = [Co, H*W] fp32——epilogue 按通道行
-加 bias 后直接写出 NCHW，全程零 transpose、省两级 kernel 发射。
+当单一执行引擎（cube / vector）无法覆盖全部输入 shape 时，在 host 侧（op plugin）按 shape 特征（如 M 维度）路由到两条完整的独立 kernel 路径：小 M（GEMV 类）走纯 VEC streaming 内核吃带宽极限，中大 M 走 cube 内核吃 MAC 吞吐。分发阈值不靠猜，用实测证据校准：中间区间（如 M∈[3,4]）按 K*N 流量是否足以摊销 cube 路径的固定 launch+workspace 开销做二级判定。
 
 ## 适用场景
-- **算子类型**: 1×1 卷积（kH=kW=1、s=1、p=0、d=1），pointwise conv、1×1 reduction
-- **瓶颈类型**: launch-bound / 小 kernel 发射开销占比大；或大 Ci 1×1 的
-  im2col 纯搬运浪费
-- **前提条件**: Ci%16==0（Nd2Nz 分形约束）且 (H*W)%16==0（B' 行 32B 对齐）。
-  注意：用 UB 中转 pad 解除 (H*W)%16 门控已证**净负收益**（xpad 自身 ~5.4us
-  走 DataCopyPad 慢速 dummy-pad 路径，翻转 GEMM 在窄 padded 行上也更慢），
-  门控不满足时回 normal 路径，勿强解
-- **预期收益**: 省 wrepack+im2col 两级发射，实测 1×1 case 1.0~1.98× 标杆
+- 瘦矩阵乘 / weight-quant matmul / GEMV-like 算子，输入 shape 跨 GEMV（M=1-8）与 GEMM（M>=32）两个域
+- 任一单引擎路径在部分 shape 区间存在结构性短板（cube 小 M 空转 mac_ratio<0.2；VEC 大 M 受指令发射延迟硬上限）
+- 瓶颈类型：tiling_imbalance（cube 低利用）或 compute_bound（VEC 发射上限），且 case 集 shape 跨度大
 
 ## 实现要点
-1. 全通路保持 Nd2Nz GM→L1（plain 2D DataCopy GM↔L1 在 dav-c220 不可靠）
-2. 翻转后 m 维 = Co（通道）、n 维 = H*W（空间）：epilogue 的 acc 行为通道行，
-   整块连续区域一次 load + 行内标量 Adds（V pipe 行间免同步）+ 一次 cast +
-   一次 store，比逐行 flag pair 快 3~4×
-3. 空间尾 n 维非 16 对齐时 LoadData3D Zn 的 channelSize 必须 round16，
-   否则跳部分分形块导致列数据损坏
-4. 与 X10 的模式分发组合：host 按几何判定走本模式还是 normal/fused
+- 两条路径必须是各自完整正确的实现，合并进同一 kernel 源文件，host tiling 各自独立；路由只换执行引擎不改数值（共享同一精确代数分解，如量化算子的 y = s*(x@w) + (off*s)*rowsum(x) + bias）
+- 路由器放 host plugin（按 M 读 tensor shape 选择 tiling 分支），零 device 侧分发开销
+- 阈值校准方法：对边界 shape 各跑两路径实测设备时间，3 次复现确认后再固化阈值；固定开销主导的小 shape 让 VEC 路径上浮承接
+- workspace 按路径条件分配（VEC 路径可免去 cube 路径的大块 dequant workspace）
+- 芯片相关常量一律运行时查询（PlatformAscendC），核数查询结果可 static 缓存避免小 kernel 上反复 host 查询引入可测延迟
+- 尾块守卫、DataCopyPad 对齐兜底从父路径继承，不随路由弱化
 
 ## 来源
-conv2d_base P0-b 首验；cann-bench conv_2d case 6（[2,2048,16,16] bf16 1×1）
-实测 1.94~1.98× 标杆，为全部 20 case 中收益最高的单点。
+自动发现于第 2 轮进化，算子 level3_weight_quant_batch_matmul，speedup 2.03x（VEC-only 父 0.98x / cube-only 父 1.51x → 混合 2.03x，geomean vs PyTorch）。基于 [[disc_X12]] 的纯 VEC 路径与 n1 系 cube 路径（K1 dequant + K2 MatmulImpl + K3 epilogue）组合分发。

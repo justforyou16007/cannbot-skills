@@ -3,6 +3,9 @@ id: P103
 bottlenecks: [scalar_compute, compute_bound]
 op_families: [cv_fusion, attention, special]
 complexity: L1
+references:
+  - ops/ascendc-api-best-practices/references/api-mix-mode.md
+  - ops/ascendc-crash-debug/references/mix-hang-debug.md
 conflicts_with: []
 synergizes_with: [P102, P87]
 requires: [P102]

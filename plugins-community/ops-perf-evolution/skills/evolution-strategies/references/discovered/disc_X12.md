@@ -1,52 +1,28 @@
 ---
 id: X12
 origin: discovered
-discovered_round: 4
-discovered_from: level3_conv_2d-cannbench-web-submit (P3/P5) + conv2d_base (tilelang2ascendc-ops-generator)
-base_speedup: conv2d_base case0 46→21us（消 70% im2col 物化）；cann-bench 大 case 0.32→0.59
+discovered_round: 1
+discovered_from: round_1/parallel_1
+base_speedup: 0.9774x (geomean 20 cases; 小 M case 3.3-8.8x)
 ---
 
-# Strategy X12: Fused img2col LoadData3D 随路展开（含 band 窗口化突破 L1 容量）
+# Strategy X12: 量化 GEMV 纯 VEC 流式路径（小 M 分流）
 
 ## 核心思路
-卷积的 im2col GM 物化路径流量为 `特征图→UB→GM→L1→L0`，GM 往返可占整算子 70%。
-fused 模式让 **A 侧不落地**：特征图转 NC1HWC0 常驻 L1，用 img2col LoadData3D
-（pad/stride/dilation 硬件处理）从 L1 直接随路展开进 L0A，B 侧复用 K-major
-权重 ws。CopyOut/epilogue/m/n 分解与 normal 路径完全复用，改动集中在 A 侧加载。
-
-**band 窗口化推广**（特征图 xNz 超 L1 时）：L1 只常驻输入**行带**而非整图。
-band 以独立 fmap 身份喂 img2col LoadData3D：重算 `padTop' = pH + minRow − o0·sH
-∈ [0,pH]`、`padBottom' ≤ pH`（均在原 pad 范围内，规避 pad 位宽溢出），mStartPt
-用 band 相对值——硬件按 `(l1H, padTop', padBottom', sH, dH, kH)` 重建的输出高度
-Ho' = o1−o0 代数恒成立，m→(ho,wo) 光栅与全图一致。块 = (img, band)，n 维在块内
-循环（band 载一次供全部 nBlock 复用）。
+对 weight-quant matmul（y = x @ ((w+o)*s) + b，w 为 int8），当 M 小（1-8，GEMV 类）时放弃 cube，走纯 VEC streaming：代数重构把 per-N scale 提出 K 循环（y[m,n] = s[n]*(sum_k x[m,k]*w[k,n] + o[n]*rowsum(x[m])) + b[n]，热 K 循环内零反量化乘加），int8 weight 仅 cast 到 half，用 c220 mixed-precision Axpy（dst=float, src=half, Tuple<float,half>）直接累加 fp32，省掉 fp32 weight tile 和二次 cast。大 M（>=32）纯 VEC 受 VEC 指令发射延迟硬上限（~30cyc/Axpy 固定开销，总指令数 M*N*K/W）必然退化，必须分流到 cube 路径——小 M VEC / 大 M cube 的 M 阈值混合分流是该类算子的最优结构。
 
 ## 适用场景
-- **算子类型**: conv2d（kHkW>1）及任何 im2col+GEMM 形态的算子
-- **瓶颈类型**: im2col GM 往返带宽/耗时占比大；或大特征图 B 面板随 m-block
-  重复加载（L1 入口带宽瓶颈）
-- **前提条件**: Ci%16==0（img2col channelSize 约束，非对齐先通道补零）；
-  xNz + 常驻 B 面板 ≤ L1 预算（不满足时用 band 窗口化）
-- **预期收益**: 消 im2col 物化 70% 占比（46→21us 级）；band 化使大 case
-  从 normal 路径 0.32 → 0.59
+- weight-quant / 反量化类 matmul（int8/int4 weight + per-N scale/offset），M 维度跨度大（1 到 128+）的 case 集合
+- 小 M GEMV 类：带宽充裕、cube 网格利用率低（单核 M tile 极小）时，纯 VEC 显著优于 cube（实测 3.3-8.8x vs PyTorch，cube 路径同 case 仅 0.39-0.71x）
+- 瓶颈判定：aiv_vec_ratio 低（<30%）且 mte2 未饱和 → 指令发射/依赖延迟瓶颈，不是带宽瓶颈
 
 ## 实现要点
-1. **硬件 img2col 展开 k 序 = (ci1, kh, kw, ci0)**——C0 通道块在最外层，与软件
-   惯用 (kh,kw,ci) 不同；权重 ws 必须按同序 repack（缓存键带布局标志）。
-   两序在 Ci==16 或 kHkW==1 时恰好重合会"蒙对"——**必须用 one-hot 探针**
-   （单元素置 1 观察落点）在 Ci>16 且 kHkW>1 的几何上实测确认，勿凭文档假设
-2. NCHW 需 xtrans AIV kernel 先生成 xT [H*W, Ci]（TransDataTo5HD repeat 批量
-   转置；bf16 按 uint16 位级转置）；NHWC 直接用原始 x，零中转
-3. 门控回退（实测坑）：
-   - **l1W ≤ ~17 窄特征图 img2col LoadData3D 病理性慢**（~10us/次，为正常 7 倍，
-     mExtension 调满无效）→ W<24 回 im2col 物化路径
-   - **kExtension > 64 不可靠**（部分几何出垃圾甚至挂死设备）→ 保持 ≤64
-   - 留环境变量开关（如 CONV2D_FUSED=0）做 A/B 与回退
-4. 每个 k tile 的展开与 Mmad 重叠靠 L0 队列深度（见 X11 要点 3）
-5. 尾块纪律不变：m/n 满 tile 计算 + Fixpipe 裁剪；channelSize 非 16 倍数会
-   跳分形块，空间尾 round16
+1. **代数重构**（与 X9 deferred scaling 同源）：s/o/bias 全部折叠出 K 循环；rowsum(x[m]) 在 K 循环内对已提取的 x 标量做 fp32 标量累加（标量/向量双发射，零额外向量指令，避免 WholeReduceSum——c220 vcadd 仅支持 half/float，bf16 非法）
+2. **mixed-precision Axpy**：fp16 路径 Axpy dst=float src=half；bf16 路径保持 fp32（wS 为 fp32 时 BK 粒度可放宽到 16 以开大 W）
+3. **确定性两阶段 K-split 归约**（关键踩坑）：c220 `SetAtomicAdd+DataCopy` 原子加实证丢更新（多次调用结果不一致），host zeros 与 RunOpApi 启动流也无法可靠保序。禁止用原子加做 K-split；改为各 split 写 fp32 部分和到 per-call workspace + 同 stream 第二 kernel 求和 cast，精度反而更好。host 守卫：kSplit>1 要求 N%16==0（fp32 store 32B 行对齐）
+4. **指令发射延迟隐藏**：8 路批量标量提取（背靠背发射 UB 标量读再发 8 个 Axpy）+ r+1 标量预取双缓冲；宽 tile（W=512, 8 repeats/Axpy）摊薄发射固定开销
+5. **occupancy-aware host tiling**：makespan 模型（指令发射成本 5+W/64 cyc/(k,m) + block 固定 ~4000cyc + DMA 项 × wave 数）在 (MT, W, BK, kSplit) 空间搜索，blocks0<48 AIV 时自动加大 kSplit∈{1,2,4,8,16}
+6. **窄尾块**：cM<5 走 8 独立部分累加器 narrow 路径，host 校验 8*tail*W <= acc 预算
 
 ## 来源
-conv2d_base（tilelang2ascendc-ops-generator）P5 首次落地（k 序探针发现）；
-cann-bench conv_2d P3/P5 推广 band 窗口化（xNz 8MB/4MB 超 L1 的 case 2/3）
-与非对齐 Ci（xtrans 通道补零后覆盖 Ci=63/47/97/65/31 等）。
+自动发现于第 1 轮进化，算子 level3_weight_quant_batch_matmul（Ascend910B2C），speedup 0.9774x（geomean），小 M case 最高 8.77x vs PyTorch。与 X9（deferred scaling）的关系：X9 覆盖代数重排本身，本策略覆盖完整 GEMV streaming 数据流 + c220 原子加坑 + M 分流结论。

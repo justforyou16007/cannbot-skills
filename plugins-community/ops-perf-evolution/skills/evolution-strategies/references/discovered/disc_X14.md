@@ -1,38 +1,28 @@
 ---
 id: X14
 origin: discovered
-discovered_round: 2
-discovered_from: conv2d_base (tilelang2ascendc-ops-generator) + level3_conv_2d-cannbench-web-submit
-base_speedup: 省去整个 wrepack kernel 发射（每次调用 ~5-15us 级，推理式重复调用全命中）
+discovered_round: 3
+discovered_from: round_3/parallel_1
+base_speedup: 2.44x
 ---
 
-# Strategy X14: Host 侧权重预打包结果 LRU 缓存（Weight Repack Cache）
+# Strategy X14: Mix-Kernel 跨核生产者/消费者融合 (Pairwise AIV-Producer/AIC-Consumer Fusion)
 
 ## 核心思路
-权重布局变换（K-major repack、fractal 重排、量化打包等）的输出是
-（weight 内容, shape, dtype, 目标布局）的**确定函数**。推理场景同一权重张量
-被反复卷积/矩阵乘，repack 结果逐 bit 相同——host 侧做 LRU 缓存，命中时
-**跳过整个 repack kernel 发射**，直接复用缓存的 workspace。
+当流水线中存在独立的前置 VEC pass（如 dequant/cast），且硬件路径（int8 直接进 cube）被证伪时，将该 VEC pass 与 cube kernel 融合进**单个 mix kernel**：AIC ci 与其配对 AIV（2ci, 2ci+1）组成生产者/消费者对，AIV 按 AIC 的消费顺序（如 (nIdx,kIdx) strip）生产中间数据到 write-once GM workspace，用 **GM flag 协议**同步（128B 步长 flag、MTE3 DataCopyPad 发布、AIC 侧 `__gm__ volatile` 有界轮询 + DCCI CACHELINE_ALL），实现跨核软件流水，launch 数减 1 且 cast 与 cube 计算重叠。
 
 ## 适用场景
-- **算子类型**: 任何带权重预打包步骤的算子（conv、matmul、quant matmul），
-  推理式重复调用模式
-- **瓶颈类型**: launch-bound；或 repack kernel 本身耗时占比可测
-- **前提条件**: repack 无随机性、无输入数据依赖；same-stream 执行
-  （workspace 的流序复用假设，与 per-call workspace 相同）
-- **预期收益**: 每次调用省 1 次 kernel 发射 + repack 计算（~5-15us 级）；
-  评测/推理循环中命中率 ~100%
+- 三 kernel（或多 kernel）串行流水线，前置 VEC pass 占 kernel 时间 >30%（如量化 matmul 的独立 dequant pass）
+- 硬件融合路径不可用（芯片特性表证伪，如 DAV_2201 ifMmadInstrSupportAntiQuant=false）
+- c220 等平台上 CrossCoreSetFlag/WaitFlag（PIPE_S）非法、用户态 ffts 握手不成立时，GM-flag 是可靠替代
+- 瓶颈类型：no_overlap / mte2_stall，且 profiling 显示独立 pass 与主计算串行
 
 ## 实现要点
-1. 缓存键：`data_ptr + sizes + dtype + version counter`——**version 必需**：
-   in-place 修改（`copy_`/`fill_` 等）会 bump version 强制重打包，否则脏数据
-2. **条目内持有 weight 强引用**：防止 allocator 回收 data_ptr 后被新张量
-   复用地址造成 stale 命中
-3. 缓存的 workspace 张量由条目持活，miss 时整体重写；LRU 容量小（个位数条目）
-4. 多目标布局（如 normal k 序 vs fused k 序，见 X12）时**布局标志进缓存键**
-5. 留环境变量开关（如 `*_WREPACK_CACHE=0`）便于 A/B 与排障
-6. 纯 host C++/ATen 逻辑，无 device 侧改动，全平台可移植
+- 配对关系先上板探针验证（910B2C：AIC ids [0,24)、AIV ids [0,48)、GetBlockNum()=24）
+- 生产顺序必须与消费顺序严格一致（strip 序）；write-once workspace 避免读写竞争
+- 三大坑（实测）：(1) AIC 侧标量 GM 轮询读会被编译器 CSE 提升，必须 `__gm__ volatile` 指针读，否则空转；(2) AIV 标量 GM 写会丢失，必须用 MTE3 DataCopyPad 发布 flag；(3) 跨核 wait 是聚合阈值语义，SyncAll 为正确性必需（裸 set/wait 可致精度全挂）
+- 生产者侧用 TQue 深度 2 流水化进一步隐藏 cast 延迟
+- 保留 legacy 多 kernel 路径作环境变量回退（如 WQBM_LEGACY_CUBE=1），平台路由兜底
 
 ## 来源
-conv2d_base P1-a 首验（推理权重不变场景净赚）；cann-bench conv_2d 评测
-（同一 case 反复调用）全命中，四级流水下 wrepack 从每调用一次变为仅首调。
+自动发现于第 3 轮进化，算子 level3_weight_quant_batch_matmul，speedup 2.44x（父 2.03x，+20.2%；msprof 实测 wqbm_dequant_kernel launch=0，原占 38.5%）。同轮 n1_s1_cont 变体以 stage-flag 变体（2/8 阶段 cast + CrossCoreSetFlag<0x2, PIPE_MTE3> + SyncAll）在 cube-only 路径独立验证同思路（1.51x→1.92x），两种同步原语均可行。与 [[disc_X13]]（双引擎分流）正交可叠加。

@@ -1,0 +1,2 @@
+batch_size,n_heads_q,n_heads_kv,seq_len_q,seq_len_kv,d_k,dtype
+4,32,4,1024,1024,128,float16

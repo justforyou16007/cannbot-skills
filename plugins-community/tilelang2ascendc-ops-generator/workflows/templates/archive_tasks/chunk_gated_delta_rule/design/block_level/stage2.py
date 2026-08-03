@@ -77,16 +77,27 @@ def stage2_ker(batch, seq_len, nk, nv, dk, dv, chunk_size=CHUNK_SIZE):
                 #   T.gemm_v0(ws_qprime, S[h], attn_inter, transpose_B=True)
                 #   T.copy 降型(attn_inter) -> out[s0:s0+valid, h, 0:dv]
                 pass
+            # C↔V 同步（checklist #5）：C3 的 v_prime 就绪 -> V2
+            T.set_cross_flag("FIX", 3)          # C -> V
 
             # V2：v_new = v_inner - v_prime
             with T.Scope("V"):
+                T.wait_cross_flag(3)             # 等 C3 的 v_prime 就绪
                 # TODO(tile-level): T.tile.sub(v_new, ws_vinner, v_prime)
                 pass
+            T.set_cross_flag("MTE3", 4)          # V -> C：v_new 就绪
 
-            # V3：S[h] ← S[h] + v_new^T @ kg（外积更新，可放 C 侧 T.gemm_v0 或 V 侧外积）
+            # C3'：dstate = v_new^T @ kg（状态更新的 matmul 部分）
+            with T.Scope("C"):
+                T.wait_cross_flag(4)             # 等 V2 的 v_new 就绪
+                # TODO(tile-level): T.gemm_v0(v_new, ws_kg, dstate, transpose_A=True)
+                pass
+            T.set_cross_flag("FIX", 5)          # C -> V：dstate 就绪
+
+            # V3：S[h] ← S[h] + dstate；写 final_state[h]（降型）
             with T.Scope("V"):
+                T.wait_cross_flag(5)             # 等 C3' 的 dstate 就绪
                 # TODO(tile-level):
-                #   dstate = v_new^T @ ws_kg（(Dv,C)@(C,Dk)->(Dv,Dk)）
                 #   S[h] = T.tile.add(S[h], dstate)；写 final_state[h]（降型）
                 pass
 

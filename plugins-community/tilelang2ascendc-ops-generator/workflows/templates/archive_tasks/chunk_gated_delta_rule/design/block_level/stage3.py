@@ -65,12 +65,22 @@ def stage3_ker(batch, seq_len, nk, nv, dk, dv, chunk_size=CHUNK_SIZE, scale=1.0)
                 #   attn_c[i][j] = ws_qkt[i][j]*g_exp[i]*g_exp_neg[j]*scale (j<=i，因果含对角)
                 #   T.copy(attn_c, tmpGM)  # 供 C4 cube 读
                 pass
+            # C↔V 同步（checklist #5）：V4 的 attn_c 就绪 -> C4
+            T.set_cross_flag("MTE3", 6)          # V -> C
 
             # C4：out += attn_c @ v_new（累加到 Stage2 写的 out）
             with T.Scope("C"):
+                T.wait_cross_flag(6)             # 等 V4 的 attn_c 就绪
                 # TODO(tile-level):
                 #   T.gemm_v0(attn_c, v_new, out_acc)   # v_new = ws_vinner（含 v_prime 贡献）
                 #   T.copy 降型(out_acc) -> out[s0:s0+valid, h, 0:dv] 累加
+                pass
+            T.set_cross_flag("FIX", 7)          # C -> V：out 累加就绪
+
+            # V5：out 写回（bf16 降型，只写 valid 行）
+            with T.Scope("V"):
+                T.wait_cross_flag(7)             # 等 C4 的 out 累加就绪
+                # TODO(tile-level): T.copy 降型(out_bf[0:valid, 0:dv], out[s0:s0+valid, h, 0:dv])
                 pass
 
     return main

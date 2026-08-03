@@ -81,22 +81,29 @@ def stage1_ker(batch, seq_len, nk, nv, dk, dv, chunk_size=CHUNK_SIZE, scale=1.0)
                 #   g_cum=cumsum(gc)；g_exp/g_exp_neg=T.tile.exp(±g_cum)
                 #   kb=kc*bc；vb=vc*bc；kbe=kb*g_exp；qPrime=qc*scale*g_exp；kg=kc*exp(g_last-g_cum)
                 pass
+            # C↔V 同步（checklist #5）：V0 产物（kb/vb）就绪 -> C1
+            T.set_cross_flag("MTE3", 0)          # V0 -> C1
 
             # C1：kbt = kb @ k^T
             with T.Scope("C"):
+                T.wait_cross_flag(0)             # 等 V0 的 kb 就绪
                 # TODO(tile-level): T.gemm_v0(kb, kT, kbt)  # kT = k^T (dk, C)
                 pass
+            T.set_cross_flag("FIX", 1)          # C1 -> V1：kbt 就绪
 
             # V1：A / X 前代 / 各逐元素量
             with T.Scope("V"):
+                T.wait_cross_flag(1)             # 等 C1 的 kbt 就绪
                 # TODO(tile-level):
                 #   decay[i][j]=g_exp[i]*g_exp_neg[j] (j<=i)
                 #   A = -(kbt*decay).tril(-1)
                 #   X = (I-A)^{-1} forward substitution（对角=1）
                 pass
+            T.set_cross_flag("MTE3", 2)          # V1 -> C2：X 就绪
 
             # C2：v_inner / k_cumdecay（写 workspace，bf16 降型）
             with T.Scope("C"):
+                T.wait_cross_flag(2)             # 等 V1 的 X 就绪
                 # TODO(tile-level):
                 #   T.gemm_v0(X, vb, v_inner)；T.gemm_v0(X, kbe, k_cumdecay)
                 #   T.copy 降型 -> ws_kcumdecay / ws_vinner / ws_qprime / ws_qkt / ws_kg

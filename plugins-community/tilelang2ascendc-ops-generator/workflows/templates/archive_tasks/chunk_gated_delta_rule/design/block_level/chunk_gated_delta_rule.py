@@ -45,6 +45,24 @@ C 侧（cube matmul）与 V 侧（向量）通过 workspace（GM，bf16）交接
   FlashAttention 那样把不同 chunk 的 C/V 交错重叠（除非引入 chunk-group + GM 状态携带
   + SyncAll 的二次并行，AscendC 即如此；本设计保留块内串行为主路径）。
 - workspace 存 stage1 产物（bf16），与 AscendC 一致：gCumExp/kCumDecay/vInner/qPrime/qkt/kg。
+
+## 同步设计（对应 AscendC 的 `SyncAll<false>()` 与 AIC↔AIV 事件）
+
+AscendC 用两套同步，block-level 里一一对应：
+
+1. **阶段间 / 组间全核 barrier —— `SyncAll<false>()` ↔ `T.barrier_all()`**：
+   在 `RunStage1 → RunStage2 → RunStage3` 之间（以及 AscendC 的 chunk-group 之间）各插一次
+   全核同步，保证上一阶段所有核的产物（workspace/out/S）已就绪、下一阶段才读。
+   本设计的 main() 在 stage1→2→3 边界显式调用 `T.barrier_all()`（见下方代码）。
+2. **阶段内 AIC↔AIV 交接 —— workspace + cross/pipe flag**：
+   Stage1 内部 C（cube matmul）与 V（向量）通过 workspace 交接，用
+   `T.set_cross_flag`/`T.wait_cross_flag`（AIC/AIV 间）与 `T.set_flag`/`T.wait_flag`
+   （MTE2→V 等 pipe 级）同步；对应 AscendC 的 `SetFlag`/`WaitFlag`/`CrossCoreSetFlag`。
+   这一层在 stage1/2/3 各自内部实现。
+
+> 说明：AscendC 的 `SyncAll` 同步的是"一组核共同处理一个 chunk-group"；本设计块=（batch,head）
+> 独立、每核跑自己的单元，`T.barrier_all()` 同步的是启动的全部 (cid, vid) 线程——语义都是
+> "阶段边界全核就绪"，是本设计对应 `SyncAll` 的落点。
 """
 
 import tilelang
@@ -119,6 +137,8 @@ def chunk_gated_delta_rule(batch, seq_len, nk, nv, dk, dv, chunk_size=CHUNK_SIZE
                             s0 = base[0] + ci * C
                             valid = T.if_then_else(Lb - ci * C < C, Lb - ci * C, C)
 
+                            # ---- Stage1 -> SyncAll -> Stage2 -> SyncAll -> Stage3 ----
+                            # 边界全核同步对应 AscendC `SyncAll<false>()`（见 docstring §同步设计）。
                             # stage1：within-chunk 预计算 -> workspace（C1/V1/C2）
                             run_stage1(
                                 query, key, value, beta, g,
@@ -126,16 +146,21 @@ def chunk_gated_delta_rule(batch, seq_len, nk, nv, dk, dv, chunk_size=CHUNK_SIZE
                                 ws_gcumexp[unit], ws_kcumdecay[unit],
                                 ws_vinner[unit], ws_qprime[unit], ws_qkt[unit], ws_kg[unit],
                             )
+                            T.barrier_all()   # SyncAll：Stage1 workspace 全部就绪
+
                             # stage2：跨 chunk 递推（状态依赖），out 写 attn_inter，更新 S
                             run_stage2(
                                 ws_gcumexp[unit], ws_kcumdecay[unit], ws_vinner[unit],
                                 ws_qprime[unit], ws_kg[unit], state, valid, C, dk, dv,
                                 out[s0:s0 + valid, h, :], final_state[b, h],
                             )
+                            T.barrier_all()   # SyncAll：out 的 attn_inter 已写、S 已更新
+
                             # stage3：attn_c = mask(qkt*decay)*scale；out += attn_c@v_new
                             run_stage3(
                                 ws_qkt[unit], ws_gcumexp[unit], ws_vinner[unit],
                                 scale, valid, C, dk, dv, out[s0:s0 + valid, h, :],
                             )
+                            T.barrier_all()   # SyncAll：本 chunk 的 out 累加完成，进入下一 chunk
 
     return main

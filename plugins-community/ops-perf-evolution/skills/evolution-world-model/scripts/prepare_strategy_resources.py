@@ -286,6 +286,49 @@ def _build_external_references_md(passed_ids: list[str]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _build_discovered_md(passed_ids: list[str]) -> str:
+    """把 passed 中的 X 系列（进化发现策略）全文注入资源块。
+
+    X 系列没有 Preconditions / Playbook 文件，实体内容在
+    evolution-strategies/references/discovered/disc_X{n}.md，
+    通过 INDEX.json 的 discovered 数组解析 doc_path。
+    """
+    idx = _load_strategy_index()
+    disc_entries = {e.get("id"): e.get("doc_path") for e in idx.get("discovered", [])}
+    refs_root = (
+        PROJECT_ROOT
+        / "plugins-community/ops-perf-evolution/skills/evolution-strategies/references"
+    )
+    sections = []
+    for pid in passed_ids:
+        doc_path = disc_entries.get(pid)
+        if not doc_path:
+            continue
+        fpath = refs_root / doc_path
+        try:
+            content = fpath.read_text(encoding="utf-8").strip()
+        except OSError:
+            LOGGER.warning("WARN: discovered doc not found: %s", fpath)
+            continue
+        sections.append(
+            f"<!-- BEGIN {pid}: {doc_path} -->\n{content}\n<!-- END {pid} -->"
+        )
+    if not sections:
+        return ""
+
+    lines = [
+        "",
+        "---",
+        "",
+        "## Discovered Strategies（X 系列进化发现策略全文）",
+        "",
+        "以下策略为既往进化中发现的方案，含核心思路、适用场景与实现要点，按此执行。",
+        "",
+        "\n\n".join(sections),
+    ]
+    return "\n".join(lines) + "\n"
+
+
 @dataclass
 class RenderContext:
     """render_block 的输入封装。"""
@@ -294,6 +337,7 @@ class RenderContext:
     filtered_by_keys: list[str]
     playbook_md: str
     excluded_md: str
+    discovered_md: str
 
 
 def _render_guided_block(ctx: RenderContext, parts: list[str]):
@@ -325,6 +369,10 @@ def _render_guided_block(ctx: RenderContext, parts: list[str]):
     external_md = _build_external_references_md(ctx.passed)
     if external_md:
         parts.append(external_md)
+
+    # 追加 X 系列进化发现策略全文（来自 INDEX.json discovered 数组）
+    if ctx.discovered_md:
+        parts.append(ctx.discovered_md)
 def _render_exploration_block(ctx: RenderContext, parts: list[str]):
     """所有策略被过滤：开放探索分支。"""
     original_ids = [f.get("id", "?") for f in ctx.failed]
@@ -450,6 +498,7 @@ def main() -> int:
         filtered_by_keys=filtered_by_keys,
         playbook_md=playbook_md,
         excluded_md=excluded_md,
+        discovered_md=_build_discovered_md(passed),
     ))
 
     # Output

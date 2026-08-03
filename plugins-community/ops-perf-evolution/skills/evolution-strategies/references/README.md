@@ -6,7 +6,7 @@
 
 ```
 meta_prompts/
-├── strategy_index.md          ← 主索引表（注入为 {meta_prompt}）
+├── strategy-index.md          ← 主索引表（注入为 {meta_prompt}）
 ├── strategies/
 │   ├── dtype_01_mixed_precision.md
 │   ├── dtype_02_template_kernel.md
@@ -53,7 +53,7 @@ meta_prompts/
 
 在dsl_lowering步骤中：
 
-1. 读取 `plugins-community/ops-perf-evolution/skills/evolution-strategies/references/strategy_index.md`
+1. 读取 `plugins-community/ops-perf-evolution/skills/evolution-strategies/references/strategy-index.md`
 2. 选择所有适用于当前算子的策略ID
 3. 读取每个引用的 `strategies/XXX.md` 详情文件
 4. 在 `tiling_pass`、`init_pass`、`process_pass`、`process_nonaligned_pass` 中应用选定的模式

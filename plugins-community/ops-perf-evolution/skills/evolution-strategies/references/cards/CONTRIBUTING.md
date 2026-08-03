@@ -11,7 +11,7 @@ plugins-community/ops-perf-evolution/skills/evolution-strategies/references/
 │   ├── SCHEMA.md                  # Frontmatter 规范（必读）
 │   ├── CONTRIBUTING.md            # 本文档
 │   └── {ID}_{slug}.md             # 各策略卡片
-├── strategy_index.md              # 人读索引（按瓶颈 / 按算子类型查表）
+├── strategy-index.md              # 人读索引（按瓶颈 / 按算子类型查表）
 └── strategy_cards_frontmatter_draft.yaml  # 草稿缓存（可删）
 ```
 
@@ -67,7 +67,7 @@ python3 plugins-community/ops-perf-evolution/skills/ops-evaluation/scripts/gener
 ### A.3 生成 frontmatter 草稿并审校
 
 ```bash
-# 从 strategy_index.md + 源文件推导 frontmatter
+# 从 strategy-index.md + 源文件推导 frontmatter
 python3 plugins-community/ops-perf-evolution/skills/ops-evaluation/scripts/generate_frontmatter_draft.py \
     --output /tmp/new_strategy_draft.yaml
 
@@ -86,9 +86,9 @@ python3 plugins-community/ops-perf-evolution/skills/ops-evaluation/scripts/injec
 python3 plugins-community/ops-perf-evolution/skills/ops-evaluation/scripts/query_strategies.py --validate-all
 ```
 
-### A.5 更新 strategy_index.md（若需）
+### A.5 更新 strategy-index.md（若需）
 
-若新策略需要被 `--bottleneck` 或 `--op-family` 反查命中，确保在 `strategy_index.md` 的三张表中也加入：
+若新策略需要被 `--bottleneck` 或 `--op-family` 反查命中，确保在 `strategy-index.md` 的三张表中也加入：
 - 主表（策略 ID + Layer + Tags）
 - 按瓶颈类型查表（Primary/Secondary 列）
 - 按算子类型查表（L0/L1 列）
@@ -205,7 +205,7 @@ grep -l "P90" plugins-community/ops-perf-evolution/skills/evolution-strategies/r
 # 手动编辑每个匹配的文件，从列表中移除 P90
 ```
 
-### E.3 清理 strategy_index.md 中的引用
+### E.3 清理 strategy-index.md 中的引用
 
 ```bash
 grep -n "P90" plugins-community/ops-perf-evolution/skills/evolution-strategies/references/INDEX.json
@@ -373,7 +373,7 @@ rm -rf /tmp/mock_op
 | 脚本 | 用途 | 何时用 |
 |------|------|-------|
 | `generate_strategy_cards.py` | 从 `strategies/` 批量生成卡片 | 新增策略、从头重建 |
-| `generate_frontmatter_draft.py` | 从 strategy_index.md 推导 frontmatter 草稿 | 新增策略、批量修改 |
+| `generate_frontmatter_draft.py` | 从 strategy-index.md 推导 frontmatter 草稿 | 新增策略、批量修改 |
 | `inject_frontmatter.py` | 将草稿注入到卡片顶部 | 新增/批量修改后 |
 | `enhance_frontmatter_from_source.py` | 从源策略文件推断瓶颈关键词 | 草稿中 bottlenecks 为空时 |
 | `patch_relations.py` | 补充对称化的冲突/协同关系 | 扩展 EXTRA_CONFLICTS / EXTRA_SYNERGIES 后 |
@@ -388,7 +388,7 @@ rm -rf /tmp/mock_op
 - [ ] frontmatter 完整且所有枚举值合法（`query_strategies.py --validate-all` 报告 0 errors）
 - [ ] 关系字段对称（运行 `patch_relations.py` 自动对称化）
 - [ ] 卡片正文含四个必要段落（核心思想/代码骨架/关键修改点/代码搜索关键词）
-- [ ] 若新增策略，已在 `strategy_index.md` 的三张表中更新
+- [ ] 若新增策略，已在 `strategy-index.md` 的三张表中更新
 - [ ] 若删除策略，已清理其他卡片的引用
 - [ ] 若新增 Playbook/Preconditions，已过 G.3 的端到端测试
 - [ ] 端到端查询测试通过

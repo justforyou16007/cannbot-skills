@@ -87,12 +87,12 @@ Mode: {mode}
   - **优先按 prompt 中 `[Optimization Approach]` 的指引执行**（主 Agent 已将策略要点内联到 `node_description` 中）
   - 仅当 prompt 中的方向描述不够清晰时，才读取至多 1 个策略文件: `plugins-community/ops-perf-evolution/skills/evolution-strategies/references/strategies/XXX.md`
   - 若 `strategy_combination` **为空**且 prompt 未给出方向:
-    - 读取 `plugins-community/ops-perf-evolution/skills/evolution-strategies/references/strategy_index.md`，自行选择策略
+    - 读取 `plugins-community/ops-perf-evolution/skills/evolution-strategies/references/strategy-index.md`，自行选择策略
     - 注意与其他并行变体保持策略多样性
   - **兼容性检查**: 读取 `plugins-community/ops-perf-evolution/skills/evolution-strategies/references/strategy-compatibility.md`，验证选定策略无互斥冲突
 
 - **open_exploration 模式**:
-  - 禁止读取 `strategy_index.md` 或任何 `strategies/*.md`
+  - 禁止读取 `strategy-index.md` 或任何 `strategies/*.md`
   - 从现有内核出发，自主推理优化方案
   - 按提示中 `[Open Exploration]` 段落的具体指引执行
 

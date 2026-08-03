@@ -9,24 +9,56 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # ----------------------------------------------------------------------------------------------------------
 
-"""Tile-level TileLang design for Chunked Gated Delta Rule.
+"""Tile-level TileLang design (expert mode) for Chunked Gated Delta Rule.
 
-Expresses the per-(batch, head) chunk recurrence with TileLang primitives.
-The value head `h` reads key head `h * nk // nv` (head grouping); the state
-S (Dv, Dk) is carried across chunks of one (batch, value-head) unit and reset
-per batch.
+This is the *expert-mode* rework of the earlier scalar design.  It expresses
+the per-(batch, value-head) chunk recurrence over the low-level primitives only:
 
-Ascend bf16 constraint (TL_ASCEND on a dav-2201 target): scalar (element-wise)
-bf16 <-> fp32 casts are not supported by the backend ("not support bf16 type
-cast").  All bf16 I/O therefore goes through `T.copy` (MTE/vector copy), which
-lowers to supported copy instructions:
-    bf16 global -> bf16 UB (T.copy, zero-padding via T.tile.fill)
+    T.Kernel / T.alloc_ub / T.copy / T.tile.* / T.reduce_sum / T.serial /
+    T.Scope("V") / T.set_flag / T.wait_flag
+
+No developer-mode primitives (T.parallel / T.Parallel / T.pipeline /
+T.Pipelined) are used anywhere.
+
+Layout & maths
+--------------
+* TND tensors: query T(T,Nk,Dk), key T(T,Nk,Dk), value T(T,Nv,Dv),
+  beta T(T,Nv) bf16, g T(T,Nv) fp32, initial/final_state (B,Nv,Dv,Dk),
+  actual_seq_lengths (B,), out (T,Nv,Dv).
+* Each (batch, value-head) unit is independent; value head *h* reads key head
+  (h*Nk)//Nv (head grouping).  State S (Dv,Dk) is carried across the chunks of
+  one (batch,head) unit.
+* Chunking (C = chunk_size): within-chunk precomputation (gCum/decay/kb/vb/
+  A/(I-A)^{-1}/vInner/kCumDecay/qkt/attn_c/qPrime/kg) + inter-chunk state
+  feed (vPrime/vNew/attnInter, S update).  Symbol relations follow
+  `GDR-block-level-AscendC-对应.md` and `design/block_level/`.
+
+bf16 handling
+-------------
+The Ascend backend (dav-2201) rejects element-wise bf16 <-> fp32 scalar casts.
+Therefore *all* bf16 I/O goes through T.copy (MTE/vector copy), which lowers to
+copy instructions that carry the type conversion:
+    bf16 global -> bf16 UB (T.copy, zero-padded via T.tile.fill)
     bf16 UB     -> fp32 UB (T.copy upcast)
     fp32 UB     -> bf16 UB (T.copy downcast)
     bf16 UB     -> bf16 global (T.copy)
-All arithmetic is carried out in fp32 on UB buffers using explicit serial
-element-wise loops; the within-chunk solve ((I - A)^{-1}) is a serial forward
-substitution over the strictly-lower A.
+Arithmetic runs in fp32 on UB.
+
+nv<16 strided column load workaround
+------------------------------------
+beta/g are (T,Nv) column vectors taken at value-head *h*.  A blocked
+`T.copy(beta[s0:s0+C, h], bc)` compiles to maskShapeN=1 which only copies the
+leading element on this backend ("nv < 16 β/g column load" issue).  We therefore
+load beta/g **per scalar** for every row of the chunk, exactly as
+`fused_sigmoid_gating_delta_rule_varlen.py` does for per-token β/g:
+
+    T.copy(beta[t, h:h+1], b16[1])     # bf16 scalar global->UB
+    T.copy(g[t, h:h+1],  g[1])         # fp32 scalar global->UB
+    T.set_flag("mte2","v",n); T.wait_flag("mte2","v",n)
+    T.copy(b16[1], f32[1])             # upcast in UB (vector)
+    bc[t] = f32[0]; gc[t] = g[0]
+
+A width-1 (1-element) scalar load is independent of nv and works for any nv.
 """
 
 import tilelang
@@ -39,18 +71,20 @@ from design.chunk_gated_delta_rule_common import (
 )
 
 
-# The value head `h` reads key head `h * nk // nv` (head grouping).
 def key_head(h, nk, nv):
+    """The value head *h* reads key head (h*Nk)//Nv (head grouping)."""
     return (h * nk) // nv
 
 
 @tilelang.jit(out_idx=[7, 8], workspace_idx=[], pass_configs=pass_configs)
-def chunk_gated_delta_rule(batch, seq_len, nk, nv, dk, dv, chunk_size=CHUNK_SIZE, scale=1.0):
+def chunk_gated_delta_rule(batch, seq_len, nk, nv, dk, dv,
+                           chunk_size=CHUNK_SIZE, scale=1.0):
     C = chunk_size
     total_units = batch * nv
     used_core_num = min(NUM_PHYSICAL_CORES, max(1, total_units))
     tasks_per_core = T.ceildiv(total_units, used_core_num)
-    max_chunks = (seq_len + C - 1) // C  # upper bound on per-batch chunk count
+    # Upper bound on the number of chunks any batch may need.
+    max_chunks = (seq_len + C - 1) // C
 
     @T.prim_func
     def main(
@@ -77,7 +111,7 @@ def chunk_gated_delta_rule(batch, seq_len, nk, nv, dk, dv, chunk_size=CHUNK_SIZE
                         is_b16 = T.alloc_ub((dv, dk), "bfloat16")
                         os_b16 = T.alloc_ub((dv, dk), "bfloat16")
 
-                        # ---- per-chunk row buffers (fp32 compute) ----
+                        # ---- per-chunk row/vector buffers (fp32 compute) ----
                         qc = T.alloc_ub((C, dk), "float32")
                         kc = T.alloc_ub((C, dk), "float32")
                         vc = T.alloc_ub((C, dv), "float32")
@@ -87,29 +121,29 @@ def chunk_gated_delta_rule(batch, seq_len, nk, nv, dk, dv, chunk_size=CHUNK_SIZE
                         g_cum_neg = T.alloc_ub((C,), "float32")
                         g_exp = T.alloc_ub((C,), "float32")
                         g_exp_neg = T.alloc_ub((C,), "float32")
-                        kb = T.alloc_ub((C, dk), "float32")
-                        vb = T.alloc_ub((C, dv), "float32")
-                        decay = T.alloc_ub((C, C), "float32")
-                        kbt = T.alloc_ub((C, C), "float32")
+                        # kb = k*beta is folded inline into A and k_cumdecay (dead
+                        # buffer dropped to fit dk=dv=64 in UB).  decay/kbt/qkt/
+                        # vb/qg/k_aug are likewise folded inline.  We keep only the
+                        # (C,C) `a` (strictly-lower A) and `attn` ((I-A)^{-1}) plus
+                        # `attn_c` result buffers.
                         a = T.alloc_ub((C, C), "float32")
                         attn = T.alloc_ub((C, C), "float32")
                         v_inner = T.alloc_ub((C, dv), "float32")
-                        kbe = T.alloc_ub((C, dk), "float32")
                         k_cumdecay = T.alloc_ub((C, dk), "float32")
-                        qkt = T.alloc_ub((C, C), "float32")
                         attn_c = T.alloc_ub((C, C), "float32")
-                        v_prime = T.alloc_ub((C, dv), "float32")
                         v_new = T.alloc_ub((C, dv), "float32")
-                        qg = T.alloc_ub((C, dk), "float32")
                         attn_inter = T.alloc_ub((C, dv), "float32")
-                        k_aug = T.alloc_ub((C, dk), "float32")
 
-                        # bf16 staging for input loading / output writing
+                        # ---- bf16 staging for block input/output ----
                         qb16 = T.alloc_ub((C, dk), "bfloat16")
                         kb16 = T.alloc_ub((C, dk), "bfloat16")
                         vb16 = T.alloc_ub((C, dv), "bfloat16")
-                        bb16 = T.alloc_ub((C,), "bfloat16")
                         ob16 = T.alloc_ub((C, dv), "bfloat16")
+
+                        # ---- per-scalar staging for beta (bf16) / g (fp32) ----
+                        beta_b16 = T.alloc_ub((1,), "bfloat16")
+                        beta_f32 = T.alloc_ub((1,), "float32")
+                        g_f32 = T.alloc_ub((1,), "float32")
 
                         # ---- per-batch init: base = sum(seq[0..b)), Lb = seq[b] ----
                         base = T.alloc_ub((1,), "int32")
@@ -128,67 +162,65 @@ def chunk_gated_delta_rule(batch, seq_len, nk, nv, dk, dv, chunk_size=CHUNK_SIZE
                         for ci in T.serial(max_chunks):
                             if ci * C < Lb:
                                 s0 = base[0] + ci * C
-                                valid = T.if_then_else(Lb - ci * C < C, Lb - ci * C, C)
+                                valid = T.if_then_else(Lb - ci * C < C,
+                                                       Lb - ci * C, C)
 
-                                # load q,k,v,beta (bf16) with zero-padding, upcast to fp32
+                                # ---- load q,k,v (bf16 block copies, full slices) ----
+                                # maskShapeN = dk/dv >= 16, so these block copies
+                                # are safe.  Rows t >= valid are zero-padded.
                                 T.tile.fill(qb16, 0.0)
                                 T.copy(query[s0:s0 + valid, kh, 0:dk], qb16)
-                                T.copy(qb16, qc)
                                 T.tile.fill(kb16, 0.0)
                                 T.copy(key[s0:s0 + valid, kh, 0:dk], kb16)
-                                T.copy(kb16, kc)
                                 T.tile.fill(vb16, 0.0)
                                 T.copy(value[s0:s0 + valid, h, 0:dv], vb16)
+                                T.copy(qb16, qc)
+                                T.copy(kb16, kc)
                                 T.copy(vb16, vc)
-                                T.tile.fill(bb16, 0.0)
-                                T.copy(beta[s0:s0 + valid, h], bb16)
-                                T.copy(bb16, bc)
-                                T.tile.fill(gc, 0.0)
-                                T.copy(g[s0:s0 + valid, h], gc[0:valid])
                                 T.barrier_all()
 
-                                # --- within-chunk ---
-                                # g_cum = cumsum(gc); decay[i][j]=exp(g_cum[i])*exp(-g_cum[j]) j<=i
+                                # ---- beta / g: per-scalar column load (nv<16 safe) ----
+                                T.tile.fill(bc, 0.0)
+                                T.tile.fill(gc, 0.0)
+                                for t in T.serial(C):
+                                    if t < valid:
+                                        T.copy(beta[s0 + t, h:h + 1], beta_b16)
+                                        T.copy(g[s0 + t, h:h + 1], g_f32)
+                                        T.set_flag("mte2", "v", 1)
+                                        T.wait_flag("mte2", "v", 1)
+                                        T.copy(beta_b16, beta_f32)
+                                        bc[t] = beta_f32[0]
+                                        gc[t] = g_f32[0]
+                                    else:
+                                        bc[t] = 0.0
+                                        gc[t] = 0.0
+                                T.barrier_all()
+
+                                # ---- within-chunk ----
+                                # g_cum = cumsum(gc)
                                 g_cum[0] = gc[0]
                                 for _i in T.serial(1, C):
                                     g_cum[_i] = g_cum[_i - 1] + gc[_i]
-                                for t in T.Parallel(C):
-                                    g_cum_neg[t] = 0.0 - g_cum[t]
-                                for t in T.Parallel(C):
-                                    g_exp[t] = T.exp(g_cum[t])
-                                for t in T.Parallel(C):
-                                    g_exp_neg[t] = T.exp(g_cum_neg[t])
-                                T.barrier_all()
-                                for i in T.serial(C):
-                                    for j in T.serial(C):
-                                        if j <= i:
-                                            decay[i, j] = g_exp[i] * g_exp_neg[j]
-                                        else:
-                                            decay[i, j] = 0.0
-
+                                # exponentials of +-g_cum (fp32 buffers)
                                 for t in T.serial(C):
-                                    for d in T.serial(dk):
-                                        kb[t, d] = kc[t, d] * bc[t]
-                                    for d in T.serial(dv):
-                                        vb[t, d] = vc[t, d] * bc[t]
-
-                                # kbt = kb @ kc^T
-                                for i in T.serial(C):
-                                    for j in T.serial(C):
-                                        kbt[i, j] = 0.0
-                                for i in T.serial(C):
-                                    for j in T.serial(C):
-                                        for kx in T.serial(dk):
-                                            kbt[i, j] += kb[i, kx] * kc[j, kx]
-
-                                # A = -kbt * decay, strictly lower
+                                    g_cum_neg[t] = 0.0 - g_cum[t]
+                                T.tile.exp(g_exp, g_cum)          # exp(g_cum)
+                                T.tile.exp(g_exp_neg, g_cum_neg)  # exp(-g_cum)
+                                # A = -decay*(kb@kc^T) strictly lower, with both the
+                                # beta (kb=kc*beta, folded as bc[i]) and the decay
+                                # factor decay[i][j]=exp(g_cum[i])*exp(-g_cum[j])
+                                # folded into the dot product (kb/decay/kbt dead).
                                 for i in T.serial(C):
                                     for j in T.serial(C):
                                         if j < i:
-                                            a[i, j] = -kbt[i, j] * decay[i, j]
+                                            a[i, j] = 0.0
+                                            for kx in T.serial(dk):
+                                                a[i, j] += kc[i, kx] * bc[i] * kc[j, kx]
+                                            a[i, j] = -a[i, j] * g_exp[i] * g_exp_neg[j]
                                         else:
                                             a[i, j] = 0.0
-                                # attn = (I-A)^{-1}: forward substitution
+
+                                # attn = (I-A)^{-1}  via forward substitution
                                 for i in T.serial(C):
                                     for j in T.serial(C):
                                         attn[i, j] = a[i, j]
@@ -199,92 +231,81 @@ def chunk_gated_delta_rule(batch, seq_len, nk, nv, dk, dv, chunk_size=CHUNK_SIZE
                                 for i in T.serial(C):
                                     attn[i, i] = 1.0
 
-                                # v_inner = attn @ vb
+                                # v_inner = attn @ (v*beta), beta folded inline
                                 for t in T.serial(C):
                                     for d in T.serial(dv):
                                         v_inner[t, d] = 0.0
                                 for t in T.serial(C):
                                     for d in T.serial(dv):
                                         for kx in T.serial(C):
-                                            v_inner[t, d] += attn[t, kx] * vb[kx, d]
+                                            v_inner[t, d] += attn[t, kx] * vc[kx, d] * bc[kx]
 
-                                # kbe = kb * exp(g_cum); k_cumdecay = attn @ kbe
-                                for t in T.serial(C):
-                                    for d in T.serial(dk):
-                                        kbe[t, d] = kb[t, d] * g_exp[t]
+                                # k_cumdecay = attn @ (kb * exp(g_cum)),
+                                # with kb=kc*beta folded inline
                                 for t in T.serial(C):
                                     for d in T.serial(dk):
                                         k_cumdecay[t, d] = 0.0
                                 for t in T.serial(C):
                                     for d in T.serial(dk):
                                         for kx in T.serial(C):
-                                            k_cumdecay[t, d] += attn[t, kx] * kbe[kx, d]
+                                            k_cumdecay[t, d] += attn[t, kx] * kc[kx, d] * bc[kx] * g_exp[kx]
 
-                                # --- inter-chunk ---
-                                # qkt = qc @ kc^T ; attn_c = (qkt*decay).tril()
-                                for i in T.serial(C):
-                                    for j in T.serial(C):
-                                        qkt[i, j] = 0.0
-                                for i in T.serial(C):
-                                    for j in T.serial(C):
-                                        for kx in T.serial(dk):
-                                            qkt[i, j] += qc[i, kx] * kc[j, kx]
+                                # ---- inter-chunk ----
+                                # attn_c = (qc@kc^T * decay).tril(), decay factor
+                                # (exp(g_cum[i])*exp(-g_cum[j])) folded into the dot
+                                # product (qkt buffer dropped).
                                 for i in T.serial(C):
                                     for j in T.serial(C):
                                         if j <= i:
-                                            attn_c[i, j] = qkt[i, j] * decay[i, j]
+                                            attn_c[i, j] = 0.0
+                                            for kx in T.serial(dk):
+                                                attn_c[i, j] += qc[i, kx] * kc[j, kx]
+                                            attn_c[i, j] = attn_c[i, j] * g_exp[i] * g_exp_neg[j]
                                         else:
                                             attn_c[i, j] = 0.0
 
-                                # v_prime = k_cumdecay @ state ; v_new = v_inner - v_prime
+                                # v_new = v_inner - k_cumdecay@state (v_prime folded inline)
                                 for t in T.serial(C):
                                     for d in T.serial(dv):
-                                        v_prime[t, d] = 0.0
+                                        v_new[t, d] = v_inner[t, d]
                                 for t in T.serial(C):
                                     for d in T.serial(dv):
                                         for kx in T.serial(dk):
-                                            v_prime[t, d] += k_cumdecay[t, kx] * state[d, kx]
-                                for t in T.serial(C):
-                                    for d in T.serial(dv):
-                                        v_new[t, d] = v_inner[t, d] - v_prime[t, d]
+                                            v_new[t, d] -= k_cumdecay[t, kx] * state[d, kx]
 
-                                # attn_inter = (q*exp(g_cum)) @ state
-                                for t in T.serial(C):
-                                    for d in T.serial(dk):
-                                        qg[t, d] = qc[t, d] * g_exp[t]
+                                # attn_inter = (q*exp(g_cum)) @ state, exp(g_cum[t])
+                                # folded inline (qg buffer dropped)
                                 for t in T.serial(C):
                                     for d in T.serial(dv):
                                         attn_inter[t, d] = 0.0
-                                for t in T.serial(C):
-                                    for d in T.serial(dv):
                                         for kx in T.serial(dk):
-                                            attn_inter[t, d] += qg[t, kx] * state[d, kx]
+                                            attn_inter[t, d] += qc[t, kx] * state[d, kx]
+                                        attn_inter[t, d] = attn_inter[t, d] * g_exp[t]
 
                                 # out = attn_inter + attn_c @ v_new
                                 for t in T.serial(C):
                                     for d in T.serial(dv):
                                         for j in T.serial(C):
                                             attn_inter[t, d] += attn_c[t, j] * v_new[j, d]
-                                # downcast fp32 -> bf16 UB, then write valid rows to global
+
+                                # fp32 -> bf16 UB, write valid rows (full slices)
                                 T.tile.fill(ob16, 0.0)
                                 T.copy(attn_inter[0:C, 0:dv], ob16)
                                 T.copy(ob16[0:valid, 0:dv], out[s0:s0 + valid, h, 0:dv])
                                 T.barrier_all()
 
-                                # --- state update: S = exp(g_last)S + (k*exp(g_last-g_cum))^T @ v_new
+                                # ---- state update ----
+                                # S = exp(g_last)S + (k*exp(g_last-g_cum))^T @ v_new,
+                                # the k_aug factor kc[t,k]*exp(g_last-g_cum[t]) folded
+                                # inline (k_aug buffer dropped).
                                 decay_last = g_exp[C - 1]
-                                for t in T.serial(C):
-                                    for d in T.serial(dk):
-                                        k_aug[t, d] = kc[t, d] * decay_last * g_exp_neg[t]
                                 for d in T.serial(dv):
                                     for k in T.serial(dk):
                                         state[d, k] = decay_last * state[d, k]
-                                for d in T.serial(dv):
-                                    for k in T.serial(dk):
                                         for t in T.serial(C):
-                                            state[d, k] += k_aug[t, k] * v_new[t, d]
+                                            state[d, k] += kc[t, k] * decay_last * g_exp_neg[t] * v_new[t, d]
 
-                        # after the last chunk: state -> final_state (downcast bf16)
+                        # after the last chunk: state -> final_state (downcast)
                         T.tile.fill(os_b16, 0.0)
                         T.copy(state, os_b16)
                         T.copy(os_b16, final_state[b, h, :, :])

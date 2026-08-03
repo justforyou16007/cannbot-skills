@@ -244,13 +244,14 @@ with open('$EVO_DIR/shared/call_spec.json', 'w') as f:
 
 1. 读取 `output/{op_name}_evo_{timestamp}/shared/model.py` 和 `shared/design/tile_level/`
 2. **必读知识库**: 读取 `plugins-community/ops-perf-evolution/skills/evolution-knowledge/references/a3/hardware/guide.md` 和 `a3/optimization_patterns/guide.md`；算子匹配特定族（attention/reduction/elementwise）时额外读取 `a3/algorithm_insights/{family}.md`；`a3/proven_solutions/INDEX.md` 中有同类算子方案时读取对应条目
-3. 分析算子特性: 内存密集型 vs 计算密集型？尾块对齐问题（形状非32字节整数倍）？数据类型特殊处理（FP16/BF16精度）？并读取 `plugins-community/ops-perf-evolution/skills/evolution-strategies/references/strategy_index.md` 识别最相关策略
+3. 分析算子特性: 内存密集型 vs 计算密集型？尾块对齐问题（形状非32字节整数倍）？数据类型特殊处理（FP16/BF16精度）？并读取 `plugins-community/ops-perf-evolution/skills/evolution-strategies/references/strategy-index.md` 识别最相关策略
 4. **模式B特殊处理**: `baseline_performance` 填入实际测量值（来自步骤3B.3），**必须包含 `time_us` 字段**（evolution-report 读取的关键字段）:
    ```json
    "baseline_performance": { "speedup": {baseline_speedup}, "precision_passed": {baseline_precision_passed}, "compilation_success": {baseline_compilation_success}, "time_us": {baseline_time_us} }
    ```
 5. 设计节点：`parallel_num × 2` 个策略导向节点（`mode="strategy_guided"`）+ `max(1, ⌈parallel_num / 4⌉)` 个开放探索节点（`mode="open_exploration"`），确保:
    - 策略多样性（各 strategy_guided 节点 strategy_combination 不完全相同）、难度梯度（difficulty 2-4 均有覆盖）、类型覆盖（P系列性能、D系列数据类型、A系列精度，按需选择）
+   - **X 系列策略必读全文**：strategy_combination 中包含 X 系列（`X{n}`，来自 strategy-index.md"探索发现策略"分类）时，必须先读取对应的 `plugins-community/ops-perf-evolution/skills/evolution-strategies/references/discovered/disc_X{n}.md` 全文，确认其适用场景与当前算子匹配后再纳入组合；X 系列无 Preconditions/Playbook，资源注入由 prepare_strategy_resources.py 自动完成
    - 每个节点必须包含 optimization_type 字段（bandwidth/tiling/algorithm），三类各至少有 1 个节点，确保 Select 保底轮有候选
    - **若 hw_params 非 null**：利用硬件参数增强节点描述（如"tile_size 建议 {max_tile_fp16_double_buf//2}，最大可达 {max_tile_fp16_double_buf}"），并做 Roofline 定性分析（算术强度 vs 拐点）确认内存/计算密集判断
 
@@ -775,8 +776,8 @@ python3 plugins-community/ops-perf-evolution/skills/evolution-world-model/script
 对每个满足条件的 open_exploration 节点：
 
 1. 读取该内核代码 `output/{op_name}_evo_{timestamp}/{node.solution_ref}/kernel/` 和 `evaluation_results.json` 中的 `implementation_note`
-2. 读取 `plugins-community/ops-perf-evolution/skills/evolution-strategies/references/strategy_index.md` 判断新颖性：该优化手段是否超出现有所有策略的范畴？（不是组合，而是一种新方法论）
-3. **若确认新颖**：列出 `.../references/discovered/disc_X*.md` 确定下一个 X 编号 → 写入新策略文件 `.../discovered/disc_X{n}.md`（格式见下方）→ 在 `strategy_index.md` 末尾追加"探索发现策略"分类条目（已存在则追加到其中）：`| X{n} | {简洁名称} | {一句话描述} |` → 将 `"X{n}"` 追加到 `world_model.json` 的 `discovered_strategies` 列表写回 → 输出 `"[提示] 策略提炼: 发现新策略 X{n} [{名称}]，已写入策略库，后续 strategy_guided 节点可引用"`
+2. 读取 `plugins-community/ops-perf-evolution/skills/evolution-strategies/references/strategy-index.md` 判断新颖性：该优化手段是否超出现有所有策略的范畴？（不是组合，而是一种新方法论）
+3. **若确认新颖**：列出 `.../references/discovered/disc_X*.md` 确定下一个 X 编号 → 写入新策略文件 `.../discovered/disc_X{n}.md`（格式见下方）→ 在 `strategy-index.md` 末尾追加"探索发现策略"分类条目（已存在则追加到其中）：`| X{n} | {简洁名称} | {一句话描述} |` → 将 `"X{n}"` 追加到 `world_model.json` 的 `discovered_strategies` 列表写回 → 若该手法具有跨算子通用性（非 {op_name} 特有场景），追加沉淀到 `plugins-community/ops-perf-evolution/skills/evolution-knowledge/references/a3/proven_solutions/INDEX.md`（格式见下方"通用方案沉淀"）→ 输出 `"[提示] 策略提炼: 发现新策略 X{n} [{名称}]，已写入策略库，后续 strategy_guided 节点可引用"`
 4. **若非新颖**：输出：`"[INFO] open_exploration 手法与策略 {匹配ID} 相似，跳过提炼"`
 
 **新策略文件格式** (`.../discovered/disc_X{n}.md`)：
@@ -803,6 +804,20 @@ base_speedup: {score}x
 ## 来源
 自动发现于第 {r} 轮进化，算子 {op_name}，speedup {score}x
 ```
+
+**通用方案沉淀**（`proven_solutions/INDEX.md`，仅当手法跨算子通用时执行）：
+
+先读取该文件确认无同类条目（已有同手法条目时，仅在其 **Source** 中补充新来源算子，不重复新增），然后：
+
+1. 在"按算子类型索引"表追加一行：`| {算子类型} | X{n}: {简洁名称} | {op_name} evolution |`
+2. 在"Recorded Solutions"末尾追加完整条目，遵循文件头部模板：
+   - **Source**: {op_name} evolution, round {r}, parallel {p}
+   - **Speedup**: {best_score_before_this_round}x → {score}x
+   - **Operator type** / **Hardware** / **Technique description**（1-3 句，描述手法本质）
+   - **Key code change**: 从该节点 kernel 代码提取前后关键片段（Before/After）
+   - **Applicability conditions**: 适用算子族、shape/平台约束
+   - **Strategy IDs**: X{n}（及关联的 P/D/A/R 系列策略）
+3. 输出：`"[提示] 通用方案沉淀: X{n} [{名称}] 已追加到 proven_solutions/INDEX.md"`
 
 **无分支命中**：跳过，直接进入 4.6 CHECKPOINT。
 

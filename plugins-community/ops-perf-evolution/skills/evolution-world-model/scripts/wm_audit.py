@@ -137,7 +137,7 @@ def cmd_diagnose(args: argparse.Namespace) -> int:
 
 def _find_precond_script():
     """定位 check_preconditions.py 脚本路径。"""
-    script_path = (Path(__file__).resolve().parent.parent.parent.parent
+    script_path = (Path(__file__).resolve().parent.parent.parent.parent.parent.parent
                    / "plugins-community/ops-perf-evolution/skills/evolution-strategies/scripts/check_preconditions.py")
     if script_path.exists():
         return script_path

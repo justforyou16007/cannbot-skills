@@ -11,7 +11,7 @@ AscendC 内核优化策略库，包含 61+ 策略，覆盖数据类型 (D)、性
 
 ```
 references/
-  strategy_index.md           # 主索引（可追加 X 系列条目）
+  strategy-index.md           # 主索引（可追加 X 系列条目）
   strategy_compatibility.md   # 互斥表、依赖关系、推荐组合
   strategy_index_a5.md        # A5 (351x/Regbase) R 系列扩展策略
   README.md                   # 策略使用指南
@@ -33,13 +33,13 @@ references/
 
 18 个基础策略：D1-D5, P1-P13, A1-A8
 
-**必读**: 读取 `references/strategy_index.md`，根据算子类型从 L0 策略中选择基础组合。
+**必读**: 读取 `references/strategy-index.md`，根据算子类型从 L0 策略中选择基础组合。
 
 ### L1 (Advanced) — 按算子类别选择
 
 35+ 个进阶策略：P14-P98
 
-根据算子类别（CV fusion, attention, matmul, quantization, reduction, sort等）选择适用的 L1 策略。参考 `strategy_index.md` 中的 "When to Apply" 列。
+根据算子类别（CV fusion, attention, matmul, quantization, reduction, sort等）选择适用的 L1 策略。参考 `strategy-index.md` 中的 "When to Apply" 列。
 
 特别关注标量计算向量化系列 (P94-P98)：对任何新生成的 kernel 优先检查是否含有标量 for 循环，这是单次优化中收益最大的模式。
 
@@ -60,13 +60,13 @@ X 系列（disc_X1.md, disc_X2.md, ...），由进化过程动态发现并注册
 
 当 open_exploration 节点取得显著提升（speedup > best_score_before * 1.10）时：
 
-1. 读取 `references/strategy_index.md` 检查新发现的优化方法是否已有覆盖
+1. 读取 `references/strategy-index.md` 检查新发现的优化方法是否已有覆盖
 2. 如果是全新策略：
    - `Glob references/discovered/disc_X*.md` 获取当前最大编号
    - `Write references/discovered/disc_X{n+1}.md` 记录新策略
-   - `Edit references/strategy_index.md` 追加新行到"探索发现策略"分类
+   - `Edit references/strategy-index.md` 追加新行到"探索发现策略"分类
 
-> **可变性说明**: `strategies/` 目录为只读精选库（P/D/A/R 系列）。`discovered/` 目录为运行时可写（X 系列）。`strategy_index.md` 仅允许追加 X 系列条目。
+> **可变性说明**: `strategies/` 目录为只读精选库（P/D/A/R 系列）。`discovered/` 目录为运行时可写（X 系列）。`strategy-index.md` 仅允许追加 X 系列条目。
 
 ## A5 架构扩展
 

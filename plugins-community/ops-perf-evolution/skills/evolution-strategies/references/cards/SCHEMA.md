@@ -63,7 +63,7 @@ quantified_gain:                   # v3.2 新增（可选）
 | `l2_cache_thrash` | L2 Cache 抖动 |
 | `ub_memory_pressure` | UB 内存压力 |
 
-**填写依据**：对着 `strategy_index.md` L250-269 "按瓶颈查表"，找到该策略出现在哪些瓶颈行的 Primary/Secondary 列。
+**填写依据**：对着 `strategy-index.md` L250-269 "按瓶颈查表"，找到该策略出现在哪些瓶颈行的 Primary/Secondary 列。
 
 ### `op_families` (必填，可为空列表 `[]`)
 - 类型：字符串列表
@@ -89,7 +89,7 @@ quantified_gain:                   # v3.2 新增（可选）
 | `special` | 特殊/复杂算子 |
 | `datapath` | 通用数据搬运通路（所有算子族都适用，如 D1-D5, P1-P12, A1-A8）|
 
-**填写依据**：对着 `strategy_index.md` L233-248 "按算子类型快速查表"，找到该策略出现在哪些算子行。若 L0 通用策略，填 `[datapath]`。
+**填写依据**：对着 `strategy-index.md` L233-248 "按算子类型快速查表"，找到该策略出现在哪些算子行。若 L0 通用策略，填 `[datapath]`。
 
 ### `complexity` (必填，单值)
 - 类型：字符串

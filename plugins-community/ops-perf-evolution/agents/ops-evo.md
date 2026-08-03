@@ -317,6 +317,7 @@ python3 plugins-community/ops-perf-evolution/skills/ops-evaluation/scripts/evalu
 4. 读取 `plugins-community/ops-perf-evolution/skills/evolution-strategies/references/strategy-index.md`，识别最相关策略
 5. 设计节点：`parallel_num × 2` 个策略导向节点（`mode="strategy_guided"`）+ `max(1, ⌈parallel_num / 4⌉)` 个开放探索节点（`mode="open_exploration"`），确保:
    - 策略多样性（各 strategy_guided 节点 strategy_combination 不完全相同）、难度梯度（difficulty 2-4 均有覆盖）、类型覆盖（P性能/D数据类型/A精度，按需）
+   - **X 系列策略必读全文**：strategy_combination 中包含 X 系列（`X{n}`，来自 strategy-index.md"探索发现策略"分类）时，必须先读取对应的 `plugins-community/ops-perf-evolution/skills/evolution-strategies/references/discovered/disc_X{n}.md` 全文，确认其适用场景与当前算子匹配后再纳入组合；X 系列无 Preconditions/Playbook，资源注入由 prepare_strategy_resources.py 自动完成
    - 若算子族匹配 ascendc-tiling-design 覆盖范围，至少为 1 个 strategy_guided 节点分配对应的 P104-P115 策略（例如 matmul 族分配 P104+P108），确保系统化 Tiling 设计有机会进入进化。
    - 每个节点必须包含 optimization_type 字段（bandwidth/tiling/algorithm），三类各至少有 1 个节点，确保 Select 保底轮有候选
    - **若 hw_params 非 null**：利用硬件参数增强节点描述（如"tile_size 建议 {max_tile_fp16_double_buf//2}，最大可达 {max_tile_fp16_double_buf}"），并做 Roofline 定性分析（算术强度 vs 拐点）确认内存/计算密集判断
@@ -832,7 +833,12 @@ Supervisor 返回结果处理（4.5.1/4.5.2 共用，仅输出标签不同）：
       ```
    c. 在 `strategy-index.md` 末尾"探索发现策略"分类追加条目（无此分类则新建）：`| X{n} | {简洁名称} | {一句话描述} |`
    d. 将 `"X{n}"` 追加到 `world_model.json` 的 `discovered_strategies` 列表，写回文件
-   e. 输出：`"[提示] 策略提炼: 发现新策略 X{n} [{名称}]，已写入策略库，后续 strategy_guided 节点可引用"`
+   e. 若该手法具有跨算子通用性（非 {op_name} 特有场景），追加沉淀到 `plugins-community/ops-perf-evolution/skills/evolution-knowledge/references/a3/proven_solutions/INDEX.md`：
+      - 先读该文件确认无同类条目（已有同手法条目时，仅在其 **Source** 中补充新来源算子，不重复新增）
+      - 在"按算子类型索引"表追加一行：`| {算子类型} | X{n}: {简洁名称} | {op_name} evolution |`
+      - 在"Recorded Solutions"末尾按文件头部模板追加完整条目：**Source**（{op_name} evolution, round {r}, parallel {p}）、**Speedup**（{best_score_before_this_round}x → {score}x）、**Operator type**、**Hardware**、**Technique description**（1-3 句）、**Key code change**（从 modified_files 提取前后关键片段 Before/After）、**Applicability conditions**、**Strategy IDs**（X{n} 及关联 P/D/A/R 策略）
+      - 输出：`"[提示] 通用方案沉淀: X{n} [{名称}] 已追加到 proven_solutions/INDEX.md"`
+   f. 输出：`"[提示] 策略提炼: 发现新策略 X{n} [{名称}]，已写入策略库，后续 strategy_guided 节点可引用"`
 4. **若非新颖**（已被现有策略覆盖）：输出 `"[INFO] open_exploration 手法与策略 {匹配ID} 相似，跳过提炼"`
 
 **无分支命中**：跳过，直接进入 4.6 CHECKPOINT。

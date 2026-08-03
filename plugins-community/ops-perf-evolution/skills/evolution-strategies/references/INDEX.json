@@ -49,7 +49,7 @@
     "preconditions": 119,
     "playbooks": 119,
     "families": 8,
-    "discovered": 16
+    "discovered": 20
   },
   "cards": [
     {
@@ -466,6 +466,164 @@
       ]
     },
     {
+      "source_key": "evolution-strategies#card/P104_matmul_multi_core_tiling_expansion",
+      "id": "P104",
+      "title": "P104: Matmul 多核切分扩展（Multi-Core Tiling Expansion）",
+      "doc_path": "cards/P104_matmul_multi_core_tiling_expansion.md",
+      "complexity": "L1",
+      "op_families": [
+        "matmul"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "parallelism_underutil",
+          "tiling_imbalance"
+        ]
+      },
+      "conflicts_with": [
+        "P72"
+      ],
+      "synergizes_with": [
+        "P4",
+        "P105",
+        "P107"
+      ],
+      "requires": [],
+      "has_preconditions": true,
+      "has_playbook": true,
+      "quantified_gain": []
+    },
+    {
+      "source_key": "evolution-strategies#card/P105_matmul_l2_cache_tile_sizing",
+      "id": "P105",
+      "title": "P105: Matmul L2 Cache Tile 尺寸规划（L2 Cache Tile Sizing）",
+      "doc_path": "cards/P105_matmul_l2_cache_tile_sizing.md",
+      "complexity": "L1",
+      "op_families": [
+        "matmul"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "memory_bound",
+          "mte2_bound"
+        ]
+      },
+      "conflicts_with": [],
+      "synergizes_with": [
+        "P52",
+        "P107",
+        "P104"
+      ],
+      "requires": [],
+      "has_preconditions": true,
+      "has_playbook": true,
+      "quantified_gain": []
+    },
+    {
+      "source_key": "evolution-strategies#card/P106_matmul_batch_merge_to_m",
+      "id": "P106",
+      "title": "P106: Matmul Batch 维度合并到 M（Batch Merge to M）",
+      "doc_path": "cards/P106_matmul_batch_merge_to_m.md",
+      "complexity": "L1",
+      "op_families": [
+        "matmul"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "parallelism_underutil",
+          "tiling_imbalance"
+        ]
+      },
+      "conflicts_with": [],
+      "synergizes_with": [
+        "P104",
+        "P16"
+      ],
+      "requires": [],
+      "has_preconditions": true,
+      "has_playbook": true,
+      "quantified_gain": []
+    },
+    {
+      "source_key": "evolution-strategies#card/P107_matmul_serpentine_traversal",
+      "id": "P107",
+      "title": "P107: Matmul Serpentine 反向遍历（Serpentine Traversal）",
+      "doc_path": "cards/P107_matmul_serpentine_traversal.md",
+      "complexity": "L1",
+      "op_families": [
+        "matmul"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "memory_bound",
+          "mte2_bound"
+        ]
+      },
+      "conflicts_with": [],
+      "synergizes_with": [
+        "P105",
+        "P52",
+        "P104"
+      ],
+      "requires": [
+        "P105"
+      ],
+      "has_preconditions": true,
+      "has_playbook": true,
+      "quantified_gain": []
+    },
+    {
+      "source_key": "evolution-strategies#card/P108_matmul_platform_routing",
+      "id": "P108",
+      "title": "P108: Matmul 平台路由（Platform Routing）",
+      "doc_path": "cards/P108_matmul_platform_routing.md",
+      "complexity": "L1",
+      "op_families": [
+        "matmul"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "portability"
+        ]
+      },
+      "conflicts_with": [],
+      "synergizes_with": [
+        "P46"
+      ],
+      "requires": [],
+      "has_preconditions": false,
+      "has_playbook": false,
+      "quantified_gain": []
+    },
+    {
+      "source_key": "evolution-strategies#card/P109_reduction_multi_axis_tiling",
+      "id": "P109",
+      "title": "P109: Reduction 多轴 Tiling 系统化设计",
+      "doc_path": "cards/P109_reduction_multi_axis_tiling.md",
+      "complexity": "L1",
+      "op_families": [
+        "reduction",
+        "normalization",
+        "softmax"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "tiling_mismatch",
+          "scalar_compute"
+        ]
+      },
+      "conflicts_with": [],
+      "synergizes_with": [
+        "P110",
+        "P68",
+        "A2"
+      ],
+      "requires": [],
+      "has_preconditions": true,
+      "has_playbook": true,
+      "quantified_gain": []
+    },
+    {
       "source_key": "evolution-strategies#card/P10_vectorized_copy",
       "id": "P10",
       "title": "P10: Vectorized Data Copy & Instructions (向量化数据与指令)",
@@ -483,6 +641,286 @@
       },
       "conflicts_with": [],
       "synergizes_with": [],
+      "requires": [],
+      "has_preconditions": true,
+      "has_playbook": true,
+      "quantified_gain": []
+    },
+    {
+      "source_key": "evolution-strategies#card/P110_reduction_ub_accumulator_reuse",
+      "id": "P110",
+      "title": "P110: Reduction UB 累加器复用",
+      "doc_path": "cards/P110_reduction_ub_accumulator_reuse.md",
+      "complexity": "L1",
+      "op_families": [
+        "reduction",
+        "normalization",
+        "softmax"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "ub_pressure",
+          "scalar_compute"
+        ]
+      },
+      "conflicts_with": [],
+      "synergizes_with": [
+        "P109",
+        "P68",
+        "A2"
+      ],
+      "requires": [],
+      "has_preconditions": true,
+      "has_playbook": true,
+      "quantified_gain": []
+    },
+    {
+      "source_key": "evolution-strategies#card/P111_sort_two_level_merge_tiling",
+      "id": "P111",
+      "title": "P111: Sort 两级归并 Tiling 系统化设计",
+      "doc_path": "cards/P111_sort_two_level_merge_tiling.md",
+      "complexity": "L1",
+      "op_families": [
+        "sort",
+        "topk"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "ub_overflow",
+          "sync_overhead",
+          "scalar_compute"
+        ]
+      },
+      "conflicts_with": [],
+      "synergizes_with": [
+        "P96",
+        "P1",
+        "P7"
+      ],
+      "requires": [],
+      "has_preconditions": true,
+      "has_playbook": true,
+      "quantified_gain": []
+    },
+    {
+      "source_key": "evolution-strategies#card/P112_elementwise_vectorized_tile_sizing",
+      "id": "P112",
+      "title": "P112: Elementwise 向量化 Tile 尺寸设计",
+      "doc_path": "cards/P112_elementwise_vectorized_tile_sizing.md",
+      "complexity": "L1",
+      "op_families": [
+        "elementwise"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "vec_underutilization",
+          "mte2_stall",
+          "tail_block"
+        ]
+      },
+      "conflicts_with": [],
+      "synergizes_with": [
+        "P1",
+        "P5",
+        "P10",
+        "P69"
+      ],
+      "requires": [],
+      "has_preconditions": true,
+      "has_playbook": true,
+      "quantified_gain": []
+    },
+    {
+      "source_key": "evolution-strategies#card/P113_broadcast_aligned_tiling",
+      "id": "P113",
+      "title": "P113: Broadcast 对齐 Tiling 设计",
+      "doc_path": "cards/P113_broadcast_aligned_tiling.md",
+      "complexity": "L1",
+      "op_families": [
+        "broadcast",
+        "elementwise"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "mte2_stall",
+          "ub_pressure",
+          "tail_block"
+        ]
+      },
+      "conflicts_with": [],
+      "synergizes_with": [
+        "P112",
+        "P12",
+        "P7",
+        "P1"
+      ],
+      "requires": [],
+      "has_preconditions": true,
+      "has_playbook": true,
+      "quantified_gain": []
+    },
+    {
+      "source_key": "evolution-strategies#card/P114_transpose_nd_tiling_with_alignment",
+      "id": "P114",
+      "title": "P114: Transpose 多维对齐 Tiling 设计",
+      "doc_path": "cards/P114_transpose_nd_tiling_with_alignment.md",
+      "complexity": "L1",
+      "op_families": [
+        "conversion",
+        "transpose"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "mte2_stall",
+          "vec_underutilization",
+          "tail_block"
+        ]
+      },
+      "conflicts_with": [],
+      "synergizes_with": [
+        "P26",
+        "P7",
+        "P1"
+      ],
+      "requires": [],
+      "has_preconditions": true,
+      "has_playbook": true,
+      "quantified_gain": []
+    },
+    {
+      "source_key": "evolution-strategies#card/P115_flashattention_tiling_routing",
+      "id": "P115",
+      "title": "P115: FlashAttention Tiling 路由",
+      "doc_path": "cards/P115_flashattention_tiling_routing.md",
+      "complexity": "L1",
+      "op_families": [
+        "attention",
+        "flash_attention"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "tiling_mismatch",
+          "cube_underutilization",
+          "sync_overhead"
+        ]
+      },
+      "conflicts_with": [],
+      "synergizes_with": [
+        "P14",
+        "P18",
+        "P38",
+        "P55"
+      ],
+      "requires": [],
+      "has_preconditions": true,
+      "has_playbook": true,
+      "quantified_gain": []
+    },
+    {
+      "source_key": "evolution-strategies#card/P116_gqa_grouped_m_head_merge",
+      "id": "P116",
+      "title": "P116: GQA Grouped-M 头合并（G 个 Query Head 合并进 Matmul M 维）",
+      "doc_path": "cards/P116_gqa_grouped_m_head_merge.md",
+      "complexity": "L1",
+      "op_families": [
+        "attention",
+        "flash_attention"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "cube_underutilization",
+          "tiling_imbalance"
+        ]
+      },
+      "conflicts_with": [],
+      "synergizes_with": [
+        "P57",
+        "P106",
+        "P115"
+      ],
+      "requires": [],
+      "has_preconditions": true,
+      "has_playbook": true,
+      "quantified_gain": []
+    },
+    {
+      "source_key": "evolution-strategies#card/P117_matmul_api_tiling_host_recipe",
+      "id": "P117",
+      "title": "P117: 双 BMM 链 MatmulApiTiling Host 配方（SetBufferSpace + SetFixSplit + depthA1 流水微调）",
+      "doc_path": "cards/P117_matmul_api_tiling_host_recipe.md",
+      "complexity": "L1",
+      "op_families": [
+        "attention",
+        "flash_attention",
+        "matmul",
+        "cv_fusion"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "cube_underutilization"
+        ]
+      },
+      "conflicts_with": [],
+      "synergizes_with": [
+        "P46",
+        "P86",
+        "P92"
+      ],
+      "requires": [],
+      "has_preconditions": true,
+      "has_playbook": true,
+      "quantified_gain": []
+    },
+    {
+      "source_key": "evolution-strategies#card/P118_mask_precompute_parallel_aiv",
+      "id": "P118",
+      "title": "P118: Causal Mask 独立 AIV Kernel 并行预生成（按需 Dense 替代通用压缩表）",
+      "doc_path": "cards/P118_mask_precompute_parallel_aiv.md",
+      "complexity": "L1",
+      "op_families": [
+        "attention",
+        "flash_attention",
+        "broadcast_mask"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "no_overlap",
+          "mte2_stall"
+        ]
+      },
+      "conflicts_with": [],
+      "synergizes_with": [
+        "P14",
+        "P116"
+      ],
+      "requires": [],
+      "has_preconditions": true,
+      "has_playbook": true,
+      "quantified_gain": []
+    },
+    {
+      "source_key": "evolution-strategies#card/P119_two_pass_to_online_softmax",
+      "id": "P119",
+      "title": "P119: Two-Pass Softmax → Online Softmax 单遍 KV 流式改写",
+      "doc_path": "cards/P119_two_pass_to_online_softmax.md",
+      "complexity": "L2",
+      "op_families": [
+        "attention",
+        "flash_attention",
+        "softmax"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "mte2_stall",
+          "no_overlap"
+        ]
+      },
+      "conflicts_with": [],
+      "synergizes_with": [
+        "P38",
+        "P115",
+        "A5"
+      ],
       "requires": [],
       "has_preconditions": true,
       "has_playbook": true,
@@ -2933,485 +3371,6 @@
       "quantified_gain": [],
       "deprecated": true,
       "deprecated_reason": "Uses fictional Mutex::Lock API. Overlaps with P28/P29/P30 sync strategies. Zero references."
-    },
-    {
-      "source_key": "evolution-strategies#card/P104_matmul_multi_core_tiling_expansion",
-      "id": "P104",
-      "title": "P104: Matmul Multi-Core Tiling Expansion",
-      "doc_path": "cards/P104_matmul_multi_core_tiling_expansion.md",
-      "complexity": "L1",
-      "op_families": [
-        "matmul"
-      ],
-      "triggers": {
-        "bottleneck_labels": [
-          "tiling_imbalance"
-        ]
-      },
-      "conflicts_with": [
-        "P72"
-      ],
-      "synergizes_with": [
-        "P4",
-        "P105",
-        "P107"
-      ],
-      "requires": [],
-      "has_preconditions": true,
-      "has_playbook": true,
-      "quantified_gain": [],
-      "references": [
-        "ops/ascendc-tiling-design/references/matmul/ascendc-api-matmul-tiling.md"
-      ]
-    },
-    {
-      "source_key": "evolution-strategies#card/P105_matmul_l2_cache_tile_sizing",
-      "id": "P105",
-      "title": "P105: Matmul L2 Cache Tile Sizing",
-      "doc_path": "cards/P105_matmul_l2_cache_tile_sizing.md",
-      "complexity": "L1",
-      "op_families": [
-        "matmul"
-      ],
-      "triggers": {
-        "bottleneck_labels": [
-          "tiling_imbalance"
-        ]
-      },
-      "conflicts_with": [],
-      "synergizes_with": [
-        "P52",
-        "P107",
-        "P104"
-      ],
-      "requires": [],
-      "has_preconditions": true,
-      "has_playbook": true,
-      "quantified_gain": [],
-      "references": [
-        "ops/ascendc-tiling-design/references/matmul/ascendc-api-matmul-tiling.md"
-      ]
-    },
-    {
-      "source_key": "evolution-strategies#card/P106_matmul_batch_merge_to_m",
-      "id": "P106",
-      "title": "P106: Matmul Batch Merge to M",
-      "doc_path": "cards/P106_matmul_batch_merge_to_m.md",
-      "complexity": "L1",
-      "op_families": [
-        "matmul"
-      ],
-      "triggers": {
-        "bottleneck_labels": [
-          "tiling_imbalance"
-        ]
-      },
-      "conflicts_with": [],
-      "synergizes_with": [
-        "P104",
-        "P16"
-      ],
-      "requires": [],
-      "has_preconditions": true,
-      "has_playbook": true,
-      "quantified_gain": [],
-      "references": [
-        "ops/ascendc-tiling-design/references/matmul/ascendc-api-matmul-tiling.md"
-      ]
-    },
-    {
-      "source_key": "evolution-strategies#card/P107_matmul_serpentine_traversal",
-      "id": "P107",
-      "title": "P107: Matmul Serpentine Traversal",
-      "doc_path": "cards/P107_matmul_serpentine_traversal.md",
-      "complexity": "L1",
-      "op_families": [
-        "matmul"
-      ],
-      "triggers": {
-        "bottleneck_labels": [
-          "tiling_imbalance"
-        ]
-      },
-      "conflicts_with": [],
-      "synergizes_with": [
-        "P105",
-        "P52",
-        "P104"
-      ],
-      "requires": [
-        "P105"
-      ],
-      "has_preconditions": true,
-      "has_playbook": true,
-      "quantified_gain": [],
-      "references": [
-        "ops/ascendc-tiling-design/references/matmul/ascendc-api-matmul-tiling.md"
-      ]
-    },
-    {
-      "source_key": "evolution-strategies#card/P108_matmul_platform_routing",
-      "id": "P108",
-      "title": "P108: Matmul Platform Routing",
-      "doc_path": "cards/P108_matmul_platform_routing.md",
-      "complexity": "L1",
-      "op_families": [
-        "matmul"
-      ],
-      "triggers": {
-        "bottleneck_labels": [
-          "tiling_imbalance"
-        ]
-      },
-      "conflicts_with": [],
-      "synergizes_with": [
-        "P46"
-      ],
-      "requires": [],
-      "has_preconditions": false,
-      "has_playbook": false,
-      "quantified_gain": [],
-      "references": [
-        "ops/ascendc-tiling-design/references/matmul/ascendc-api-matmul-tiling.md"
-      ]
-    },
-    {
-      "source_key": "evolution-strategies#card/P109_reduction_multi_axis_tiling",
-      "id": "P109",
-      "title": "P109: Reduction 多轴 Tiling 系统化设计",
-      "doc_path": "cards/P109_reduction_multi_axis_tiling.md",
-      "complexity": "L1",
-      "op_families": [
-        "reduction",
-        "normalization",
-        "softmax"
-      ],
-      "triggers": {
-        "bottleneck_labels": [
-          "tiling_imbalance",
-          "scalar_compute"
-        ]
-      },
-      "conflicts_with": [],
-      "synergizes_with": [
-        "P110",
-        "P68",
-        "A2"
-      ],
-      "requires": [],
-      "has_preconditions": true,
-      "has_playbook": true,
-      "quantified_gain": [],
-      "references": [
-        "ops/ascendc-tiling-design/references/reduction/patterns.md",
-        "ops/ascendc-tiling-design/references/reduction/algorithms.md",
-        "ops/ascendc-tiling-design/references/reduction/multi-axis-transform.md",
-        "ops/ascendc-tiling-design/references/reduction/tiling-fields.md"
-      ]
-    },
-    {
-      "source_key": "evolution-strategies#card/P110_reduction_ub_accumulator_reuse",
-      "id": "P110",
-      "title": "P110: Reduction UB 累加器复用",
-      "doc_path": "cards/P110_reduction_ub_accumulator_reuse.md",
-      "complexity": "L1",
-      "op_families": [
-        "reduction",
-        "normalization",
-        "softmax"
-      ],
-      "triggers": {
-        "bottleneck_labels": [
-          "tiling_imbalance",
-          "scalar_compute"
-        ]
-      },
-      "conflicts_with": [],
-      "synergizes_with": [
-        "P109",
-        "P68",
-        "A2"
-      ],
-      "requires": [],
-      "has_preconditions": true,
-      "has_playbook": true,
-      "quantified_gain": [],
-      "references": [
-        "ops/ascendc-tiling-design/references/reduction/algorithms.md",
-        "ops/ascendc-tiling-design/references/reduction/patterns.md",
-        "ops/ascendc-tiling-design/references/reduction/tiling-fields.md"
-      ]
-    },
-    {
-      "source_key": "evolution-strategies#card/P111_sort_two_level_merge_tiling",
-      "id": "P111",
-      "title": "P111: Sort 两级归并 Tiling 系统化设计",
-      "doc_path": "cards/P111_sort_two_level_merge_tiling.md",
-      "complexity": "L1",
-      "op_families": [
-        "sort",
-        "topk"
-      ],
-      "triggers": {
-        "bottleneck_labels": [
-          "tiling_imbalance",
-          "scalar_compute"
-        ]
-      },
-      "conflicts_with": [],
-      "synergizes_with": [
-        "P96",
-        "P1",
-        "P7"
-      ],
-      "requires": [],
-      "has_preconditions": true,
-      "has_playbook": true,
-      "quantified_gain": [],
-      "references": [
-        "ops/ascendc-tiling-design/references/sort/patterns.md",
-        "ops/ascendc-tiling-design/references/sort/alg-two-level-mrgsort.md"
-      ]
-    },
-    {
-      "source_key": "evolution-strategies#card/P112_elementwise_vectorized_tile_sizing",
-      "id": "P112",
-      "title": "P112: Elementwise 向量化 Tile 尺寸设计",
-      "doc_path": "cards/P112_elementwise_vectorized_tile_sizing.md",
-      "complexity": "L1",
-      "op_families": [
-        "elementwise"
-      ],
-      "triggers": {
-        "bottleneck_labels": [
-          "tiling_imbalance",
-          "mte2_stall"
-        ]
-      },
-      "conflicts_with": [],
-      "synergizes_with": [
-        "P1",
-        "P5",
-        "P10",
-        "P69"
-      ],
-      "requires": [],
-      "has_preconditions": true,
-      "has_playbook": true,
-      "quantified_gain": [],
-      "references": [
-        "ops/ascendc-tiling-design/references/elewise/patterns.md",
-        "ops/ascendc-tiling-design/references/elewise/tiling.md"
-      ]
-    },
-    {
-      "source_key": "evolution-strategies#card/P113_broadcast_aligned_tiling",
-      "id": "P113",
-      "title": "P113: Broadcast 对齐 Tiling 设计",
-      "doc_path": "cards/P113_broadcast_aligned_tiling.md",
-      "complexity": "L1",
-      "op_families": [
-        "broadcast",
-        "elementwise"
-      ],
-      "triggers": {
-        "bottleneck_labels": [
-          "mte2_stall",
-          "tiling_imbalance"
-        ]
-      },
-      "conflicts_with": [],
-      "synergizes_with": [
-        "P112",
-        "P12",
-        "P7",
-        "P1"
-      ],
-      "requires": [],
-      "has_preconditions": true,
-      "has_playbook": true,
-      "quantified_gain": [],
-      "references": [
-        "ops/ascendc-tiling-design/references/broadcast/patterns.md",
-        "ops/ascendc-tiling-design/references/broadcast/nddma-broadcast.md",
-        "ops/ascendc-tiling-design/references/broadcast/ub-broadcast.md",
-        "ops/ascendc-tiling-design/references/broadcast/dynamic-ub-broadcast.md",
-        "ops/ascendc-tiling-design/references/broadcast/onedim.md"
-      ]
-    },
-    {
-      "source_key": "evolution-strategies#card/P114_transpose_nd_tiling_with_alignment",
-      "id": "P114",
-      "title": "P114: Transpose 多维对齐 Tiling 设计",
-      "doc_path": "cards/P114_transpose_nd_tiling_with_alignment.md",
-      "complexity": "L1",
-      "op_families": [
-        "conversion",
-        "transpose"
-      ],
-      "triggers": {
-        "bottleneck_labels": [
-          "mte2_stall",
-          "tiling_imbalance"
-        ]
-      },
-      "conflicts_with": [],
-      "synergizes_with": [
-        "P26",
-        "P7",
-        "P1"
-      ],
-      "requires": [],
-      "has_preconditions": true,
-      "has_playbook": true,
-      "quantified_gain": [],
-      "references": [
-        "ops/ascendc-tiling-design/references/conversion/patterns.md"
-      ]
-    },
-    {
-      "source_key": "evolution-strategies#card/P115_flashattention_tiling_routing",
-      "id": "P115",
-      "title": "P115: FlashAttention Tiling 路由",
-      "doc_path": "cards/P115_flashattention_tiling_routing.md",
-      "complexity": "L1",
-      "op_families": [
-        "attention",
-        "flash_attention"
-      ],
-      "triggers": {
-        "bottleneck_labels": [
-          "tiling_imbalance"
-        ]
-      },
-      "conflicts_with": [],
-      "synergizes_with": [
-        "P14",
-        "P18",
-        "P38",
-        "P55"
-      ],
-      "requires": [],
-      "has_preconditions": true,
-      "has_playbook": true,
-      "quantified_gain": [],
-      "references": [
-        "ops/ascendc-tiling-design/references/flashattention/patterns.md",
-        "ops/ascendc-tiling-design/references/flashattention/foundation/fundamentals.md",
-        "ops/ascendc-tiling-design/references/flashattention/foundation/roofline.md",
-        "ops/ascendc-tiling-design/references/flashattention/design/_governance.md",
-        "ops/ascendc-tiling-design/references/flashattention/subfamilies/base_design.md"
-      ]
-    },
-    {
-      "source_key": "evolution-strategies#card/P116_gqa_grouped_m_head_merge",
-      "id": "P116",
-      "title": "P116: GQA Grouped-M 头合并（G 个 Query Head 合并进 Matmul M 维）",
-      "doc_path": "cards/P116_gqa_grouped_m_head_merge.md",
-      "complexity": "L1",
-      "op_families": [
-        "attention",
-        "flash_attention"
-      ],
-      "triggers": {
-        "bottleneck_labels": [
-          "cube_underutilization",
-          "tiling_imbalance"
-        ]
-      },
-      "conflicts_with": [],
-      "synergizes_with": [
-        "P57",
-        "P106",
-        "P115"
-      ],
-      "requires": [],
-      "has_preconditions": true,
-      "has_playbook": true,
-      "quantified_gain": []
-    },
-    {
-      "source_key": "evolution-strategies#card/P117_matmul_api_tiling_host_recipe",
-      "id": "P117",
-      "title": "P117: 双 BMM 链 MatmulApiTiling Host 配方（SetBufferSpace + SetFixSplit + depthA1 流水微调）",
-      "doc_path": "cards/P117_matmul_api_tiling_host_recipe.md",
-      "complexity": "L1",
-      "op_families": [
-        "attention",
-        "flash_attention",
-        "matmul",
-        "cv_fusion"
-      ],
-      "triggers": {
-        "bottleneck_labels": [
-          "cube_underutilization"
-        ]
-      },
-      "conflicts_with": [],
-      "synergizes_with": [
-        "P46",
-        "P86",
-        "P92"
-      ],
-      "requires": [],
-      "has_preconditions": true,
-      "has_playbook": true,
-      "quantified_gain": []
-    },
-    {
-      "source_key": "evolution-strategies#card/P118_mask_precompute_parallel_aiv",
-      "id": "P118",
-      "title": "P118: Causal Mask 独立 AIV Kernel 并行预生成（按需 Dense 替代通用压缩表）",
-      "doc_path": "cards/P118_mask_precompute_parallel_aiv.md",
-      "complexity": "L1",
-      "op_families": [
-        "attention",
-        "flash_attention",
-        "broadcast_mask"
-      ],
-      "triggers": {
-        "bottleneck_labels": [
-          "no_overlap",
-          "mte2_stall"
-        ]
-      },
-      "conflicts_with": [],
-      "synergizes_with": [
-        "P14",
-        "P116"
-      ],
-      "requires": [],
-      "has_preconditions": true,
-      "has_playbook": true,
-      "quantified_gain": []
-    },
-    {
-      "source_key": "evolution-strategies#card/P119_two_pass_to_online_softmax",
-      "id": "P119",
-      "title": "P119: Two-Pass Softmax → Online Softmax 单遍 KV 流式改写",
-      "doc_path": "cards/P119_two_pass_to_online_softmax.md",
-      "complexity": "L2",
-      "op_families": [
-        "attention",
-        "flash_attention",
-        "softmax"
-      ],
-      "triggers": {
-        "bottleneck_labels": [
-          "mte2_stall",
-          "no_overlap"
-        ]
-      },
-      "conflicts_with": [],
-      "synergizes_with": [
-        "P38",
-        "P115",
-        "A5"
-      ],
-      "requires": [],
-      "has_preconditions": true,
-      "has_playbook": true,
-      "quantified_gain": []
     }
   ],
   "preconditions": [
@@ -3506,9 +3465,84 @@
       "doc_path": "preconditions/P103.yaml"
     },
     {
+      "source_key": "evolution-strategies#preconditions/P104",
+      "id": "P104",
+      "doc_path": "preconditions/P104.yaml"
+    },
+    {
+      "source_key": "evolution-strategies#preconditions/P105",
+      "id": "P105",
+      "doc_path": "preconditions/P105.yaml"
+    },
+    {
+      "source_key": "evolution-strategies#preconditions/P106",
+      "id": "P106",
+      "doc_path": "preconditions/P106.yaml"
+    },
+    {
+      "source_key": "evolution-strategies#preconditions/P107",
+      "id": "P107",
+      "doc_path": "preconditions/P107.yaml"
+    },
+    {
+      "source_key": "evolution-strategies#preconditions/P109",
+      "id": "P109",
+      "doc_path": "preconditions/P109.yaml"
+    },
+    {
       "source_key": "evolution-strategies#preconditions/P11",
       "id": "P11",
       "doc_path": "preconditions/P11.yaml"
+    },
+    {
+      "source_key": "evolution-strategies#preconditions/P110",
+      "id": "P110",
+      "doc_path": "preconditions/P110.yaml"
+    },
+    {
+      "source_key": "evolution-strategies#preconditions/P111",
+      "id": "P111",
+      "doc_path": "preconditions/P111.yaml"
+    },
+    {
+      "source_key": "evolution-strategies#preconditions/P112",
+      "id": "P112",
+      "doc_path": "preconditions/P112.yaml"
+    },
+    {
+      "source_key": "evolution-strategies#preconditions/P113",
+      "id": "P113",
+      "doc_path": "preconditions/P113.yaml"
+    },
+    {
+      "source_key": "evolution-strategies#preconditions/P114",
+      "id": "P114",
+      "doc_path": "preconditions/P114.yaml"
+    },
+    {
+      "source_key": "evolution-strategies#preconditions/P115",
+      "id": "P115",
+      "doc_path": "preconditions/P115.yaml"
+    },
+    {
+      "source_key": "evolution-strategies#preconditions/P116",
+      "id": "P116",
+      "doc_path": "preconditions/P116.yaml"
+    },
+    {
+      "source_key": "evolution-strategies#preconditions/P117",
+      "id": "P117",
+      "doc_path": "preconditions/P117.yaml"
+    },
+    {
+      "source_key": "evolution-strategies#preconditions/P118",
+      "id": "P118",
+      "doc_path": "preconditions/P118.yaml"
+    },
+    {
+      "source_key": "evolution-strategies#preconditions/P119",
+      "id": "P119",
+      "doc_path": "preconditions/P119.yaml"
     },
     {
       "source_key": "evolution-strategies#preconditions/P12",
@@ -3934,81 +3968,6 @@
       "source_key": "evolution-strategies#preconditions/P99",
       "id": "P99",
       "doc_path": "preconditions/P99.yaml"
-    },
-    {
-      "source_key": "evolution-strategies#preconditions/P104",
-      "id": "P104",
-      "doc_path": "preconditions/P104.yaml"
-    },
-    {
-      "source_key": "evolution-strategies#preconditions/P105",
-      "id": "P105",
-      "doc_path": "preconditions/P105.yaml"
-    },
-    {
-      "source_key": "evolution-strategies#preconditions/P106",
-      "id": "P106",
-      "doc_path": "preconditions/P106.yaml"
-    },
-    {
-      "source_key": "evolution-strategies#preconditions/P107",
-      "id": "P107",
-      "doc_path": "preconditions/P107.yaml"
-    },
-    {
-      "source_key": "evolution-strategies#preconditions/P109",
-      "id": "P109",
-      "doc_path": "preconditions/P109.yaml"
-    },
-    {
-      "source_key": "evolution-strategies#preconditions/P110",
-      "id": "P110",
-      "doc_path": "preconditions/P110.yaml"
-    },
-    {
-      "source_key": "evolution-strategies#preconditions/P111",
-      "id": "P111",
-      "doc_path": "preconditions/P111.yaml"
-    },
-    {
-      "source_key": "evolution-strategies#preconditions/P112",
-      "id": "P112",
-      "doc_path": "preconditions/P112.yaml"
-    },
-    {
-      "source_key": "evolution-strategies#preconditions/P113",
-      "id": "P113",
-      "doc_path": "preconditions/P113.yaml"
-    },
-    {
-      "source_key": "evolution-strategies#preconditions/P114",
-      "id": "P114",
-      "doc_path": "preconditions/P114.yaml"
-    },
-    {
-      "source_key": "evolution-strategies#preconditions/P115",
-      "id": "P115",
-      "doc_path": "preconditions/P115.yaml"
-    },
-    {
-      "source_key": "evolution-strategies#preconditions/P116",
-      "id": "P116",
-      "doc_path": "preconditions/P116.yaml"
-    },
-    {
-      "source_key": "evolution-strategies#preconditions/P117",
-      "id": "P117",
-      "doc_path": "preconditions/P117.yaml"
-    },
-    {
-      "source_key": "evolution-strategies#preconditions/P118",
-      "id": "P118",
-      "doc_path": "preconditions/P118.yaml"
-    },
-    {
-      "source_key": "evolution-strategies#preconditions/P119",
-      "id": "P119",
-      "doc_path": "preconditions/P119.yaml"
     }
   ],
   "playbooks": [
@@ -4088,9 +4047,89 @@
       "doc_path": "playbooks/P101_gathermask_host_column_split.md"
     },
     {
+      "source_key": "evolution-strategies#playbook/P102_scalar_matmul_to_cv_fusion_rewrite",
+      "id": "P102",
+      "doc_path": "playbooks/P102_scalar_matmul_to_cv_fusion_rewrite.md"
+    },
+    {
+      "source_key": "evolution-strategies#playbook/P104_matmul_multi_core_tiling_expansion",
+      "id": "P104",
+      "doc_path": "playbooks/P104_matmul_multi_core_tiling_expansion.md"
+    },
+    {
+      "source_key": "evolution-strategies#playbook/P105_matmul_l2_cache_tile_sizing",
+      "id": "P105",
+      "doc_path": "playbooks/P105_matmul_l2_cache_tile_sizing.md"
+    },
+    {
+      "source_key": "evolution-strategies#playbook/P106_matmul_batch_merge_to_m",
+      "id": "P106",
+      "doc_path": "playbooks/P106_matmul_batch_merge_to_m.md"
+    },
+    {
+      "source_key": "evolution-strategies#playbook/P107_matmul_serpentine_traversal",
+      "id": "P107",
+      "doc_path": "playbooks/P107_matmul_serpentine_traversal.md"
+    },
+    {
+      "source_key": "evolution-strategies#playbook/P109_reduction_multi_axis_tiling",
+      "id": "P109",
+      "doc_path": "playbooks/P109_reduction_multi_axis_tiling.md"
+    },
+    {
       "source_key": "evolution-strategies#playbook/P10_vectorized_copy",
       "id": "P10",
       "doc_path": "playbooks/P10_vectorized_copy.md"
+    },
+    {
+      "source_key": "evolution-strategies#playbook/P110_reduction_ub_accumulator_reuse",
+      "id": "P110",
+      "doc_path": "playbooks/P110_reduction_ub_accumulator_reuse.md"
+    },
+    {
+      "source_key": "evolution-strategies#playbook/P111_sort_two_level_merge_tiling",
+      "id": "P111",
+      "doc_path": "playbooks/P111_sort_two_level_merge_tiling.md"
+    },
+    {
+      "source_key": "evolution-strategies#playbook/P112_elementwise_vectorized_tile_sizing",
+      "id": "P112",
+      "doc_path": "playbooks/P112_elementwise_vectorized_tile_sizing.md"
+    },
+    {
+      "source_key": "evolution-strategies#playbook/P113_broadcast_aligned_tiling",
+      "id": "P113",
+      "doc_path": "playbooks/P113_broadcast_aligned_tiling.md"
+    },
+    {
+      "source_key": "evolution-strategies#playbook/P114_transpose_nd_tiling_with_alignment",
+      "id": "P114",
+      "doc_path": "playbooks/P114_transpose_nd_tiling_with_alignment.md"
+    },
+    {
+      "source_key": "evolution-strategies#playbook/P115_flashattention_tiling_routing",
+      "id": "P115",
+      "doc_path": "playbooks/P115_flashattention_tiling_routing.md"
+    },
+    {
+      "source_key": "evolution-strategies#playbook/P116_gqa_grouped_m_head_merge",
+      "id": "P116",
+      "doc_path": "playbooks/P116_gqa_grouped_m_head_merge.md"
+    },
+    {
+      "source_key": "evolution-strategies#playbook/P117_matmul_api_tiling_host_recipe",
+      "id": "P117",
+      "doc_path": "playbooks/P117_matmul_api_tiling_host_recipe.md"
+    },
+    {
+      "source_key": "evolution-strategies#playbook/P118_mask_precompute_parallel_aiv",
+      "id": "P118",
+      "doc_path": "playbooks/P118_mask_precompute_parallel_aiv.md"
+    },
+    {
+      "source_key": "evolution-strategies#playbook/P119_two_pass_to_online_softmax",
+      "id": "P119",
+      "doc_path": "playbooks/P119_two_pass_to_online_softmax.md"
     },
     {
       "source_key": "evolution-strategies#playbook/P11_tail_block_handling",
@@ -4526,86 +4565,6 @@
       "source_key": "evolution-strategies#playbook/P9_deterministic_output",
       "id": "P9",
       "doc_path": "playbooks/P9_deterministic_output.md"
-    },
-    {
-      "source_key": "evolution-strategies#playbook/P102_scalar_matmul_to_cv_fusion_rewrite",
-      "id": "P102",
-      "doc_path": "playbooks/P102_scalar_matmul_to_cv_fusion_rewrite.md"
-    },
-    {
-      "source_key": "evolution-strategies#playbook/P104_matmul_multi_core_tiling_expansion",
-      "id": "P104",
-      "doc_path": "playbooks/P104_matmul_multi_core_tiling_expansion.md"
-    },
-    {
-      "source_key": "evolution-strategies#playbook/P105_matmul_l2_cache_tile_sizing",
-      "id": "P105",
-      "doc_path": "playbooks/P105_matmul_l2_cache_tile_sizing.md"
-    },
-    {
-      "source_key": "evolution-strategies#playbook/P106_matmul_batch_merge_to_m",
-      "id": "P106",
-      "doc_path": "playbooks/P106_matmul_batch_merge_to_m.md"
-    },
-    {
-      "source_key": "evolution-strategies#playbook/P107_matmul_serpentine_traversal",
-      "id": "P107",
-      "doc_path": "playbooks/P107_matmul_serpentine_traversal.md"
-    },
-    {
-      "source_key": "evolution-strategies#playbook/P109_reduction_multi_axis_tiling",
-      "id": "P109",
-      "doc_path": "playbooks/P109_reduction_multi_axis_tiling.md"
-    },
-    {
-      "source_key": "evolution-strategies#playbook/P110_reduction_ub_accumulator_reuse",
-      "id": "P110",
-      "doc_path": "playbooks/P110_reduction_ub_accumulator_reuse.md"
-    },
-    {
-      "source_key": "evolution-strategies#playbook/P111_sort_two_level_merge_tiling",
-      "id": "P111",
-      "doc_path": "playbooks/P111_sort_two_level_merge_tiling.md"
-    },
-    {
-      "source_key": "evolution-strategies#playbook/P112_elementwise_vectorized_tile_sizing",
-      "id": "P112",
-      "doc_path": "playbooks/P112_elementwise_vectorized_tile_sizing.md"
-    },
-    {
-      "source_key": "evolution-strategies#playbook/P113_broadcast_aligned_tiling",
-      "id": "P113",
-      "doc_path": "playbooks/P113_broadcast_aligned_tiling.md"
-    },
-    {
-      "source_key": "evolution-strategies#playbook/P114_transpose_nd_tiling_with_alignment",
-      "id": "P114",
-      "doc_path": "playbooks/P114_transpose_nd_tiling_with_alignment.md"
-    },
-    {
-      "source_key": "evolution-strategies#playbook/P115_flashattention_tiling_routing",
-      "id": "P115",
-      "doc_path": "playbooks/P115_flashattention_tiling_routing.md"
-    },
-    {
-      "source_key": "evolution-strategies#playbook/P116_gqa_grouped_m_head_merge",
-      "id": "P116",
-      "doc_path": "playbooks/P116_gqa_grouped_m_head_merge.md"
-    },
-    {
-      "source_key": "evolution-strategies#playbook/P117_matmul_api_tiling_host_recipe",
-      "id": "P117",
-      "doc_path": "playbooks/P117_matmul_api_tiling_host_recipe.md"
-    },
-    {
-      "source_key": "evolution-strategies#playbook/P118_mask_precompute_parallel_aiv",
-      "id": "P118",
-      "doc_path": "playbooks/P118_mask_precompute_parallel_aiv.md"
-    },
-    {
-      "source_key": "evolution-strategies#playbook/P119_two_pass_to_online_softmax",
-      "id": "P119",
-      "doc_path": "playbooks/P119_two_pass_to_online_softmax.md"
     }
   ],
   "families": [
@@ -4615,9 +4574,24 @@
       "doc_path": "families/attention_guide.md"
     },
     {
+      "source_key": "evolution-strategies#family/broadcast_guide",
+      "title": "Broadcast Guide",
+      "doc_path": "families/broadcast_guide.md"
+    },
+    {
+      "source_key": "evolution-strategies#family/conversion_guide",
+      "title": "Conversion Guide",
+      "doc_path": "families/conversion_guide.md"
+    },
+    {
       "source_key": "evolution-strategies#family/elementwise_guide",
       "title": "Elementwise Guide",
       "doc_path": "families/elementwise_guide.md"
+    },
+    {
+      "source_key": "evolution-strategies#family/flashattention_guide",
+      "title": "Flashattention Guide",
+      "doc_path": "families/flashattention_guide.md"
     },
     {
       "source_key": "evolution-strategies#family/matmul_guide",
@@ -4633,21 +4607,6 @@
       "source_key": "evolution-strategies#family/sort_guide",
       "title": "Sort Guide",
       "doc_path": "families/sort_guide.md"
-    },
-    {
-      "source_key": "evolution-strategies#family/broadcast_guide",
-      "title": "Broadcast Guide",
-      "doc_path": "families/broadcast_guide.md"
-    },
-    {
-      "source_key": "evolution-strategies#family/conversion_guide",
-      "title": "Conversion Guide",
-      "doc_path": "families/conversion_guide.md"
-    },
-    {
-      "source_key": "evolution-strategies#family/flashattention_guide",
-      "title": "FlashAttention Guide",
-      "doc_path": "families/flashattention_guide.md"
     }
   ],
   "discovered": [
@@ -4657,9 +4616,64 @@
       "doc_path": "discovered/disc_X1.md"
     },
     {
+      "source_key": "evolution-strategies#discovered/disc_X10",
+      "id": "X10",
+      "doc_path": "discovered/disc_X10.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X11",
+      "id": "X11",
+      "doc_path": "discovered/disc_X11.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X12",
+      "id": "X12",
+      "doc_path": "discovered/disc_X12.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X13",
+      "id": "X13",
+      "doc_path": "discovered/disc_X13.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X14",
+      "id": "X14",
+      "doc_path": "discovered/disc_X14.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X15",
+      "id": "X15",
+      "doc_path": "discovered/disc_X15.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X16",
+      "id": "X16",
+      "doc_path": "discovered/disc_X16.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X17",
+      "id": "X17",
+      "doc_path": "discovered/disc_X17.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X18",
+      "id": "X18",
+      "doc_path": "discovered/disc_X18.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X19",
+      "id": "X19",
+      "doc_path": "discovered/disc_X19.md"
+    },
+    {
       "source_key": "evolution-strategies#discovered/disc_X2",
       "id": "X2",
       "doc_path": "discovered/disc_X2.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X20",
+      "id": "X20",
+      "doc_path": "discovered/disc_X20.md"
     },
     {
       "source_key": "evolution-strategies#discovered/disc_X3",

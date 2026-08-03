@@ -11,7 +11,8 @@
 
 """Block-level 设计：Stage2 — 跨 chunk 递推（C3 / V2 / V3）。
 
-对应 AscendC `Stage2`（stage2.h）。消费 Stage1 workspace（kCumDecay/vInner/qPrime/gCum/kg）
+对应 AscendC `Stage2`（stage2.h）与 **tile-level 的 `stage2_ker`**（`design/tile_level/stage2.py`，
+独立 jit kernel）。消费 Stage1 workspace（kCumDecay/vInner/qPrime/gCum/kg）
 与当前状态 S（首组=initial_state，后续=上一 chunk 更新后的 S），对当前 chunk：
 
     C3  v_prime    = k_cumdecay @ S            （C×Dk @ Dk×Dv -> C×Dv）
@@ -36,7 +37,7 @@
 import tilelang.language as T
 
 
-def run_stage2(
+def stage2_ker(
     ws_gcumexp, ws_kcumdecay, ws_vinner, ws_qprime, ws_kg,
     state,            # (Dv, Dk) fp32 块内 UB，跨 chunk 携带
     valid, C, dk, dv,

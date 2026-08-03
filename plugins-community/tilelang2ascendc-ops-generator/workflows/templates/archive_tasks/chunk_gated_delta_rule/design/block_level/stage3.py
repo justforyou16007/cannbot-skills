@@ -11,7 +11,8 @@
 
 """Block-level 设计：Stage3 — chunk 内贡献累加（V4 / C4）。
 
-对应 AscendC `Stage3`（stage3.h）。消费 Stage1 的 qkt/gCumExp/vInner 与 Stage2 写好的
+对应 AscendC `Stage3`（stage3.h）与 **tile-level 的 `stage3_ker`**（`design/tile_level/stage3.py`，
+独立 jit kernel）。消费 Stage1 的 qkt/gCumExp/vInner 与 Stage2 写好的
 out（attn_inter 部分），对当前 chunk：
 
     V4  attn_c = mask(qkt * decay) * scale     # decay[i][j]=g_exp[i]*g_exp_neg[j] (j<=i)
@@ -32,7 +33,7 @@ out（attn_inter 部分），对当前 chunk：
 import tilelang.language as T
 
 
-def run_stage3(
+def stage3_ker(
     ws_qkt,           # (C, C) bf16，Stage1 产物（原始 q@k^T）
     ws_gcumexp,       # (C,)   fp32，Stage1 产物（exp(g_cum)）
     ws_vinner,        # (C, Dv) bf16，含 Stage2 的 v_prime 贡献（即 v_new）

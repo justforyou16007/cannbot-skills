@@ -11,8 +11,9 @@
 
 """Block-level 设计：Stage1 — within-chunk 预计算（C1 / V1 / C2）。
 
-对应 AscendC `Stage1`（stage1.h）。对当前 chunk（行窗口 [s0, s0+valid)）计算所有
-「只依赖本 chunk、不依赖历史状态」的量，写 workspace（bf16/fp32）供 Stage2/3 用。
+对应 AscendC `Stage1`（stage1.h）与 **tile-level 的 `stage1_ker`**（`design/tile_level/stage1.py`，
+独立 jit kernel）。对当前 chunk（行窗口 [s0, s0+valid)）计算所有「只依赖本 chunk、不依赖
+历史状态」的量，写 workspace（bf16/fp32）供 Stage2/3 用。
 
 ## C/V 子阶段（块内）
 
@@ -38,7 +39,7 @@ C/V 交接：C1 的 kbt 写 UB 给 V1；V1 的 X/kb/vb/kbe 给 C2；C2 产物经
 import tilelang.language as T
 
 
-def run_stage1(
+def stage1_ker(
     query, key, value, beta, g,
     s0, valid, kh, h, scale, unit, C, dk, dv,
     ws_gcumexp, ws_kcumdecay, ws_vinner, ws_qprime, ws_qkt, ws_kg,

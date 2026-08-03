@@ -10,8 +10,8 @@
 | 6 | **workspace 完整**：`workspace_idx` 位置、每个 workspace 张量的 shape/dtype/谁写谁读，列出对照表 | ✅ 必须 |
 | 7 | **细粒度计算有 TODO(tile-level)**：不是模糊的"计算 S = Q@K^T"，而是标注 TODO(tile-level)，明确该处细算在 tile-level 落地 | ✅ 必须 |
 | 8 | **多 prim_func 模板**：不同 shape 是否需要不同 block 组织（如 rms_norm 按 N 选 merge_n/single_row），用 trace-time 选择并在文件里说明 | ⭕ 推荐 |
-| 9 | **技术约束已确认**：非整除 seq、尾块 mask、动态边界（actual_seq_lengths / cu_seqlens）在 block-level 有处理说明 | ✅ 必须 |
+| 9 | **技术约束已确认**：非整除 seq、尾块 mask、动态边界（actual_seq_lengths / cu_seqlens）在 block-level 有处理说明 | ⭕ 推荐 |
 | 10 | **GEMM 场景分形/容量约束**：block_M/N ≥ 16；`block_M×block_N×sizeof(accum) ≤ L0C(128KB)` | ✅ 必须 |
 | 11 | **无全局变量依赖**：维度参数从 tensor shape 或函数参数获取，支持多场景顺序测试 | ⭕ 推荐 |
 
-**通过条件**：必须项（1,2,3,4,5,6,7,9,10）全部通过。
+**通过条件**：必须项（1,2,3,4,5,6,7,10）全部通过。

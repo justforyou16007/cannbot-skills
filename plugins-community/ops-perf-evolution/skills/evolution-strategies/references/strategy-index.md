@@ -331,11 +331,30 @@ P67-P69 为 Vector 计算效率基础策略（Counter 模式、低延迟归约�
 | Special / Complex ops | D2, D3 | P85, P88, P96, P102 |
 | CV Matmul (Cube+Vector) | D1, D3, P1, P4, P7, A3 | P14, P17, P46, P47, P49, P51, P52, P63, P70, P71, P72, P73, P78, P79, P83, P86, P87, P90, P92, P93, P102, P103, P104, P105, P106, P107, P108, P117, P120 |
 | CV FFN (MoE) | D1, D3, P1, P4, A1 | P46, P48, P49, P50, P73, P75, P88 |
-| Flash Attention | D1, P1, P5, A4, A5 | P14, P16, P17, P18, P29, P38, P53, P57, P58, P60, P61, P76, P77, P80, P90, P91, P115, P116, P117, P118, P119, P120, P121, P122, P123, P124, P125, P126 |
+| Flash Attention | D1, P1, P5, A4, A5 | P14, P16, P17, P18, P29, P38, P53, P57, P58, P60, P61, P76, P77, P80, P90, P91, P115-P126（**按下方 FA SOP 阶段顺序选用，勿平铺**） |
 | Reduction (mean/sum/max/min) | D1, P1, P2, A1, A2 | P68, P69, P109, P110 |
 | Sort / TopK | D1, P1, P2, A7 | P96, P111 |
 | Transpose / Layout Conversion | D1, P1, P7, P10 | P26, P114 |
 | Data Path (通用数据通路) | D1, D5, P1, P8, P10, P20, P25, P40, P54, P65, P66, P74 | — |
+
+### FA 算子族优化 SOP（按阶段顺序推进）
+
+适用：Flash Attention 及其全部变体（MHA / GQA / MQA / MLA / Sparse / Paged / Sliding-Window / Fwd / Bwd 等；形态判定见 `families/flashattention_guide.md`）。FA 族策略收益与依赖均有序：**结构改写 > CV 流水 > 内存搬运 > mask/稀疏特化 > 调度均衡**。进化时从未完成的最早阶段选策略，每轮落地一个阶段，不要跨阶段平铺堆叠。
+
+| 阶段 | 目标 | 策略（按优先级） | 跳过条件 |
+|---|---|---|---|
+| S0 形态判定 | 确定基础形态（MHA/GQA/MLA）与正交 trait（稀疏/量化/decode/paged） | P115（Tiling 路由） | 每次必做，决定后续各阶段适用卡 |
+| S1 结构改写 | 消除算法级浪费（收益最大） | P119（two-pass→online softmax）、P120（向量点积→cube mmad）、P124（MLA nope/rope 拼 K 维） | 已是 online softmax + cube 路径（如官方 FIA 移植实现）则整阶段跳过 |
+| S2 CV 流水 | AIC/AIV 生产者-消费者重叠 | P121（SplitFuse 流水，依赖 P120）、P14（CV 预发射）、P125（跨任务预取，依赖 P121）、P29（跨核同步） | 仍在纯 Vector 路径时先回 S1 完成 P120 |
+| S3 内存与搬运 | 摊薄握手/启动开销，L1/L2 常驻 | P122（KV 大块化 + L1 预算公式）、P18/P53（L1 常驻）、P38（softmax 状态常驻）、P60（decode KV NZ）、P61（L2 cache） | mte2_stall 非主瓶颈且 L1/UB 预算已达标 |
+| S4 mask/稀疏特化 | 消除无效计算与搬运 | P123（causal 跳过 + 边界 mask 特化）、P118（mask 预生成独立 AIV）、P76/P77（sparse KV 预合并/聚合）、P80（Sink task 注入） | 非 causal/sparse/sink 形态 |
+| S5 调度与负载均衡 | 多核利用率与变长调度 | P116（GQA G→M 合并）、P117（host MatmulApiTiling 配方）、P126（GM 任务表变长调度）、P57/P58（FlashDecode 分区） | tiling_imbalance 非瓶颈且核已打满 |
+| S6 通用收尾 | 基础数据通路与数值稳定 | D1、P1、P5、P7、A4、A5、P90；Bwd 另加 P91 | — |
+
+规则：
+1. 顺序不可颠倒：cube 路径（S1）→ CV 流水（S2）→ 大块化（S3）是硬依赖链，跳阶段会产生编译失败或负收益变体，浪费进化轮次。
+2. 同轮组合必须过 `strategy-compatibility.md` §1/§2 的依赖/互斥检查（如 P121 依赖 P120；P123 与逐元素 mask 兜底互斥须删除旧路径）。
+3. Refine 阶段若 profiling 证据明确指向某瓶颈，以"按瓶颈类型查表"优先，SOP 顺序让位于证据。
 
 ### 按瓶颈类型查表 (Bottleneck-Driven Strategy Selection)
 

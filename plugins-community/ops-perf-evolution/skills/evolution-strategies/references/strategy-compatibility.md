@@ -177,6 +177,7 @@ P119 ──→ P38
 | GQA decode 实战链 | P116 + P117 + P118 + P119 | G 头合并进 M + MatmulApiTiling 配方 + mask 独立预生成 + online softmax |
 | MHA cube 化实战链 | P120 + P121 + P122 + P123 | 向量点积→mmad 重写 + SplitFuse CV 流水 + KV 堆叠大块化 + causal 跳过边界特化 |
 | MLA decode 实战链 | P120 + P121 + P124 + P125 + P126 | mmad 重写 + CV 流水 + nope/rope K 维拼接 + 跨任务预取 + GM 任务表变长调度 |
+| FA 族全链路 SOP | S1: P119+P120(+P124) → S2: P121/P14 → S3: P122/P18/P38 → S4: P123/P118 → S5: P116/P117/P126 | 任意 FA 变体（MHA/GQA/MLA/Sparse/Paged）的标准优化顺序；分轮逐阶段落地而非单轮平铺，阶段依赖与互斥见 §1/§2，完整 SOP 见 strategy-index.md |
 
 ## §4 UB 内存压力指南
 

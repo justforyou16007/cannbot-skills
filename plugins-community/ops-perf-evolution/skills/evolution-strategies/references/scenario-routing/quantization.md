@@ -18,7 +18,8 @@
 | Q2 多模式分发 | 支持多种量化模式（per-tensor/per-channel/int8/fp8） | P48（多量化模式编译期分发） | 单一模式 |
 | Q3 反量化 | dequant 由 Mul+Add 向量链实现 | P49（AscendDequant 硬件反量化） | 已用硬件指令 |
 | Q4 内联量化 | 输出端 requant 走独立 pass | P70（FixPipe buffer 内联量化，Cube 输出直接量化写回） | 无 requant |
-| Q5 小 M 分流 | weight-quant GEMV 类（M 1-8） | X12（纯 VEC 流式路径，scale 提出 K 循环）；大 M 回 cube | M 大 |
+| Q5 引擎分流与 Cube 修复 | weight-quant GEMM/GEMV 类，M 跨度大 | 小 M（1-8）→ X12（纯 VEC 流式，scale 提出 K 循环）；M 跨度大 → X13（shape 自适应双引擎分流，实测校准 M 阈值）；cube 利用率异常低（ND drain 碎片）→ X11（CType 路由 ND + baseM 扩至 L0C 上限） | 纯 fp16/bf16 无量化 |
+| Q6 dequant pass 消除 | 独立 VEC dequant kernel + cube kernel 两趟 | X14（mix-kernel 跨核生产者/消费者融合，AIV 产 strip / AIC 消费，launch 3→2） | 已单 kernel 融合 |
 
 ## 组合约束
 

@@ -74,8 +74,12 @@ def run_stage3(nk, nv, dk, dv, C, scale,
     with T.Scope("V"):
         T.wait_cross_flag(7)
         out_bf_s3 = T.alloc_ub((C, dv), "bfloat16")
-        out_ub_s3 = T.alloc_ub((C, dv), "float32")
+        # tail pad: stage2 seeded `out` only as far as `valid` rows; zero-fill
+        # the (C-valid) rows so the fp32 accumulate below never reads garbage UB
+        # (对应 AscendC CalMaskedQKT 的 "chunkSize 自动补齐" 语义).
+        T.tile.fill(out_bf_s3, 0.0)
         T.copy(out[s0:s0 + valid, h, 0:dv], out_bf_s3)
+        out_ub_s3 = T.alloc_ub((C, dv), "float32")
         T.copy(out_bf_s3, out_ub_s3)
         ac_bf_s3 = T.alloc_ub((C, dv), "bfloat16")
         ac_ub_s3 = T.alloc_ub((C, dv), "float32")

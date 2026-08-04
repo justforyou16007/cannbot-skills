@@ -48,6 +48,8 @@ def run_stage1(nk, nv, dk, dv, C, scale,
                ws_q, ws_k, ws_kb, ws_kbe, ws_qprime, ws_kg, ws_vb,
                ws_kbt, ws_qkt, ws_x, ws_v_inner, ws_k_cumdecay,
                ws_g_exp, ws_g_exp_neg):
+    # 求逆分块边长: diagonal blocks O00/O11 用 V 前代, off-diagonal O10 用 cube gemm.
+    F = C // 2
     # ---- V0 : elementwise prep -> workspace ----
     with T.Scope("V"):
         q_buf = T.alloc_ub((C, dk), "bfloat16")
@@ -187,22 +189,63 @@ def run_stage1(nk, nv, dk, dv, C, scale,
             for j in T.serial(C):
                 attn_ub[i, j] = a_ub[i, j]
         acc1 = T.alloc_ub((1,), "float32")
-        for i in T.serial(1, C):
+        # AIC/AIV 协同求逆 ((I-A)^{-1}), 仿 solve_tril_64_ker:
+        #   A = [[M00,0],[M10,M11]] (对角线以下), O = [[O00,0],[O10,O11]].
+        #   - AIV (V pipe): 对角子块 O00 / O11 用 V 向量前代 (对应 AscendC InverseAIV).
+        #   - AIC (C pipe):  非对角子块 O10 = O11 @ (+M10) @ O00 用 cube gemm, 在 C2 完成
+        #                     (对应 AscendC InverseAICProcess / AttnInverseMMCompute).
+        # 这里 V 只算对角子块, 并把 off-diag 的 +M10(round 后) 暂存到 ws_x[F:C,0:F],
+        # 留给 C2 的 gemm 覆盖成 O10.  sign: M10 = a_ub[F:C,0:F] (负), +M10 = kbt*decay.
+        # -- O00 = (I + M00)^-1, 行 0..F --
+        for i in T.serial(1, F):
             for j in T.serial(i):
                 acc1[0] = 0.0
                 for jp in T.serial(i):
                     acc1[0] += a_ub[i, jp] * attn_ub[jp, j]
                 attn_ub[i, j] = a_ub[i, j] + acc1[0]
-        for i in T.serial(C):
+        for i in T.serial(F):
             attn_ub[i, i] = 1.0
+        # -- O11 = (I + M11)^-1, 行 F..C --
+        for ii in T.serial(1, F):
+            for jj in T.serial(ii):
+                acc1[0] = 0.0
+                for jp in T.serial(F, ii + F):
+                    acc1[0] += a_ub[ii + F, jp] * attn_ub[jp, jj + F]
+                attn_ub[ii + F, jj + F] = a_ub[ii + F, jj + F] + acc1[0]
+        for i in T.serial(F, C):
+            attn_ub[i, i] = 1.0
+        # -- off-diag: 暂存 +M10 (round 后取正) 供 C2 gemm 用 --
+        for i in T.serial(F, C):
+            for j in T.serial(F):
+                attn_ub[i, j] = 0.0 - a_ub[i, j]
         x_bf = T.alloc_ub((C, C), "bfloat16")
         T.copy(attn_ub, x_bf)
         T.copy(x_bf, ws_x[unit, 0, 0])
         T.set_cross_flag("MTE3", 2)         # V1 -> C2
 
-    # ---- C2 : v_inner / k_cumdecay ----
+    # ---- C2 : X off-diagonal (AIC gemm) + v_inner / k_cumdecay ----
     with T.Scope("C"):
         T.wait_cross_flag(2)
+        # AIC 完成求逆 off-diag: O10 = (O11 @ +M10) @ O00   (仿 AscendC InverseAICProcess / solve_tril_64_ker)
+        #   AIV(V) 已把 O00/O11(对角) 与 +M10(off-diag 取正) 暂存到 ws_x[F:C,0:F].
+        #   独立 C 子阶段, 让小块(F,F) cube buffer 不与全尺寸(X@vb/X@kbe) L1/L0C 重叠生命周期.
+        o11_l1 = T.alloc_L1((F, F), "bfloat16")
+        p10_l1 = T.alloc_L1((F, F), "bfloat16")
+        t10_l0 = T.alloc_L0C((F, F), "float32")
+        o00_l1 = T.alloc_L1((F, F), "bfloat16")
+        p10b_l1 = T.alloc_L1((F, F), "bfloat16")
+        o10_l0 = T.alloc_L0C((F, F), "float32")
+        T.copy(ws_x[unit, F:C, F:C], o11_l1)              # O11
+        T.copy(ws_x[unit, F:C, 0:F], p10_l1)              # +M10
+        T.gemm_v0(o11_l1, p10_l1, t10_l0, init=True)      # O11 @ (+M10)
+        T.copy(t10_l0, ws_x[unit, F:C, 0:F])
+        T.copy(ws_x[unit, 0:F, 0:F], o00_l1)              # O00
+        T.copy(ws_x[unit, F:C, 0:F], p10b_l1)             # (O11 @ +M10) round 到 bf16
+        T.gemm_v0(p10b_l1, o00_l1, o10_l0, init=True)     # (O11@+M10) @ O00
+        T.copy(o10_l0, ws_x[unit, F:C, 0:F])              # 覆盖为最终 O10; ws_x 现为完整 X
+
+    # ---- C2b : X @ vb / X @ kbe (原 C2 gemm) ----
+    with T.Scope("C"):
         x_l1 = T.alloc_L1((C, C), "bfloat16")
         T.copy(ws_x[unit, 0, 0], x_l1)
         vb_l1 = T.alloc_L1((C, dv), "bfloat16")

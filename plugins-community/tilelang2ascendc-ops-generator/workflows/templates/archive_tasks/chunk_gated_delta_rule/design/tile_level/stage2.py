@@ -16,12 +16,23 @@ Mirrors block_level/stage2.py / AscendC `Stage2`, but *inlined* into the single
 chunk it consumes the Stage1 workspace frag + the carried state `S` (GM
 `ws_S[unit]`) and computes:
 
-    C3   v_prime    = k_cumdecay @ S^T            -> ws_v_prime
-         attn_inter = qPrime @ S^T                -> ws_attn_inter
-    V2   v_new      = v_inner - v_prime           -> ws_v_new
-    C3'  dstate     = v_new^T @ kg                -> ws_dstate
-    V3   out        <- attn_inter ; S = g_last*S + dstate
-                      -> ws_S[unit] (carried) + final_state[b,h]
+    C3   v_prime    = k_cumdecay @ S^T            -> ws_v_prime   (AIC / cube)
+         attn_inter = qPrime @ S^T                -> ws_attn_inter (AIC / cube)
+    V2   v_new      = v_inner - v_prime           -> ws_v_new     (AIV / vector)
+    C3'  dstate     = v_new^T @ kg                -> ws_dstate     (AIC / cube)
+    V3   g_last     = exp(g_cum[C-1])             (AIV / scalar)
+         S = g_last*S + dstate                    -> ws_S[unit] (carried)   (AIV / vector)
+         out        <- attn_inter ; final_state[b,h] <- S
+
+Correspondence to AscendC `Stage2` (chunk_gated_delta_rule_stage2.h):
+    AIC (cube, T.Scope("C")) : CalVPrime / CalAttnInter (C3), CalStateNew (C3') --
+        v_prime/attn_inter/dstate 均为 T.gemm_v0; rhs 是 S 转置 read, trans = 真 S 布局 (Dv,Dk).
+    AIV (vector, T.Scope("V")) : CalGCumExp 取 g_last(Muls: S←g_last·S) + V2 减法 + V3 累加.
+        S = g_last*S + dstate 拆为 T.tile.mul(S, S, gl) + T.tile.add(S, S, dstate)
+        (AscendC 把 g_last·S 放 AIV、+dstate 由 AIC IterateAll accumulate 折入 finalState).
+    同步: C3 产物经 GM + cross_flag 3 (=AIC CrossCoreSetFlag(0x2)/AIV WaitFlag(0x2)),
+          V2 产物经 cross_flag 4 (=AIV SetFlag(0x5)/AIC WaitFlag(0x5)),
+          C3' 产物经 cross_flag 5 (=AIC SetFlag(0x4)/AIV WaitFlag(0x4)).
 
 State transport (学 AscendC `curState`): S lives in the persistent GM tensor
 `ws_S`, initialised once per unit from `initial_state[b,h]` before the chunk
@@ -62,21 +73,23 @@ def run_stage2(nk, nv, dk, dv, C,
         T.copy(ai_l0, ws_attn_inter[unit, 0, 0])
         T.set_cross_flag("FIX", 3)          # C -> V
 
-    # ---- V2 : v_new = v_inner - v_prime (in-place, shared bf16 reread) ----
+    # ---- V2 : v_new = v_inner - v_prime (AIV vector, 学 AscendC FIX 子块) ----
     with T.Scope("V"):
         T.wait_cross_flag(3)
+        vinner_bf = T.alloc_ub((C, dv), "bfloat16")
+        vprime_bf = T.alloc_ub((C, dv), "bfloat16")
+        vinner_ub = T.alloc_ub((C, dv), "float32")
+        vprime_ub = T.alloc_ub((C, dv), "float32")
         vnew_ub = T.alloc_ub((C, dv), "float32")
+        # v_inner (bf16 via two-stage T.copy)
+        T.copy(ws_v_inner[unit, 0, 0], vinner_bf)
+        T.copy(vinner_bf, vinner_ub)
+        # v_prime (bf16 via two-stage T.copy)
+        T.copy(ws_v_prime[unit, 0, 0], vprime_bf)
+        T.copy(vprime_bf, vprime_ub)
+        # v_new = v_inner - v_prime  (vectorized, no scalar loop)
+        T.tile.sub(vnew_ub, vinner_ub, vprime_ub)
         vnew_bf = T.alloc_ub((C, dv), "bfloat16")
-        vtmp_ub = T.alloc_ub((C, dv), "float32")
-        # vnew_ub = v_inner
-        T.copy(ws_v_inner[unit, 0, 0], vnew_bf)
-        T.copy(vnew_bf, vnew_ub)
-        # vtmp_ub = v_prime (reuse the bf16 read buffer)
-        T.copy(ws_v_prime[unit, 0, 0], vnew_bf)
-        T.copy(vnew_bf, vtmp_ub)
-        for t in T.serial(C):
-            for d in T.serial(dv):
-                vnew_ub[t, d] = vnew_ub[t, d] - vtmp_ub[t, d]
         T.copy(vnew_ub, vnew_bf)
         T.copy(vnew_bf, ws_v_new[unit, 0, 0])
         T.set_cross_flag("MTE3", 4)         # V -> C
@@ -109,6 +122,7 @@ def run_stage2(nk, nv, dk, dv, C,
     # ---- V3b : S = g_last*S + dstate (separate scope so the planner frees the
     # out-write buffers before aliasing these) ----
     with T.Scope("V"):
+        # g_last = exp(g_cum[C-1]) (学 AscendC CalGCumExp 取最后一位)
         g_exp_s2 = T.alloc_ub((C,), "float32")
         T.copy(ws_g_exp[unit, 0], g_exp_s2)
         gl = g_exp_s2[C - 1]
@@ -116,13 +130,14 @@ def run_stage2(nk, nv, dk, dv, C,
         state_s2 = T.alloc_ub((dv, dk), "float32")
         T.copy(ws_S[unit, 0, 0], state_bf_s2)
         T.copy(state_bf_s2, state_s2)
+        # S = g_last * S   (vector scale, 学 AscendC CalGCumExp Muls)
+        T.tile.mul(state_s2, state_s2, gl)
         ds_bf = T.alloc_ub((dv, dk), "bfloat16")
         ds_ub = T.alloc_ub((dv, dk), "float32")
         T.copy(ws_dstate[unit, 0, 0], ds_bf)
         T.copy(ds_bf, ds_ub)
-        for d in T.serial(dv):
-            for k in T.serial(dk):
-                state_s2[d, k] = gl * state_s2[d, k] + ds_ub[d, k]
+        # S = S + dstate   (vector accumulate, 学 AscendC CalStateNew 累加)
+        T.tile.add(state_s2, state_s2, ds_ub)
         T.copy(state_s2, state_bf_s2)
         T.copy(state_bf_s2, ws_S[unit, 0, 0])
         T.copy(state_bf_s2, final_state[b, h, :, :])

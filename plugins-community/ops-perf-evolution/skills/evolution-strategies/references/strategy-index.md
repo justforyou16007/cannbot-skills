@@ -3,7 +3,7 @@
 Source: 43 production-grade operators + 6 CV fused operator expert implementations (IdeaPool). Select all applicable strategies for your operator, then **Read each referenced detail file** before writing AscendC code.
 
 ## 编号说明
-策略卡共 141 张：P 系列（性能，P1-P126）/ D 系列（数据类型，D1-D5）/ A 系列（精度，A1-A8）/ R 系列（A5 架构，R1-R8）。P 系列编号存在间隙（P15, P23, P27, P31, P36, P39），为预留位。
+策略卡共 146 张：P 系列（性能，P1-P131）/ D 系列（数据类型，D1-D5）/ A 系列（精度，A1-A8）/ R 系列（A5 架构，R1-R8）。P 系列编号存在间隙（P15, P23, P27, P31, P36, P39），为预留位。
 所有有效策略 ID 均在下方表格中列出。Agent 在 strategy_combination 中只应使用下方表格中的 ID。
 
 ## Layer 定义
@@ -268,6 +268,16 @@ P67-P69 为 Vector 计算效率基础策略（Counter 模式、低延迟归约�
 | P125 | Cross-task cube prefetch | L2 | flash_attention, cv_fusion | CV 流水多任务 kernel 任务边界断流时：KV 循环尾部一拍预读下一任务 tiling 并预发射其首块 QK^T（含 Q→L1），pingpongIdx 跨任务连续 | playbooks/P125_cross_task_cube_prefetch.md |
 | P126 | GM tiling table task schedule | L1 | flash_attention | decode 变长 kvSeqlen 仍按 totalQ 均匀切分 + 除法反解坐标时：host 拍平任务表（kvSeqlen 降序）+ kernel process 轮询领取，一次 launch 跑全 batch | playbooks/P126_gm_tiling_table_task_schedule.md |
 
+## 性能优化策略 — Conversion 模式特化与 Conv 实战优化 (P127-P131) [Layer: L1-L2]
+
+| ID | Strategy | Layer | Tags | When to Apply | Detail File |
+|----|----------|-------|------|---------------|-------------|
+| P127 | Conversion pattern specialization routing | L1 | conversion, transpose | permute/transpose/split 等纯布局变换算子：R1 view 短路→R2 维合并→R3 退化路由→R4 模式专用 kernel→R5 fallback；禁止单一 generic gather 主路径 | playbooks/P127_conversion_pattern_specialization_routing.md |
+| P128 | FP32-via-BF16 hi/lo 3-GEMM | L2 | conv, matmul, fp32 | Cube 不吃 fp32 时：hi+lo 双 bf16 分量 3-GEMM 保精度（~1e-4）换 Cube 吞吐（ex-X17） | playbooks/P128_fp32_via_bf16_hilo_3gemm.md |
+| P129 | Fused img2col LoadData3D | L2 | conv, im2col | conv kHkW>1：A 侧免 GM 物化随路展开；特征图超 L1 用 band 窗口化（ex-X18） | playbooks/P129_fused_img2col_loaddata3d.md |
+| P130 | 1x1 Conv flipped GEMM | L1 | conv, pointwise | 1×1 卷积：原始布局即 GEMM 操作数，免 wrepack/im2col 两级发射（ex-X19） | playbooks/P130_1x1conv_flipped_gemm.md |
+| P131 | Weight repack LRU cache | L1 | conv, matmul, host-cache | 推理式重复调用：host 侧缓存权重 repack 结果，命中跳过 repack kernel 发射（ex-X20） | playbooks/P131_weight_repack_lru_cache.md |
+
 ## 精度优化策略 (A1-A8) [Layer: L0]
 
 | ID | Strategy | Layer | Tags | When to Apply | Detail File |
@@ -310,21 +320,15 @@ P67-P69 为 Vector 计算效率基础策略（Counter 模式、低延迟归约�
 
 ## How to Use
 
-1. Identify your operator's characteristics (dtype, shape, op type)
-2. Select ALL applicable strategy IDs from the tables above
+1. **先归族**：打开 [`scenario-routing/README.md`](scenario-routing/README.md)，用结构判据确定算子族，打开对应族 workflow
+2. 按 workflow 阶段顺序选卡（通用前置 → 族内阶段），本文档表格仅作补充反查
 3. Read each referenced `playbooks/XXX.md` detail file (P102/P103 无 playbook，读对应 cards/ 卡片)
 4. Apply the selected patterns in `tiling_pass`, `init_pass`, `process_pass`, `process_nonaligned_pass`
 5. **Check compatibility**: Read `strategy-compatibility.md` to verify no mutual exclusions and all dependencies are met
 
 ### 族判定快速路由（选策略前先归族）
 
-**不要靠算子名字判族**（EMSA / BAM / CoT / CrissCross / Window / Axial / BigBird / Linformer 等变体名字不含标准词）。按结构判据：
-
-- **FA 族**：model.py / kernel 满足以下任一 → 直接走下方"FA 算子族优化 SOP"按阶段选卡，不要平铺选卡：
-  1. 计算主干为 `Q@K^T → (scale + mask) → softmax → @V`（含 online softmax 变体）
-  2. kernel 含 online softmax 状态机（running max/sum/rescale）或 FA 特征参数（`preTokens`/`nextTokens`/sink/paged KV cache）
-  3. head 数关系命中 MHA/MQA/GQA（`num_q_heads` vs `num_kv_heads`，判据见 `../../evolution-knowledge/references/a3/algorithm_insights/attention_family.md`）
-- 其余族按算子结构对号下方查表行。
+**已下沉为独立场景路由目录**：[`scenario-routing/README.md`](scenario-routing/README.md)。先按结构判据归族（FA / conv / matmul / quantization / reduction / sort / conversion / 小族 / elementwise），再打开对应族的 workflow 文件按阶段顺序选卡——不要在下表平铺选卡。下表仅作补充反查。
 
 ### 按算子类型快速查表 (Quick Reference by Operator Type)
 
@@ -341,30 +345,16 @@ P67-P69 为 Vector 计算效率基础策略（Counter 模式、低延迟归约�
 | Special / Complex ops | D2, D3 | P85, P88, P96, P102 |
 | CV Matmul (Cube+Vector) | D1, D3, P1, P4, P7, A3 | P14, P17, P46, P47, P49, P51, P52, P63, P70, P71, P72, P73, P78, P79, P83, P86, P87, P90, P92, P93, P102, P103, P104, P105, P106, P107, P108, P117, P120 |
 | CV FFN (MoE) | D1, D3, P1, P4, A1 | P46, P48, P49, P50, P73, P75, P88 |
-| Flash Attention | D1, P1, P5, A4, A5 | P14, P16, P17, P18, P29, P38, P53, P57, P58, P60, P61, P76, P77, P80, P90, P91, P115-P126（**按下方 FA SOP 阶段顺序选用，勿平铺**） |
+| Flash Attention | D1, P1, P5, A4, A5 | P14, P16, P17, P18, P29, P38, P53, P57, P58, P60, P61, P76, P77, P80, P90, P91, P115-P126（**按 scenario-routing/flashattention.md 的 SOP 阶段顺序选用，勿平铺**） |
 | Reduction (mean/sum/max/min) | D1, P1, P2, A1, A2 | P68, P69, P109, P110 |
 | Sort / TopK | D1, P1, P2, A7 | P96, P111 |
-| Transpose / Layout Conversion | D1, P1, P7, P10 | P26, P114 |
+| Transpose / Layout Conversion | D1, P1, P7, P10 | P127（模式特化路由）, P26, P114 |
+| Convolution (conv1d/2d/3d, depthwise, ConvTranspose) | D1, P1, P7, A1 | P130（1×1）, P128（fp32）, P129（fused im2col）, P131（repack 缓存）——按 scenario-routing/convolution.md 模式分发 |
 | Data Path (通用数据通路) | D1, D5, P1, P8, P10, P20, P25, P40, P54, P65, P66, P74 | — |
 
-### FA 算子族优化 SOP（按阶段顺序推进）
+### FA 算子族优化 SOP
 
-适用：Flash Attention 及其全部变体（MHA / GQA / MQA / MLA / Sparse / Paged / Sliding-Window / Fwd / Bwd 等；形态判定见 `families/flashattention_guide.md`）。FA 族策略收益与依赖均有序：**结构改写 > CV 流水 > 内存搬运 > mask/稀疏特化 > 调度均衡**。进化时从未完成的最早阶段选策略，每轮落地一个阶段，不要跨阶段平铺堆叠。
-
-| 阶段 | 目标 | 策略（按优先级） | 跳过条件 |
-|---|---|---|---|
-| S0 形态判定 | 按 head 数关系定基础形态（MHA/MQA/GQA/MLA，判据见 `../../evolution-knowledge/references/a3/algorithm_insights/attention_family.md`）+ 正交 trait（稀疏/量化/decode/paged，见 `families/flashattention_guide.md`） | P115（Tiling 路由） | 每次必做，决定后续各阶段适用卡 |
-| S1 结构改写 | 消除算法级浪费（收益最大） | P119（two-pass→online softmax）、P120（向量点积→cube mmad）、P124（MLA nope/rope 拼 K 维） | 已是 online softmax + cube 路径（如官方 FIA 移植实现）则整阶段跳过 |
-| S2 CV 流水 | AIC/AIV 生产者-消费者重叠 | P121（SplitFuse 流水，依赖 P120）、P14（CV 预发射）、P125（跨任务预取，依赖 P121）、P29（跨核同步） | 仍在纯 Vector 路径时先回 S1 完成 P120 |
-| S3 内存与搬运 | 摊薄握手/启动开销，L1/L2 常驻 | P122（KV 大块化 + L1 预算公式）、P18/P53（L1 常驻）、P38（softmax 状态常驻）、P60（decode KV NZ）、P61（L2 cache） | mte2_stall 非主瓶颈且 L1/UB 预算已达标 |
-| S4 mask/稀疏特化 | 消除无效计算与搬运 | P123（causal 跳过 + 边界 mask 特化）、P118（mask 预生成独立 AIV）、P76/P77（sparse KV 预合并/聚合）、P80（Sink task 注入） | 非 causal/sparse/sink 形态 |
-| S5 调度与负载均衡 | 多核利用率与变长调度 | P116（GQA G→M 合并）、P117（host MatmulApiTiling 配方）、P126（GM 任务表变长调度）、P57/P58（FlashDecode 分区） | tiling_imbalance 非瓶颈且核已打满 |
-| S6 通用收尾 | 基础数据通路与数值稳定 | D1、P1、P5、P7、A4、A5、P90；Bwd 另加 P91 | — |
-
-规则：
-1. 顺序不可颠倒：cube 路径（S1）→ CV 流水（S2）→ 大块化（S3）是硬依赖链，跳阶段会产生编译失败或负收益变体，浪费进化轮次。
-2. 同轮组合必须过 `strategy-compatibility.md` §1/§2 的依赖/互斥检查（如 P121 依赖 P120；P123 与逐元素 mask 兜底互斥须删除旧路径）。
-3. Refine 阶段若 profiling 证据明确指向某瓶颈，以"按瓶颈类型查表"优先，SOP 顺序让位于证据。
+**已迁入场景路由**：[`scenario-routing/flashattention.md`](scenario-routing/flashattention.md)（S0 形态判定 → S1 结构改写 → S2 CV 流水 → S3 内存搬运 → S4 mask/稀疏特化 → S5 调度均衡 → S6 通用收尾）。
 
 ### 按瓶颈类型查表 (Bottleneck-Driven Strategy Selection)
 
@@ -372,12 +362,12 @@ P67-P69 为 Vector 计算效率基础策略（Counter 模式、低延迟归约�
 
 | Bottleneck Type | Primary | Secondary | Anti |
 |-----------------|---------|-----------|------|
-| mte2_stall | P1, P10 | P2, P7, P19, P18, P56, P59, P66, P92, P93, P101, P112, P113, P114, P118, P119, P124 | P3 |
+| mte2_stall | P1, P10 | P2, P7, P19, P18, P56, P59, P66, P92, P93, P101, P112, P113, P114, P118, P119, P124, P127, P129, P130 | P3 |
 | mte3_stall | P1 | P8, P19, P40, P56, P59 | — |
 | tiling_imbalance | P4, P2 | P11, P47, P51, P58, P72, P73, P75, P104, P106, P116, P126 | P3 |
 | scalar_loading | P5, P67 | P2, P54, P90, P97, P99, P100, P101 | — |
-| scalar_compute | P5, P67, P94, P95, P98, P99, P100, P102 | P84, P103, P111, P120, P126 | — |
-| compute_bound | D1, P46, P94, P95, P96, P102 | A1, P47, P68, P69, P79, P84, P91, P92, P103, P120, P123 | — |
+| scalar_compute | P5, P67, P94, P95, P98, P99, P100, P102 | P84, P103, P111, P120, P126, P127 | — |
+| compute_bound | D1, P46, P94, P95, P96, P102 | A1, P47, P68, P69, P79, P84, P91, P92, P103, P120, P123, P127, P128, P130, P131 | — |
 | near_optimal | P98 | — | — |
 | no_overlap | P1 | P10, P19, P63, P118, P119, P121, P122, P125 | — |
 | partial_overlap | P1, P2 | P8, P18, P26, P53, P83, P90, P125 | — |

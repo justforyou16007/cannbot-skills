@@ -5,6 +5,8 @@ discovered_round: 4
 discovered_from: level3_conv_2d-cannbench-web-submit (P4/P5)
 base_speedup: fp32 geomean 0.000 → 0.50（单 case 最高 0.60，标量兜底 ~21000x 慢 → 0.5x）
 ---
+> **已晋升为 P128**（card + precondition + playbook 三件套见 `cards/`、`preconditions/`、`playbooks/`）。本文件保留为实战详细记录（含实测数据与否定项依据），卡片内容以 P128 为准。
+
 
 # Strategy X17: FP32-via-BF16 Hi/Lo 拆分 3-GEMM（Cube 不吃 fp32 时的保精度路径）
 

@@ -1,0 +1,17 @@
+strategy_id: P131
+description: 权重 repack LRU 缓存适用性检查 — 算子带权重预打包步骤（conv/matmul/quant matmul），且为推理式重复调用模式。
+
+checks:
+  - id: has_weight_repack
+    type: grep_count
+    pattern: "repack|wrepack|Repack|weight.*[Pp]ack"
+    files: [kernel, header]
+    expected: ">= 1"
+    fail_msg: "无权重预打包步骤 → P131 不适用。"
+
+  - id: no_cache_yet
+    type: grep_count
+    pattern: "cache|Cache|LRU|lru"
+    files: [kernel, header]
+    expected: "== 0"
+    fail_msg: "已存在缓存机制 → P131 主要价值已发挥。"

@@ -5,6 +5,8 @@ discovered_round: 2
 discovered_from: conv2d_base (tilelang2ascendc-ops-generator) + level3_conv_2d-cannbench-web-submit
 base_speedup: 省去整个 wrepack kernel 发射（每次调用 ~5-15us 级，推理式重复调用全命中）
 ---
+> **已晋升为 P131**（card + precondition + playbook 三件套见 `cards/`、`preconditions/`、`playbooks/`）。本文件保留为实战详细记录（含实测数据与否定项依据），卡片内容以 P131 为准。
+
 
 # Strategy X20: Host 侧权重预打包结果 LRU 缓存（Weight Repack Cache）
 

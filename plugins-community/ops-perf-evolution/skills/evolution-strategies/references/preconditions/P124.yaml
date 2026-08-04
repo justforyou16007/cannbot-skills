@@ -1,0 +1,30 @@
+strategy_id: P124
+description: MLA nope+rope 拼接单 GEMM K 维适用性检查 — 算子为 MLA/attention 类且 Q/K 由 nope+rope（或 latent+rope）双张量组成，score 被拆成两段独立计算再合并，尚未拼成单 GEMM K 维。
+checks:
+  - id: has_rope_split_input
+    type: grep_count
+    pattern: "rope|Rope|nope|Nope|latent"
+    files: [kernel, header]
+    expected: ">= 1"
+    fail_msg: "未检测到 nope/rope 双分量输入 → 非 MLA 拆分形态，P124 不适用。"
+
+  - id: is_cube_mmad_present
+    type: grep_count
+    pattern: "Mmad|mmad|BlockMmad|Matmul"
+    files: [kernel, header]
+    expected: ">= 1"
+    fail_msg: "尚未使用 Cube mmad → 先实施 P120（向量点积 → Cube 重写），P124 是其后的 K 维合并优化。"
+
+  - id: no_concat_k_loop_yet
+    type: grep_count
+    pattern: "embedSplit|embedCat|initL0C|isRope|embed \\+ embedRope"
+    files: [kernel, header]
+    expected: "== 0"
+    fail_msg: "已存在 K 维拼接证据（embed-split 循环或 embed+embedRope 单 GEMM K 维）→ P124 已实施。"
+
+  - id: has_dual_segment_score
+    type: grep_count
+    pattern: "qRope|kRope|gARope|gBRope|ropeGm|RopeGm"
+    files: [kernel, header]
+    expected: ">= 1"
+    fail_msg: "未检测到独立的 rope GM 张量通路 → 确认 Q/K 是否已预先拼接，已拼则 P124 无收益。"

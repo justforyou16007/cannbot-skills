@@ -43,6 +43,13 @@
 | P117 (MatmulApiTiling host recipe) | P46/P86/P92 | P117 在 host 生成 bmm tiling，P46 在 kernel 消费；P86/P92 在配方落地后继续调优 |
 | P118 (Mask precompute parallel AIV) | P14/P116 | P118 剥离 mask 到独立 AIV kernel；与 P116 组合时 mask 行数需 ×G |
 | P119 (Two-pass to online softmax) | P38/A5/P115 | P119 是结构改写，P38 组织改写后的状态 buffer；A5 保证数值稳定；与逐 token Kahan 互斥（须删除） |
+| P120 (FA Vec-Dot to Cube Mmad) | P13/P119/P121/P122 | P13 是通用判定卡，P120 是 FA 落地配方；改写后接 P119 online 状态与 P121 流水；与"先 Cast fp32 再算"的老路径互斥（须删除） |
+| P121 (FA SplitFuse CV Pipeline) | P14/P73/P120/P122 | P14 是通用环形预发射，P121 是 FA 具体拓扑（workspace 槽+三 flag+PRE_LAUNCH）；P73 在其上调核数比例；与 SyncAll 全局屏障互斥（须删除） |
+| P122 (KV Stack Large Tile + L1 Adaptive) | P18/P83/P120/P121 | P18/P83 是 L1 常驻通用模式，P122 给出 FA 预算公式与 512 堆叠基准；堆叠后 workspace 槽必须联动放大，否则与 P121 槽位冲突 |
+| P123 (Causal KV Skip + Boundary Mask) | P118/P119/D2/P122 | P118 负责 mask 预生成，P123 负责消费侧跳过与边界特化；D2 是通用模板分发，P123 是 FA 的 dtype×mask 4 入口落地；与逐元素 mask 兜底互斥（须删除） |
+| P124 (MLA Nope+Rope Concat GEMM K) | P120/P122/P116/P121 | P120 建 cube 路径后做 K 维拼接；embed-split 分段是 P122 L1 预算划分的 K 维实例；M=qHeads 是 P116 头合并的 MLA 极限形式；与"两段独立 GEMM 再 Add"互斥（须删除） |
+| P125 (Cross-task Cube Prefetch) | P121/P14/P107/P122 | P121 建任务内流水，P125 堵任务边界空泡（尾部一拍预发射下一任务首块 QK）；遍历顺序必须复用 P107 蛇形换算；与"任务边界清零 pingpongIdx"互斥 |
+| P126 (GM Tiling Table Task Schedule) | P107/P116/P125/P122 | host 任务表替代均匀切分+除法反解；任务粒度配合 P116 头合并降到 (batch,token)；为 P125 跨任务预取提供表项直读；与"totalQ 均匀切分"互斥（须删除） |
 
 ## §2 依赖关系
 
@@ -80,6 +87,13 @@
 | P117 | P46 | host 生成的 bmm tiling 由 kernel 侧 MatmulImpl(P46) 消费 |
 | P118 | — | 独立 mask kernel，无硬依赖；GQA 场景建议配合 P116 |
 | P119 | P38 | online 改写后的 max/sum/acc 状态按 P38 常驻组织 |
+| P120 | P13 | 先由 P13 判定"向量模拟 matmul"成立，再按 P120 的 FA 配方落地（layout/分形/精度链路） |
+| P121 | P120 | CV 流水要求 QK/PV 已上 cube；纯 vector 实现先走 P120 |
+| P122 | P120 | 堆叠大块化服务于 mmad 维度与握手摊薄，需先有 cube 路径 |
+| P123 | — | 无硬依赖；与 P122 共用 noSkipKvS 循环界时建议同轮落地 |
+| P124 | P120 | K 维拼接建立在 QK^T 已上 cube 的 mmad 路径上 |
+| P125 | P121 | 跨任务预取复用 P121 的握手协议与 workspace 槽位 |
+| P126 | — | 无硬依赖；配合 P116 头合并后任务粒度最优 |
 
 ### 推荐搭配（非硬依赖，但组合效果显著优于单独使用）
 
@@ -161,6 +175,9 @@ P119 ──→ P38
 | 多核访存优化 | P64 + P65 + P66 | GM 冲突规避 + UB bank 冲突规避 + 512B 对齐 |
 | CV 并行全套 | P73 + P75 + P16 + P51 | AIC:AIV 配比 + 双 AIV 拆分 + 代价模型 + 动态核配比 |
 | GQA decode 实战链 | P116 + P117 + P118 + P119 | G 头合并进 M + MatmulApiTiling 配方 + mask 独立预生成 + online softmax |
+| MHA cube 化实战链 | P120 + P121 + P122 + P123 | 向量点积→mmad 重写 + SplitFuse CV 流水 + KV 堆叠大块化 + causal 跳过边界特化 |
+| MLA decode 实战链 | P120 + P121 + P124 + P125 + P126 | mmad 重写 + CV 流水 + nope/rope K 维拼接 + 跨任务预取 + GM 任务表变长调度 |
+| FA 族全链路 SOP | S1: P119+P120(+P124) → S2: P121/P14 → S3: P122/P18/P38 → S4: P123/P118 → S5: P116/P117/P126 | 任意 FA 变体（MHA/GQA/MLA/Sparse/Paged）的标准优化顺序；分轮逐阶段落地而非单轮平铺，阶段依赖与互斥见 §1/§2，完整 SOP 见 strategy-index.md |
 
 ## §4 UB 内存压力指南
 

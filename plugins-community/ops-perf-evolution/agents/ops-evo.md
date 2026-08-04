@@ -60,7 +60,7 @@ skills:
 - **跨粒度思考**: 不要局限于策略库中的指令级优化（P1-P88），主动考虑：算法级（减少计算量、近似算法）、数据流级（改变遍历顺序、融合操作、减少中间结果）、硬件级（特定指令、DMA 模式）
 - **策略选择协议（分层检索）**: 读取 `plugins-community/ops-perf-evolution/skills/evolution-strategies/references/strategy-index.md` 后，按以下顺序选择策略：
   · **Step 1 — L0 通用策略 (必选)**: 查"按算子类型快速查表"的 L0 列，选择所有匹配的 D/P/A 策略
-  · **Step 2 — L1 高级策略 (按需)**: 根据算子特征判断：Cube+Vector 融合（matmul+vector 后处理）→ 查 CV Matmul 行；Flash Attention 模式 → 查 Flash Attention 行；量化/反量化 → 查 Quantization 行 + P48/P49；MoE 专家并行 → 查 CV FFN (MoE) 行 + P50；多核 M×N 分块 → P47（对角线调度）；AIC/AIV 混合 → P51（动态核配比）
+  · **Step 2 — L1 高级策略 (按需)**: 根据算子特征判断：Cube+Vector 融合（matmul+vector 后处理）→ 查 CV Matmul 行；Flash Attention 模式（**先按 strategy-index.md 的「族判定快速路由」结构判据归族**，名字不典型的 attention 变体也算）→ 查 Flash Attention 行并按 FA SOP 阶段顺序选卡；量化/反量化 → 查 Quantization 行 + P48/P49；MoE 专家并行 → 查 CV FFN (MoE) 行 + P50；多核 M×N 分块 → P47（对角线调度）；AIC/AIV 混合 → P51（动态核配比）
 
   对于 ascendc-tiling-design 已覆盖族，Init 阶段默认将以下系统化 Tiling 策略纳入候选池（若族匹配）：
   · matmul → P104, P105, P106, P107, P108

@@ -2,7 +2,7 @@
 
 | # | 检查项 | 是否必须通过 |
 |---|--------|-------------|
-| 1 | **任务划分明确**：block 负责输出哪段区域，写出具体输出切片表达式（如 `Output[bz, by, bx*block_M:(bx+1)*block_M, :]`），不是"处理一段输出" | ✅ 必须 |
+| 1 | **任务划分明确**：block 负责输出哪段区域，写出具体输出切片表达式（如 `Output[bz, by, bx*block_M:(bx+1)*block_M, :]`）；输入侧也须明确——写出该 block 消费的输入区域切片表达式（如 `Input[bz, :, bx*block_K:(bx+1)*block_K]`），不是"处理一段输出" | ✅ 必须 |
 | 2 | **块内遍历明确**：用代码显式写清楚块内遍历循环（如 `for kv_loops in ...` 的 for 循环代码），写清哪个维在块内循环、遍历哪些输入数据，而不是文字描述 | ✅ 必须 |
 | 3 | **布局整理说明**：需要先 pack / 轴合并 / 移位才利于分工的（如 GQA 的 Q/K/V pack、pooling 的 channel 移位），在 block-level 阶段就写明，而不是拖到 tile-level | ✅ 必须 |
 | 4 | **C/V 分工明确**：每个子阶段标 `T.Scope("C")`（cube：T.gemm/T.mma/T.copy→L0）或 `T.Scope("V")`（vector：T.tile.*/T.reduce_sum），谁是 cube 谁是 vector 一目了然 | ✅ 必须 |

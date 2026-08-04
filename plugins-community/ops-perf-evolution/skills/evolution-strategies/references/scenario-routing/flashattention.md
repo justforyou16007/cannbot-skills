@@ -5,7 +5,7 @@
 
 ## Step 0 — 族判定确认
 
-命中 [README.md](README.md) 判定表第 1 行（QK^T+softmax+PV 主干 / online softmax 状态机 / head 数关系）即归本族。形态细分（GQA/MHA/MLA + 量化/稀疏/feature flags）见 [../families/flashattention_guide.md](../families/flashattention_guide.md)。
+命中 [README.md](README.md) 判定表第 1 行（QK^T+softmax+PV 主干 / online softmax 状态机 / head 数关系）即归本族。
 
 ## Step 1 — 通用前置
 

@@ -667,12 +667,18 @@ def _extract_shape_dtype_from_jsonl(case):
 
 
 def _case_has_empty_tensor(case):
-    """判断 case 中是否包含 0 元素张量（空 tensor）。"""
+    """判断 case 中是否包含 0 元素张量（空 tensor）。
+
+    shape=None 表示形状未指定（如可选 bias），不应视作空 tensor。
+    只有形状明确包含 0 维度或为空列表的才是真正的空 tensor。
+    """
     if not case:
         return False
     for inp in case.get("inputs", []):
         if inp.get("type") == "tensor":
             shape = inp.get("shape", [])
+            if shape is None:
+                continue
             if not shape or any(s == 0 for s in shape):
                 return True
     return False
@@ -849,6 +855,7 @@ class _WrapperConfig:
     device_id: int
     warmup: int
     jsonl_case: Optional[Dict[str, Any]] = None
+    repeats: int = 1
 
 
 _WRAPPER_SCRIPT_TEMPLATE = """\
@@ -927,39 +934,39 @@ else:
     model = cls().to(device).eval()
 
 _use_positional_fallback = 0  # 0=kargs, 1=spread, 2=tuple
-for _ in range({warmup}):
+
+
+def _one_iter():
+    global _use_positional_fallback
     with torch.no_grad():
         if _use_kwargs:
-            try:
-                _ = model(**_inputs_dict)
-            except TypeError:
-                _use_positional_fallback = 1
+            if _use_positional_fallback == 0:
                 try:
-                    _ = model(*_inputs_list)
+                    _ = model(**_inputs_dict)
                 except TypeError:
-                    _use_positional_fallback = 2
-                    _ = model(tuple(_inputs_list))
+                    _use_positional_fallback = 1
+                    try:
+                        _ = model(*_inputs_list)
+                    except TypeError:
+                        _use_positional_fallback = 2
+                        _ = model(tuple(_inputs_list))
+            elif _use_positional_fallback == 1:
+                _ = model(*_inputs_list)
+            else:
+                _ = model(tuple(_inputs_list))
         else:
             _ = model(*inputs)
     torch.npu.synchronize()
 
-with torch.no_grad():
-    if _use_kwargs:
-        if _use_positional_fallback == 0:
-            try:
-                _ = model(**_inputs_dict)
-            except TypeError:
-                try:
-                    _ = model(*_inputs_list)
-                except TypeError:
-                    _ = model(tuple(_inputs_list))
-        elif _use_positional_fallback == 1:
-            _ = model(*_inputs_list)
-        else:
-            _ = model(tuple(_inputs_list))
-    else:
-        _ = model(*inputs)
-torch.npu.synchronize()
+
+# ---- in-process warmup: 与 torch_npu profiler 的 warmup 语义一致 ----
+# 这些迭代同样落在 msprof 采集窗口内，解析时按 run 拆分后丢弃前 {warmup} 次。
+for _ in range({warmup}):
+    _one_iter()
+
+# ---- timed repeats ----
+for _ in range({repeats}):
+    _one_iter()
 """
 
 
@@ -970,6 +977,7 @@ def _build_wrapper_script_content(cfg, model_file, cls_name, inputs_code):
         device_id=cfg.device_id,
         case_idx=cfg.case_idx,
         warmup=cfg.warmup,
+        repeats=cfg.repeats,
         seed=cfg.seed,
         model_file=model_file,
         cls_name=cls_name,
@@ -1195,13 +1203,55 @@ def _parse_msprof_duration(prof_group_dir: str):
     return None, None, "no compute rows found"
 
 
-def _parse_msprof_duration_quick(prof_group_dir: str):
+_META_KERNEL_TYPES = ("PROFILING_ENABLE", "PROFILING_DISABLE", "TASK_TIMEOUT_SET", "")
+
+
+def _split_task_time_runs(rows: List[Dict[str, str]], n_runs: int):
+    """把 task_time.csv 的 kernel 行按「重复的 kernel 序列」拆成 n_runs 次 run。
+
+    采集窗口内包含 warmup + repeats 次迭代，每次迭代发射完全相同的 kernel 序列。
+    按 task_start 排序后，总行数应能被 n_runs 整除，且每个分块的 kernel_name
+    序列必须逐位相同 —— 否则说明迭代次数与预期不符，返回 None 由调用方回退。
+
+    Returns: list[list[float]] 每个 run 的 kernel 耗时列表，或 None。
+    """
+    kernels = []
+    for r in rows:
+        if r.get("kernel_type", "") in _META_KERNEL_TYPES:
+            continue
+        try:
+            dur = float(r.get("task_time(us)", "") or 0)
+            start = float((r.get("task_start(us)", "") or "0").strip())
+        except ValueError:
+            continue
+        if dur <= 0:
+            continue
+        kernels.append((start, r.get("kernel_name", "unknown"), dur))
+
+    if not kernels or n_runs < 1 or len(kernels) % n_runs:
+        return None
+    kernels.sort(key=lambda x: x[0])
+
+    n = len(kernels) // n_runs
+    runs, seq = [], [k[1] for k in kernels[:n]]
+    for i in range(n_runs):
+        chunk = kernels[i * n:(i + 1) * n]
+        if [k[1] for k in chunk] != seq:
+            return None
+        runs.append([k[2] for k in chunk])
+    return runs
+
+
+def _parse_msprof_duration_quick(prof_group_dir: str, warmup: int = 0, repeats: int = 1):
     """快速模式解析：从 PROF 目录中查找 task_time.csv 或 api_statistic.csv 并提取时间。
 
     快速模式只跑 1 轮（不采集 7 个 aic-metrics），因此没有 op_summary_*.csv。
 
-    warmup 已在 msprof 外部执行，task_time.csv 只包含正式 timed run 的 kernel 时间，
-    对单次采集中所有计算 kernel 的耗时直接累加即可。
+    采集窗口内包含 warmup + repeats 次 in-process 迭代（与 torch_npu profiler 的
+    warmup/active 语义一致）。这里按 kernel 序列把它们拆开，**只对后 repeats 次
+    （active）求平均**，丢弃 warmup 次 —— 避免首次迭代的冷启动污染测量值。
+
+    若拆分失败（行数不匹配等），回退为「全部 kernel 求和 / (warmup+repeats)」。
 
     兼容两种目录结构：
       - 无 --aic-metrics: PROF_*/mindstudio_profiler_output/task_time_*.csv
@@ -1220,32 +1270,59 @@ def _parse_msprof_duration_quick(prof_group_dir: str):
             with open(task_time_files[0], "r", encoding="utf-8", errors="replace") as f:
                 reader = csv.DictReader(f)
                 rows = list(reader)
-            # 收集所有非元事件的 kernel 行，按 kernel_name 分组
-            kernel_times: Dict[str, List[float]] = {}
+
+            # 优先：按 run 拆分，只取 active（后 repeats 次）的均值
+            runs = _split_task_time_runs(rows, warmup + repeats)
+            if runs is not None:
+                active = runs[warmup:] if warmup < len(runs) else runs
+                per_run = [sum(x) for x in active]
+                return (sum(per_run) / len(per_run)), "multiple_kernels", None
+
+            # 回退路径：run 拆分失败（kernel 名称序列不一致等），不再按名分组，
+            # 改为按时间排序后做位置分片，显式丢弃前 warmup 份再取均值。
+            kernels = []
             for r in rows:
                 kernel_type = r.get("kernel_type", "")
                 task_time = r.get("task_time(us)", "")
-                if kernel_type not in ("PROFILING_ENABLE", "PROFILING_DISABLE", "TASK_TIMEOUT_SET", "") and task_time:
-                    try:
-                        duration = float(task_time)
-                        if duration > 0:
-                            kernel_name = r.get("kernel_name", "unknown")
-                            kernel_times.setdefault(kernel_name, []).append(duration)
-                    except ValueError:
-                        continue
+                if kernel_type in _META_KERNEL_TYPES or not task_time:
+                    continue
+                try:
+                    dur = float(task_time)
+                    start = float((r.get("task_start(us)", "") or "0").strip())
+                except ValueError:
+                    continue
+                if dur <= 0:
+                    continue
+                kernels.append((start, r.get("kernel_name", "unknown"), dur))
 
-            if kernel_times:
-                # 汇总所有 kernel 的耗时
-                all_durations = []
-                all_kernel_names = set()
-                for times in kernel_times.values():
-                    all_durations.extend(times)
-                for name in kernel_times.keys():
-                    all_kernel_names.add(name)
-                total_duration = sum(all_durations)
-                if total_duration > 0:
-                    kernel_name = list(all_kernel_names)[0] if len(all_kernel_names) == 1 else "multiple_kernels"
-                    return total_duration, kernel_name, None
+            if kernels:
+                kernels.sort(key=lambda x: x[0])
+                total = sum(d for _, _, d in kernels)
+                n_total = warmup + repeats
+                if n_total <= 0:
+                    n_total = 1
+                n_kernels = len(kernels)
+
+                if n_kernels % n_total == 0:
+                    # 行数可整除：按位置精确分片，丢弃前 warmup 份
+                    k_per = n_kernels // n_total
+                    active_kernels = kernels[warmup * k_per:]
+                    active_total = sum(d for _, _, d in active_kernels)
+                    result = active_total / max(1, repeats)
+                else:
+                    # 行数不可整除：按比例估算，丢弃时间轴上前 warmup/n_total 的部分
+                    split_idx = max(1, int(n_kernels * warmup / n_total))
+                    active_kernels = kernels[split_idx:]
+                    active_total = sum(d for _, _, d in active_kernels)
+                    # 按 active kernel 数占总 kernel 数的比例折算单次迭代耗时
+                    if len(active_kernels) > 0:
+                        result = active_total / (len(active_kernels) / (n_kernels / n_total))
+                    else:
+                        result = total / n_total
+
+                kernel_names = list({k[1] for k in kernels})
+                kernel_name = kernel_names[0] if len(kernel_names) == 1 else "multiple_kernels"
+                return result, kernel_name, None
         except Exception:
             pass
 
@@ -1505,34 +1582,42 @@ def _measure_one_impl(mi: _MeasureInput):
 def _measure_one_impl_quick(mi: _MeasureInput):
     """快速模式：Measure one implementation with retries and repeats.
 
-    --retry 用于解析失败重试；--repeats 控制 wrapper 内 timed iteration 次数。
-    wrapper 做 repeats 次 timed run，msprof 一把采集，total / repeats = 单次耗时。
-    warmup 由 _run_msprof_quick 在 msprof 外部执行。
+    --retry 用于解析失败重试。
+
+    与 torch_npu profiler 对齐的口径：wrapper 在**同一个被采集的进程内**先跑
+    --warmup 次预热迭代、再跑 --repeats 次计时迭代，msprof 一把全采；解析时按
+    kernel 序列拆分成 (warmup + repeats) 次 run，只对后 repeats 次求平均。
+
+    旧实现把 warmup 放在 msprof 外部的独立进程里执行，对被采集的那个进程毫无
+    预热作用，导致采到的必然是冷 run（首个 kernel 被放大 ~47%）。--ext-warmup
+    保留了旧行为，默认关闭。
 
     Returns (duration_us, error, prof_dir).
     """
     prof_dir = None
     impl_abbr = "ref" if mi.impl == "reference" else "asc"
     repeats = max(1, getattr(mi.args, "repeats", 1))
+    warmup = max(0, getattr(mi.args, "warmup", 0))
+    ext_warmup = max(0, getattr(mi.args, "ext_warmup", 0))
 
     for _ in range(1 + mi.args.retry):
-        # 让 wrapper 内跑 repeats 次 timed run，msprof 一把采集后除以 repeats 得到单次
         wrapper = _generate_wrapper_script(_WrapperConfig(
             mi.out_dir, mi.case_idx, mi.impl, mi.args.seed, mi.device_id,
-            repeats - 1, mi.jsonl_case))
-        tmpdir = f"/tmp/msprof_quick_{impl_abbr}_{mi.out_dir.name}_c{mi.case_idx}"
+            warmup, mi.jsonl_case, repeats))
+        tag = getattr(mi.args, "prof_tag", None)
+        tmpdir = (f"/tmp/msprof_quick_{impl_abbr}_{mi.out_dir.name}_c{mi.case_idx}"
+                  + (f"_{tag}" if tag else ""))
         _cleanup_prof_dirs(tmpdir)
-        prof_dir, err = _run_msprof_quick(wrapper, tmpdir, mi.device_id, mi.args.warmup)
+        prof_dir, err = _run_msprof_quick(wrapper, tmpdir, mi.device_id, ext_warmup)
         if not prof_dir:
             continue
 
-        duration, _op_name, parse_err = _parse_msprof_duration_quick(prof_dir)
+        duration, _op_name, parse_err = _parse_msprof_duration_quick(
+            prof_dir, warmup, repeats)
         if duration is None:
             err = f"{parse_err} (app log: {tmpdir}/app_output.log)"
             continue
 
-        # msprof 采集了 repeats 次 timed run，除以 repeats 得到单次耗时
-        duration = duration / repeats
         return duration, None, prof_dir
 
     return None, err, prof_dir
@@ -1774,7 +1859,13 @@ def _run_quick_loop(out_dir, cases, n_cases, args, device_id):
     """
     rows, speedups, ref_times, asc_times = [], [], [], []
 
-    for idx in range(n_cases):
+    sel = getattr(args, "cases", None)
+    if sel:
+        idx_list = [int(x) for x in str(sel).split(",") if x.strip() != ""]
+    else:
+        idx_list = list(range(n_cases))
+
+    for idx in idx_list:
         shape, dtype = _extract_shape_dtype_from_jsonl(cases[idx]) if cases else ("?", "?")
         jsonl_case = cases[idx] if cases else None
 
@@ -1790,10 +1881,17 @@ def _run_quick_loop(out_dir, cases, n_cases, args, device_id):
             })
             continue
 
-        ref_mi = _MeasureInput(out_dir, idx, "reference", args, device_id, jsonl_case)
-        asc_mi = _MeasureInput(out_dir, idx, "ascendc", args, device_id, jsonl_case)
-        ref_us, ref_err, ref_prof_dir = _measure_one_impl_quick(ref_mi)
-        asc_us, asc_err, asc_prof_dir = _measure_one_impl_quick(asc_mi)
+        which = getattr(args, "impl", "both")
+        if which in ("both", "ref"):
+            ref_mi = _MeasureInput(out_dir, idx, "reference", args, device_id, jsonl_case)
+            ref_us, ref_err, ref_prof_dir = _measure_one_impl_quick(ref_mi)
+        else:
+            ref_us, ref_err, ref_prof_dir = None, "skipped (--impl)", None
+        if which in ("both", "asc"):
+            asc_mi = _MeasureInput(out_dir, idx, "ascendc", args, device_id, jsonl_case)
+            asc_us, asc_err, asc_prof_dir = _measure_one_impl_quick(asc_mi)
+        else:
+            asc_us, asc_err, asc_prof_dir = None, "skipped (--impl)", None
 
         if ref_us is not None and asc_us is not None and asc_us > 0:
             sp = ref_us / asc_us
@@ -1858,6 +1956,13 @@ def run_quick_mode(args):
     if case_source:
         LOGGER.info(f"[INFO] Loaded {n_cases} cases from {case_source}")
 
+    max_cases = getattr(args, "max_cases", 0)
+    if max_cases and max_cases < n_cases:
+        n_cases = max_cases
+        LOGGER.info(f"[INFO] --max-cases: limiting to first {n_cases} cases")
+
+    LOGGER.info(f"[INFO] in-process warmup={args.warmup}, timed repeats={args.repeats}, "
+                f"ext-warmup={getattr(args, 'ext_warmup', 0)}, impl={getattr(args, 'impl', 'both')}")
     _log_compare_header(out_dir, args)
     rows, speedups, ref_times, asc_times = _run_quick_loop(
         out_dir, cases, n_cases, args, device_id)
@@ -2113,8 +2218,20 @@ def main():
     parser.add_argument("--compare", action="store_true", help="启用对比模式（8 轮采集：7 metrics + sample）")
     parser.add_argument("--quick", action="store_true", help="启用快速模式（1 轮采集：只获取 kernel 时间，不采集 7 个 aic-metrics）")
     parser.add_argument("--output-dir", dest="output_dir", help="算子输出目录（对比模式/快速模式）")
-    parser.add_argument("--warmup", type=int, default=3, help="msprof warmup 次数")
-    parser.add_argument("--repeats", type=int, default=1, help="重复采集次数")
+    parser.add_argument("--warmup", type=int, default=3,
+                        help="quick 模式：被采集进程内的预热迭代次数（解析时丢弃）")
+    parser.add_argument("--repeats", type=int, default=1,
+                        help="quick 模式：被采集进程内的计时迭代次数（解析时取均值）")
+    parser.add_argument("--ext-warmup", dest="ext_warmup", type=int, default=0,
+                        help="旧行为：在 msprof 外部另起进程预热的次数（对被采集进程无预热效果，默认 0）")
+    parser.add_argument("--impl", choices=["both", "ref", "asc"], default="both",
+                        help="quick 模式只采集指定实现（ref=参考实现，asc=AscendC 实现）")
+    parser.add_argument("--max-cases", dest="max_cases", type=int, default=0,
+                        help="quick 模式只跑前 N 个 case（0=全部，用于冒烟测试）")
+    parser.add_argument("--cases", default=None,
+                        help="quick 模式只跑指定 case 下标，逗号分隔，如 0,4,9,18（优先于 --max-cases）")
+    parser.add_argument("--prof-tag", dest="prof_tag", default=None,
+                        help="PROF 临时目录后缀，用于同一 case 多次独立采集互不覆盖")
     parser.add_argument("--seed", type=int, default=0, help="随机种子")
     parser.add_argument("--retry", type=int, default=2, help="单 case 解析失败重试次数")
     parser.add_argument("--device", type=int, default=None, help="NPU 设备 id")

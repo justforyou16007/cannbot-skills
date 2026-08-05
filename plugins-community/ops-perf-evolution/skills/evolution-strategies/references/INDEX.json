@@ -43,11 +43,11 @@
     ]
   },
   "stats": {
-    "cards": 141,
-    "active_cards": 128,
+    "cards": 146,
+    "active_cards": 133,
     "deprecated": 13,
-    "preconditions": 126,
-    "playbooks": 126,
+    "preconditions": 131,
+    "playbooks": 131,
     "families": 8,
     "discovered": 20
   },
@@ -1155,6 +1155,86 @@
       "quantified_gain": []
     },
     {
+      "source_key": "evolution-strategies#card/P127_conversion_pattern_specialization_routing",
+      "id": "P127",
+      "title": "P127: Conversion 模式特化路由（Transpose/Permute 禁止通用 gather 主路径）",
+      "doc_path": "cards/P127_conversion_pattern_specialization_routing.md",
+      "complexity": "L1",
+      "op_families": [
+        "special",
+        "elementwise"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "mte2_stall",
+          "scalar_compute",
+          "compute_bound"
+        ]
+      },
+      "conflicts_with": [],
+      "synergizes_with": [
+        "P26",
+        "P114",
+        "P7",
+        "P1"
+      ],
+      "requires": [],
+      "has_preconditions": true,
+      "has_playbook": true,
+      "quantified_gain": []
+    },
+    {
+      "source_key": "evolution-strategies#card/P128_fp32_via_bf16_hilo_3gemm",
+      "id": "P128",
+      "title": "P128: FP32-via-BF16 Hi/Lo 拆分 3-GEMM（Cube 不吃 fp32 时的保精度路径）",
+      "doc_path": "cards/P128_fp32_via_bf16_hilo_3gemm.md",
+      "complexity": "L2",
+      "op_families": [
+        "matmul",
+        "special"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "compute_bound"
+        ]
+      },
+      "conflicts_with": [],
+      "synergizes_with": [
+        "P129",
+        "P130",
+        "D1"
+      ],
+      "requires": [],
+      "has_preconditions": true,
+      "has_playbook": true,
+      "quantified_gain": []
+    },
+    {
+      "source_key": "evolution-strategies#card/P129_fused_img2col_loaddata3d",
+      "id": "P129",
+      "title": "P129: Fused img2col LoadData3D 随路展开（含 band 窗口化突破 L1 容量）",
+      "doc_path": "cards/P129_fused_img2col_loaddata3d.md",
+      "complexity": "L2",
+      "op_families": [
+        "matmul",
+        "special"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "mte2_stall"
+        ]
+      },
+      "conflicts_with": [],
+      "synergizes_with": [
+        "P128",
+        "P131"
+      ],
+      "requires": [],
+      "has_preconditions": true,
+      "has_playbook": true,
+      "quantified_gain": []
+    },
+    {
       "source_key": "evolution-strategies#card/P12_broadcast_mask",
       "id": "P12",
       "title": "P12: Broadcast & Mask Operations (广播与掩码操作)",
@@ -1170,6 +1250,58 @@
       },
       "conflicts_with": [],
       "synergizes_with": [],
+      "requires": [],
+      "has_preconditions": true,
+      "has_playbook": true,
+      "quantified_gain": []
+    },
+    {
+      "source_key": "evolution-strategies#card/P130_1x1conv_flipped_gemm",
+      "id": "P130",
+      "title": "P130: 1×1 Conv 翻转 GEMM（原始布局即操作数，免 wrepack/im2col）",
+      "doc_path": "cards/P130_1x1conv_flipped_gemm.md",
+      "complexity": "L1",
+      "op_families": [
+        "matmul",
+        "special"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "compute_bound",
+          "mte2_stall"
+        ]
+      },
+      "conflicts_with": [],
+      "synergizes_with": [
+        "P129",
+        "P131"
+      ],
+      "requires": [],
+      "has_preconditions": true,
+      "has_playbook": true,
+      "quantified_gain": []
+    },
+    {
+      "source_key": "evolution-strategies#card/P131_weight_repack_lru_cache",
+      "id": "P131",
+      "title": "P131: Host 侧权重预打包结果 LRU 缓存（Weight Repack Cache）",
+      "doc_path": "cards/P131_weight_repack_lru_cache.md",
+      "complexity": "L1",
+      "op_families": [
+        "matmul",
+        "special",
+        "quantization"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "compute_bound"
+        ]
+      },
+      "conflicts_with": [],
+      "synergizes_with": [
+        "P129",
+        "P130"
+      ],
       "requires": [],
       "has_preconditions": true,
       "has_playbook": true,
@@ -3792,6 +3924,31 @@
       "doc_path": "preconditions/P126.yaml"
     },
     {
+      "source_key": "evolution-strategies#preconditions/P127",
+      "id": "P127",
+      "doc_path": "preconditions/P127.yaml"
+    },
+    {
+      "source_key": "evolution-strategies#preconditions/P128",
+      "id": "P128",
+      "doc_path": "preconditions/P128.yaml"
+    },
+    {
+      "source_key": "evolution-strategies#preconditions/P129",
+      "id": "P129",
+      "doc_path": "preconditions/P129.yaml"
+    },
+    {
+      "source_key": "evolution-strategies#preconditions/P130",
+      "id": "P130",
+      "doc_path": "preconditions/P130.yaml"
+    },
+    {
+      "source_key": "evolution-strategies#preconditions/P131",
+      "id": "P131",
+      "doc_path": "preconditions/P131.yaml"
+    },
+    {
       "source_key": "evolution-strategies#preconditions/P14",
       "id": "P14",
       "doc_path": "preconditions/P14.yaml"
@@ -4414,9 +4571,34 @@
       "doc_path": "playbooks/P126_gm_tiling_table_task_schedule.md"
     },
     {
+      "source_key": "evolution-strategies#playbook/P127_conversion_pattern_specialization_routing",
+      "id": "P127",
+      "doc_path": "playbooks/P127_conversion_pattern_specialization_routing.md"
+    },
+    {
+      "source_key": "evolution-strategies#playbook/P128_fp32_via_bf16_hilo_3gemm",
+      "id": "P128",
+      "doc_path": "playbooks/P128_fp32_via_bf16_hilo_3gemm.md"
+    },
+    {
+      "source_key": "evolution-strategies#playbook/P129_fused_img2col_loaddata3d",
+      "id": "P129",
+      "doc_path": "playbooks/P129_fused_img2col_loaddata3d.md"
+    },
+    {
       "source_key": "evolution-strategies#playbook/P12_broadcast_mask",
       "id": "P12",
       "doc_path": "playbooks/P12_broadcast_mask.md"
+    },
+    {
+      "source_key": "evolution-strategies#playbook/P130_1x1conv_flipped_gemm",
+      "id": "P130",
+      "doc_path": "playbooks/P130_1x1conv_flipped_gemm.md"
+    },
+    {
+      "source_key": "evolution-strategies#playbook/P131_weight_repack_lru_cache",
+      "id": "P131",
+      "doc_path": "playbooks/P131_weight_repack_lru_cache.md"
     },
     {
       "source_key": "evolution-strategies#playbook/P14_cv_pipeline_preload",

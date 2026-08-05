@@ -58,9 +58,9 @@ skills:
 
 - **联网搜索**: 遇到不熟悉的算子类型或优化技巧时，可使用 WebSearch 搜索学术论文、工业实践、开源实现（如 FlashAttention、Triton kernel 等）
 - **跨粒度思考**: 不要局限于策略库中的指令级优化（P1-P88），主动考虑：算法级（减少计算量、近似算法）、数据流级（改变遍历顺序、融合操作、减少中间结果）、硬件级（特定指令、DMA 模式）
-- **策略选择协议（分层检索）**: 读取 `plugins-community/ops-perf-evolution/skills/evolution-strategies/references/strategy-index.md` 后，按以下顺序选择策略：
-  · **Step 1 — L0 通用策略 (必选)**: 查"按算子类型快速查表"的 L0 列，选择所有匹配的 D/P/A 策略
-  · **Step 2 — L1 高级策略 (按需)**: 根据算子特征判断：Cube+Vector 融合（matmul+vector 后处理）→ 查 CV Matmul 行；Flash Attention 模式（**先按 strategy-index.md 的「族判定快速路由」结构判据归族**，名字不典型的 attention 变体也算）→ 查 Flash Attention 行并按 FA SOP 阶段顺序选卡；量化/反量化 → 查 Quantization 行 + P48/P49；MoE 专家并行 → 查 CV FFN (MoE) 行 + P50；多核 M×N 分块 → P47（对角线调度）；AIC/AIV 混合 → P51（动态核配比）
+- **策略选择协议（场景路由）**: 按以下顺序选择策略：
+  · **Step 1 — 归族（必做）**: 读 `plugins-community/ops-perf-evolution/skills/evolution-strategies/references/scenario-routing/README.md` 的族判定表，用结构判据（计算主干 / kernel 特征 / shape 特征，**不靠算子名**）把算子归入 FA / conv / matmul / quantization / reduction / sort / conversion / 小族 / elementwise 之一；多族特征同时命中时拆「主干族 + trait」
+  · **Step 2 — 按族 workflow 选卡（主路径）**: 打开 README 中该族对应的 workflow 文件（flashattention.md / convolution.md / matmul.md 等）：先过 `_common-prerequisites.md` 通用前置判定链（C1-C5，**命中用卡、未命中跳过**，覆盖双缓冲/对齐/标量向量化/dtype/数值稳定等基础项），再按 workflow 阶段表顺序选 L1 策略（每阶段带判定与跳过条件）；workflow 标注「覆盖缺口」的阶段转 Step 3
 
   对于 ascendc-tiling-design 已覆盖族，Init 阶段默认将以下系统化 Tiling 策略纳入候选池（若族匹配）：
   · matmul → P104, P105, P106, P107, P108
@@ -71,8 +71,8 @@ skills:
   · conversion → P114
   · flashattention → P115
   这些策略与 L0/L1 其他策略组合时需遵守 strategy-compatibility.md 的依赖/互斥约束。
-  · **Step 3 — 瓶颈驱动 (Refine 阶段)**: profiling_evidence 可用时，查"按瓶颈类型查表"追加/替换策略
-  · **原则**: L0 保证基本正确性和性能，L1 针对特定场景提供 2-5x 额外提升。Init 阶段优先用 L0 + 少量 L1，Refine 阶段按 profiling 证据精准追加 L1
+  · **Step 3 — 瓶颈驱动 (Refine 阶段)**: profiling_evidence 可用时，查 strategy-index.md「按瓶颈类型查表」追加/替换策略，**证据优先于 workflow 顺序**
+  · **原则**: 通用前置保证基本正确性和性能，族内 L1 针对特定场景提供 2-5x 额外提升。Init 阶段优先通用前置 + 少量 L1，Refine 阶段按 profiling 证据精准追加 L1
   · **ops 仓特别说明**: ops-nn/cv 仓算子更可能需要 L1（CV 融合、量化），ops-math/transformer 仓算子更多用 L0
 - **知识库查询协议**: `plugins-community/ops-perf-evolution/skills/evolution-knowledge/references/a3/` 采用渐进式披露，先读 guide.md 快速参考，按需深入。
   **Init 阶段必读**: `hardware/guide.md`（硬件关键参数和瓶颈判断）、`optimization_patterns/guide.md`（优化模式选择决策树）、按算子族读 `algorithm_insights/{family}.md`（匹配时）

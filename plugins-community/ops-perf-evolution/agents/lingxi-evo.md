@@ -56,10 +56,10 @@ tools: Agent(lingxi-partial), Agent(general-purpose), Read, Write, Edit, Bash, G
 
 - **联网搜索**: 遇到不熟悉的算子类型或优化技巧时，可用 WebSearch 搜索学术论文、工业实践、开源实现（如 FlashAttention、Triton kernel 等）
 - **跨粒度思考**: 不要局限于策略库中的指令级优化（P1-P52），主动考虑：算法级（减少计算量、近似算法）、数据流级（改变遍历顺序、融合操作、减少中间结果）、硬件级（特定指令、DMA 模式）
-- **策略选择协议（分层检索）**: 读取 `plugins-community/ops-perf-evolution/skills/evolution-strategies/references/strategy-index.md` 后按序选择：
-  · **Step 1 — L0 通用策略 (必选)**: 查"按算子类型快速查表"的 L0 列，选择所有匹配的 D/P/A 策略
-  · **Step 2 — L1 高级策略 (按需)**: 按算子特征判断 — Cube+Vector 融合（matmul+vector 后处理）→ CV Matmul 行；Flash Attention 模式（**先按 strategy-index.md 的「族判定快速路由」结构判据归族**，名字不典型的 attention 变体也算）→ Flash Attention 行并按 FA SOP 阶段顺序选卡；量化/反量化 → Quantization 行+P48/P49；MoE 专家并行 → CV FFN (MoE) 行+P50；多核 M×N 分块 → P47；AIC/AIV 混合 → P51
-  · **Step 3 — 瓶颈驱动 (Refine 阶段)**: profiling_evidence 可用时，查"按瓶颈类型查表"追加/替换策略。**原则**: L0 保证基本正确性和性能，L1 针对特定场景提供 2-5x 额外提升；Init 阶段优先 L0 + 少量 L1，Refine 阶段根据 profiling 证据精准追加 L1
+- **策略选择协议（场景路由）**: 按以下顺序选择策略：
+  · **Step 1 — 归族（必做）**: 读 `plugins-community/ops-perf-evolution/skills/evolution-strategies/references/scenario-routing/README.md` 的族判定表，用结构判据（计算主干 / kernel 特征 / shape 特征，**不靠算子名**）把算子归入 FA / conv / matmul / quantization / reduction / sort / conversion / 小族 / elementwise 之一；多族特征同时命中时拆「主干族 + trait」
+  · **Step 2 — 按族 workflow 选卡（主路径）**: 打开 README 中该族对应的 workflow 文件（flashattention.md / convolution.md / matmul.md 等）：先过 `_common-prerequisites.md` 通用前置判定链（C1-C5，**命中用卡、未命中跳过**，覆盖双缓冲/对齐/标量向量化/dtype/数值稳定等基础项），再按 workflow 阶段表顺序选 L1 策略（每阶段带判定与跳过条件）；workflow 标注「覆盖缺口」的阶段转 Step 3
+  · **Step 3 — 瓶颈驱动 (Refine 阶段)**: profiling_evidence 可用时，查 strategy-index.md「按瓶颈类型查表」追加/替换策略，**证据优先于 workflow 顺序**。**原则**: 通用前置保证基本正确性和性能，族内 L1 针对特定场景提供 2-5x 额外提升；Init 阶段优先通用前置 + 少量 L1，Refine 阶段根据 profiling 证据精准追加 L1
 - **知识库查询协议**: `plugins-community/ops-perf-evolution/skills/evolution-knowledge/references/a3/` 渐进式披露，先读 guide.md 按需深入。
   **Init 必读**: `a3/hardware/guide.md`、`a3/optimization_patterns/guide.md`、按算子族读 `a3/algorithm_insights/{family}.md`（匹配时）
   **子 agent prompt 参考**: `a3/ascendc_api/guide.md`（避坑提醒）；**策略提炼查阅**: `a3/proven_solutions/INDEX.md`（判断新颖性、避免重复）

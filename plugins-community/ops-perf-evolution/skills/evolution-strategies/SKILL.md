@@ -1,27 +1,27 @@
 ---
 name: evolution-strategies
-description: AscendC kernel optimization strategy library with 61+ strategies across D/P/A/R/X series, supporting tiered retrieval, compatibility checking, and autonomous strategy discovery. 当需要为 AscendC kernel 选择优化策略、按瓶颈/算子族筛选策略、检查策略兼容性或登记进化发现的新策略时使用。
+description: AscendC kernel optimization strategy library with 146 strategies across D/P/A/R/X series, supporting tiered retrieval, compatibility checking, and autonomous strategy discovery. 当需要为 AscendC kernel 选择优化策略、按瓶颈/算子族筛选策略、检查策略兼容性或登记进化发现的新策略时使用。
 ---
 
 # Evolution Strategies
 
-AscendC 内核优化策略库，包含 61+ 策略，覆盖数据类型 (D)、性能 (P)、精度 (A)、A5 架构 (R)、进化发现 (X) 五大系列。
+AscendC 内核优化策略库，包含 146 策略，覆盖数据类型 (D)、性能 (P)、精度 (A)、A5 架构 (R)、进化发现 (X) 五大系列。
 
 ## 文件布局
 
 ```
 references/
-  strategy-index.md           # 主索引（可追加 X 系列条目）
-  strategy_compatibility.md   # 互斥表、依赖关系、推荐组合
-  strategy_index_a5.md        # A5 (351x/Regbase) R 系列扩展策略
-  README.md                   # 策略使用指南
-  IDEAS_SUMMARY.md            # 高层策略总览
-
-  strategies/                 # [只读] 精选策略库
-    perf_01_double_buffer.md ... perf_52_l2_cache_hint.md   # P 系列
-    dtype_01_mixed_precision.md ... dtype_05_bf16_special_handling.md  # D 系列
-    acc_01_fp32_intermediate.md ... acc_08_quant_precision.md  # A 系列
-    a5_R1_vf_fusion.md ... a5_R8_mutex_sync.md  # R 系列 (A5)
+  scenario-routing/           # [选策略入口] 族判定 + 各族优化工作流（先于 index 查表）
+    README.md                 # 族判定表（结构判据，不靠算子名）
+    _common-prerequisites.md  # 通用前置判定链（C1-C5，所有族共享）
+    flashattention.md / matmul.md / convolution.md / reduction.md / ...  # 族工作流
+  strategy-index.md           # 策略卡注册表 + 补充反查（快速查表 / 瓶颈查表）
+  strategy-compatibility.md   # 互斥表、依赖关系、推荐组合
+  INDEX.json                  # 程序化索引（generate_index_json.py 生成）
+  cards/                      # 策略卡片（146 张：P121 / D5 / A8 / R8）
+  preconditions/              # 适用性硬门控 YAML（每策略一份）
+  playbooks/                  # 分步落地 SOP（每策略一份）
+  families/                   # 算子族指南（attention / flashattention / matmul / reduction 等 8 族）
 
   discovered/                 # [可写] 进化运行时发现的策略
     disc_X1.md ...            # X 系列，由 agent 动态写入
@@ -33,11 +33,11 @@ references/
 
 18 个基础策略：D1-D5, P1-P13, A1-A8
 
-**必读**: 读取 `references/strategy-index.md`，根据算子类型从 L0 策略中选择基础组合。
+**必读**: 先读 `references/scenario-routing/README.md` 按结构判据归族，打开对应族 workflow 按阶段选卡；`references/strategy-index.md` 的查表仅作补充反查。
 
 ### L1 (Advanced) — 按算子类别选择
 
-35+ 个进阶策略：P14-P98
+进阶策略：P14-P131（按族见 scenario-routing 各 workflow）
 
 根据算子类别（CV fusion, attention, matmul, quantization, reduction, sort等）选择适用的 L1 策略。参考 `strategy-index.md` 中的 "When to Apply" 列。
 

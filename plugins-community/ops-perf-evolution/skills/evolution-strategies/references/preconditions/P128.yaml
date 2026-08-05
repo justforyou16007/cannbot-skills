@@ -1,0 +1,24 @@
+strategy_id: P128
+description: FP32-via-BF16 Hi/Lo 3-GEMM 适用性检查 — 算子为 fp32 输入的 GEMM 类计算（conv/matmul），且当前 fp32 被困在 Vector/标量路径。
+
+checks:
+  - id: has_fp32_compute
+    type: grep_count
+    pattern: "float|fp32|DTYPE_FLOAT"
+    files: [kernel, header]
+    expected: ">= 1"
+    fail_msg: "无 fp32 数据通路 → P128 不适用。"
+
+  - id: is_gemm_like
+    type: grep_count
+    pattern: "Mmad|Matmul|im2col|conv|ReduceSum"
+    files: [kernel, header]
+    expected: ">= 1"
+    fail_msg: "非 GEMM 类计算 → P128 不适用。"
+
+  - id: no_cube_fp16_path
+    type: grep_count
+    pattern: "Mmad|MatmulImpl|LoadData.*L0"
+    files: [kernel]
+    expected: "== 0"
+    fail_msg: "已使用 Cube 路径 → P128 主要价值已发挥。"

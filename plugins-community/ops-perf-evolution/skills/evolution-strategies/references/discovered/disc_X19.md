@@ -5,6 +5,8 @@ discovered_round: 3
 discovered_from: level3_conv_2d-cannbench-web-submit (P2) + conv2d_base (tilelang2ascendc-ops-generator)
 base_speedup: cann-bench 1×1 case 1.98× 标杆（54.02us 标杆 vs 54.20/74.28us 实测，kernel 级反超近 2×）
 ---
+> **已晋升为 P130**（card + precondition + playbook 三件套见 `cards/`、`preconditions/`、`playbooks/`）。本文件保留为实战详细记录（含实测数据与否定项依据），卡片内容以 P130 为准。
+
 
 # Strategy X19: 1×1 Conv 翻转 GEMM（原始布局即操作数，免 wrepack/im2col）
 

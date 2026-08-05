@@ -5,6 +5,8 @@ discovered_round: 4
 discovered_from: level3_conv_2d-cannbench-web-submit (P3/P5) + conv2d_base (tilelang2ascendc-ops-generator)
 base_speedup: conv2d_base case0 46→21us（消 70% im2col 物化）；cann-bench 大 case 0.32→0.59
 ---
+> **已晋升为 P129**（card + precondition + playbook 三件套见 `cards/`、`preconditions/`、`playbooks/`）。本文件保留为实战详细记录（含实测数据与否定项依据），卡片内容以 P129 为准。
+
 
 # Strategy X18: Fused img2col LoadData3D 随路展开（含 band 窗口化突破 L1 容量）
 

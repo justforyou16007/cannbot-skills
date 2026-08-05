@@ -1,0 +1,17 @@
+strategy_id: P130
+description: 1×1 Conv 翻转 GEMM 适用性检查 — 算子为 1×1 pointwise 卷积（kH=kW=1, s=1, p=0, d=1），且当前仍走 wrepack+im2col 两级发射。
+
+checks:
+  - id: is_1x1_conv
+    type: grep_count
+    pattern: "kH|kernelH|kernelSize"
+    files: [kernel, header]
+    expected: ">= 1"
+    fail_msg: "无卷积参数证据 → 需人工确认 kH==kW==1 后使用 P130。"
+
+  - id: has_repack_or_im2col
+    type: grep_count
+    pattern: "repack|wrepack|im2col|Im2col"
+    files: [kernel, header]
+    expected: ">= 1"
+    fail_msg: "未检测到 wrepack/im2col 发射 → 可能已是翻转 GEMM 路径。"

@@ -50,6 +50,9 @@
 | P124 (MLA Nope+Rope Concat GEMM K) | P120/P122/P116/P121 | P120 建 cube 路径后做 K 维拼接；embed-split 分段是 P122 L1 预算划分的 K 维实例；M=qHeads 是 P116 头合并的 MLA 极限形式；与"两段独立 GEMM 再 Add"互斥（须删除） |
 | P125 (Cross-task Cube Prefetch) | P121/P14/P107/P122 | P121 建任务内流水，P125 堵任务边界空泡（尾部一拍预发射下一任务首块 QK）；遍历顺序必须复用 P107 蛇形换算；与"任务边界清零 pingpongIdx"互斥 |
 | P126 (GM Tiling Table Task Schedule) | P107/P116/P125/P122 | host 任务表替代均匀切分+除法反解；任务粒度配合 P116 头合并降到 (batch,token)；为 P125 跨任务预取提供表项直读；与"totalQ 均匀切分"互斥（须删除） |
+| P127 (Conversion 模式特化路由) | P26/P114 | P127 是路由卡：R4 分发到单维转置走 P26、small-channel 走 P114；与「单一 generic gather 主路径」互斥（须重写） |
+| P129 (Fused img2col) | P128/P131 | fp32 场景 P129 与 P128 组合（拆分后双分量各自随路展开）；权重 ws repack 配 P131 缓存 |
+| P130 (1×1 翻转 GEMM) | P129/P131 | 与 P129 按几何互斥分发（host 判定 1×1 走 P130、kHkW>1 走 P129）；多布局时 P131 缓存键需带布局标志 |
 
 ## §2 依赖关系
 
@@ -177,7 +180,8 @@ P119 ──→ P38
 | GQA decode 实战链 | P116 + P117 + P118 + P119 | G 头合并进 M + MatmulApiTiling 配方 + mask 独立预生成 + online softmax |
 | MHA cube 化实战链 | P120 + P121 + P122 + P123 | 向量点积→mmad 重写 + SplitFuse CV 流水 + KV 堆叠大块化 + causal 跳过边界特化 |
 | MLA decode 实战链 | P120 + P121 + P124 + P125 + P126 | mmad 重写 + CV 流水 + nope/rope K 维拼接 + 跨任务预取 + GM 任务表变长调度 |
-| FA 族全链路 SOP | S1: P119+P120(+P124) → S2: P121/P14 → S3: P122/P18/P38 → S4: P123/P118 → S5: P116/P117/P126 | 任意 FA 变体（MHA/GQA/MLA/Sparse/Paged）的标准优化顺序；分轮逐阶段落地而非单轮平铺，阶段依赖与互斥见 §1/§2，完整 SOP 见 strategy-index.md |
+| Conv 实战链 | P128 + P129 + P130 + P131 | fp32 hi/lo 3-GEMM + fused im2col + 1×1 翻转 GEMM + repack LRU 缓存（按几何模式分发，见 scenario-routing/convolution.md） |
+| FA 族全链路 SOP | S1: P119+P120(+P124) → S2: P121/P14 → S3: P122/P18/P38 → S4: P123/P118 → S5: P116/P117/P126 | 任意 FA 变体（MHA/GQA/MLA/Sparse/Paged）的标准优化顺序；分轮逐阶段落地而非单轮平铺，阶段依赖与互斥见 §1/§2，完整 SOP 见 scenario-routing/flashattention.md |
 
 ## §4 UB 内存压力指南
 

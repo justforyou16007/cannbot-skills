@@ -26,7 +26,7 @@ k_l1/v_l1[s2_base_size, dim]；L0 为 block_M × block_N（128×128），L0C dou
 
 技术约束：
 - K/V 尾块：越界读安全兜底；tail_valid 驱动 T.tile.select 按位掩码填 -1e30
-- q 尾块：整块越界 m_sub 跳过 + 写 Output 逐 half-row 行守卫
+- q 尾块：整块越界 m_sub 跳过（写 Output 越界行由编译器自动跳过）
 - GEMM 容量：128×128×4 = 64KB ≤ L0C 128KB ✓
 
 细算见各段 `# TODO(tile-level, ...)` 注释。

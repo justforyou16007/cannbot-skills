@@ -342,16 +342,15 @@ def flash_attention_gqa_fwd(
                                                 T.tile.mul(acc_o[r, :], acc_o[r, :], alpha_ub[r])
                                         T.tile.add(acc_o, acc_o, acc_o_ub)          # merge 当前块
                                         if is_last_s2:
-                                            # 末 s2 块：归一化并写回 Output（q 尾块行守卫）
+                                            # 末 s2 块：归一化并写回 Output（越界写由编译器自动跳过）
                                             for r in range(block_M // 2):
                                                 T.tile.div(acc_o[r, :], acc_o[r, :], sumexp_ub[r])
                                             T.copy(acc_o, acc_o_half)
                                             row_start = q_row_start + base_row
-                                            if row_start < q_seq_len:
-                                                T.copy(
-                                                    acc_o_half,
-                                                    Output[bz, q_head, row_start:row_start + block_M // 2, :],
-                                                )
+                                            T.copy(
+                                                acc_o_half,
+                                                Output[bz, q_head, row_start:row_start + block_M // 2, :],
+                                            )
                                         else:
                                             # 非末 s2 块：写回当前 slot（running O 在 GM 流转）
                                             T.copy(

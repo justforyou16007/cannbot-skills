@@ -54,7 +54,7 @@ class Model(nn.Module):
 
 def get_input_groups():
     # 逐行读同名 JSON，按 inputs 数组生成 [args, ...] 列表
-    # dtype_map 含全部 dtype 及别名（fp32/float32, fp16/float16, bf16/bfloat16, fp64/float64）
+    # dtype_map 含全部 dtype 及别名（fp32/float32, fp16/float16, bf16/bfloat16）
     # make_tensor 按 dtype 分支：int→randint, bool→randint, uint→int64+cast, 其他→randn
     # tensor_list 同时支持 "shapes"（同 dtype）和 "tensors"（异构）两种 JSON 格式
     ...

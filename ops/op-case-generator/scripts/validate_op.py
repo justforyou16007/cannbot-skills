@@ -66,6 +66,105 @@ def _extract_id_and_name(py_path: str) -> tuple[str, str]:
     return "", fname
 
 
+def _make_tensor_probe(dtype_str: str, shape: list, device=None):
+    """Create a small test tensor for dtype probing."""
+    import torch
+    t_dtype_map = {
+        "float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16,
+        "int32": torch.int32, "int64": torch.int64, "int8": torch.int8, "uint8": torch.uint8,
+        "bool": torch.bool,
+    }
+    t_dtype = t_dtype_map.get(dtype_str, torch.float32)
+    if t_dtype in (torch.int8, torch.int16, torch.int32, torch.int64):
+        return torch.randint(-5, 5, shape, dtype=t_dtype, device=device)
+    elif t_dtype == torch.bool:
+        return torch.randint(0, 2, shape, dtype=torch.bool, device=device)
+    elif t_dtype == torch.uint8:
+        return torch.randint(0, 10, shape, dtype=torch.uint8, device=device)
+    else:
+        return torch.randn(shape, dtype=t_dtype, device=device)
+
+
+def _probe_dtype_support(py_path: str, template_case: dict, op_class: str) -> set:
+    """Auto-detect which dtypes the operator actually supports by running
+    a small test input for each candidate dtype.
+
+    Probes on NPU if available (accurate), falls back to CPU with a warning.
+    Falls back to DEFAULT_DTYPES if the module can't be imported or all probes fail.
+    """
+    import torch
+
+    candidate_dtypes = ["float16", "float32", "bfloat16", "int32", "int64", "int8", "uint8", "bool"]
+
+    # Detect NPU device
+    device = None
+    try:
+        if torch.npu.is_available():
+            device = torch.device("npu:0")
+    except (AttributeError, RuntimeError):
+        pass
+
+    if device is None:
+        print("[WARN] NPU 不可用，dtype 探针回退到 CPU（bfloat16/int 类型可能误判）")
+
+    # Try to import module
+    try:
+        spec = importlib.util.spec_from_file_location("_dtype_probe", py_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    except Exception:
+        return DEFAULT_DTYPES.get(op_class, {"float16", "float32"})
+
+    # Get init args
+    try:
+        inits = module.get_init_inputs()
+        if not inits:
+            inits = [tuple()]
+    except Exception:
+        return DEFAULT_DTYPES.get(op_class, {"float16", "float32"})
+
+    supported = set()
+    inputs_spec = template_case.get("inputs", [])
+
+    for dtype in candidate_dtypes:
+        try:
+            args = []
+            for inp in inputs_spec:
+                if inp.get("type") == "tensor":
+                    shape = list(inp.get("shape", [2, 2]))
+                    shape = [min(d, 8) if d > 8 else max(d, 1) for d in shape]
+                    if not shape:
+                        shape = [2]
+                    args.append(_make_tensor_probe(dtype, shape, device=device))
+                elif inp.get("type") == "attr":
+                    args.append(inp.get("value", 1))
+                elif inp.get("type") == "tensor_list":
+                    shapes = inp.get("shapes", [[2, 2]])
+                    tensors = []
+                    for s in shapes:
+                        small_s = [min(d, 8) if d > 8 else max(d, 1) for d in s]
+                        if not small_s:
+                            small_s = [2]
+                        tensors.append(_make_tensor_probe(dtype, small_s, device=device))
+                    args.append(tensors)
+
+            init = inits[0] if inits else tuple()
+            if isinstance(init, (list, tuple)) and init:
+                model = module.Model(*init)
+            else:
+                model = module.Model()
+            if device is not None:
+                model = model.to(device)
+            model(*args)
+            supported.add(dtype)
+        except Exception:
+            pass
+
+    if not supported:
+        return DEFAULT_DTYPES.get(op_class, {"float16", "float32"})
+    return supported
+
+
 # ---------------------------------------------------------------------------
 # static checks (AST-based, no torch needed)
 # ---------------------------------------------------------------------------
@@ -309,9 +408,10 @@ def _infer_op_class(py_path: str) -> str:
     return "elementwise"  # default
 
 
-def _analyze_dtype_coverage(cases: list[dict], op_class: str) -> dict:
-    """Score dtype coverage."""
-    expected = DEFAULT_DTYPES.get(op_class, {"float16", "float32"})
+def _analyze_dtype_coverage(cases: list[dict], op_class: str, expected: set = None) -> dict:
+    """Score dtype coverage. If expected is None, falls back to DEFAULT_DTYPES."""
+    if expected is None:
+        expected = DEFAULT_DTYPES.get(op_class, {"float16", "float32"})
     max_score = 25
     details = []
     score = 0
@@ -682,7 +782,10 @@ def _check_coverage(py_path: str, json_path: str, op_class: str) -> dict:
     if not cases:
         return {"status": "FAIL", "error": "JSON file is empty", "coverage": {}}
 
-    dtype = _analyze_dtype_coverage(cases, op_class)
+    # Auto-probe supported dtypes instead of relying on a static lookup table
+    expected_dtypes = _probe_dtype_support(py_path, cases[0], op_class)
+
+    dtype = _analyze_dtype_coverage(cases, op_class, expected_dtypes)
     shape = _analyze_shape_coverage(cases)
     attr = _analyze_attr_coverage(cases)
     boundary = _analyze_boundary_coverage(cases, op_class)

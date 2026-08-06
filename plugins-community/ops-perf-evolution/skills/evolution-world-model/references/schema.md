@@ -163,7 +163,7 @@ output/{op_name}_evo_{timestamp}/world_model.json
 
   "profiling_evidence": null
   // 指令级深度空泡分析（可选字段，由 lingxi-evo 步骤 4.4.P2 在触发条件满足时填入）
-  // 数据来源：ops-profiling skill 的 msprof_perf_summary.py --diagnose 分析结果
+  // 数据来源：ops-profiling skill 的 msprof_perf_summary.py --compare 完整采集（op_summary_*.csv）+ run_deep_profiling.py 分析
   // 非 null 时结构：
   // {
   //   "bottleneck_type": "mte2_stall",          // 瓶颈分类: mte2_stall / mte3_stall / tiling_imbalance / scalar_loading / scalar_compute / compute_bound / near_optimal / no_overlap / partial_overlap / undersize_transfer / icache_miss / bus_contention

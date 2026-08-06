@@ -698,13 +698,12 @@ python3 plugins-community/ops-perf-evolution/skills/evolution-world-model/script
 **执行流程**（使用 ops-profiling 的 msprof_perf_summary.py）：
 
 1. **运行深度 profiling 分析（诊断模式）**：
+   当前 `msprof_perf_summary.py` 无 `--diagnose / --profiling-dir / --task-type` 参数。深度分析基于该节点已有的 Phase 1.5 `--compare` 产物（`{node.solution_ref}/profiling/PROF_GROUP_*/PROF_*/op_summary_*.csv` 与 `perf_report.md`），由 `wm_ops.py deep-profiling` 内部调用 `run_deep_profiling.py` 提炼；仅当节点尚未采集 `--compare` 数据时，先补采：
    ```bash
-   python3 ops/ops-profiling/scripts/msprof_perf_summary.py --diagnose \
-       --profiling-dir "output/{op_name}_evo_{timestamp}/{node.solution_ref}/profiling" \
-       --task-type {task_type} \
-       --output "output/{op_name}_evo_{timestamp}/{node.solution_ref}/deep_profiling_result.json"
+   python3 ops/ops-profiling/scripts/msprof_perf_summary.py --compare \
+       --output-dir "output/{op_name}_evo_{timestamp}/{node.solution_ref}"
    ```
-   若诊断运行失败（msprof 不可用、超时、脚本报错等）：输出警告 `"[注意] 深度分析失败，跳过该节点"`，跳过该节点。
+   若补采/分析失败（msprof 不可用、超时、脚本报错等）：输出警告 `"[注意] 深度分析失败，跳过该节点"`，跳过该节点。
 
 2. **写入 world_model.json（wm_ops.py 一步完成）**：
    ```bash
@@ -716,7 +715,7 @@ python3 plugins-community/ops-perf-evolution/skills/evolution-world-model/script
        --merge-children
    ```
 
-3. **对比上次深度分析（差异检测）**: 若 `last_deep_profiling_round >= 1`（非首次），对上次与本次的 simulator_dir 各跑一次 `msprof_perf_summary.py --diagnose`（输出到 `{node.solution_ref}/diff_before.json` / `diff_after.json`），将对比结果摘要写入 `open_questions`。
+3. **对比上次深度分析（差异检测）**: 若 `last_deep_profiling_round >= 1`（非首次），对上次与本次的 profiling 数据（`PROF_GROUP_*/PROF_*/op_summary_*.csv` / `perf_report.md`）各做一次解析对比（无 `--diagnose`，直接对比两次的 pipe 比值与 op_summary 指标），结果写入 `{node.solution_ref}/diff_before.json` / `diff_after.json`，将对比摘要写入 `open_questions`。
 
 4. **更新冷却标记** `last_deep_profiling_round = r`，并**输出诊断摘要**（读取 `deep_profiling_result.json`）：
    ```
@@ -731,7 +730,7 @@ python3 plugins-community/ops-perf-evolution/skills/evolution-world-model/script
 
 **4.4.4 Profiling 完整性检查（不可跳过）**
 
-进入 4.5 REACT 前执行：对本轮 `profiling_insight is null` 的 passed 节点，输出「[注意] 以下节点缺少 profiling_insight，补执行 CSV Profiling」并逐个补跑 `msprof_perf_summary.py --diagnose`（同 4.4.1 流程）写入 `node.profiling_insight`。补跑后仍缺失的，输出「[注意] {n} 个节点 CSV Profiling 失败，profiling_insight 保持 null。后续 SELECT 中这些节点的子节点将不获得 w_evidence 加分」——不填充默认值，保持 null。
+进入 4.5 REACT 前执行：对本轮 `profiling_insight is null` 的 passed 节点，输出「[注意] 以下节点缺少 profiling_insight，补执行 CSV Profiling」并逐个补跑 `msprof_perf_summary.py --compare --output-dir {node.solution_ref}`（无 `--diagnose`；同 Phase 1.5 完整采集，并归置 op_summary 到 `profiling/`），从 perf_report.md / op_summary 提炼写入 `node.profiling_insight`。补跑后仍缺失的，输出「[注意] {n} 个节点 CSV Profiling 失败，profiling_insight 保持 null。后续 SELECT 中这些节点的子节点将不获得 w_evidence 加分」——不填充默认值，保持 null。
 
 **4.4.5 世界模型分析（Analyze）**
 
@@ -891,18 +890,16 @@ base_speedup: {score}x
 
 检查当前全局最优节点（`best_score` 对应的节点）是否已有 `profiling_insight`：若已有 → 跳过进入 4.6.3.2；若为 null → 强制执行 CSV 级 Profiling，结果写入 `best_node.profiling_insight` 并写回 `world_model.json`：
   ```bash
-  python3 ops/ops-profiling/scripts/msprof_perf_summary.py --diagnose \
-      --profiling-dir "output/{op_name}_evo_{timestamp}/{best_node.solution_ref}/profiling" \
-      --task-type {task_type} \
-      --output "output/{op_name}_evo_{timestamp}/{best_node.solution_ref}/csv_profiling.json"
+  python3 ops/ops-profiling/scripts/msprof_perf_summary.py --compare \
+      --output-dir "output/{op_name}_evo_{timestamp}/{best_node.solution_ref}"
   ```
-  输出：「补全 CSV Profiling：{profiling_one_liner}」
+  从新产出的 `perf_report.md` / `op_summary_*.csv` 提炼 `best_node.profiling_insight`（当前脚本无 `--diagnose` 命令）。输出：「补全 CSV Profiling：{profiling_one_liner}」
 
 **4.6.3.2 深度 Profiling 决策（Agent 自主判断）**
 
 若 `last_deep_profiling_round >= 1`（已执行过）→ 跳过，进入 4.6.3.3。若从未执行过，Agent 自主判断：`best_score < target_speedup × 0.8`（距目标仍有较大差距）→ 倾向执行；最优节点 `profiling_insight.bottleneck = "balanced"`（CSV级无法定位瓶颈）→ 倾向执行；`best_score >= target_speedup × 0.95`（已非常接近目标）→ 倾向跳过。
 
-若决定执行：对 `best_node` 执行 4.4.3 的两条命令（`msprof_perf_summary.py --diagnose` + `wm_ops.py deep-profiling --merge-children`，路径中的 `{node.solution_ref}`/`{node_id}` 替换为 best 节点对应值），输出：「[分析] 补全深度 Profiling：{profiling_evidence 摘要}」。若决定跳过，输出：「[INFO] 跳过深度 Profiling（{跳过理由}）」
+若决定执行：对 `best_node` 执行 4.4.3 的流程（先按需补跑 `msprof_perf_summary.py --compare --output-dir {best_node.solution_ref}`，再 `wm_ops.py deep-profiling --merge-children`，路径中的 `{node.solution_ref}`/`{node_id}` 替换为 best 节点对应值），输出：「[分析] 补全深度 Profiling：{profiling_evidence 摘要}」。若决定跳过，输出：「[INFO] 跳过深度 Profiling（{跳过理由}）」
 
 **4.6.3.3 延长判定**
 

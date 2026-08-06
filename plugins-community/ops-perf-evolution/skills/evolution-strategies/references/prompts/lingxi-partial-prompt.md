@@ -89,6 +89,16 @@ If Mode=profiling_driven:
   d. Apply optimization by modifying parent kernel (patch, don't replace from scratch)
   e. In implementation_note: state what profiling bottleneck was targeted and how
 
+If Mode=workflow_guided:
+  本变体是归族 workflow 分支的专门变体。必须严格按下方 [WORKFLOW_REF] 中的 stage_order 阶段顺序优化，不得跳过任一阶段：
+  a. Read the family workflow file at: {workflow_file_path}（如 skills/evolution-strategies/references/scenario-routing/convolution.md）
+  b. 阶段 0 — 通用前置：过 _common-prerequisites.md C1-C5（命中用卡、未命中跳过）
+  c. 阶段 1 — 分支专用路径：按 {branch} 分支的「判定条件 → 专用路径」实现（如 conv C-2 → P128 hi/lo bf16 3-GEMM、C-6 → im2col+Cube GEMM）
+  d. 阶段 2 — 族内收尾：如 workflow 转 GEMM 主干，按 matmul.md M2/M3/M7 阶段收尾（多核切分、L2 复用、CV 流水）
+  e. 阶段 3 — 门控纪律：遵守 workflow 的「门控纪律」段（如硬件 img2col 展开 k 序须 one-hot 探针实测、W<24 禁 LoadData3D、留环境变量开关）
+  f. In implementation_note: 以 ## Workflow: {workflow_file} {branch} 开头，逐阶段记录做了什么、命中了哪些判定、跳过了哪些（含理由）
+  策略相关资源（card + Playbook SOP）见下方 [STRATEGY RESOURCES] 段；workflow 分支专用路径的策略 Playbook 在其中。
+
 If Mode=strategy_guided (default):
   The [MANDATORY OPTIMIZATION DIRECTION] already contains the strategy direction and key points.
   策略相关资源（card 主体内容 + Playbook SOP）已由主 agent 通过 source_key 程序化加载，见下方 [STRATEGY RESOURCES] 段；不需要再去 plugins-community/ops-perf-evolution/skills/evolution-strategies/references/cards/ 文件系统读取。
@@ -98,6 +108,10 @@ If Mode=strategy_guided (default):
     Read parent kernel at: output/{op_name}_evo_{timestamp}/{parent_solution_ref}/kernel/
     Use as optimization starting point.
   {meta_prompt}
+
+[WORKFLOW_REF]  ← 归族 workflow 分支保底节点专用段（v3.2.1 新增）
+{workflow_ref_block}
+（非 workflow_guided 节点此段为空，跳过）
 
 [STRATEGY RESOURCES]  ← v3.2 新增段，由主 agent 用 query_strategies / load_playbook 程序化注入
 {strategy_resources_block}

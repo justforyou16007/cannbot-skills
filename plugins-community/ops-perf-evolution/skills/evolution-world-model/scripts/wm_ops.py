@@ -874,6 +874,24 @@ class _BranchQuota:
         self.branch_count[pid] = self.branch_count.get(pid, 0) + 1
 
 
+def _select_workflow_guaranteed(strategy_guided: list, sg_slots: int,
+                                quota: _BranchQuota, selected_sg: list, used_ids: set):
+    """workflow 分支保底：归族命中后，带 workflow_ref 的节点至少占 1 槽。
+
+    规则（lingxi-evo Init/Select 固化）：Init 阶段归族命中某 workflow 分支后，
+    必须生成至少 1 个 workflow_guided 节点（node.workflow_ref 非空，指向族 workflow
+    文件 + 分支 ID + 阶段顺序）。SELECT 必须为此类节点保留至少 1 个槽位，
+    防止被低难度 / 高 parent_score 的通用节点挤掉。该节点按 workflow_ref 指定的
+    族 workflow 分支阶段顺序优化（如 conv C-2/C-6 → P128/P102 → GEMM 收尾）。
+    """
+    for nid, nd in strategy_guided:
+        if nd.get("workflow_ref") and quota.ok(nd) and not _collides_with_selected(nd, selected_sg):
+            selected_sg.append((nid, nd))
+            used_ids.add(nid)
+            quota.add(nd)
+            return
+
+
 def _select_sg_guaranteed(strategy_guided: list, sg_slots: int, quota: _BranchQuota,
                           selected_sg: list, used_ids: set):
     """保底轮：每种 optimization_type 的开放节点先各占 1 槽。
@@ -901,9 +919,12 @@ def _select_sg_guaranteed(strategy_guided: list, sg_slots: int, quota: _BranchQu
 
 
 def _select_sg_slots(strategy_guided: list, sg_slots: int, quota: _BranchQuota) -> list:
-    """strategy_guided 槽位选择：保底轮 + utility 排序 + 两级放宽兜底。"""
+    """strategy_guided 槽位选择：workflow 保底 + 类型保底 + utility 排序 + 两级放宽兜底。"""
     selected_sg: list[tuple[str, dict]] = []
     used_ids: set[str] = set()
+
+    # workflow 分支保底优先于类型保底：归族命中的 workflow 节点必得 1 槽
+    _select_workflow_guaranteed(strategy_guided, sg_slots, quota, selected_sg, used_ids)
 
     _select_sg_guaranteed(strategy_guided, sg_slots, quota, selected_sg, used_ids)
 

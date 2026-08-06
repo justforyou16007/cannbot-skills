@@ -59,7 +59,7 @@ tools: Agent(lingxi-partial), Agent(general-purpose), Read, Write, Edit, Bash, G
 - **跨粒度思考**: 不要局限于策略库中的指令级优化（P1-P52），主动考虑：算法级（减少计算量、近似算法）、数据流级（改变遍历顺序、融合操作、减少中间结果）、硬件级（特定指令、DMA 模式）
 - **策略选择协议（场景路由）**: 按以下顺序选择策略：
   · **Step 1 — 归族（必做）**: 读 `plugins-community/ops-perf-evolution/skills/evolution-strategies/references/scenario-routing/README.md` 的族判定表，用结构判据（计算主干 / kernel 特征 / shape 特征，**不靠算子名**）把算子归入 FA / conv / matmul / quantization / reduction / sort / conversion / 小族 / elementwise 之一；多族特征同时命中时拆「主干族 + trait」
-  · **Step 2 — 按族 workflow 选卡（主路径）**: 打开 README 中该族对应的 workflow 文件（flashattention.md / convolution.md / matmul.md 等）：先过 `_common-prerequisites.md` 通用前置判定链（C1-C5，**命中用卡、未命中跳过**，覆盖双缓冲/对齐/标量向量化/dtype/数值稳定等基础项），再按 workflow 阶段表顺序选 L1 策略（每阶段带判定与跳过条件）；workflow 标注「覆盖缺口」的阶段转 Step 3
+  · **Step 2 — 按族 workflow 选卡（主路径）**: 打开 README 中该族对应的 workflow 文件（flashattention.md / convolution.md / matmul.md 等）：先过 `_common-prerequisites.md` 通用前置判定链（C1-C5，**命中用卡、未命中跳过**，覆盖双缓冲/对齐/标量向量化/dtype/数值稳定等基础项），再按 workflow 阶段表顺序选 L1 策略（每阶段带判定与跳过条件）；workflow 标注「覆盖缺口」的阶段转 Step 3。**【固化规则】归族命中任一分支时，Init 必须生成 ≥1 个 `workflow_guided` 节点（带 `workflow_ref`）作为该分支的专门变体，SELECT 保底 1 槽——命中分支必须有一个节点严格按 workflow 分支阶段顺序优化，不得仅靠通用前置/随机策略覆盖。**
   · **Step 3 — 瓶颈驱动 (Refine 阶段)**: profiling_evidence 可用时，查 strategy-index.md「按瓶颈类型查表」追加/替换策略，**证据优先于 workflow 顺序**。**原则**: 通用前置保证基本正确性和性能，族内 L1 针对特定场景提供 2-5x 额外提升；Init 阶段优先通用前置 + 少量 L1，Refine 阶段根据 profiling 证据精准追加 L1
 - **知识库查询协议**:
   **OKF 知识库（首选）**: 用 `evolution-knowledge-query` skill 查询 `skills/evolution-knowledge/references/okf/`，按 `--op-family` / `--bottleneck` / `--phenomenon` / `--failed-combination` / `--kind` 结构化检索（discovered_strategy X 系列 / proven_solution / failure_pattern）。Init 阶段按 `op_family`（有 baseline 瓶颈信息时叠加 `--bottleneck`）查一次，命中即读对应卡片全文纳入策略选择依据；`status: stub` 的卡不用于支撑结论（须 active）。
@@ -285,6 +285,7 @@ with open('$EVO_DIR/shared/call_spec.json', 'w') as f:
    - 策略多样性（各 strategy_guided 节点 strategy_combination 不完全相同）、难度梯度（difficulty 2-4 均有覆盖）、类型覆盖（P系列性能、D系列数据类型、A系列精度，按需选择）
    - **X 系列策略必读全文**：strategy_combination 中包含 X 系列（`X{n}`，来自 strategy-index.md"探索发现策略"分类）时，必须先读取对应的 `plugins-community/ops-perf-evolution/skills/evolution-strategies/references/discovered/disc_X{n}.md` 全文，确认其适用场景与当前算子匹配后再纳入组合；X 系列无 Preconditions/Playbook，资源注入由 prepare_strategy_resources.py 自动完成
    - 每个节点必须包含 optimization_type 字段（bandwidth/tiling/algorithm），三类各至少有 1 个节点，确保 Select 保底轮有候选
+   - **【固化规则】workflow 分支保底节点（必做）**：Init 阶段必须先归族（scenario-routing 判定表）。若算子命中某族 workflow 的任一分支（如 conv C-1~C-7 / matmul M1~Mn / FA 阶段表 / reduction 分轴模式），必须额外生成**至少 1 个** `mode="workflow_guided"` 节点，并带 `workflow_ref` 字段：`{ family, workflow_file, branch, branch_condition, stage_order }`。`stage_order` 按族 workflow 顺序列出（先过 `_common-prerequisites.md` C1-C5，再按分支专用路径选 L1 策略，最后按需转 GEMM 收尾 / 瓶颈驱动）；`strategy_combination` 取该分支专用路径策略（如 conv C-2 → P128、C-6 → P102/P129）。此节点由 SELECT 的 `_select_workflow_guaranteed` 保底 1 槽，保证命中分支有专门变体按 workflow 顺序优化。
    - **若 hw_params 非 null**：利用硬件参数增强节点描述（如"tile_size 建议 {max_tile_fp16_double_buf//2}，最大可达 {max_tile_fp16_double_buf}"），并做 Roofline 定性分析（算术强度 vs 拐点）确认内存/计算密集判断
 
    开放探索节点（ID 依次为 `x0`、`x1`、…，格式相同仅 ID 递增）：完整字段结构见 `evolution-world-model/references/schema.md` 的 node schema，其中 `"mode": "open_exploration"`、`"strategy_combination": []`、`"optimization_type": "algorithm"`、`difficulty: 3`、`description` 固定为 `"开放探索：不使用策略库，读取最优内核代码和流水线数据，从第一原理自主推理并实现新优化方向"`，其余字段按 schema 默认值初始化（`depth: 1, parent_id: "root", status: "open", score: null, retry_count: 0` 等）。
@@ -450,17 +451,18 @@ SELECTIONS=$(python3 plugins-community/ops-perf-evolution/skills/evolution-world
 echo "$SELECTIONS"
 ```
 
-脚本内部自动完成：效用分计算、类型多样性保证、分支多样性约束（每个 parent_id 最多贡献 `ceil(n / active_branches)` 个槽位）、open_exploration 保留位分配。输出为 JSON 数组，元素含 `parallel_index`、`node_id`、`utility`、`mode`、`description`、`strategy_combination`、`parent_id`、`parent_score`、`parent_solution_ref`、`parent_profiling_one_liner`、`difficulty`、`depth`。
+脚本内部自动完成：效用分计算、**workflow 分支保底（`_select_workflow_guaranteed`：带 `workflow_ref` 的节点至少 1 槽，优先于类型保底）**、类型多样性保证、分支多样性约束（每个 parent_id 最多贡献 `ceil(n / active_branches)` 个槽位）、open_exploration 保留位分配。输出为 JSON 数组，元素含 `parallel_index`、`node_id`、`utility`、`mode`、`description`、`strategy_combination`、`parent_id`、`parent_score`、`parent_solution_ref`、`parent_profiling_one_liner`、`difficulty`、`depth`。
 
 2. 将选中节点的 `status` 更新为 `"in_progress"`，写回 `world_model.json`；记录本轮分配结果 `{parallel_index → node_id}` 映射（供4.4 Refine使用）
 3. 确定 `best_solution_ref`：从所有节点中找 `score = best_score` 且 `solution_ref` 非 null 的节点，取其 `solution_ref`；若无则置空字符串
 
-**兜底**：若 `wm_ops.py select` 执行失败，按以下公式手工计算效用分并分配（槽位分配：保底轮类型覆盖 + 剩余槽位效用分降序 + open_exploration 保留位）：
+**兜底**：若 `wm_ops.py select` 执行失败，按以下公式手工计算效用分并分配（槽位分配：**workflow 分支保底 1 槽** + 保底轮类型覆盖 + 剩余槽位效用分降序 + open_exploration 保留位）：
    ```
    parent_score = 父节点的 score（为 null 用 1.0）
    w_root_explore = 2.0（parent_id == "root"）或 0.0；w_evidence = 1.5（父节点有 profiling_evidence）或 0.0
    utility = 3.0 × parent_score + 2.5 × (5 - node.difficulty) + 0.75 × node.depth + w_root_explore + w_evidence
    ```
+   手工分配时**必须**：若存在带 `workflow_ref` 的 open 节点，先为其保留 1 个槽位（取效用分最高者），再执行类型保底与效用分排序。
 
 **若 `world_model_active = false`**: 跳过此步，所有变体使用空策略组合（子agent自由选择）。
 

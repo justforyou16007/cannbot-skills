@@ -57,6 +57,17 @@
        P2/P4/P5/P8 为主 → tiling；其余或 open_exploration → algorithm
      * D/A 系列策略不影响类型标签（它们是精度约束）
 
+   - **workflow 分支保底（固化规则，必做）**：
+     * Init 必须先归族（scenario-routing 判定表），若算子命中某族 workflow 的任一分支
+       （如 conv C-1~C-7 / matmul M1~Mn / FA 阶段表 / reduction 分轴模式），
+       必须生成**至少 1 个** `workflow_guided` 节点（mode="workflow_guided"）。
+     * 该节点必须带 `workflow_ref` 字段：`{ family, workflow_file, branch, branch_condition, stage_order }`，
+       其中 `stage_order` 列出该分支的工作流阶段顺序（先过 `_common-prerequisites.md` C1-C5，
+       再按分支专用路径选 L1 策略，最后转 GEMM 收尾 / 瓶颈驱动）。
+     * 节点 strategy_combination 取该分支的专用路径策略（如 conv C-2 → P128、C-6 → P102/P129）。
+     * 目的：确保归族命中的 workflow 分支有**专门变体**按 workflow 顺序优化，不被通用节点挤掉。
+     * 参考：convolution.md 的"几何模式分发"分支表 / matmul.md 阶段表 / flashattention.md 阶段表。
+
 4. 难度估计原则：
    - difficulty=1: 单一简单策略（如仅P7对齐）
    - difficulty=2: 单一中等策略（如P1双缓冲）
@@ -118,6 +129,11 @@ SELECTIONS=$(python3 plugins-community/ops-perf-evolution/skills/evolution-world
 若脚本不可用，按上述公式手工计算。
 
 4. 槽位分配（保底 + 放权，共 parallel_num 个槽位）：
+
+   **workflow 分支保底轮（固化规则，优先于类型保底）**：
+   - 若有 open 节点带 `workflow_ref`（workflow_guided 节点），必须为其保留**至少 1 个** strategy_guided 槽位
+   - 由 wm_ops.py `_select_workflow_guaranteed` 实现；多节点命中时取效用分最高者
+   - 目的：归族命中的 workflow 分支必被单独运行，不依赖效用分排序
 
    保底轮（确保类型覆盖）：
    - 对 bandwidth、tiling、algorithm 三类，各取该类型内效用分最高的 1 个 open 节点（strategy_guided 组）

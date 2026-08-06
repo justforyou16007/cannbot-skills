@@ -100,6 +100,12 @@ Mode: {mode}
   - 读取提示中的 `[Profiling Context]` 瓶颈诊断
   - 设计针对性优化，不限于策略库
 
+- **workflow_guided 模式**（归族 workflow 分支保底）:
+  - 严格按 prompt 中 `[WORKFLOW_REF]` 的 `stage_order` 阶段顺序优化（通用前置 C1-C5 → 分支专用路径 → 族内收尾 → 门控纪律）
+  - 读取 `[WORKFLOW_REF].workflow_file` 指向的族 workflow 文件（如 scenario-routing/convolution.md）
+  - 分支专用路径的策略 Playbook 在 `[STRATEGY RESOURCES]` 段，按 Step 1-5 执行
+  - implementation_note 以 `## Workflow: {workflow_file} {branch}` 开头，逐阶段记录
+
 **父节点代码参考规则**:
 - 若 `parent_solution_ref` **非空**:
   - 先读取父变体的 AscendC kernel: `{parent_solution_ref}/kernel/`

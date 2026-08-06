@@ -876,16 +876,21 @@ class _BranchQuota:
 
 def _select_workflow_guaranteed(strategy_guided: list, sg_slots: int,
                                 quota: _BranchQuota, selected_sg: list, used_ids: set):
-    """workflow 分支保底：归族命中后，带 workflow_ref 的节点至少占 1 槽。
+    """workflow 分支保底：归族命中后，workflow_guided 节点至少占 1 槽。
 
     规则（lingxi-evo Init/Select 固化）：Init 阶段归族命中某 workflow 分支后，
-    必须生成至少 1 个 workflow_guided 节点（node.workflow_ref 非空，指向族 workflow
+    必须生成至少 1 个 workflow_guided 节点（node.workflow_ref 指向族 workflow
     文件 + 分支 ID + 阶段顺序）。SELECT 必须为此类节点保留至少 1 个槽位，
-    防止被低难度 / 高 parent_score 的通用节点挤掉。该节点按 workflow_ref 指定的
-    族 workflow 分支阶段顺序优化（如 conv C-2/C-6 → P128/P102 → GEMM 收尾）。
+    防止被低难度 / 高 parent_score 的通用节点挤掉（utility 公式对新节点
+    score=null + difficulty=4 系统性低估：约 6.9 vs 低难度 11.9 vs 派生子节点 13.5）。
+
+    匹配判定：`mode == "workflow_guided"` **或** `workflow_ref` 非空均可——
+    workflow_ref 是规范字段，但为避免 Init 漏填 workflow_ref 导致失去保护，
+    mode 本身也作为保护判据（双保险）。
     """
     for nid, nd in strategy_guided:
-        if nd.get("workflow_ref") and quota.ok(nd) and not _collides_with_selected(nd, selected_sg):
+        is_workflow = (nd.get("mode") == "workflow_guided") or bool(nd.get("workflow_ref"))
+        if is_workflow and quota.ok(nd) and not _collides_with_selected(nd, selected_sg):
             selected_sg.append((nid, nd))
             used_ids.add(nid)
             quota.add(nd)

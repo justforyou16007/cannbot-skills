@@ -28,7 +28,8 @@ from pathlib import Path
 
 LOGGER = logging.getLogger(__name__)
 
-SKILL_ROOT = Path("plugins-community/ops-perf-evolution/skills/evolution-strategies/references")
+# 以脚本自身位置锚定路径（不依赖 cwd），兼容从插件根或 workspace 根运行
+SKILL_ROOT = Path(__file__).resolve().parent.parent / "references"
 CARDS_DIR = SKILL_ROOT / "cards"
 PRECOND_DIR = SKILL_ROOT / "preconditions"
 PLAYBOOK_DIR = SKILL_ROOT / "playbooks"
@@ -36,7 +37,12 @@ FAMILIES_DIR = SKILL_ROOT / "families"
 DISCOVERED_DIR = SKILL_ROOT / "discovered"
 INDEX_PATH = SKILL_ROOT / "INDEX.json"
 
+# OKF 知识库根目录（evolution-knowledge 插件 skill 下）
+# 脚本在 skills/evolution-strategies/scripts/ → 上三级到 skills/
+OKF_ROOT = Path(__file__).resolve().parent.parent.parent / "evolution-knowledge" / "references" / "okf"
+
 SKILL = "evolution-strategies"
+OKF_SKILL = "evolution-knowledge"
 
 
 def split_frontmatter(text: str):
@@ -81,12 +87,14 @@ def parse_yaml_frontmatter(fm: str) -> dict:
             current_list = []
             result[key] = current_list
         elif val.startswith("[") and val.endswith("]"):
-            # 行内列表
+            # 行内列表（兼容带引号项：op_families: ['matmul']）
             inner = val[1:-1].strip()
             if not inner:
                 result[key] = []
             else:
-                result[key] = [item.strip() for item in inner.split(",")]
+                result[key] = [
+                    item.strip().strip('"').strip("'") for item in inner.split(",")
+                ]
             current_key = None
             current_list = None
         elif val.lower() in ("true", "false"):
@@ -197,6 +205,99 @@ def discover_discovered() -> list[dict]:
     return entries
 
 
+def discover_okf() -> list[dict]:
+    """扫描 OKF 知识库（evolution-knowledge/references/okf/）生成卡片条目。
+
+    三类卡片合并进 INDEX.json 的 cards 数组，source_key 前缀
+    evolution-knowledge#okf/ 供 evolution-knowledge-query 检索（按 kind /
+    op_families / bottlenecks / phenomenon / failed_combination 过滤）：
+      - discovered_strategy（X 系列，OKF 增强版，与 discovered/ 双轨保留）
+      - proven_solution（跨算子已验证方案）
+      - failure_pattern（已知失败模式，用于 anti 提示）
+
+    每张卡都必须带 id 字段（profiling_evidence/wm_ledger 按 id 反查会硬取）。
+    """
+    entries = []
+    if not OKF_ROOT.exists():
+        return entries
+
+    # 1) discovered_strategy（X 系列 OKF 增强版）
+    disc_dir = OKF_ROOT / "strategies" / "discovered"
+    for p in sorted(disc_dir.glob("disc_*.md")):
+        text = p.read_text(encoding="utf-8")
+        fm, _ = split_frontmatter(text)
+        if not fm:
+            continue
+        meta = parse_yaml_frontmatter(fm)
+        slug = p.stem  # disc_X5
+        sid = slug.split("_", 1)[1] if "_" in slug else slug  # X5
+        entries.append({
+            "source_key": f"{OKF_SKILL}#okf/strategies/discovered/{sid}",
+            "id": sid,
+            "title": meta.get("title", sid),
+            "doc_path": f"skills/evolution-knowledge/references/okf/strategies/discovered/{p.name}",
+            "kind": "discovered_strategy",
+            "confidence": meta.get("confidence", "single_op"),
+            "status": meta.get("status", "active"),
+            "op_families": meta.get("op_families", []),
+            "bottlenecks": meta.get("bottlenecks", []),
+            "tags": meta.get("tags", []),
+            "description": meta.get("description", ""),
+        })
+
+    # 2) proven_solution（跨算子已验证方案）
+    proven_dir = OKF_ROOT / "runbooks" / "proven-solutions"
+    for p in sorted(proven_dir.glob("*.md")):
+        if p.name == "index.md":
+            continue
+        text = p.read_text(encoding="utf-8")
+        fm, _ = split_frontmatter(text)
+        if not fm:
+            continue
+        meta = parse_yaml_frontmatter(fm)
+        slug = p.stem
+        entries.append({
+            "source_key": f"{OKF_SKILL}#okf/runbooks/proven-solutions/{slug}",
+            "id": slug,
+            "title": meta.get("title", slug),
+            "doc_path": f"skills/evolution-knowledge/references/okf/runbooks/proven-solutions/{p.name}",
+            "kind": "proven_solution",
+            "confidence": meta.get("confidence", "single_op"),
+            "status": meta.get("status", "active"),
+            "op_families": meta.get("op_families", []),
+            "strategy_ids": meta.get("strategy_ids", []),
+            "tags": [],
+        })
+
+    # 3) failure_pattern（已知失败模式，用于 anti 提示）
+    failure_dir = OKF_ROOT / "runbooks" / "failure-patterns"
+    for p in sorted(failure_dir.glob("*.md")):
+        if p.name == "index.md":
+            continue
+        text = p.read_text(encoding="utf-8")
+        fm, _ = split_frontmatter(text)
+        if not fm:
+            continue
+        meta = parse_yaml_frontmatter(fm)
+        slug = p.stem
+        entries.append({
+            "source_key": f"{OKF_SKILL}#okf/runbooks/failure-patterns/{slug}",
+            "id": meta.get("key", slug),
+            "title": f"{meta.get('phenomenon', slug)}: {' + '.join(meta.get('failed_combination', []))}",
+            "doc_path": f"skills/evolution-knowledge/references/okf/runbooks/failure-patterns/{p.name}",
+            "kind": "failure_pattern",
+            "phenomenon": meta.get("phenomenon", ""),
+            "failed_combination": meta.get("failed_combination", []),
+            "status": meta.get("status", "stub"),
+            "severity": meta.get("severity", ""),
+            "operator_type": meta.get("operator_type", []),
+            "op_families": meta.get("op_families", []),
+            "bottlenecks": [],
+            "tags": meta.get("tags", []),
+        })
+    return entries
+
+
 # 标签词表（与 evolution-world-model/scripts/profiling_evidence.py 的
 # BOTTLENECK_STRATEGY_MAP 对齐）
 BOTTLENECK_LABELS = [
@@ -218,6 +319,8 @@ OP_FAMILIES = [
 def main():
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     cards = discover_cards()
+    okf = discover_okf()
+    cards = cards + okf
     preconds = discover_preconditions()
     playbooks = discover_playbooks()
     families = discover_families()
@@ -242,6 +345,7 @@ def main():
             "playbooks": len(playbooks),
             "families": len(families),
             "discovered": len(discovered),
+            "okf": len(okf),
         },
         "cards": cards,
         "preconditions": preconds,
@@ -257,10 +361,10 @@ def main():
     LOGGER.info("Wrote %s", INDEX_PATH)
     LOGGER.info("  cards=%d (active=%d, deprecated=%d), "
                 "preconditions=%d, playbooks=%d, "
-                "families=%d, discovered=%d",
+                "families=%d, discovered=%d, okf=%d",
                 len(cards), active_cards, deprecated_count,
                 len(preconds), len(playbooks),
-                len(families), len(discovered))
+                len(families), len(discovered), len(okf))
 
 
 if __name__ == "__main__":

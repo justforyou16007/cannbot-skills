@@ -63,6 +63,7 @@ DATA_LOGGER.setLevel(logging.INFO)
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent.parent.parent.parent
+PLUGIN_ROOT = PROJECT_ROOT / "plugins-community/ops-perf-evolution"
 SKILL_SCRIPTS = PROJECT_ROOT / "plugins-community/ops-perf-evolution/skills/evolution-strategies/scripts"
 WM_OPS = SCRIPT_DIR / "wm_ops.py"
 STATE_OPS = SCRIPT_DIR / "state_ops.py"
@@ -289,22 +290,31 @@ def _build_external_references_md(passed_ids: list[str]) -> str:
 def _build_discovered_md(passed_ids: list[str]) -> str:
     """把 passed 中的 X 系列（进化发现策略）全文注入资源块。
 
-    X 系列没有 Preconditions / Playbook 文件，实体内容在
-    evolution-strategies/references/discovered/disc_X{n}.md，
-    通过 INDEX.json 的 discovered 数组解析 doc_path。
+    X 系列没有 Preconditions / Playbook 文件。优先读取 OKF 增强版
+    （evolution-knowledge/references/okf/strategies/discovered/，经 INDEX.json
+    cards 数组中 kind=discovered_strategy 的卡反查 doc_path），未迁移到 OKF
+    的回落兼容层（evolution-strategies/references/discovered/ 的 discovered 数组）。
     """
     idx = _load_strategy_index()
-    disc_entries = {e.get("id"): e.get("doc_path") for e in idx.get("discovered", [])}
-    refs_root = (
+    # OKF 增强版（优先）：cards 数组中 kind=discovered_strategy 的卡
+    okf_disc = {
+        c.get("id"): c.get("doc_path")
+        for c in idx.get("cards", [])
+        if c.get("kind") == "discovered_strategy"
+    }
+    # 兼容层：discovered 数组 doc_path（相对 evolution-strategies/references）
+    compat_disc = {e.get("id"): e.get("doc_path") for e in idx.get("discovered", [])}
+    compat_root = (
         PROJECT_ROOT
         / "plugins-community/ops-perf-evolution/skills/evolution-strategies/references"
     )
     sections = []
     for pid in passed_ids:
-        doc_path = disc_entries.get(pid)
+        doc_path = okf_disc.get(pid) or compat_disc.get(pid)
         if not doc_path:
             continue
-        fpath = refs_root / doc_path
+        # OKF doc_path 相对插件根；兼容层 doc_path 相对 evolution-strategies/references
+        fpath = (PLUGIN_ROOT / doc_path) if pid in okf_disc else (compat_root / doc_path)
         try:
             content = fpath.read_text(encoding="utf-8").strip()
         except OSError:
@@ -338,6 +348,46 @@ class RenderContext:
     playbook_md: str
     excluded_md: str
     discovered_md: str
+    failure_anti_md: str
+
+
+def _build_failure_patterns_anti_md(passed_ids: list[str]) -> str:
+    """策略组合命中已知失败模式时，注入 anti 提示。
+
+    从 INDEX.json cards 中 kind=failure_pattern 的卡，查找 failed_combination
+    完全被 passed_ids 覆盖的组合，输出警告 + Resolution 指引，防止复用
+    既往已证实会失败的策略组合（OKF runbooks/failure-patterns/）。
+    """
+    if not passed_ids:
+        return ""
+    idx = _load_strategy_index()
+    passed_set = set(passed_ids)
+    alerts = []
+    for c in idx.get("cards", []):
+        if c.get("kind") != "failure_pattern":
+            continue
+        fc = c.get("failed_combination") or []
+        if not fc or not set(fc).issubset(passed_set):
+            continue
+        alerts.append(c)
+    if not alerts:
+        return ""
+
+    lines = [
+        "",
+        "---",
+        "",
+        "## ⚠️ Failure Pattern Alerts（策略组合命中已知失败模式）",
+        "",
+        "以下组合在既往进化中被证实会失败，请避开或按 Resolution 处理：",
+        "",
+    ]
+    for a in alerts:
+        lines.append(f"- **{a.get('id', '?')}** [{a.get('status', '')}]: "
+                     f"组合 `{' + '.join(a.get('failed_combination', []))}` → "
+                     f"{a.get('phenomenon', '?')}（severity: {a.get('severity', '?')}）")
+        lines.append(f"  - 详见 `{a.get('doc_path', '')}`，先读其中的 Resolution 再决定是否规避。")
+    return "\n".join(lines) + "\n"
 
 
 def _render_guided_block(ctx: RenderContext, parts: list[str]):
@@ -426,6 +476,10 @@ def render_block(ctx: RenderContext) -> str:
     else:
         _render_exploration_block(ctx, parts)
 
+    # ── 失败模式 anti 提示（策略组合命中已知失败组合时）──
+    if ctx.failure_anti_md:
+        parts.append(ctx.failure_anti_md)
+
     # ── Excluded 段（两种分支共用）──
     if ctx.excluded_md and "暂无已读" not in ctx.excluded_md:
         parts.append("")
@@ -499,6 +553,7 @@ def main() -> int:
         playbook_md=playbook_md,
         excluded_md=excluded_md,
         discovered_md=_build_discovered_md(passed),
+        failure_anti_md=_build_failure_patterns_anti_md(passed),
     ))
 
     # Output

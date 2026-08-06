@@ -43,13 +43,14 @@
     ]
   },
   "stats": {
-    "cards": 146,
-    "active_cards": 133,
+    "cards": 174,
+    "active_cards": 161,
     "deprecated": 13,
     "preconditions": 131,
     "playbooks": 131,
     "families": 8,
-    "discovered": 20
+    "discovered": 21,
+    "okf": 28
   },
   "cards": [
     {
@@ -3710,6 +3711,716 @@
       "quantified_gain": [],
       "deprecated": true,
       "deprecated_reason": "Uses fictional Mutex::Lock API. Overlaps with P28/P29/P30 sync strategies. Zero references."
+    },
+    {
+      "source_key": "evolution-knowledge#okf/strategies/discovered/X1",
+      "id": "X1",
+      "title": "Inline Target Capture",
+      "doc_path": "skills/evolution-knowledge/references/okf/strategies/discovered/disc_X1.md",
+      "kind": "discovered_strategy",
+      "confidence": "single_op",
+      "status": "active",
+      "op_families": [
+        "reduction"
+      ],
+      "bottlenecks": [
+        "mte2_stall",
+        "no_overlap"
+      ],
+      "tags": [
+        "cross_entropy",
+        "inline_target",
+        "reduction",
+        "online_softmax"
+      ],
+      "description": "在 Online Softmax 的前向流式扫描过程中，当处理到包含目标索引的 tile 时，立即捕获目标元素的原始值（如 target logit）， 避免在扫描完成后再用一次独立的 DataCopy 回读目标 tile。这将 \\\"reduce + lookup\\\" 两步操作融合为单次遍历， 对于 CrossEntropyLoss 等需要同时做全行归约和单点索引查找的算子，可完全消除一个独立的 pa"
+    },
+    {
+      "source_key": "evolution-knowledge#okf/strategies/discovered/X10",
+      "id": "X10",
+      "title": "设备侧分组调度 + NZ plane 权重缓存（Grouped Matmul Cube 化）",
+      "doc_path": "skills/evolution-knowledge/references/okf/strategies/discovered/disc_X10.md",
+      "kind": "discovered_strategy",
+      "confidence": "single_op",
+      "status": "active",
+      "op_families": [
+        "matmul",
+        "moe"
+      ],
+      "bottlenecks": [
+        "compute_bound",
+        "mte3_stall",
+        "no_overlap",
+        "scalar_compute",
+        "tiling_imbalance"
+      ],
+      "tags": [
+        "compute_bound",
+        "matmul",
+        "moe",
+        "mte3_stall",
+        "no_overlap",
+        "quantization",
+        "scalar_compute",
+        "tiling_imbalance"
+      ],
+      "description": "Grouped matmul（group_list 为 device 端 cumsum）的 Cube 化不要在 host 侧展开分组计划：每个 AIC 核在设备侧自行从 group_list 构建本核的 (group, M-block) 调度（empty group 自然跳过，无 host 同步）；每个专家的 weight 以 NZ plane 形式作为静态缓存放入 GM workspace，ti"
+    },
+    {
+      "source_key": "evolution-knowledge#okf/strategies/discovered/X11",
+      "id": "X11",
+      "title": "ND-drain + L0B 喂给率驱动 baseM 扩升（量化 Matmul Cube 利用率修复）",
+      "doc_path": "skills/evolution-knowledge/references/okf/strategies/discovered/disc_X11.md",
+      "kind": "discovered_strategy",
+      "confidence": "single_op",
+      "status": "active",
+      "op_families": [
+        "matmul"
+      ],
+      "bottlenecks": [
+        "compute_bound",
+        "l2_cache_thrash",
+        "mte3_stall",
+        "no_overlap",
+        "scalar_compute"
+      ],
+      "tags": [
+        "compute_bound",
+        "l2_cache_thrash",
+        "matmul",
+        "mte3_stall",
+        "no_overlap",
+        "quantization",
+        "scalar_compute"
+      ],
+      "description": "c220 (910B) 上 MatmulImpl 的多 fragment NZ drain 是芯片缺陷（与 orgM 对齐无关，已证伪对齐假说）， 而 ND int32 多行 drain 完全正确——Cube 输出格式应路由到 ND。真正的 AIC 瓶颈不是 B 的 L2 refetch（scM 扩 16x 时间纹丝不动），而是 **L0B-fill:mad 比**：baseM=16 时每个 ba"
+    },
+    {
+      "source_key": "evolution-knowledge#okf/strategies/discovered/X12",
+      "id": "X12",
+      "title": "量化 GEMV 纯 VEC 流式路径（小 M 分流）",
+      "doc_path": "skills/evolution-knowledge/references/okf/strategies/discovered/disc_X12.md",
+      "kind": "discovered_strategy",
+      "confidence": "single_op",
+      "status": "active",
+      "op_families": [
+        "matmul",
+        "reduction"
+      ],
+      "bottlenecks": [
+        "compute_bound",
+        "mte2_stall",
+        "scalar_compute",
+        "tiling_imbalance"
+      ],
+      "tags": [
+        "compute_bound",
+        "matmul",
+        "mte2_stall",
+        "quantization",
+        "reduction",
+        "scalar_compute",
+        "tiling_imbalance"
+      ],
+      "description": "对 weight-quant matmul（y = x @ ((w+o)*s) + b，w 为 int8），当 M 小（1-8，GEMV 类）时放弃 cube，走纯 VEC streaming：代数重构把 per-N scale 提出 K 循环（y[m,n] = s[n]*(sum_k x[m,k]*w[k,n] + o[n]*rowsum(x[m])) + b[n]，热 K 循环内零反量化乘加）"
+    },
+    {
+      "source_key": "evolution-knowledge#okf/strategies/discovered/X13",
+      "id": "X13",
+      "title": "Shape 自适应双引擎分流 (M-Threshold Hybrid Routing)",
+      "doc_path": "skills/evolution-knowledge/references/okf/strategies/discovered/disc_X13.md",
+      "kind": "discovered_strategy",
+      "confidence": "single_op",
+      "status": "active",
+      "op_families": [
+        "matmul"
+      ],
+      "bottlenecks": [
+        "compute_bound",
+        "scalar_compute",
+        "tiling_imbalance"
+      ],
+      "tags": [
+        "compute_bound",
+        "matmul",
+        "quantization",
+        "scalar_compute",
+        "tiling_imbalance"
+      ],
+      "description": "当单一执行引擎（cube / vector）无法覆盖全部输入 shape 时，在 host 侧（op plugin）按 shape 特征（如 M 维度）路由到两条完整的独立 kernel 路径：小 M（GEMV 类）走纯 VEC streaming 内核吃带宽极限，中大 M 走 cube 内核吃 MAC 吞吐。分发阈值不靠猜，用实测证据校准：中间区间（如 M∈[3,4]）按 K*N 流量是否足以摊"
+    },
+    {
+      "source_key": "evolution-knowledge#okf/strategies/discovered/X14",
+      "id": "X14",
+      "title": "Mix-Kernel 跨核生产者/消费者融合 (Pairwise AIV-Producer/AIC-Consumer Fusion)",
+      "doc_path": "skills/evolution-knowledge/references/okf/strategies/discovered/disc_X14.md",
+      "kind": "discovered_strategy",
+      "confidence": "single_op",
+      "status": "active",
+      "op_families": [
+        "matmul"
+      ],
+      "bottlenecks": [
+        "compute_bound",
+        "l2_cache_thrash",
+        "mte2_stall",
+        "mte3_stall",
+        "no_overlap",
+        "scalar_compute"
+      ],
+      "tags": [
+        "compute_bound",
+        "l2_cache_thrash",
+        "matmul",
+        "mte2_stall",
+        "mte3_stall",
+        "no_overlap",
+        "quantization",
+        "scalar_compute"
+      ],
+      "description": "当流水线中存在独立的前置 VEC pass（如 dequant/cast），且硬件路径（int8 直接进 cube）被证伪时，将该 VEC pass 与 cube kernel 融合进**单个 mix kernel**：AIC ci 与其配对 AIV（2ci, 2ci+1）组成生产者/消费者对，AIV 按 AIC 的消费顺序（如 (nIdx,kIdx) strip）生产中间数据到 write-on"
+    },
+    {
+      "source_key": "evolution-knowledge#okf/strategies/discovered/X15",
+      "id": "X15",
+      "title": "递归拆分-并行投影外提 (Recurrent Split: Hoist Parallel Projection)",
+      "doc_path": "skills/evolution-knowledge/references/okf/strategies/discovered/disc_X15.md",
+      "kind": "discovered_strategy",
+      "confidence": "single_op",
+      "status": "active",
+      "op_families": [
+        "matmul"
+      ],
+      "bottlenecks": [
+        "compute_bound",
+        "mte3_stall",
+        "scalar_compute"
+      ],
+      "tags": [
+        "compute_bound",
+        "matmul",
+        "mte3_stall",
+        "scalar_compute"
+      ],
+      "description": "对 RNN/LSTM/GRU/scan 类含串行循环的算子，将计算拆为\\\"非递归部分\\\"与\\\"严格串行部分\\\"： 非递归投影（如全部时间步的 x@W_ih）与循环无关，可一次性合并为单个大 GEMM，外提到 host 侧 调用框架/库的高性能 GEMM（自动走 Cube 单元）；自定义内核只保留严格串行的递归残差 （如每步 h@W_hh + 门激活 + 状态更新），并将递归权重（W_hh）在 UB 常驻、"
+    },
+    {
+      "source_key": "evolution-knowledge#okf/strategies/discovered/X16",
+      "id": "X16",
+      "title": "循环算子 H-slice 多核切分 (Recurrent H-Slice Multi-Core Split)",
+      "doc_path": "skills/evolution-knowledge/references/okf/strategies/discovered/disc_X16.md",
+      "kind": "discovered_strategy",
+      "confidence": "single_op",
+      "status": "active",
+      "op_families": [
+        "matmul"
+      ],
+      "bottlenecks": [
+        "compute_bound",
+        "scalar_compute",
+        "tiling_imbalance"
+      ],
+      "tags": [
+        "compute_bound",
+        "matmul",
+        "scalar_compute",
+        "tiling_imbalance"
+      ],
+      "description": "对 LSTM/GRU/RNN/scan 类含串行循环的算子，时间维不可并行，并行度只能从 batch×hidden 中榨取。 当 batch 小（核空闲）时，将 hidden 维度切分到多个 AIV 核：每核独占一段隐藏单元 [hStart, hEnd) 及对应的 4 个门控列，W_hh 切片 [hSlice, 4·hSlice] 每核只加载一次并跨 batch tile 与全部时间步复用（UB"
+    },
+    {
+      "source_key": "evolution-knowledge#okf/strategies/discovered/X17",
+      "id": "X17",
+      "title": "FP32-via-BF16 Hi/Lo 拆分 3-GEMM（Cube 不吃 fp32 时的保精度路径）",
+      "doc_path": "skills/evolution-knowledge/references/okf/strategies/discovered/disc_X17.md",
+      "kind": "discovered_strategy",
+      "confidence": "single_op",
+      "status": "active",
+      "op_families": [
+        "matmul"
+      ],
+      "bottlenecks": [
+        "compute_bound",
+        "scalar_compute"
+      ],
+      "tags": [
+        "compute_bound",
+        "matmul",
+        "scalar_compute"
+      ],
+      "description": "910B Cube 的 Mmad 不直接消费 fp32 输入。将 fp32 操作数拆分为 bf16 双分量 `x ≈ hi + lo`（hi = cast_bf16(x)，lo = cast_bf16(x − hi)），用 3 个 bf16 GEMM `hi·hi + hi·lo + lo·hi`（fp32 累加）逼近 fp32 GEMM，获得 Cube 级吞吐 + 接近 fp32 的精度（~1e"
+    },
+    {
+      "source_key": "evolution-knowledge#okf/strategies/discovered/X18",
+      "id": "X18",
+      "title": "Fused img2col LoadData3D 随路展开（含 band 窗口化突破 L1 容量）",
+      "doc_path": "skills/evolution-knowledge/references/okf/strategies/discovered/disc_X18.md",
+      "kind": "discovered_strategy",
+      "confidence": "single_op",
+      "status": "active",
+      "op_families": [
+        "cv_fusion",
+        "matmul"
+      ],
+      "bottlenecks": [
+        "compute_bound",
+        "mte3_stall",
+        "scalar_compute"
+      ],
+      "tags": [
+        "compute_bound",
+        "conv2d",
+        "cv_fusion",
+        "matmul",
+        "mte3_stall",
+        "scalar_compute"
+      ],
+      "description": "卷积的 im2col GM 物化路径流量为 `特征图→UB→GM→L1→L0`，GM 往返可占整算子 70%。 fused 模式让 **A 侧不落地**：特征图转 NC1HWC0 常驻 L1，用 img2col LoadData3D （pad/stride/dilation 硬件处理）从 L1 直接随路展开进 L0A，B 侧复用 K-major 权重 ws。CopyOut/epilogue/m/n"
+    },
+    {
+      "source_key": "evolution-knowledge#okf/strategies/discovered/X19",
+      "id": "X19",
+      "title": "1×1 Conv 翻转 GEMM（原始布局即操作数，免 wrepack/im2col）",
+      "doc_path": "skills/evolution-knowledge/references/okf/strategies/discovered/disc_X19.md",
+      "kind": "discovered_strategy",
+      "confidence": "single_op",
+      "status": "active",
+      "op_families": [
+        "cv_fusion",
+        "matmul",
+        "reduction"
+      ],
+      "bottlenecks": [
+        "compute_bound",
+        "mte2_stall",
+        "mte3_stall"
+      ],
+      "tags": [
+        "compute_bound",
+        "conv2d",
+        "cv_fusion",
+        "matmul",
+        "mte2_stall",
+        "mte3_stall",
+        "reduction"
+      ],
+      "description": "1×1 卷积的 im2col 是恒等变换：NCHW 原始布局的 x 本身就是 `[K=Ci, M=H*W]` 的 GEMM B 操作数。把 GEMM **翻转**——A = 原始权重 [Co, Ci]（跨图共享，免 wrepack）、 B = 原始 x [Ci, H*W]（免 im2col 发射）、acc = [Co, H*W] fp32——epilogue 按通道行 加 bias 后直接写出 N"
+    },
+    {
+      "source_key": "evolution-knowledge#okf/strategies/discovered/X2",
+      "id": "X2",
+      "title": "大张量驻留 Device、仅小索引过总线",
+      "doc_path": "skills/evolution-knowledge/references/okf/strategies/discovered/disc_X2.md",
+      "kind": "discovered_strategy",
+      "confidence": "single_op",
+      "status": "active",
+      "op_families": [
+        "index_scatter",
+        "datapath"
+      ],
+      "bottlenecks": [
+        "bus_contention",
+        "mte2_stall"
+      ],
+      "tags": [
+        "bus_contention",
+        "datapath",
+        "index_scatter",
+        "mte2_stall"
+      ],
+      "description": "对于 host 协调的 gather/scatter/routing 类算子（host 预先排序并算好索引、kernel 仅做按索引搬运）， **不要**把大数据张量 (N×H) 做 device→host→device 往返再在 CPU gather，而是让大张量**全程驻留 device**， 只把小的 int32 索引张量 (N×K，比数据小一两个数量级) 过总线交给 CPU 做必须的排序，"
+    },
+    {
+      "source_key": "evolution-knowledge#okf/strategies/discovered/X20",
+      "id": "X20",
+      "title": "Host 侧权重预打包结果 LRU 缓存（Weight Repack Cache）",
+      "doc_path": "skills/evolution-knowledge/references/okf/strategies/discovered/disc_X20.md",
+      "kind": "discovered_strategy",
+      "confidence": "single_op",
+      "status": "active",
+      "op_families": [
+        "cv_fusion",
+        "elementwise",
+        "matmul"
+      ],
+      "bottlenecks": [
+        "l2_cache_thrash",
+        "no_overlap"
+      ],
+      "tags": [
+        "conv2d",
+        "cv_fusion",
+        "elementwise",
+        "l2_cache_thrash",
+        "matmul",
+        "no_overlap",
+        "quantization"
+      ],
+      "description": "权重布局变换（K-major repack、fractal 重排、量化打包等）的输出是 （weight 内容, shape, dtype, 目标布局）的**确定函数**。推理场景同一权重张量 被反复卷积/矩阵乘，repack 结果逐 bit 相同——host 侧做 LRU 缓存，命中时 **跳过整个 repack kernel 发射**，直接复用缓存的 workspace。"
+    },
+    {
+      "source_key": "evolution-knowledge#okf/strategies/discovered/X21",
+      "id": "X21",
+      "title": "910B2C Cube 化平台纪律 + 数据驱动 Kahan 精度路由",
+      "doc_path": "skills/evolution-knowledge/references/okf/strategies/discovered/disc_X21.md",
+      "kind": "discovered_strategy",
+      "confidence": "single_op",
+      "status": "active",
+      "op_families": [
+        "cv_fusion",
+        "matmul"
+      ],
+      "bottlenecks": [
+        "compute_bound",
+        "mte2_stall",
+        "mte3_stall",
+        "no_overlap",
+        "scalar_compute"
+      ],
+      "tags": [
+        "compute_bound",
+        "conv2d",
+        "cv_fusion",
+        "matmul",
+        "mte2_stall",
+        "mte3_stall",
+        "no_overlap",
+        "scalar_compute"
+      ],
+      "description": "在 910B2C（DAV_2201）上把 AIV 算子 Cube 化时，正确性杀手往往不是算法而是**平台纪律**： 四条独立实证的平台陷阱会静默产出垃圾/hang，且 CANN 不报错。逐一避坑后，Cube 路线 才能真正落地；对 fp32 L0C 累加必然超差的相消重元素 case，用**数据驱动预扫描**（非 shape 硬编码）按一般性能量规则分流到 Kahan 兜底，保住全量精度。 四条"
+    },
+    {
+      "source_key": "evolution-knowledge#okf/strategies/discovered/X3",
+      "id": "X3",
+      "title": "端到端 dtype 直传下沉 (End-to-End Dtype Passthrough)",
+      "doc_path": "skills/evolution-knowledge/references/okf/strategies/discovered/disc_X3.md",
+      "kind": "discovered_strategy",
+      "confidence": "single_op",
+      "status": "active",
+      "op_families": [
+        "elementwise"
+      ],
+      "bottlenecks": [
+        "compute_bound",
+        "mte2_stall",
+        "scalar_compute",
+        "tiling_imbalance"
+      ],
+      "tags": [
+        "compute_bound",
+        "elementwise",
+        "mte2_stall",
+        "scalar_compute",
+        "tiling_imbalance"
+      ],
+      "description": "对多 dtype elementwise / foreach 算子，瓶颈往往不在 kernel 计算，而在 **wrapper / host 侧把低精度输入 (fp16/bf16) 全量 `.to(fp32)` 升 cast，kernel 再按 fp32 读写**——这使 HBM 流量相对原始 dtype 膨胀约 5x （fp16: wrapper 入 cast 3x(读2B+写4B)=18B +"
+    },
+    {
+      "source_key": "evolution-knowledge#okf/strategies/discovered/X4",
+      "id": "X4",
+      "title": "Concat-Fused Strided DMA + Two-Level Skv Reduction",
+      "doc_path": "skills/evolution-knowledge/references/okf/strategies/discovered/disc_X4.md",
+      "kind": "discovered_strategy",
+      "confidence": "single_op",
+      "status": "active",
+      "op_families": [
+        "attention",
+        "flash_attention",
+        "reduction"
+      ],
+      "bottlenecks": [
+        "compute_bound",
+        "mte2_stall",
+        "scalar_compute"
+      ],
+      "tags": [
+        "attention",
+        "compute_bound",
+        "decode",
+        "flash_attention",
+        "gqa",
+        "mla",
+        "mte2_stall",
+        "reduction",
+        "scalar_compute"
+      ],
+      "description": "针对 decode/MTP attention（单行/小批量 Q、长 Skv）的 **DMA-launch-latency-bound** 瓶颈（非 BW）： 1. **Concat 折叠进 K-tile DMA**：一个 tile 用两条 MTE2（nope-tile / rope-tile）以 strided dst 交错写入连续 `[T,D_qk]` UB（ND2NZ 式 packed lo"
+    },
+    {
+      "source_key": "evolution-knowledge#okf/strategies/discovered/X5",
+      "id": "X5",
+      "title": "GQA-Decode GEMV->GEMM (M=N_q)",
+      "doc_path": "skills/evolution-knowledge/references/okf/strategies/discovered/disc_X5.md",
+      "kind": "discovered_strategy",
+      "confidence": "single_op",
+      "status": "active",
+      "op_families": [
+        "attention",
+        "flash_attention",
+        "matmul"
+      ],
+      "bottlenecks": [
+        "compute_bound",
+        "mte2_stall",
+        "scalar_compute",
+        "tiling_imbalance"
+      ],
+      "tags": [
+        "attention",
+        "compute_bound",
+        "decode",
+        "flash_attention",
+        "gqa",
+        "matmul",
+        "mla",
+        "mte2_stall",
+        "scalar_compute",
+        "tiling_imbalance"
+      ],
+      "description": "对 GQA decode/MTP（N_kv=1，一个 token 的全部 N_q 个 query head 共享同一个 KV head），把 decode 注意力的 M 维取为 **N_q（128/64）而非 S**。于是一块 = 一个 (b,s) token、grid=B·S、M=N_q，QK^T=`Q[N_q,D_qk]@K^T[D_qk,S_kv]` 与 PV=`P[N_q,S_kv]@V["
+    },
+    {
+      "source_key": "evolution-knowledge#okf/strategies/discovered/X6",
+      "id": "X6",
+      "title": "Merge Partial + Reduce Kernel for Split-KV FlashDecode",
+      "doc_path": "skills/evolution-knowledge/references/okf/strategies/discovered/disc_X6.md",
+      "kind": "discovered_strategy",
+      "confidence": "single_op",
+      "status": "active",
+      "op_families": [
+        "attention",
+        "flash_attention",
+        "reduction"
+      ],
+      "bottlenecks": [
+        "bus_contention",
+        "compute_bound",
+        "mte2_stall",
+        "mte3_stall",
+        "scalar_compute"
+      ],
+      "tags": [
+        "attention",
+        "bus_contention",
+        "compute_bound",
+        "decode",
+        "flash_attention",
+        "mte2_stall",
+        "mte3_stall",
+        "quantization",
+        "reduction",
+        "scalar_compute"
+      ],
+      "description": "在 Split-KV FlashDecode 实现中，算子通常拆分为两个独立的 kernel launch： 1. **partial kernel**：每个 (task, split) 单元独立扫描其 token 子区间， 产出 online-softmax 的中间状态 `(m, l, acc[D])` 并写入 workspace； 2. **reduce kernel**：读取所有 split"
+    },
+    {
+      "source_key": "evolution-knowledge#okf/strategies/discovered/X7",
+      "id": "X7",
+      "title": "Token Block Size (TB) Tuning for Pure-Vector Attention",
+      "doc_path": "skills/evolution-knowledge/references/okf/strategies/discovered/disc_X7.md",
+      "kind": "discovered_strategy",
+      "confidence": "single_op",
+      "status": "active",
+      "op_families": [
+        "attention",
+        "flash_attention"
+      ],
+      "bottlenecks": [
+        "compute_bound",
+        "l2_cache_thrash",
+        "mte3_stall",
+        "scalar_compute",
+        "tiling_imbalance"
+      ],
+      "tags": [
+        "attention",
+        "compute_bound",
+        "decode",
+        "flash_attention",
+        "l2_cache_thrash",
+        "mte3_stall",
+        "quantization",
+        "scalar_compute",
+        "tiling_imbalance"
+      ],
+      "description": "在纯 AIV（Vector）实现的 FlashDecode / TurboQuant decode 中，kernel 内部以 **token block（TB）** 为单位处理 KV cache：每个 chunk 加载 `TB` 个 token 的 slot，解量化后做 `q·K`、softmax、weighted-V 累加。TB 的选择直接决定： 1. **标量控制流占比**：TB 越小，循环迭"
+    },
+    {
+      "source_key": "evolution-knowledge#okf/strategies/discovered/X8",
+      "id": "X8",
+      "title": "Host-Side Precomputation of Constant Offset Tables",
+      "doc_path": "skills/evolution-knowledge/references/okf/strategies/discovered/disc_X8.md",
+      "kind": "discovered_strategy",
+      "confidence": "single_op",
+      "status": "active",
+      "op_families": [
+        "attention",
+        "flash_attention"
+      ],
+      "bottlenecks": [
+        "compute_bound",
+        "mte2_stall",
+        "mte3_stall",
+        "no_overlap",
+        "scalar_compute",
+        "tiling_imbalance"
+      ],
+      "tags": [
+        "attention",
+        "compute_bound",
+        "decode",
+        "flash_attention",
+        "mte2_stall",
+        "mte3_stall",
+        "no_overlap",
+        "scalar_compute",
+        "tiling_imbalance"
+      ],
+      "description": "许多 AscendC kernel 在 `Init` 阶段会计算一些**仅由超参数决定、与输入数据无关** 的常量表，例如： - 量化/反量化的 bit offset 表 - gather 索引表 - stride/alignment 修正表 - RoPE 频率表 - softmax 的 stride offset 表 这些表目前在 device 端通过标量循环计算（`SetValue`），每个"
+    },
+    {
+      "source_key": "evolution-knowledge#okf/strategies/discovered/X9",
+      "id": "X9",
+      "title": "Deferred Scaling — 反量化仿射结构的代数重排（延迟缩放）",
+      "doc_path": "skills/evolution-knowledge/references/okf/strategies/discovered/disc_X9.md",
+      "kind": "discovered_strategy",
+      "confidence": "single_op",
+      "status": "active",
+      "op_families": [
+        "quantization",
+        "reduction"
+      ],
+      "bottlenecks": [
+        "bus_contention",
+        "l2_cache_thrash",
+        "mte2_stall",
+        "scalar_compute"
+      ],
+      "tags": [
+        "affine",
+        "bus_contention",
+        "dequant",
+        "l2_cache_thrash",
+        "mte2_stall",
+        "quantization",
+        "reduction",
+        "scalar_compute"
+      ],
+      "description": "反量化 decode 类 kernel 的典型结构是： ``` 对 nTok*D 个元素逐一施加 per-token 缩放/偏移（D-wide Muls/Adds × nTok） → 然后马上被归约（ReduceSum / 加权累加）消费成低维量 ``` P94/P95 能把包裹这些向量指令的**标量外壳**向量化，但向量指令本身的数量 （2~3 × nTok 条 D-wide op）并未减少。本"
+    },
+    {
+      "source_key": "evolution-knowledge#okf/runbooks/proven-solutions/matmultransa-cube-tiling-systematic-design",
+      "id": "matmultransa-cube-tiling-systematic-design",
+      "title": "MatmulTransA: Cube Tiling Systematic Design",
+      "doc_path": "skills/evolution-knowledge/references/okf/runbooks/proven-solutions/matmultransa-cube-tiling-systematic-design.md",
+      "kind": "proven_solution",
+      "confidence": "cross_op_verified",
+      "status": "active",
+      "op_families": [
+        "matmul"
+      ],
+      "strategy_ids": "P46 (MatmulImpl high-level API), P104 (multi-core tiling expansion), P108 (platform routing)",
+      "tags": []
+    },
+    {
+      "source_key": "evolution-knowledge#okf/runbooks/proven-solutions/x1-causal-s2-block-skipping-flashattentionsimple",
+      "id": "x1-causal-s2-block-skipping-flashattentionsimple",
+      "title": "X1: Causal S2 Block Skipping (FlashAttentionSimple)",
+      "doc_path": "skills/evolution-knowledge/references/okf/runbooks/proven-solutions/x1-causal-s2-block-skipping-flashattentionsimple.md",
+      "kind": "proven_solution",
+      "confidence": "single_op",
+      "status": "active",
+      "op_families": [
+        "attention",
+        "flash_attention"
+      ],
+      "strategy_ids": "X-series (novel, discovered during evolution)",
+      "tags": []
+    },
+    {
+      "source_key": "evolution-knowledge#okf/runbooks/proven-solutions/x2-scalar-to-vector-conversion-nms-groupnorm-topk",
+      "id": "x2-scalar-to-vector-conversion-nms-groupnorm-topk",
+      "title": "X2: Scalar-to-Vector Conversion (NMS + GroupNorm + TopK)",
+      "doc_path": "skills/evolution-knowledge/references/okf/runbooks/proven-solutions/x2-scalar-to-vector-conversion-nms-groupnorm-topk.md",
+      "kind": "proven_solution",
+      "confidence": "cross_op_verified",
+      "status": "active",
+      "op_families": [
+        "elementwise",
+        "normalization",
+        "reduction"
+      ],
+      "strategy_ids": "X2 (cross-operator validation: works on NMS, GroupNorm, TopK; pattern abstracted to P85-P89 strategy cards)",
+      "tags": []
+    },
+    {
+      "source_key": "evolution-knowledge#okf/runbooks/proven-solutions/x21-910b2c-cube-化平台纪律-数据驱动-kahan-精度路由-conv3dbackpropfilter",
+      "id": "x21-910b2c-cube-化平台纪律-数据驱动-kahan-精度路由-conv3dbackpropfilter",
+      "title": "X21: 910B2C Cube 化平台纪律 + 数据驱动 Kahan 精度路由 (Conv3DBackpropFilter)",
+      "doc_path": "skills/evolution-knowledge/references/okf/runbooks/proven-solutions/x21-910b2c-cube-化平台纪律-数据驱动-kahan-精度路由-conv3dbackpropfilter.md",
+      "kind": "proven_solution",
+      "confidence": "single_op",
+      "status": "active",
+      "op_families": [
+        "cv_fusion",
+        "matmul"
+      ],
+      "strategy_ids": "X21（关联 X18 k 序探针纪律的 3D 推广）",
+      "tags": []
+    },
+    {
+      "source_key": "evolution-knowledge#okf/runbooks/proven-solutions/x3-hardware-sort-engine-replacement-nms-topk",
+      "id": "x3-hardware-sort-engine-replacement-nms-topk",
+      "title": "X3: Hardware Sort Engine Replacement (NMS + TopK)",
+      "doc_path": "skills/evolution-knowledge/references/okf/runbooks/proven-solutions/x3-hardware-sort-engine-replacement-nms-topk.md",
+      "kind": "proven_solution",
+      "confidence": "cross_op_verified",
+      "status": "active",
+      "op_families": [
+        "sort",
+        "topk"
+      ],
+      "strategy_ids": "X3 (captured in P87 strategy card)",
+      "tags": []
+    },
+    {
+      "source_key": "evolution-knowledge#okf/runbooks/proven-solutions/x4-hybrid-scalarvector-dispatch-groupnorm",
+      "id": "x4-hybrid-scalarvector-dispatch-groupnorm",
+      "title": "X4: Hybrid Scalar/Vector Dispatch (GroupNorm)",
+      "doc_path": "skills/evolution-knowledge/references/okf/runbooks/proven-solutions/x4-hybrid-scalarvector-dispatch-groupnorm.md",
+      "kind": "proven_solution",
+      "confidence": "cross_op_verified",
+      "status": "active",
+      "op_families": [
+        "normalization",
+        "reduction"
+      ],
+      "strategy_ids": "X4 (captured in P89 strategy card)",
+      "tags": []
+    },
+    {
+      "source_key": "evolution-knowledge#okf/runbooks/failure-patterns/f1-p22-a1-reduction-tail-precision",
+      "id": "P22+A1:reduction:tail_precision",
+      "title": "precision_failure: P22 + A1",
+      "doc_path": "skills/evolution-knowledge/references/okf/runbooks/failure-patterns/f1-p22-a1-reduction-tail-precision.md",
+      "kind": "failure_pattern",
+      "phenomenon": "precision_failure",
+      "failed_combination": [
+        "P22",
+        "A1"
+      ],
+      "status": "stub",
+      "severity": "major",
+      "operator_type": [
+        "reduction"
+      ],
+      "op_families": [],
+      "bottlenecks": [],
+      "tags": [
+        "precision",
+        "dtype",
+        "tail"
+      ]
     }
   ],
   "preconditions": [
@@ -5133,6 +5844,11 @@
       "source_key": "evolution-strategies#discovered/disc_X20",
       "id": "X20",
       "doc_path": "discovered/disc_X20.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X21",
+      "id": "X21",
+      "doc_path": "discovered/disc_X21.md"
     },
     {
       "source_key": "evolution-strategies#discovered/disc_X3",

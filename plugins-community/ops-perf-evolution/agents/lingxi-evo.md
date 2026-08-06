@@ -60,10 +60,12 @@ tools: Agent(lingxi-partial), Agent(general-purpose), Read, Write, Edit, Bash, G
   · **Step 1 — 归族（必做）**: 读 `plugins-community/ops-perf-evolution/skills/evolution-strategies/references/scenario-routing/README.md` 的族判定表，用结构判据（计算主干 / kernel 特征 / shape 特征，**不靠算子名**）把算子归入 FA / conv / matmul / quantization / reduction / sort / conversion / 小族 / elementwise 之一；多族特征同时命中时拆「主干族 + trait」
   · **Step 2 — 按族 workflow 选卡（主路径）**: 打开 README 中该族对应的 workflow 文件（flashattention.md / convolution.md / matmul.md 等）：先过 `_common-prerequisites.md` 通用前置判定链（C1-C5，**命中用卡、未命中跳过**，覆盖双缓冲/对齐/标量向量化/dtype/数值稳定等基础项），再按 workflow 阶段表顺序选 L1 策略（每阶段带判定与跳过条件）；workflow 标注「覆盖缺口」的阶段转 Step 3
   · **Step 3 — 瓶颈驱动 (Refine 阶段)**: profiling_evidence 可用时，查 strategy-index.md「按瓶颈类型查表」追加/替换策略，**证据优先于 workflow 顺序**。**原则**: 通用前置保证基本正确性和性能，族内 L1 针对特定场景提供 2-5x 额外提升；Init 阶段优先通用前置 + 少量 L1，Refine 阶段根据 profiling 证据精准追加 L1
-- **知识库查询协议**: `plugins-community/ops-perf-evolution/skills/evolution-knowledge/references/a3/` 渐进式披露，先读 guide.md 按需深入。
+- **知识库查询协议**:
+  **OKF 知识库（首选）**: 用 `evolution-knowledge-query` skill 查询 `skills/evolution-knowledge/references/okf/`，按 `--op-family` / `--bottleneck` / `--phenomenon` / `--failed-combination` / `--kind` 结构化检索（discovered_strategy X 系列 / proven_solution / failure_pattern）。Init 阶段按 `op_family`（有 baseline 瓶颈信息时叠加 `--bottleneck`）查一次，命中即读对应卡片全文纳入策略选择依据；`status: stub` 的卡不用于支撑结论（须 active）。
+  **经典知识库**: `plugins-community/ops-perf-evolution/skills/evolution-knowledge/references/a3/` 渐进式披露，先读 guide.md 按需深入。
   **Init 必读**: `a3/hardware/guide.md`、`a3/optimization_patterns/guide.md`、按算子族读 `a3/algorithm_insights/{family}.md`（匹配时）
   **子 agent prompt 参考**: `a3/ascendc_api/guide.md`（避坑提醒）；**策略提炼查阅**: `a3/proven_solutions/INDEX.md`（判断新颖性、避免重复）
-  **检索优先级**: 知识库 → 策略库 → proven_solutions → WebSearch
+  **检索优先级**: OKF 知识库 → a3 知识库 → 策略库 → proven_solutions → WebSearch
 - **读取参考实现**: open_exploration 节点被选中时，主动读取同类算子的已知高性能实现作为灵感来源
 
 每次探索必须产出具体的可编译代码，不能只停留在分析阶段。
@@ -271,7 +273,8 @@ with open('$EVO_DIR/shared/call_spec.json', 'w') as f:
 **执行过程**:
 
 1. 读取 `output/{op_name}_evo_{timestamp}/shared/model.py` 和 `shared/design/tile_level/`
-2. **必读知识库**: 读取 `plugins-community/ops-perf-evolution/skills/evolution-knowledge/references/a3/hardware/guide.md` 和 `a3/optimization_patterns/guide.md`；算子匹配特定族（attention/reduction/elementwise）时额外读取 `a3/algorithm_insights/{family}.md`；`a3/proven_solutions/INDEX.md` 中有同类算子方案时读取对应条目
+2. **OKF 知识库查询**: 用 `evolution-knowledge-query --op-family {family}`（有 baseline 瓶颈信息时加 `--bottleneck {bottleneck}`、`--status active`）查询 `okf/` 的 discovered_strategy / proven_solution / failure_pattern，命中即读对应卡片全文，纳入节点设计（尤其 X 系列策略的适用场景核对）。然后按 a3 渐进式披露：
+   **必读知识库**: 读取 `plugins-community/ops-perf-evolution/skills/evolution-knowledge/references/a3/hardware/guide.md` 和 `a3/optimization_patterns/guide.md`；算子匹配特定族（attention/reduction/elementwise）时额外读取 `a3/algorithm_insights/{family}.md`；`a3/proven_solutions/INDEX.md` 中有同类算子方案时读取对应条目
 3. 分析算子特性: 内存密集型 vs 计算密集型？尾块对齐问题（形状非32字节整数倍）？数据类型特殊处理（FP16/BF16精度）？并读取 `plugins-community/ops-perf-evolution/skills/evolution-strategies/references/strategy-index.md` 识别最相关策略
 4. **模式B特殊处理**: `baseline_performance` 填入实际测量值（来自步骤3B.3），**必须包含 `time_us` 字段**（evolution-report 读取的关键字段）:
    ```json
@@ -665,7 +668,10 @@ print(f'[OK] Refine 验证通过，round_{r} 所有节点已写入世界模型')
 
 **4.4.2 失败诊断（LLM 补充，仅当有失败节点时）**
 
-若 `pending_diagnosis.json` 存在且非空，对每个失败节点读取其 `implementation_note.txt`（最后 30 行），推理 `failure_type`：`"impl_error"`（策略方向正确但实现有误，如语法错误、API 误用）→ 生成修复子节点；`"strategy_infeasible"`（策略本身不可行）→ 封锁该方向（difficulty=5）。
+若 `pending_diagnosis.json` 存在且非空，对每个失败节点读取其 `implementation_note.txt`（最后 30 行）：
+
+1. **先查 OKF 失败模式库**：用 `evolution-knowledge-query --kind failure_pattern --failed-combination {strategy_combination} --status all` 查询 `okf/runbooks/failure-patterns/`。命中（failed_combination 完全匹配）→ 直接复用其 Resolution 判定根因，`failure_type` 按其根因给出；未命中 → 进入常规诊断，并将本次失败按 `evolution-knowledge-maintain` skill 的写入协议沉淀为新 failure_pattern（`status: stub`、`occurrences: 1`，记录 phenomenon / failed_combination / implementation_note 证据）。
+2. **推理 `failure_type`**：`"impl_error"`（策略方向正确但实现有误，如语法错误、API 误用）→ 生成修复子节点；`"strategy_infeasible"`（策略本身不可行）→ 封锁该方向（difficulty=5）。
 
 ```bash
 python3 plugins-community/ops-perf-evolution/skills/evolution-world-model/scripts/wm_ops.py diagnose \
@@ -804,8 +810,8 @@ python3 plugins-community/ops-perf-evolution/skills/evolution-world-model/script
 对每个满足条件的 open_exploration 节点：
 
 1. 读取该内核代码 `output/{op_name}_evo_{timestamp}/{node.solution_ref}/kernel/` 和 `evaluation_results.json` 中的 `implementation_note`
-2. 读取 `plugins-community/ops-perf-evolution/skills/evolution-strategies/references/strategy-index.md` 判断新颖性：该优化手段是否超出现有所有策略的范畴？（不是组合，而是一种新方法论）
-3. **若确认新颖**：列出 `.../references/discovered/disc_X*.md` 确定下一个 X 编号 → 写入新策略文件 `.../discovered/disc_X{n}.md`（格式见下方）→ 在 `strategy-index.md` 末尾追加"探索发现策略"分类条目（已存在则追加到其中）：`| X{n} | {简洁名称} | {一句话描述} |` → 将 `"X{n}"` 追加到 `world_model.json` 的 `discovered_strategies` 列表写回 → 若该手法具有跨算子通用性（非 {op_name} 特有场景），追加沉淀到 `plugins-community/ops-perf-evolution/skills/evolution-knowledge/references/a3/proven_solutions/INDEX.md`（格式见下方"通用方案沉淀"）→ 输出 `"[提示] 策略提炼: 发现新策略 X{n} [{名称}]，已写入策略库，后续 strategy_guided 节点可引用"`
+2. 读取 `plugins-community/ops-perf-evolution/skills/evolution-strategies/references/strategy-index.md` 判断新颖性：该优化手段是否超出现有所有策略的范畴？（不是组合，而是一种新方法论）；同时用 `evolution-knowledge-query --kind discovered_strategy --keyword {手法关键词}` 查 OKF 库，避免与已有 OKF 卡重复
+3. **若确认新颖**：列出 `.../references/discovered/disc_X*.md` 确定下一个 X 编号 → 写入新策略文件 `.../discovered/disc_X{n}.md`（格式见下方）→ **同步写入 OKF 增强版** `plugins-community/ops-perf-evolution/skills/evolution-knowledge/references/okf/strategies/discovered/disc_X{n}.md`（按 `evolution-knowledge-maintain` skill 写入协议：先按 kind+id 查重，带 `kind: discovered_strategy` / `confidence: single_op` / `status: active` / `op_families` / `bottlenecks` / `tags` frontmatter，op_families 与 bottlenecks 从本次算子的 op_family 与 profiling bottleneck 提炼）→ 在 `strategy-index.md` 末尾追加"探索发现策略"分类条目（已存在则追加到其中）：`| X{n} | {简洁名称} | {一句话描述} |` → 将 `"X{n}"` 追加到 `world_model.json` 的 `discovered_strategies` 列表写回 → 若该手法具有跨算子通用性（非 {op_name} 特有场景），追加沉淀到 `plugins-community/ops-perf-evolution/skills/evolution-knowledge/references/a3/proven_solutions/INDEX.md`（格式见下方"通用方案沉淀"）**并同步追加 OKF proven-solution** `okf/runbooks/proven-solutions/x{n}-{slug}.md` → 运行 `python3 plugins-community/ops-perf-evolution/skills/evolution-strategies/scripts/generate_index_json.py` 重建 INDEX.json → 输出 `"[提示] 策略提炼: 发现新策略 X{n} [{名称}]，已写入策略库与 OKF 知识库，后续 strategy_guided 节点可引用"`
 4. **若非新颖**：输出：`"[INFO] open_exploration 手法与策略 {匹配ID} 相似，跳过提炼"`
 
 **新策略文件格式** (`.../discovered/disc_X{n}.md`)：
@@ -845,7 +851,8 @@ base_speedup: {score}x
    - **Key code change**: 从该节点 kernel 代码提取前后关键片段（Before/After）
    - **Applicability conditions**: 适用算子族、shape/平台约束
    - **Strategy IDs**: X{n}（及关联的 P/D/A/R 系列策略）
-3. 输出：`"[提示] 通用方案沉淀: X{n} [{名称}] 已追加到 proven_solutions/INDEX.md"`
+3. **同步追加 OKF proven-solution**：按 `evolution-knowledge-maintain` 协议在 `okf/runbooks/proven-solutions/x{n}-{slug}.md` 建立同内容卡片（带 `kind: proven_solution` / `op_families` / `strategy_ids` frontmatter；已在 OKF 有同类条目时仅补 **Source** 新算子，不重复新增）
+4. 输出：`"[提示] 通用方案沉淀: X{n} [{名称}] 已追加到 proven_solutions/INDEX.md 与 OKF proven-solutions"`
 
 **无分支命中**：跳过，直接进入 4.6 CHECKPOINT。
 

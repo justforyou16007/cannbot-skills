@@ -49,13 +49,9 @@ public:
         HW_ = HW;
         batch_ = batch;
         ciBlocks_ = Ci_ / C0;
-        // hw rows per tile: largest power-of-two <= 128 that keeps both UB
-        // buffers within ~48KB total (slab [Ci][T] + stage [T][Ci])
-        T_ = 128;
-        while (T_ > C0 && Ci_ * T_ * static_cast<int32_t>(sizeof(T)) * 2 >
-                              48 * 1024) {
-            T_ /= 2;
-        }
+        // hw rows per tile: shared with the host via ConvXtransT (UB budget
+        // + exact-divisor preference, P1.5)
+        T_ = ConvXtransT(Ci_, HW_, static_cast<int32_t>(sizeof(T)));
         hwBlocks_ = (HW_ + T_ - 1) / T_;
         xGM_.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(x),
                              static_cast<int64_t>(batch) * Ci_ * HW_);
@@ -80,6 +76,16 @@ public:
 
         AscendC::LocalTensor<T> slab = slabBuf_.Get<T>();
         AscendC::LocalTensor<T> stage = stageBuf_.Get<T>();
+
+        // P1.5 NOTE (measured, reverted): hoisting the TransDataTo5HD
+        // pointer lists out of the tile loop (v3 R1) was NET NEGATIVE here
+        // (case0 xtrans 8.75 -> 9.1us, case9 11.2 -> 12.5us): 128 hoisted
+        // LocalTensor objects with a runtime cib index force stack
+        // materialization, while the per-call constructions are register-
+        // allocated by the compiler. The divisor-of-HW T selection was also
+        // NET NEGATIVE (case0 9.7 -> 12.2us: more tiles = more per-tile
+        // fixed costs). Both halves of P1.5 are reverted to the original
+        // per-call construction + power-of-two T.
 
         int64_t tiles = static_cast<int64_t>(batch_) * hwBlocks_;
         for (int64_t t = coreIdx; t < tiles; t += numCores) {

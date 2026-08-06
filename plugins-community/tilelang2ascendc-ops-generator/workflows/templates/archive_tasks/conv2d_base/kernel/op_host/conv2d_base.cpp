@@ -48,6 +48,8 @@
 #include "aclrtlaunch_conv2d_base_xpad_bf16.h"
 #include "aclrtlaunch_conv2d_base_xtrans_fp16.h"
 #include "aclrtlaunch_conv2d_base_xtrans_bf16.h"
+#include "aclrtlaunch_conv2d_base_dw_fp16.h"
+#include "aclrtlaunch_conv2d_base_dw_bf16.h"
 #include "conv2d_base_tiling.h"
 #include "ops.h"
 
@@ -83,6 +85,55 @@ constexpr size_t kWRepackCacheCapacity = 8;
 std::list<WeightRepackCacheEntry> g_wrepackCache;
 std::mutex g_wrepackCacheMutex;
 
+// P1.8 (ported from v3 R6): shape-keyed LRU cache for the per-call
+// workspaces (im2col / acc / xT). The device kernels fully overwrite every
+// byte of these buffers on each call (im2col pre-zeroes pad regions via
+// in-kernel Duplicate; acc is covered by Fixpipe writes over every block;
+// xT is fully written by xtrans), so reusing a same-size stale buffer is
+// semantics-preserving and eliminates 2-3 at::empty host allocations per
+// operator call. Same-stream execution is assumed (the same assumption the
+// wrepack cache and the per-call workspaces already rely on).
+// Disable with CONV2D_WS_CACHE=0.
+struct WsCacheEntry {
+    int32_t role;  // 0=im2col, 1=acc, 2=xT
+    int64_t bytes;
+    at::Tensor ws;
+};
+
+constexpr size_t kWsCacheCapacity = 32;
+std::list<WsCacheEntry> g_wsCache;
+std::mutex g_wsCacheMutex;
+
+bool wsCacheEnabled()
+{
+    static const bool enabled = [] {
+        const char *e = getenv("CONV2D_WS_CACHE");
+        return !(e != nullptr && atoi(e) == 0);
+    }();
+    return enabled;
+}
+
+at::Tensor wsGet(int32_t role, int64_t bytes)
+{
+    if (!wsCacheEnabled()) {
+        return at::empty({bytes}, at::device(at::kPrivateUse1).dtype(at::kByte));
+    }
+    std::lock_guard<std::mutex> lock(g_wsCacheMutex);
+    for (auto it = g_wsCache.begin(); it != g_wsCache.end(); ++it) {
+        if (it->role == role && it->bytes == bytes) {
+            g_wsCache.splice(g_wsCache.begin(), g_wsCache, it);
+            return it->ws;
+        }
+    }
+    at::Tensor ws = at::empty({bytes},
+                              at::device(at::kPrivateUse1).dtype(at::kByte));
+    g_wsCache.push_front({role, bytes, ws});
+    while (g_wsCache.size() > kWsCacheCapacity) {
+        g_wsCache.pop_back();
+    }
+    return ws;
+}
+
 bool wrepackCacheEnabled()
 {
     static const bool enabled = [] {
@@ -113,7 +164,8 @@ at::Tensor conv2d_base(
     std::vector<int64_t> stride,
     std::vector<int64_t> padding,
     std::vector<int64_t> dilation,
-    std::string data_format)
+    std::string data_format,
+    int64_t groups)
 {
     TORCH_CHECK(x.dim() == 4, "x must be 4D");
     TORCH_CHECK(weight.dim() == 4, "weight must be 4D [Co, Ci, kH, kW]");
@@ -142,7 +194,11 @@ at::Tensor conv2d_base(
     const int64_t Co = weight.sizes()[0];
     const int64_t kH = weight.sizes()[2];
     const int64_t kW = weight.sizes()[3];
-    TORCH_CHECK(weight.sizes()[1] == Ci, "weight Ci must match x");
+    TORCH_CHECK(groups >= 1, "groups must be >= 1");
+    TORCH_CHECK(Ci % groups == 0 && Co % groups == 0,
+                "Ci and Co must be divisible by groups");
+    const int64_t CiG = Ci / groups;
+    TORCH_CHECK(weight.sizes()[1] == CiG, "weight Ci/groups must match x");
     TORCH_CHECK(kH * kW <= 64, "kH*kW > 64 not supported by wrepack tile");
 
     const bool hasBias = bias.has_value() && bias->numel() > 0;
@@ -157,6 +213,95 @@ at::Tensor conv2d_base(
     const int64_t Ho = (H + 2 * pH - dH * (kH - 1) - 1) / sH + 1;
     const int64_t Wo = (W + 2 * pW - dW * (kW - 1) - 1) / sW + 1;
     TORCH_CHECK(Ho > 0 && Wo > 0, "output spatial size must be positive");
+
+    // ---- depthwise direct vector path (groups > 1) ----
+    // P0.1 (v3 R2 port to fp16/bf16): groups == Ci (CiG == 1), Co % Ci == 0
+    // (depthwise multiplier K = Co/Ci supported), stride 1, dilation 1,
+    // kH*kW <= 64, NCHW only -> pure AIV kernel with fp32 accumulation
+    // (conv2d_base_dw_{fp16,bf16}): x planes are staged into a fp32 GM
+    // scratch with zero halo, kW shifted windows are reloaded through
+    // DataCopyPad (absorbs element-grain misalignment), fp32 Axpy FMA
+    // chain, CAST_RINT back to T on store. No im2col / GEMM / epilogue
+    // pipeline. groups > 1 shapes outside this gate (e.g. strided dw, or
+    // 1 < groups < Ci grouped conv) are not supported by this archive.
+    if (groups > 1) {
+        const bool dwOk = (!nhwc) && (groups == Ci) && (Co % Ci == 0) &&
+                          sH == 1 && sW == 1 && dH == 1 && dW == 1 &&
+                          kH * kW <= 64 && W <= 8192 && Co <= 2048;
+        TORCH_CHECK(dwOk,
+                    "conv2d_base archive supports only groups==1 or depthwise "
+                    "(NCHW, groups==Ci, Co%Ci==0, stride==1, dilation==1, "
+                    "kH*kW<=64)");
+
+        auto platformDw = platform_ascendc::PlatformAscendCManager::GetInstance();
+        const int32_t aicNumDw =
+            static_cast<int32_t>(platformDw->GetCoreNumAic());
+        const int32_t WoPad = static_cast<int32_t>((Wo + 7) / 8 * 8);
+        const int32_t haloL = static_cast<int32_t>((pW + 7) / 8 * 8);
+        const int32_t wpadNeed =
+            static_cast<int32_t>(haloL - pW + (kW - 1) * dW + WoPad);
+        const int32_t wpad = (wpadNeed + 7) / 8 * 8;
+        const int64_t winBudget = 76 * 1024;
+        const int32_t rowsMax =
+            static_cast<int32_t>(winBudget / (kW * WoPad * 4));
+        const int32_t rowsNeed1 = static_cast<int32_t>((kH - 1) * dH + 1);
+        TORCH_CHECK(rowsMax >= rowsNeed1,
+                    "conv2d_base depthwise: plane too wide for win buffer");
+        int32_t bandOh = (rowsMax - rowsNeed1) / static_cast<int32_t>(sH) + 1;
+        const int32_t bandOutCap =
+            static_cast<int32_t>((24 * 1024) / (WoPad * 4));
+        bandOh = bandOh > bandOutCap ? bandOutCap : bandOh;
+        bandOh = bandOh < 1 ? 1 :
+                 (bandOh > Ho ? static_cast<int32_t>(Ho) : bandOh);
+        const int32_t rowsSlot = rowsMax;
+
+        at::Tensor y = at::empty({batch, Co, Ho, Wo}, x.options());
+        at::Tensor xp = at::zeros(
+            {batch * Ci * H * static_cast<int64_t>(wpad)},
+            at::device(at::kPrivateUse1).dtype(at::kFloat));
+        at::Tensor biasDw = hasBias ? *bias : weight;  // dummy when no bias
+        const int32_t totalTasksDw = static_cast<int32_t>(batch * Co);
+        const uint32_t dwDim = static_cast<uint32_t>(
+            totalTasksDw < aicNumDw ? totalTasksDw : aicNumDw);
+
+        // named scalars: EXEC_KERNEL_CMD binds args by lvalue ref
+        int32_t batchDw = static_cast<int32_t>(batch);
+        int32_t ciDw = static_cast<int32_t>(Ci);
+        int32_t coDw = static_cast<int32_t>(Co);
+        int32_t coGDw = static_cast<int32_t>(Co / Ci);
+        int32_t hDw = static_cast<int32_t>(H);
+        int32_t wDw = static_cast<int32_t>(W);
+        int32_t wpadDw = wpad;
+        int32_t kHDw = static_cast<int32_t>(kH);
+        int32_t kWDw = static_cast<int32_t>(kW);
+        int32_t sHDw = static_cast<int32_t>(sH);
+        int32_t pHDw = static_cast<int32_t>(pH);
+        int32_t pWDw = static_cast<int32_t>(pW);
+        int32_t dHDw = static_cast<int32_t>(dH);
+        int32_t dWDw = static_cast<int32_t>(dW);
+        int32_t hoDw = static_cast<int32_t>(Ho);
+        int32_t woDw = static_cast<int32_t>(Wo);
+        int32_t woPadDw = WoPad;
+        int32_t rowsSlotDw = rowsSlot;
+        int32_t bandOhDw = bandOh;
+        int32_t haloLDw = haloL;
+        int32_t hasBiasDw = hasBias ? 1 : 0;
+        int32_t totalTasksDwV = totalTasksDw;
+        if (x.scalar_type() == at::kHalf) {
+            EXEC_KERNEL_CMD(conv2d_base_dw_fp16, dwDim, x, xp, weight, biasDw,
+                            y, batchDw, ciDw, coDw, coGDw, hDw, wDw, wpadDw,
+                            kHDw, kWDw, sHDw, pHDw, pWDw, dHDw, dWDw,
+                            hoDw, woDw, woPadDw, rowsSlotDw, bandOhDw,
+                            haloLDw, hasBiasDw, totalTasksDwV);
+        } else {
+            EXEC_KERNEL_CMD(conv2d_base_dw_bf16, dwDim, x, xp, weight, biasDw,
+                            y, batchDw, ciDw, coDw, coGDw, hDw, wDw, wpadDw,
+                            kHDw, kWDw, sHDw, pHDw, pWDw, dHDw, dWDw,
+                            hoDw, woDw, woPadDw, rowsSlotDw, bandOhDw,
+                            haloLDw, hasBiasDw, totalTasksDwV);
+        }
+        return y;
+    }
 
     // ---- tiling scalars ----
     const int32_t CiPad = ConvRoundUp16(static_cast<int32_t>(Ci));
@@ -211,7 +356,16 @@ at::Tensor conv2d_base(
     const uint32_t wDim = static_cast<uint32_t>(wTiles < aivNum ? wTiles : aivNum);
 
     const int32_t woBlocks = static_cast<int32_t>((Wo + 15) / 16);
-    const int32_t i2cTiles = static_cast<int32_t>(batch * Ho * woBlocks);
+    // P1.6 (v3 R5 Opt-B port, MEASURED-REVERTED): kh-dimension task split
+    // for small grids was implemented (kernel-side kh range decode + slice
+    // store, correctness verified 10/10) but is slower in practice: case7
+    // im2col steady 7.8 -> 11.1us. The per-task fixed overhead (~3us:
+    // prezero + 4 sync pairs + strided slice store vs one contiguous store)
+    // does not scale with the 1/kH work, so splitting a latency-bound tiny
+    // tile triples the fixed costs. Gate disabled; kernel machinery kept
+    // (khSplit_=0 => kh0=0/khEnd=kH, identical to the original flow).
+    int32_t khSplitVal = 0;
+    int32_t i2cTiles = static_cast<int32_t>(batch * Ho * woBlocks);
     // stagger-aware cap: ~2 tiles/core for small grids, <= 24 cores for
     // large ones (case 0: 224 tiles -> 24 cores, 42.0 -> 40.8us; case 9:
     // 14 tiles -> 7 cores, 9.1 -> 8.3us measured)
@@ -297,11 +451,9 @@ at::Tensor conv2d_base(
     }
     at::Tensor im2colWs;
     if (!direct1x1 && !fusedOk) {
-        im2colWs = at::empty({totalRows * K * es},
-                             at::device(at::kPrivateUse1).dtype(at::kByte));
+        im2colWs = wsGet(0, totalRows * K * es);
     }
-    at::Tensor accWs = at::empty({totalRows * CoPad * static_cast<int64_t>(sizeof(float))},
-                                 at::device(at::kPrivateUse1).dtype(at::kByte));
+    at::Tensor accWs = wsGet(1, totalRows * CoPad * static_cast<int64_t>(sizeof(float)));
 
     at::Tensor biasArg = hasBias ? *bias : weight;  // dummy ptr when no bias
     const int32_t hasBiasVal = hasBias ? 1 : 0;
@@ -359,8 +511,7 @@ at::Tensor conv2d_base(
         // acc holds [batch*Co, hwPad] fp32 rows in direct mode
         const int64_t accDirectBytes = batch * Co * hwPad * 4;
         if (accDirectBytes > totalRows * CoPad * 4) {
-            accWs = at::empty({accDirectBytes},
-                              at::device(at::kPrivateUse1).dtype(at::kByte));
+            accWs = wsGet(1, accDirectBytes);
         }
         int32_t mGemmD = static_cast<int32_t>(Co);
         int32_t nGemmD = hwPadD;
@@ -434,15 +585,15 @@ at::Tensor conv2d_base(
         at::Tensor xTWs;
         at::Tensor xT = x;
         if (!nhwc) {
-            xTWs = at::empty({batch * Ci * H * W * es},
-                             at::device(at::kPrivateUse1).dtype(at::kByte));
+            xTWs = wsGet(2, batch * Ci * H * W * es);
             xT = xTWs;
         }
-        const int32_t xtT = [&] {
-            int32_t t = 128;
-            while (t > 16 && Ci * t * es * 2 > 48 * 1024) { t /= 2; }
-            return t;
-        }();
+        // P1.5 (v3 R1 port): prefer a T that divides H*W exactly — a ragged
+        // tail tile falls back to per-row loads and unbalances the waves.
+        // ConvXtransT is the single source of truth shared with the kernel.
+        const int32_t xtT = ConvXtransT(static_cast<int32_t>(Ci),
+                                        static_cast<int32_t>(H * W),
+                                        static_cast<int32_t>(es));
         const int32_t xtTiles = static_cast<int32_t>(batch) *
                                 static_cast<int32_t>((H * W + xtT - 1) / xtT);
         uint32_t xtDim;
@@ -504,7 +655,8 @@ at::Tensor conv2d_base(
         EXEC_KERNEL_CMD(conv2d_base_im2col_fp16, i2cDim, x, im2colWs,
                         hVal, wVal, ciVal, ciPadVal, khVal, kwVal, hoVal, woVal,
                         shVal, swVal, dhVal, dwVal, phVal, pwVal,
-                        kVal, mImgVal, woBlocksVal, i2cTilesVal, isNCHW);
+                        kVal, mImgVal, woBlocksVal, i2cTilesVal, isNCHW,
+                        khSplitVal);
         if (stage < 3) return y;
         EXEC_KERNEL_CMD(conv2d_base_conv_fp16, convDimEnv, im2colWs, wWs, accWs,
                         batchVal, mImgVal, coPadVal, kVal, kAL1Val,
@@ -524,7 +676,8 @@ at::Tensor conv2d_base(
         EXEC_KERNEL_CMD(conv2d_base_im2col_bf16, i2cDim, x, im2colWs,
                         hVal, wVal, ciVal, ciPadVal, khVal, kwVal, hoVal, woVal,
                         shVal, swVal, dhVal, dwVal, phVal, pwVal,
-                        kVal, mImgVal, woBlocksVal, i2cTilesVal, isNCHW);
+                        kVal, mImgVal, woBlocksVal, i2cTilesVal, isNCHW,
+                        khSplitVal);
         EXEC_KERNEL_CMD(conv2d_base_conv_bf16, convDimEnv, im2colWs, wWs, accWs,
                         batchVal, mImgVal, coPadVal, kVal, kAL1Val,
                         mBlocksVal, nBlocksVal, totalBlocksVal, directOff,

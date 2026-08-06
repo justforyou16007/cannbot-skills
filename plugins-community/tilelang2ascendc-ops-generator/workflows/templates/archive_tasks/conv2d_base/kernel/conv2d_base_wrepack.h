@@ -81,10 +81,33 @@ public:
         AscendC::LocalTensor<T> tile = tileBuf_.Get<T>();
         AscendC::LocalTensor<T> trans = transBuf_.Get<T>();
 
+        // P1.9 (v3 R3/R6 port): batch DMA calls. The per-c inner loop used
+        // 16 tiny per-row loads + kHkW per-row 32B stores (~26 calls per c,
+        // ~416 per tile; call-count bound at ~60-70ns/call => ~20-27us cold).
+        // Now: ONE 2D DataCopyPad per c loads all 16 co rows (rows pack at
+        // the 32B-rounded pitch, which equals rowElems for 2B dtypes), and
+        // ONE 2D DataCopyPad per c stores all kHkW rows (srcStride=0 packed,
+        // dstStride>0 — the verified multi-row form). The transpose pointer
+        // lists are tile/c-independent (persistent buffers) -> hoisted.
+        using TransT = typename std::conditional<std::is_same<T, half>::value,
+                                                 half, uint16_t>::type;
+
         if (kHkW_ == 1) {
-            // 1x1 fast path: the repack degenerates to a [Co, Ci] transpose.
-            // Load the whole [16 co][16 ci] tile with ONE 2D DataCopyPad
-            // (instead of 16x16 two-byte row copies), transpose once, store.
+            // 1x1 path: the repack degenerates to a [Co, Ci] transpose.
+            // Per (cib, cob) tile: ONE 2D DataCopyPad load, one transpose,
+            // 16 pipelined row stores. NOTE: a full-Co slab variant (16
+            // tasks, one contiguous store per task) was measured and
+            // REVERTED — better steady (16.9 vs ~20us) but consistently
+            // worse in the official cold single-call metric (case9
+            // 53.3-56.5 vs 52.2us baseline across 3 runs); the cold-metric
+            // floor is the first-launch inflation + TransDataTo5HD call
+            // count, which the slab does not reduce.
+            AscendC::LocalTensor<TransT> srcList1[16];
+            AscendC::LocalTensor<TransT> dstList1[16];
+            for (uint32_t i = 0; i < 16; ++i) {
+                srcList1[i] = tile[i * C0].template ReinterpretCast<TransT>();
+                dstList1[i] = trans[C0 * i].template ReinterpretCast<TransT>();
+            }
             for (int32_t t = coreIdx; t < totalTiles; t += numCores) {
                 int32_t cib = t % ciBlocks;
                 int32_t cob = t / ciBlocks;
@@ -115,25 +138,20 @@ public:
                 WaitFlag<AscendC::HardEvent::MTE2_V>(evMte2V);
 
                 // transpose [16 co][16 ci] -> [16 ci][16 co]
-                // (bf16 unsupported by TransDataTo5HD on c220: transpose as raw u16)
-                using TransT = typename std::conditional<std::is_same<T, half>::value,
-                                                         half, uint16_t>::type;
-                AscendC::LocalTensor<TransT> srcList[16];
-                AscendC::LocalTensor<TransT> dstList[16];
-                for (uint32_t i = 0; i < 16; ++i) {
-                    srcList[i] = tile[i * C0].template ReinterpretCast<TransT>();
-                    dstList[i] = trans[C0 * i].template ReinterpretCast<TransT>();
-                }
                 AscendC::TransDataTo5HDParams params(false, false, 1, 0, 0);
-                AscendC::TransDataTo5HD<TransT>(dstList, srcList, params);
+                AscendC::TransDataTo5HD<TransT>(dstList1, srcList1, params);
                 SetFlag<AscendC::HardEvent::V_MTE3>(evVMte3);
                 WaitFlag<AscendC::HardEvent::V_MTE3>(evVMte3);
 
                 // store 16 rows: out[(cib*16 + ci) * CoPad + cob*16] (kk = 0)
+                // NOTE: a 2D batched store (blockCount=16, dstStride=CoPad)
+                // measured SLOWER here than 16 pipelined row stores
+                // (case9 Ci=256/Co=512: cold 24.0 -> 27.3us, reverted)
+                int64_t dstBase = static_cast<int64_t>(cib) * C0 * CoPad_ +
+                                  cob * C0;
                 for (uint32_t ci = 0; ci < C0; ++ci) {
-                    int64_t dstOff = (static_cast<int64_t>(cib) * C0 + ci) * CoPad_
-                                     + cob * C0;
-                    AscendC::DataCopy(outGM_[dstOff], trans[ci * C0], C0);
+                    AscendC::DataCopy(outGM_[dstBase + ci * CoPad_],
+                                      trans[ci * C0], C0);
                 }
                 SetFlag<AscendC::HardEvent::MTE3_MTE2>(evMte3Mte2);
                 WaitFlag<AscendC::HardEvent::MTE3_MTE2>(evMte3Mte2);
@@ -145,60 +163,89 @@ public:
             return;
         }
 
+        // general path (kHkW > 1): per (cib, cob) tile, per c: ONE 2D load +
+        // transpose + ONE 2D store with per-c syncs, so the pipes of
+        // consecutive c iterations overlap (load c+1 during transpose c).
+        // A fully batched variant (stage all 16 c, one sync per pipe)
+        // measured slightly WORSE (case0 steady 12.3 -> 13.0us): it
+        // serializes the MTE2 loads against the V transposes.
+        uint16_t dstRS = (repeats_ == 1) ? 0 : 16;
+        uint16_t srcRS = (repeats_ == 1) ? 0 : 1;
+        // per-kk dst row stride in the K-major ws (elements)
+        const int64_t kkStride = fused_ ? static_cast<int64_t>(C0) * CoPad_
+                                        : static_cast<int64_t>(CiPad_) * CoPad_;
+        AscendC::LocalTensor<TransT> srcList[16];
+        AscendC::LocalTensor<TransT> dstList[16];
+        for (uint32_t i = 0; i < 16; ++i) {
+            srcList[i] = tile[i * rowElems_].template ReinterpretCast<TransT>();
+            dstList[i] = trans[C0 * i].template ReinterpretCast<TransT>();
+        }
+
         for (int32_t t = coreIdx; t < totalTiles; t += numCores) {
             int32_t cib = t % ciBlocks;
             int32_t cob = t / ciBlocks;
+            int32_t validCo = Co_ - cob * C0;
+            validCo = validCo < static_cast<int32_t>(C0) ? validCo
+                                                         : static_cast<int32_t>(C0);
 
-            // every ci of the 16-channel block needs its own [16 co][kk]
-            // load + transpose + store (k rows (kk, cib*16+c) for c in [0,16))
+            // every ci of the 16-channel block: [16 co][kk] 2D load +
+            // transpose + [kk][16 co] 2D store
             for (uint32_t c = 0; c < C0; ++c) {
                 int32_t ci = cib * C0 + static_cast<int32_t>(c);
 
-                // load [16 co][rowElems kk] tile (zero-padded)
-                for (uint32_t r = 0; r < 16; ++r) {
-                    int32_t co = cob * C0 + r;
-                    if (co < Co_ && ci < Ci_) {
-                        int64_t srcOff = (static_cast<int64_t>(co) * Ci_ + ci) * kHkW_;
-                        AscendC::DataCopyExtParams cp{1, static_cast<uint32_t>(kHkW_ * sizeof(T)),
-                                                      0, 0, 0};
-                        AscendC::DataCopyPadExtParams<T> pp{true, 0,
-                            static_cast<uint8_t>(rowElems_ - kHkW_), static_cast<T>(0)};
-                        AscendC::DataCopyPad(tile[r * rowElems_], wGM_[srcOff], cp, pp);
-                    } else {
-                        AscendC::Duplicate(tile[r * rowElems_], static_cast<T>(0), rowElems_);
+                if (ci < Ci_) {
+                    // zero the co-tail rows (keep pad co columns defined)
+                    if (validCo < static_cast<int32_t>(C0)) {
+                        for (int32_t r = validCo; r < static_cast<int32_t>(C0);
+                             ++r) {
+                            AscendC::Duplicate(tile[r * rowElems_],
+                                               static_cast<T>(0), rowElems_);
+                        }
                     }
+                    // ONE 2D load: [validCo co rows][kHkW] from
+                    // w[cob*16 + r][ci][0]; rows pack at the 32B-rounded
+                    // pitch == rowElems (2B dtypes). In-row pad columns
+                    // [kHkW, rowElems) keep stale data — they transpose into
+                    // trans rows kk >= kHkW, which are never stored.
+                    int64_t srcOff = (static_cast<int64_t>(cob) * C0 * Ci_ +
+                                      ci) * kHkW_;
+                    AscendC::DataCopyExtParams cp{static_cast<uint16_t>(validCo),
+                        static_cast<uint32_t>(kHkW_ * sizeof(T)),
+                        static_cast<uint32_t>((Ci_ - 1) * kHkW_ * sizeof(T)),
+                        0, 0};
+                    AscendC::DataCopyPadExtParams<T> pp{false, 0, 0,
+                                                        static_cast<T>(0)};
+                    AscendC::DataCopyPad(tile, wGM_[srcOff], cp, pp);
+                } else {
+                    // ci tail: the K rows for ci >= Ci MUST be zero — the
+                    // im2col ws pads those columns with zeros and 0 x NaN
+                    // (stale GM) would poison the GEMM accumulator
+                    AscendC::Duplicate(tile, static_cast<T>(0),
+                                       C0 * rowElems_);
                 }
                 SetFlag<AscendC::HardEvent::MTE2_V>(evMte2V);
                 WaitFlag<AscendC::HardEvent::MTE2_V>(evMte2V);
 
                 // transpose [16 co][kk] -> [kk][16 co]
-                // (bf16 unsupported by TransDataTo5HD on c220: transpose as raw u16)
-                using TransT = typename std::conditional<std::is_same<T, half>::value,
-                                                         half, uint16_t>::type;
-                AscendC::LocalTensor<TransT> srcList[16];
-                AscendC::LocalTensor<TransT> dstList[16];
-                for (uint32_t i = 0; i < 16; ++i) {
-                    srcList[i] = tile[i * rowElems_].template ReinterpretCast<TransT>();
-                    dstList[i] = trans[C0 * i].template ReinterpretCast<TransT>();
-                }
-                uint16_t dstRS = (repeats_ == 1) ? 0 : 16;
-                uint16_t srcRS = (repeats_ == 1) ? 0 : 1;
                 AscendC::TransDataTo5HDParams params(false, false,
-                                                     static_cast<uint8_t>(repeats_), dstRS, srcRS);
+                    static_cast<uint8_t>(repeats_), dstRS, srcRS);
                 AscendC::TransDataTo5HD<TransT>(dstList, srcList, params);
                 SetFlag<AscendC::HardEvent::V_MTE3>(evVMte3);
                 WaitFlag<AscendC::HardEvent::V_MTE3>(evVMte3);
 
-                // store rows kk < kHkW to wOut[kIdx*CoPad + cob*16]; kIdx is
-                // (kk*CiPad + ci) in im2col order, ((cib*kHkW + kk)*C0 + c)
-                // in the P5 fused img2col-LoadData3D order (ci1 outermost)
-                for (int32_t kk = 0; kk < kHkW_; ++kk) {
-                    int64_t kIdx = fused_
-                        ? (static_cast<int64_t>(cib) * kHkW_ + kk) * C0 + c
-                        : static_cast<int64_t>(kk) * CiPad_ + ci;
-                    int64_t dstOff = kIdx * CoPad_ + cob * C0;
-                    AscendC::DataCopy(outGM_[dstOff], trans[kk * C0], C0);
-                }
+                // ONE 2D store: rows kk = 0..kHkW-1, src packed (trans rows
+                // are contiguous 32B blocks), dst row stride kkStride elems
+                // (> C0 always, so dstStride > 0). kIdx is (kk*CiPad + ci)
+                // in im2col order, ((cib*kHkW + kk)*C0 + c) in the P5 fused
+                // img2col-LoadData3D order (ci1 outermost).
+                int64_t dstBase = fused_
+                    ? (static_cast<int64_t>(cib) * kHkW_ * C0 + c) * CoPad_ +
+                      cob * C0
+                    : static_cast<int64_t>(ci) * CoPad_ + cob * C0;
+                AscendC::DataCopyExtParams sp{static_cast<uint16_t>(kHkW_),
+                    static_cast<uint32_t>(C0 * sizeof(T)), 0,
+                    static_cast<uint32_t>((kkStride - C0) * sizeof(T)), 0};
+                AscendC::DataCopyPad(outGM_[dstBase], trans, sp);
                 SetFlag<AscendC::HardEvent::MTE3_MTE2>(evMte3Mte2);
                 WaitFlag<AscendC::HardEvent::MTE3_MTE2>(evMte3Mte2);
                 // MTE3 store reads trans; next sub-iteration's V (transpose)

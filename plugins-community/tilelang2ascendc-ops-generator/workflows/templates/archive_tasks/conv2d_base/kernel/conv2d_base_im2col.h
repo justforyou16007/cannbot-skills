@@ -67,6 +67,7 @@ public:
                                 int32_t padH, int32_t padW,
                                 int32_t K, int32_t mImg, int32_t woBlocks,
                                 int32_t totalTiles, int32_t isNCHW,
+                                int32_t khSplit,
                                 AscendC::TPipe *pipe)
     {
         H_ = H;
@@ -120,6 +121,15 @@ public:
             // ci rows (srcOff parity = f(ci) via ci*H*W) -> require H*W even
             useFast_ = 0;
         }
+        // P1.6 (v3 R5 Opt-B port): the host may split tasks by kh on small
+        // grids (totalTiles then counts (img,ho,woBlock,kh)). Only the fast
+        // path implements the split decode; legacy falls back to the
+        // unsplit count.
+        khSplit_ = khSplit;
+        if (khSplit_ && !useFast_) {
+            totalTiles_ = totalTiles_ / kH_;
+            khSplit_ = 0;
+        }
 
         pipe->InitBuffer(slabBuf_,
                          static_cast<uint32_t>(useFast_ ? fastSlabBytes : slabBytes));
@@ -165,9 +175,23 @@ public:
         AscendC::LocalTensor<T> rowbuf = rowbufBuf_.Get<T>();
 
         for (int32_t t = coreIdx; t < totalTiles_; t += numCores) {
-            int32_t wb = t % woBlocks_;
-            int32_t ho = (t / woBlocks_) % Ho_;
-            int32_t img = t / (woBlocks_ * Ho_);
+            // P1.6: optional kh-dimension task split for small grids
+            // (each task then handles exactly one kh band)
+            int32_t kh0 = 0;
+            int32_t khEnd = kH_;
+            int32_t wb, ho, img;
+            if (khSplit_) {
+                kh0 = t % kH_;
+                khEnd = kh0 + 1;
+                int32_t rest = t / kH_;
+                wb = rest % woBlocks_;
+                ho = (rest / woBlocks_) % Ho_;
+                img = rest / (woBlocks_ * Ho_);
+            } else {
+                wb = t % woBlocks_;
+                ho = (t / woBlocks_) % Ho_;
+                img = t / (woBlocks_ * Ho_);
+            }
             uint32_t mCnt = Wo_ - wb * MTILE;
             mCnt = mCnt > MTILE ? MTILE : mCnt;
             uint32_t wWin = (mCnt - 1) * sW_ + (kW_ - 1) * dW_ + 1;
@@ -178,13 +202,14 @@ public:
                 // P4: one prezero + all (kh,cib) loads back-to-back + ONE
                 // MTE2->V wait + all transposes back-to-back (V pipe keeps
                 // program order). Replaces 2 flag pairs per (kh,cib).
-                AscendC::Duplicate(slabAll, static_cast<T>(0),
-                                   static_cast<int32_t>(kH_) *
+                AscendC::Duplicate(slabAll[kh0 * ciBlocks_ * 16 * wWinPad_],
+                                   static_cast<T>(0),
+                                   (khEnd - kh0) *
                                    static_cast<int32_t>(ciBlocks_) * 16 *
                                    static_cast<int32_t>(wWinPad_));
                 SetFlag<AscendC::HardEvent::V_MTE2>(evVMte2_);
                 WaitFlag<AscendC::HardEvent::V_MTE2>(evVMte2_);
-                for (int32_t kh = 0; kh < kH_; ++kh) {
+                for (int32_t kh = kh0; kh < khEnd; ++kh) {
                     int32_t hi = ho * sH_ + kh * dH_ - pH_;
                     for (int32_t cib = 0; cib < (int32_t)ciBlocks_; ++cib) {
                         AscendC::LocalTensor<T> slice =
@@ -194,7 +219,7 @@ public:
                 }
                 SetFlag<AscendC::HardEvent::MTE2_V>(evMte2V_);
                 WaitFlag<AscendC::HardEvent::MTE2_V>(evMte2V_);
-                for (int32_t kh = 0; kh < kH_; ++kh) {
+                for (int32_t kh = kh0; kh < khEnd; ++kh) {
                     for (int32_t cib = 0; cib < (int32_t)ciBlocks_; ++cib) {
                         AscendC::LocalTensor<T> slice =
                             slabAll[(kh * ciBlocks_ + cib) * 16 * wWinPad_];
@@ -202,7 +227,7 @@ public:
                     }
                 }
             } else {
-                for (int32_t kh = 0; kh < kH_; ++kh) {
+                for (int32_t kh = kh0; kh < khEnd; ++kh) {
                     int32_t hi = ho * sH_ + kh * dH_ - pH_;
                     // whole-row slab loads straight into transAll[kh] slice
                     AscendC::LocalTensor<T> dst =
@@ -210,7 +235,7 @@ public:
                     LoadSlabNHWC(img, hi, wiStart, wWin, dst);
                 }
             }
-            ExpandStore(img, ho, wb, mCnt, ws, transAll, rowbuf);
+            ExpandStore(img, ho, wb, mCnt, ws, kh0, khEnd, transAll, rowbuf);
         }
     }
 
@@ -303,11 +328,14 @@ private:
         AscendC::TransDataTo5HD<TransT>(dstList, srcList, params);
     }
 
-    // FAST: expansion + store for one (img, ho, wb) tile.
+    // FAST: expansion + store for one (img, ho, wb[, kh]) tile.
     // transAll layout [kH*wWinPad][CiPad]; GM rows of the tile are consecutive
-    // im2col rows: row0 = img*mImg + ho*Wo + wb*MTILE.
+    // im2col rows: row0 = img*mImg + ho*Wo + wb*MTILE. With the P1.6 kh
+    // split only [kh0, khEnd) bands are expanded and only their column slice
+    // of the row buffer is stored.
     __aicore__ inline void ExpandStore(int32_t img, int32_t ho, int32_t wb,
                                        uint32_t mCnt, int32_t ws,
+                                       int32_t kh0, int32_t khEnd,
                                        AscendC::LocalTensor<T> &transAll,
                                        AscendC::LocalTensor<T> &rowbuf)
     {
@@ -322,29 +350,57 @@ private:
                 WaitFlag<AscendC::HardEvent::MTE2_V>(evMte2V_);
             }
             if (dbgNoStore_ != 1 && dbgNoStore_ != 7) {
-                for (int32_t kh = 0; kh < kH_; ++kh) {
+                for (int32_t kh = kh0; kh < khEnd; ++kh) {
                     int32_t hi = ho * sH_ + kh * dH_ - pH_;
                     uint32_t shift = ShiftOf(img, hi, ws);
-                    for (int32_t kw = 0; kw < kW_; ++kw) {
-                        uint32_t srcRow = kh * wWinPad_ + kw * dW_ + shift;
-                        uint32_t dstCol = (kh * kW_ + kw) * CiPad_;
+                    if (dW_ == 1) {
+                        // P1.7: the kW per-kw V-copies of one kh band read
+                        // CONSECUTIVE transAll rows and write contiguous
+                        // rowbuf columns — ONE Copy per kh (kH*kW -> kH calls)
+                        uint32_t srcRow = kh * wWinPad_ + shift;
+                        uint32_t dstCol = kh * kW_ * CiPad_;
                         AscendC::CopyRepeatParams rp{
                             1, 1,
                             static_cast<uint16_t>(K_ * esz / 32),
                             static_cast<uint16_t>(sW_ * CiPad_ * esz / 32)};
                         AscendC::Copy(rowbuf[dstCol], transAll[srcRow * CiPad_],
-                                      static_cast<uint64_t>(CiPad_),
+                                      static_cast<uint64_t>(kW_ * CiPad_),
                                       static_cast<uint8_t>(mCnt), rp);
+                    } else {
+                        for (int32_t kw = 0; kw < kW_; ++kw) {
+                            uint32_t srcRow = kh * wWinPad_ + kw * dW_ + shift;
+                            uint32_t dstCol = (kh * kW_ + kw) * CiPad_;
+                            AscendC::CopyRepeatParams rp{
+                                1, 1,
+                                static_cast<uint16_t>(K_ * esz / 32),
+                                static_cast<uint16_t>(sW_ * CiPad_ * esz / 32)};
+                            AscendC::Copy(rowbuf[dstCol], transAll[srcRow * CiPad_],
+                                          static_cast<uint64_t>(CiPad_),
+                                          static_cast<uint8_t>(mCnt), rp);
+                        }
                     }
                 }
             }
             SetFlag<AscendC::HardEvent::V_MTE3>(evVMte3_);
             WaitFlag<AscendC::HardEvent::V_MTE3>(evVMte3_);
             if (dbgNoStore_ != 1 && dbgNoStore_ != 7) {
-                // tile rows are consecutive im2col rows -> one contiguous store
-                AscendC::DataCopyParams cp{static_cast<uint16_t>(mCnt),
-                    static_cast<uint16_t>(K_ * esz / 32), 0, 0};
-                AscendC::DataCopy(im2colGM_[row0 * K_], rowbuf, cp);
+                if (khSplit_) {
+                    // P1.6: store only this task's [kh0] column slice:
+                    // [mCnt rows][kW*CiPad] at row stride K on both sides
+                    uint32_t slice = kW_ * CiPad_;
+                    AscendC::DataCopyParams cp{static_cast<uint16_t>(mCnt),
+                        static_cast<uint16_t>(slice * esz / 32),
+                        static_cast<uint16_t>((K_ - slice) * esz / 32),
+                        static_cast<uint16_t>((K_ - slice) * esz / 32)};
+                    AscendC::DataCopy(im2colGM_[row0 * K_ + kh0 * slice],
+                                      rowbuf[kh0 * slice], cp);
+                } else {
+                    // tile rows are consecutive im2col rows -> one
+                    // contiguous store
+                    AscendC::DataCopyParams cp{static_cast<uint16_t>(mCnt),
+                        static_cast<uint16_t>(K_ * esz / 32), 0, 0};
+                    AscendC::DataCopy(im2colGM_[row0 * K_], rowbuf, cp);
+                }
             }
             SetFlag<AscendC::HardEvent::MTE3_V>(evMte3V_);
             WaitFlag<AscendC::HardEvent::MTE3_V>(evMte3V_);
@@ -353,7 +409,7 @@ private:
             SetFlag<AscendC::HardEvent::V_MTE3>(evVMte3_);
             WaitFlag<AscendC::HardEvent::V_MTE3>(evVMte3_);
             if (dbgNoStore_ != 1 && dbgNoStore_ != 7) {
-                for (int32_t kh = 0; kh < kH_; ++kh) {
+                for (int32_t kh = kh0; kh < khEnd; ++kh) {
                     int32_t hi = ho * sH_ + kh * dH_ - pH_;
                     uint32_t shift = ShiftOf(img, hi, ws);
                     for (int32_t kw = 0; kw < kW_; ++kw) {
@@ -602,6 +658,7 @@ private:
     uint32_t srcShift_;  // odd GM-address realign offset (0/1 elements)
     int32_t useFast_;
     int32_t rowbufMode_;
+    int32_t khSplit_ = 0;
     int32_t evMte2V_;
     int32_t evVMte3_;
     int32_t evMte3Mte2_;

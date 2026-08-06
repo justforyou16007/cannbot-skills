@@ -120,6 +120,42 @@ kH*kW==1 时恰好重合——如果第一个验证 case 恰好是 Ci=16，会"�
    （flag 往返是纯延迟，无事可重叠）。
 8. **MTE3 store 与同 buffer 后续 V 计算**：store 读 trans buffer，下一轮转置覆写它，
    MTE3 必须 drain 后 V 才能继续。
+9. **img2col LoadData3D 通道块索引 C1 ≥ 15（Ci ≥ 240）产生垃圾** → gate C1 ≤ 14，
+   Ci=256/512 回退 normal 路径（archive 因 L1 gate 从未探测该域，勿凭"archive 同
+   结构"推断安全）。
+10. **AIV 侧无 `HardEvent::MTE2_MTE3`**（AIC-only），误用 → 507014 死锁；AIV 等价
+    保护用 SetFlag/WaitFlag 旗标对。
+11. **aicore timeout 的 kernel 会使该 NPU 进入持久坏状态**（同设备 torch_npu 原生
+    conv 都输出错误）——调试崩溃类问题必须先换干净设备对照，避免把设备污染误判
+    为代码回归。
+12. **V 管异步写 vs MTE2/MTE3 读（及 V 读 vs MTE2 写）的 WAR 竞态必须立即配对
+    V_MTE2 / MTE3_V**：手工 buffer 复用链（split-K 求和、批处理 im2col 批次边界）
+    不受"上一 op 的 EnQue/DeQue 已覆盖"保护，各踩过一次精度/覆写坑。
+13. **GM→UB DataCopyPad dstStride=0 的多行打包要求行块长本身 32B 对齐**（fp32
+    ln%8==0），否则行起点未对齐、后续向量读出错——成批加载门限必须按此设定。
+14. **Level-0 count+repeat 形式的向量 API（Cast/Add 等），count 不得超过单条指令
+    元素宽度**（fp32=64，fp16=128）：超出部分**静默保留陈旧值，无报错**，坏点呈
+    指令宽度周期分布（误差分布探针可一次定位）。
+15. **PipeBarrier<PIPE_ALL> 会泄流相邻迭代在飞的 MTE3 存储**（曾致 case0 回归
+    2.5x）——默认选最窄旗标对（V_S/S_V），PIPE_ALL 仅在确需跨多管道时使用。
+16. **TransDataTo5HD per-call 成本 ≈ 140/coC us 固定值**（与 rows、stride 几何无关）
+    ——小 co 转置存在 ~23.5us/tile 结构地板，只能靠减少调用次数（coC 最大化、
+    hi/lo 打包单次调用）或更换转置机制突破。
+17. **一个 .cpp 只能有一个 `extern "C"` kernel**：双 kernel 单文件在
+    rtRegisterAllKernel 阶段报 107000（binary parse failed）——aclrtlaunch 打包
+    按文件组织，多 kernel 必须拆文件。
+18. **DataCopyPad 每次调用固定成本 ~1.5-2us、每 2D block 描述符 ~100ns**：小 case
+    kernel 设计必须最小化调用次数（20 次调用即 ~34us 地板），整块
+    （blockCount=1）大传输优先；预载类任务"更多并行更优"是伪直觉——
+    whole-copy 预载体积与任务数无关，任务越多 L2 冗余越大（bands 1/2/3 实测
+    17.55/20.69/22.93us）。
+19. **x 内容 LRU 缓存对 benchmark 稳态有效**（harness 输入张量只搬一次）：staging/
+    预处理结果可按 (data_ptr+version+sizes) 缓存，正确性依赖 version_counter
+    追踪原地改写 + 条目持有强引用防 data_ptr 复用（wrepack 缓存同款机制）。
+20. **UB 侧元素粒度位移不可行，唯一可行模式是 GM scratch 位移副本 + blockCount=1
+    整块预载**：UB 内三类位移手段全部受限（向量 src 需 32B 对齐、UB→UB 拷贝
+    32B 块步长、GatherMask src 需 32B 对齐）——需要 {-1,0,+1} 这类元素级窗口
+    位移时，在 GM scratch 写好多份位移副本，再整块大传输载入。
 
 ---
 
@@ -132,3 +168,103 @@ kH*kW==1 时恰好重合——如果第一个验证 case 恰好是 Ci=16，会"�
 | C0 | 16 | fp16/bf16 分形 C0 = 32B/2B |
 | UB 预算 | 192 KB 总量留 headroom | im2col slab / epilogue acc tile 按此反推行数 |
 | epilogue acc tile | ~16K fp32 元素/tile（64KB UB） | rowsPerTile = 8192/CoPad 反推 |
+
+---
+
+## 第八章：六轮性能迭代策略总结（ConvStandard2d 实测）
+
+fp32 Conv2d 全参数（groups/dilation/stride/bias）vs torch_npu 融合 conv，10 case
+精简集（含 depthwise×2、grouped×2、k1/k5s2/dilation 各一），`--quick` 口径。
+六轮迭代 geomean **0.22 → 0.35 → 0.49 → 0.53/0.60 → 0.755 → 0.785**，全程精度
+50/50 保持。
+
+### 轮次轨迹
+
+| 轮 | 策略主题 | geomean | 核心改动 |
+|:---|:---|:---|:---|
+| R1 | fused img2col 落地 | 0.22→0.35 | 4 个 fused kernel（xtrans/wrepack/gemm/epilogue）+ host 按 case 路由，normal 路径保留回退 |
+| R2 | depthwise 专用路径 | 0.35→0.49 | 纯 AIV Axpy kernel，4 个 dw case 全部反超标杆（子集 geomean 1.75） |
+| R3 | 小 case 流水优化 | 0.49→0.53 | xtrans 列表提升 / k1-direct / 工作区 LRU / split-K / im2col 成批 |
+| R4 | 测量口径修正 | 0.53→0.60 | 非代码改动：op_summary 全量采集口径失真，统一 `--quick` |
+| R5 | 瓶颈排序逐项击破 | 0.60→0.755 | epilogue 合并转置 / im2col band 拆分 / flat-span / k1direct 单 kernel |
+| R6 | stride-2 直卷积专用路径 | 0.755→0.785 | s2 去交织 staging（x 内容 LRU 缓存）+ 纯 AIV 直卷积 kernel，case9 0.377→0.546 |
+
+### R1 fused img2col（机制见第四章）
+
+- 硬件 img2col k 序 (ci1,kh,kw,ci0) 用 24 个 one-hot 探针实测确认，勿凭文档假设。
+- C1≥15 硬件缺陷 gate（第六章 #9）；2D UB→GM 批量存储（srcStride=0）实测有效。
+- 教训：fused 收益集中在消 GM 物化，但对小行/微行 case 无效，需后续轮次补齐。
+
+### R2 depthwise 专用路径
+
+- 路由条件：`CiG==1 && groups==Ci && stride==1 && kH*kW≤64`；纯 AIV 原生 fp32
+  FMA（Axpy 链），DataCopyPad 吸收移位窗口非对齐。
+- 教训：**用通用 im2col+GEMM 处理 depthwise 是结构性错误**（0.08x），专用
+  通道级 elementwise kernel 直接反超标杆。groups 类 case 先判 depthwise 再谈 GEMM。
+
+### R3 小 case 流水优化
+
+- **先分解后动手**：msprof 逐 kernel 分解推翻"gemm 流水链主瓶颈"预设——真凶是
+  epilogue_fused（24-42us）与 xtrans（15-45us），gemm 仅 9-26us。
+- TransDataTo5HD 固定成本定律（第六章 #16）→ xtrans 指针列表提升出任务循环
+  （-63~68%）+ host 侧 T 选择避开碎尾 tile。
+- host 工作区（im2col/acc/xtrans buffer）按 shape **LRU 缓存**，消除每调用
+  at::empty/zeros + 清零 kernel（缓存零值语义等价）。
+- split-K 收益有限：gemm per-block 固定成本 ~20us（strip+B 面板+启动+fixpipe）
+  主导而非 kt 循环——**先探针量化固定成本再决定是否拆 K**。
+- im2col 8 行成批门槛 ln%8==0（第六章 #13）。
+- k1-direct 初版（hilo 纯拆分 kernel 走 normal flip GEMM）已证 1x1 免转置可行，
+  R5 Opt-D 将其推到单 kernel 形态。
+
+### R4 测量口径（方法论铁律）
+
+- **msprof 全量 aic-metrics 采集（op_summary 模式）会使 asc 侧虚高 2-3x、ref 侧
+  虚低 ~2x**：同一二进制下 depthwise case 测出 0.21 vs 1.10 的两相反结论。
+  对比测试必须 `--quick`（1 轮采集、无 aic-metrics）。
+- 冷启动 host 开销是假象：稳态 host≈device，每次 launch 固定 ~7.6us。
+- 台间噪声 ±5% 量级：多轮测量趋势一致才可采信，单轮绝对值不可作为回归判据。
+
+### R5 瓶颈排序逐项击破
+
+| 优化 | 机制 | 实测收益 |
+|:---|:---|:---|
+| Opt-A epilogue 合并转置 | hi/lo 打包单次 TransDataTo5HD（repeatCount=2*nb 连续两段）+ 跨步 Cast/Add 重组 + host R=256 候选（UB 门限） | case7 epi 42→15us（0.53→0.68）；case5 0.55→0.65 |
+| Opt-B im2col oh-band 拆分 | 任务粒度 (n,g,ci,kh)→(…,oh-band)，band 数按 2×aicNum 自适应 | case0 im2col 29.6→11.3us（0.44→0.50）；case4→0.85 |
+| Opt-C flat-span 小空间路径 | W==Wo 时 col 行 = 平面连续平移拷贝，1 次装载 + 边缘 kw mask（Duplicate+标量置零）+ 成对存储；同步用最窄 V_S/S_V 旗标（#15） | case1 im2col 227→55us（**0.46→0.92**） |
+| Opt-D k1direct 单 kernel | 1x1/s1/p0 新增纯 AIV Axpy kernel：免 GEMM/免 wrepack/免 hi-lo/免转置，3-launch→1-launch | case3 **0.35→0.84**（33.4us+2launch→13.0us） |
+| （放弃）3-launch MIX 融合 | 可省 ~15us/call，但有 CrossCore 死锁+设备污染史，探针本身危及设备 | 风险 > 收益，记录放弃 |
+
+### R6 stride-2 直卷积专用路径（case9 专项）
+
+case9（[1,16,28,28] k5 s2，M=196/N=16/K=400，2.5 MFLOP）走完整 im2col+cube 流水
+时 90% 耗时是固定成本（gemm per-block ~20us + 转置地板 + 3-launch）。全问题
+（x 50KB + w 25KB）可入单核 UB → 纯 AIV 直卷积路径：
+
+- **s2stage**（仅首调，结果按 x 内容 LRU 缓存，#19）：stride-2 窗口去交织为 4 个
+  stride-1 子平面（行奇偶 GM 2D strided 装载；列奇偶 GatherMask pattern），按
+  {-1,0,+1} 偏移写 3 份 GM scratch 位移副本（#20：UB 侧元素位移不可行）。
+- **s2conv**（每调用）：任务=(n,co)，2 次 blockCount=1 整块预载（#18：DataCopyPad
+  调用次数是地板）+ 400 Axpy + 1 次 2D 存储。
+- 收益：device 44.3us（3 kernel）→ 17.55us（单 kernel），case9 0.377→0.546。
+- 路由 gate 收紧到全量 50 中仅 case9 命中——专用路径的 gate 必须先用全量集
+  验证不误伤其他 case。
+- 教训：v1/v2 两轮基于"串行旗标等待是主因"的假设去串行化，实测只省 10us——
+  **先做阶段探针定位 per-call 固定成本，再定优化结构**。
+- 双 kernel 必须拆 .cpp 文件（#17）。
+
+### 贯穿六轮的方法论
+
+1. **分解先行**：每轮先做逐 kernel 分解/探针实验再动代码（R3/R5 两次推翻预设
+   瓶颈）；多 case 精度失败先看误差分布（周期坏点=指令宽度问题），勿逐个猜。
+2. **固定成本建模**：小 case 由 per-call/per-block 固定成本主导（trans ~140/coC、
+   launch ~7.6us、gemm block ~20us）——先建实测成本模型，再选优化点；预期收益
+   未量化前不上车（R3 无效 barrier 削减、R5 split-K 低收益均为教训）。
+3. **单变量迭代**：每项改动独立"精度 10/10 → quick 实测无回归 → 保留/回退"，
+   无效项回退并记录走偏点，不堆积未验证改动。
+4. **专用路径 > 通用打磨**：depthwise/1x1/小空间三类 case 的收益全部来自专用
+   kernel 或专用路径（R2/Opt-C/Opt-D），通用 im2col+GEMM 的渐进打磨收益递减。
+5. **风险预算**：有设备污染史的方向（MIX 融合）宁可放弃；调试崩溃先换干净设备
+   对照（第六章 #11）。
+6. **tiling 参数单点计算、显式下发**：host 与 kernel 各自推导同一 tiling 参数是
+   高危模式，任一侧引入新候选都会静默破坏另一侧 buffer 预算（曾致 242KB>192KB
+   UB 崩溃）。

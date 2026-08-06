@@ -36,6 +36,8 @@ ascendc_library(kernels STATIC
     ${CMAKE_CURRENT_SOURCE_DIR}/op_kernel/conv2d_base_xpad_bf16.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/op_kernel/conv2d_base_xtrans_fp16.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/op_kernel/conv2d_base_xtrans_bf16.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/op_kernel/conv2d_base_dw_fp16.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/op_kernel/conv2d_base_dw_bf16.cpp
 )
 
 # Include directories for AscendC kernel compilation

@@ -24,7 +24,8 @@ at::Tensor conv2d_base(
     std::vector<int64_t> stride,
     std::vector<int64_t> padding,
     std::vector<int64_t> dilation,
-    std::string data_format);
+    std::string data_format,
+    int64_t groups);
 
 } // namespace ascend_kernel
 

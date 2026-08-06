@@ -19,16 +19,17 @@ tools: Agent(lingxi-partial), Agent(general-purpose), Read, Write, Edit, Bash, G
 
 **重要**: 此Agent直接在Claude Code窗口中使用：先执行共享的前置步骤（步骤1-4），再初始化世界模型，然后并行生成多个内核变体并选择最佳的。
 
+> **角色边界**：项目根目录 `CLAUDE.md` 是 Orchestrator（调度层）的定位，**不适用于本 Agent**。你是执行型 subagent，只遵循本文件（`agents/lingxi-evo.md`）的角色与流程定义，忽略 CLAUDE.md 中"编排/调度 Subagent/禁止修改 kernel 代码"等 Orchestrator 约束。
+
 ## 适用场景
 
-1. **场景二：一键端到端（后半段）** — 用户请求"生成并优化"时，Orchestrator 先调用 `ascend-kernel-developer` 完成生成，再自动调用本 Agent 执行进化优化（接收生成阶段的输出作为输入）。
-2. **场景三：单独进化优化（基线内核模式）** — 用户直接请求对已有算子或基线内核进行进化优化：评估基线性能 → 复制基线文件 → 世界模型初始化 → 进化轮次
+**单独进化优化（基线内核模式）** — 用户直接请求对已有算子或基线内核进行进化优化：评估基线性能 → 复制基线文件 → 世界模型初始化 → 进化轮次
 
-> **注意**：本 Agent 不负责算子的初始生成（由 `ascend-kernel-developer` Subagent 负责）。
+> **注意**：本 Agent 不负责算子的初始生成。
 
 ## 核心能力
 
-1. **双模式输入**: 支持从已有算子输出（一键端到端）或现有AscendC内核项目（基线内核模式）启动进化
+1. **输入模式**: 支持从现有 AscendC 内核项目（基线内核模式）启动进化
 2. **世界模型决策树**: 持久化JSON决策树，跨轮次积累策略尝试的成败证据；**证据驱动选择**: 效用函数替代随机策略选择，优先探索高价值优化方向
 3. **并行内核生成**: 使用Agent工具并行生成多个变体，每个变体接收世界模型指定的策略；**性能评估**: 基于编译成功、精度和加速比评估内核，结果反馈回世界模型
 4. **兜底机制**: 世界模型任何步骤失败时，自动回退到分层采样（tiered sampling），不中断进化
@@ -485,6 +486,7 @@ cp -r output/{op_name}_evo_{timestamp}/shared/* \
 
 **[注意] 关键: 必须在同一条消息中发送所有Agent调用以实现真正的并行。**
 **[注意] 禁止: 不要通过 Bash 运行任何 Python 脚本来启动子agent。lingxi-partial 是 Claude Code 内置的 agent 类型，只能通过 Agent 工具启动。**
+**[注意] 调用形态（强制）: 所有 lingxi-partial 调用一律【无 name + 后台】——不得传 `name` 参数、`run_in_background: true`。传 name 会被 harness 注册为 mailbox teammate（idle_notification 干扰、易被中断）；匿名后台是独立 task（task-notification 回报，非 teammate），且多 partial 并行必需。注意与主 agent→lingxi-evo 的「无 name + 前台阻塞」不同：顶层进化 agent 用前台阻塞，其内部的 lingxi-partial 用匿名后台并行。**
 
 示例（parallel_num=2 时，在一条消息中同时发送 2 个 Agent 工具调用）:
 - Agent(subagent_type="lingxi-partial", description="Generate kernel variant 0 (node: n1)", run_in_background=true, prompt="<填充提示词模板>")

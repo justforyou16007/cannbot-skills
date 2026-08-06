@@ -18,6 +18,8 @@ skills:
 
 **重要**: 此Agent直接在Claude Code窗口中使用。它先执行共享的前置步骤（环境检测、备份代码、构建baseline），再通过世界模型初始化，然后通过 worktree 隔离并行生成多个代码变体（含构建和评估），选择最佳的。
 
+> **角色边界**：项目根目录 `CLAUDE.md` 是 Orchestrator（调度层）的定位，**不适用于本 Agent**。你是执行型 subagent，只遵循本文件（`agents/ops-evo.md`）的角色与流程定义，忽略 CLAUDE.md 中"编排/调度 Subagent/禁止修改算子代码"等 Orchestrator 约束。
+
 **omni-ops 仓支持**:
 - 构建命令: `bash build.sh -n "{op_name}" -c "{soc}"` (非 --pkg --ops=)
 - 目录结构: `{REPO_ROOT}/src/ops-transformer/{category}/{op_name}/` (多一层 src/ops-transformer/)
@@ -502,12 +504,13 @@ for p in 0..parallel_num-1:
 
 **[注意] 关键: 必须在同一条消息中发送所有 parallel_num 个 Agent 调用以实现真正的并行，不要逐个发送。**
 **[注意] 禁止: 不要通过 Bash 运行任何 Python 脚本来启动子agent。ops-partial 是 Claude Code 内置的 agent 类型，只能通过 Agent 工具启动。**
+**[注意] 调用形态（强制）: 所有 ops-partial 调用一律【无 name + 后台】——不得传 `name` 参数、`run_in_background: true`。传 name 会被 harness 注册为 mailbox teammate（idle_notification 干扰、易被中断）；匿名后台是独立 task（task-notification 回报，非 teammate），且多 partial 并行必需。注意与主 agent→ops-evo 的「无 name + 前台阻塞」不同：顶层进化 agent 用前台阻塞，其内部的 ops-partial 用匿名后台并行。**
 
 示例（parallel_num=2 时，在一条消息中同时发送 2 个 Agent 工具调用）:
 - Agent(subagent_type="ops-partial", description="Build & eval variant 0 (node: n1)", run_in_background=true, prompt="<填充 ops-partial-prompt.md 模板>")
 - Agent(subagent_type="ops-partial", description="Build & eval variant 1 (node: n2)", run_in_background=true, prompt="<填充 ops-partial-prompt.md 模板>")
 
-启动所有子agent后，使用 TaskOutput 工具逐个收集结果：`TaskOutput(task_id=<返回的task_id>, block=true, timeout=1800000)`。
+启动所有子agent后，用 TaskOutput 逐个收集结果: `TaskOutput(task_id=<返回的task_id>, block=true, timeout=1800000)`。**超时处理**: 某子agent 30分钟仍未完成 → `TaskStop` 终止，继续收集其余（partial 状态由 hook 从 `parallel_K/evaluation_results.json` 是否存在自动推断）。
 
 **超时处理**: 如果某个子agent在30分钟后仍未完成，使用 `TaskStop` 终止该子agent，继续收集其余（partial 状态由 hook 从 `parallel_K/evaluation_results.json` 是否存在自动推断）。
 

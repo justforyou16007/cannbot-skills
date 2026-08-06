@@ -559,6 +559,7 @@ max_p_retries = 3      # 性能迭代预算上限
 1. **Block 层级设计**：调用 `tilelang2ascend-tilelang-designer` skill，生成 `{output_dir}/design/block_level/`
    - Step 1a-1d: 技术约束检测 + 编程模式决策 + 信息收集 + 生成 block_level/ 骨架
    - Step 1e: 设计期性能初检（反模式扫描 + 算子类型对应的优化范围确认）
+   - Step 1f: **按自检清单逐项检查**——生成/修改任意 `design/block_level/*.py` 后，对照 `ops/tilelang-op-design/references/BlockLevelDesign-quality-checklist.md` 逐项检查（必须项 1,2,3,4,5,6,7,10 全部通过），不通过则修改 block_level/ 直至满足，通过后才允许进入 Tile 层级设计
    - Skill 依赖: `tilelang-op-design`（约束/决策/信息收集）、`tilelang-perf-optimization`（性能反模式）
 2. **Tile 层级设计**：调用 `tilelang2ascend-tilelang-designer` skill，生成 `{output_dir}/design/tile_level/`
    - Step 2a-2d: 编码规范 + GEMM/CV 融合 + V 核并行化 + 生成 tile_level/

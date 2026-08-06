@@ -100,6 +100,7 @@ LINGXI进化支持基线内核模式（用户提供现有AscendC内核项目目�
 - **算子名称**: 简短标识符 (例如: "FastGELU", "Tril")
 - **[基线模式] 基线内核路径**: 现有AscendC内核项目目录路径 (例如: `output/FastGELU_evo_xxx/round_2/parallel_1` 或手写内核目录)
 - **最大轮数** (默认: 2, 推荐: 2-3)；**并行数量**: 每轮并行候选数 (默认: 3, 推荐: 3-5)；**目标加速比** (默认: 3x)
+- **[重要] 目标加速比语义**: `target_speedup` 是**相对 PyTorch** 的加速比（`evaluation_results.json` 的 `speedup` 字段 = Ref_time / Asc_time），**不是**相对基线内核（`comparison.speedup`）。节点 `score` / `best_score` 是 **vs 基线**尺度；判定达标、或计算 `best_score < target_speedup × N` 这类阈值时必须换算：vs PyTorch 加速比 ≈ `comparison.speedup × baseline_vs_pytorch_speedup`，等价地 `effective_target_vs_baseline = target_speedup / baseline_vs_pytorch_speedup`（例：baseline vs PyTorch 0.29x、目标 2.0x → 需相对基线提升 ~6.9x）
 - **停滞窗口** (可选): 连续多少轮无显著提升（< 2%）后提前终止 (默认自动计算 = `max(1, min(ceil(max_rounds / 2), max_rounds - 1))`，该公式确保 window < max_rounds，使停滞检测有机会在上限前触发)
 - **改进轮数** (可选): Local Refinement 内层循环最多执行次数 (默认: 3，设为0可禁用)；**改进停滞窗口** (可选): Local Refinement 连续多少轮无显著提升（< 2%）后退出 (默认: 2)
 
@@ -197,7 +198,7 @@ python3 plugins-community/ops-perf-evolution/skills/evolution-world-model/script
      编译:     [通过]/[失败]（依据 n_cases_valid > 0）
      精度:     [通过]/[失败]（依据 per_case 无 asc_error）
      加速比:   {avg_speedup}x (vs PyTorch, geomean={geomean_speedup}x) | 内核时间: {baseline_time_us}μs
-   进化目标: 超越基线 {avg_speedup}x → 达到 {target_speedup}x
+   进化目标: 相对 PyTorch 达到 {target_speedup}x（当前基线 vs PyTorch {avg_speedup}x → 需相对基线提升 ~{target_speedup / avg_speedup:.1f}x）
    ```
 
 #### 步骤3B.4: 复制基线文件到 shared/
@@ -879,7 +880,7 @@ base_speedup: {score}x
 
 **4.6.2 终止判定**
 
-- [通过] **目标达成**: 任意实现的加速比 ≥ `target_speedup` → `should_continue = false`，输出「 目标达成！最佳加速比 {best_speedup}x ≥ 目标 {target_speedup}x」，进入步骤5
+- [通过] **目标达成**: 任意实现的 **vs PyTorch 加速比（`evaluation_results.json` 的 `speedup` 字段）≥ `target_speedup`** → `should_continue = false`，输出「 目标达成！最佳加速比 {best_vs_pytorch}x ≥ 目标 {target_speedup}x（vs PyTorch）」，进入步骤5。**注意**：节点 `score` / `best_score` 是 vs 基线的 `comparison.speedup`，**不得**直接与 `target_speedup` 比较来判定达标
 - [通过] **全部失败**: 本轮所有实现均失败（编译失败且精度不通过）→ `should_continue = false`，输出「[失败] 本轮全部失败，终止进化」，进入步骤5
 - => **否则**: `r += 1`，返回步骤4.1 GATE，继续下一轮
 

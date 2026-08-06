@@ -19,7 +19,7 @@ TORCH_LIBRARY_FRAGMENT(npu, m)
 {
     m.def("conv2d_base(Tensor x, Tensor weight, Tensor? bias=None, "
           "int[] stride=[1,1], int[] padding=[0,0], int[] dilation=[1,1], "
-          "str data_format=\"NCHW\") -> Tensor");
+          "str data_format=\"NCHW\", int groups=1) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(npu, PrivateUse1, m)

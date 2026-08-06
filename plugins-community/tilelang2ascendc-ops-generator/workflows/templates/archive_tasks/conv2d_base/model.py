@@ -9,13 +9,16 @@ class Model(nn.Module):
     """
     Conv2d reference model (CPU golden).
 
-    forward(x, weight, bias=None, stride=[1,1], padding=[0,0], dilation=[1,1], data_format="NCHW")
+    forward(x, weight, bias=None, stride=[1,1], padding=[0,0], dilation=[1,1],
+            data_format="NCHW", groups=1)
 
     Reference semantics:
       - All inputs are moved to CPU and cast to float32.
       - NHWC input is permuted to NCHW, computed with torch.nn.functional.conv2d,
         then permuted back to NHWC.
       - bias is optional.
+      - groups: grouped/depthwise convolution (groups == C with weight
+        [Co, 1, kH, kW] is depthwise; Co % groups == 0).
       - Result is cast back to x.dtype.
 
     Attribute conventions:
@@ -32,7 +35,8 @@ class Model(nn.Module):
         super(Model, self).__init__()
 
     def forward(self, x: torch.Tensor, weight: torch.Tensor, bias=None,
-                stride=[1, 1], padding=[0, 0], dilation=[1, 1], data_format="NCHW"):
+                stride=[1, 1], padding=[0, 0], dilation=[1, 1], data_format="NCHW",
+                groups=1):
         out_dtype = x.dtype
 
         # NPU branch (performance benchmarking): native torch_npu conv2d,
@@ -42,10 +46,12 @@ class Model(nn.Module):
             if data_format == "NHWC":
                 x_l = x.permute(0, 3, 1, 2)
                 out = F.conv2d(x_l, weight, bias, stride=tuple(stride),
-                               padding=tuple(padding), dilation=tuple(dilation))
+                               padding=tuple(padding), dilation=tuple(dilation),
+                               groups=groups)
                 return out.permute(0, 2, 3, 1).contiguous()
             return F.conv2d(x, weight, bias, stride=tuple(stride),
-                            padding=tuple(padding), dilation=tuple(dilation))
+                            padding=tuple(padding), dilation=tuple(dilation),
+                            groups=groups)
 
         # CPU branch (precision golden): fp32 domain
         x_f32 = x.detach().cpu().to(torch.float32)
@@ -58,7 +64,7 @@ class Model(nn.Module):
 
         out = F.conv2d(x_f32, w_f32, b_f32,
                        stride=tuple(stride), padding=tuple(padding),
-                       dilation=tuple(dilation))
+                       dilation=tuple(dilation), groups=groups)
 
         if data_format == "NHWC":
             # logical [N, Co, Ho, Wo] -> physical [N, Ho, Wo, Co]
@@ -85,6 +91,7 @@ def get_input_groups():
         padding = [0, 0]
         dilation = [1, 1]
         data_format = "NCHW"
+        groups = 1
 
         for inp in inputs:
             name = inp.get("name", "")
@@ -102,6 +109,8 @@ def get_input_groups():
                 dilation = list(inp["value"])
             elif name == "data_format":
                 data_format = inp["value"]
+            elif name == "groups":
+                groups = int(inp["value"])
 
         dtype = dtype_map[x_info["dtype"]]
 
@@ -118,7 +127,7 @@ def get_input_groups():
         if bias_info is not None:
             bias = torch.empty(bias_info["shape"], dtype=dtype).uniform_(-0.5, 0.5)
 
-        input_groups.append([x, weight, bias, stride, padding, dilation, data_format])
+        input_groups.append([x, weight, bias, stride, padding, dilation, data_format, groups])
 
     return input_groups
 

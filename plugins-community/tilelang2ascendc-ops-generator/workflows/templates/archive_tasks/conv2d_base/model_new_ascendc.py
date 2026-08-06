@@ -30,11 +30,13 @@ class ModelNew(nn.Module):
 
     Interface mirrors model.Model:
       forward(x, weight, bias=None, stride=[1,1], padding=[0,0],
-              dilation=[1,1], data_format="NCHW")
+              dilation=[1,1], data_format="NCHW", groups=1)
     x logical shape is always [N, C, H, W]; for data_format="NHWC" the
-    physical tensor is [N, H, W, C]. weight is always [Co, Ci, kH, kW].
+    physical tensor is [N, H, W, C]. weight is always [Co, Ci/groups, kH, kW].
     Layout normalization (NHWC + spatial/channel zero-pad + weight K-major)
-    happens inside the host op.
+    happens inside the host op. groups > 1 routes to the pure-AIV depthwise
+    kernel (gate: NCHW, groups==C, Co%C==0, stride==1, dilation==1,
+    kH*kW<=64); other grouped forms are rejected host-side.
     """
 
     def __init__(self):
@@ -42,10 +44,11 @@ class ModelNew(nn.Module):
 
     def forward(self, x: torch.Tensor, weight: torch.Tensor, bias=None,
                 stride=[1, 1], padding=[0, 0], dilation=[1, 1],
-                data_format="NCHW"):
+                data_format="NCHW", groups=1):
         return torch.ops.npu.conv2d_base(
             x, weight, bias,
             [int(stride[0]), int(stride[1])],
             [int(padding[0]), int(padding[1])],
             [int(dilation[0]), int(dilation[1])],
-            str(data_format))
+            str(data_format),
+            int(groups))

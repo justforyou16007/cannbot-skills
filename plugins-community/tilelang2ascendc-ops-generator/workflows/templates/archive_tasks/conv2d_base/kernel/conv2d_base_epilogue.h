@@ -208,11 +208,13 @@ private:
                     static_cast<uint32_t>(len * sizeof(T)), 0, 0, 0};
                 AscendC::DataCopyPad(yGM_[c0], outLocal, ocp);
             }
-            // buffer reuse across chunks
-            SetFlag<AscendC::HardEvent::V_MTE2>(evVMte2_);
-            WaitFlag<AscendC::HardEvent::V_MTE2>(evVMte2_);
-            SetFlag<AscendC::HardEvent::MTE3_V>(evMte3V_);
-            WaitFlag<AscendC::HardEvent::MTE3_V>(evMte3V_);
+            // buffer reuse across chunks (P1.4: skip on the last chunk)
+            if (c0 + DIRECT_TILE < e1) {
+                SetFlag<AscendC::HardEvent::V_MTE2>(evVMte2_);
+                WaitFlag<AscendC::HardEvent::V_MTE2>(evVMte2_);
+                SetFlag<AscendC::HardEvent::MTE3_V>(evMte3V_);
+                WaitFlag<AscendC::HardEvent::MTE3_V>(evMte3V_);
+            }
         }
     }
 
@@ -273,11 +275,14 @@ private:
             AscendC::DataCopyPad(yGM_[row0 * co_], outLocal, ocp);
             // buffer reuse across tiles: next MTE2 load writes accLocal (was
             // read by V Add/Cast); next V Cast writes outLocal (was read by
-            // the MTE3 store)
-            SetFlag<AscendC::HardEvent::V_MTE2>(evVMte2_);
-            WaitFlag<AscendC::HardEvent::V_MTE2>(evVMte2_);
-            SetFlag<AscendC::HardEvent::MTE3_V>(evMte3V_);
-            WaitFlag<AscendC::HardEvent::MTE3_V>(evMte3V_);
+            // the MTE3 store). P1.4: skipped on the last tile per core (the
+            // round-trip is pure latency with nothing to overlap).
+            if (t + numCores < tiles) {
+                SetFlag<AscendC::HardEvent::V_MTE2>(evVMte2_);
+                WaitFlag<AscendC::HardEvent::V_MTE2>(evVMte2_);
+                SetFlag<AscendC::HardEvent::MTE3_V>(evMte3V_);
+                WaitFlag<AscendC::HardEvent::MTE3_V>(evMte3V_);
+            }
         }
     }
 
@@ -480,11 +485,14 @@ private:
                 AscendC::DataCopyPad(yGM_[dstBase + c * mImg_ + rowsMain],
                                      trans[c * rowsPad + rowsMain], tcp);
             }
-            // buffer reuse across tiles
-            SetFlag<AscendC::HardEvent::V_MTE2>(evVMte2_);
-            WaitFlag<AscendC::HardEvent::V_MTE2>(evVMte2_);
-            SetFlag<AscendC::HardEvent::MTE3_V>(evMte3V_);
-            WaitFlag<AscendC::HardEvent::MTE3_V>(evMte3V_);
+            // buffer reuse across tiles (P1.4: skip on the last tile per
+            // core — pure latency with nothing to overlap)
+            if (t + numCores < tiles) {
+                SetFlag<AscendC::HardEvent::V_MTE2>(evVMte2_);
+                WaitFlag<AscendC::HardEvent::V_MTE2>(evVMte2_);
+                SetFlag<AscendC::HardEvent::MTE3_V>(evMte3V_);
+                WaitFlag<AscendC::HardEvent::MTE3_V>(evMte3V_);
+            }
         }
     }
 

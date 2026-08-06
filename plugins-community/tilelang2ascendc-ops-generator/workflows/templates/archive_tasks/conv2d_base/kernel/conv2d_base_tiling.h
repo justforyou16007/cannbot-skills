@@ -65,4 +65,27 @@ inline int32_t ConvRoundUp16(int32_t v)
     return (v + CONV_C0 - 1) / CONV_C0 * CONV_C0;
 }
 
+// dual-side (host + device) qualifier: device compilation via ccec needs
+// __aicore__; host g++ sees an empty macro
+#if defined(__CCE_AICORE__)
+#define CONV_HOST_DEV __aicore__
+#else
+#define CONV_HOST_DEV
+#endif
+
+// xtrans hw-rows per tile: largest power-of-two <= 128 within the UB
+// budget (slab [Ci][T] + stage [T][Ci] <= ~48KB). NOTE: a divisor-of-HW
+// preference (v3 R1) was measured NET NEGATIVE here (case0 xtrans cold
+// 9.7 -> 12.2us): more tiles = more per-tile fixed costs (loads/trans/
+// store launches), outweighing the eliminated tail-tile penalty. Keep the
+// original halving rule. Single source of truth for host and kernel.
+CONV_HOST_DEV inline int32_t ConvXtransT(int32_t Ci, int32_t HW,
+                                         int32_t dtypeSize)
+{
+    (void)HW;
+    int32_t t = 128;
+    while (t > 16 && Ci * t * dtypeSize * 2 > 48 * 1024) { t /= 2; }
+    return t;
+}
+
 #endif // CONV2D_BASE_TILING_H

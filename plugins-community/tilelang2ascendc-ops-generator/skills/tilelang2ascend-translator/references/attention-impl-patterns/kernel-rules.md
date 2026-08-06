@@ -11,6 +11,7 @@
 | 5. UB / L1 / L0 buffer 规划缺少可追溯依据（重点 L1） | RK-B02 |
 | 6. tiling 边界 off-by-one（end 参数语义） | RK-C01 |
 | 7. impl 阶段私改 common.h 契约无留痕 / cube 与 vec 并发改冲突 | RK-A05 |
+| 8. AIV sub-block 写 workspace 目标地址缺 rowStart_ 偏移 → fp32 精度灾难 | RK-D01 |
 
 - **转译实现时**：按“禁止 / 要求”执行。
 - **代码审查时**：按“检查方法”检查；只报告有明确代码证据的违反项。
@@ -239,10 +240,48 @@ P1：可能导致边界问题或实现意图不可追溯
 
 ---
 
+## 类别 D：MIX kernel sub-block 数据分区
+
+### RK-D01 AIV sub-block 写 workspace 必须按 rowStart_ 偏移目标地址
+
+- **解决问题**：MIX kernel fp32 hi/lo 分片路径下，多 AIV sub-block 并行向同一块 workspace
+  写入 Q/K/V 分片数据时，sub-block 1 覆盖 sub-block 0 的数据，导致 AIC 读到错误的行段，
+  fp32 精度灾难性退化（MRE≈1.0, cos_sim≈0.2）。
+- **锚点**：`op_kernel/*_vec.h` 中所有 `SplitTileToWs` / `ProducerAcquire` 调用点，
+  以及任何 AIV 侧 `DataCopy(workspace[offset], ub, ...)` 写入跨核共享 workspace 的位置。
+- **禁止**：
+  - 多个 sub-block 向同一 workspace slot 的**相同偏移**写入数据 —— sub-block 1 会覆盖
+    sub-block 0 已写入的数据
+  - 依赖"sub-block 串行执行"假设 —— sub-block 可能并行，写入顺序不确定
+  - 仅源地址包含 `rowStart_` 偏移而目标地址遗漏
+- **要求**：
+  - 每个 sub-block 向 workspace 写入时，目标地址必须包含本 sub-block 的行偏移：
+    `workspace[(uint64_t)rowStart_ * dim]`，确保 sub-block 0 写入 rows 0..SUB_ROWS-1，
+    sub-block 1 写入 rows SUB_ROWS..2*SUB_ROWS-1
+  - 此要求适用于所有 AIV→AIC workspace 写入路径：SplitQ、SplitKV、以及任何 DataCopy
+    写 workspace 后由 AIC ConsumerAcquire 读取的场景
+  - 已经正确包含偏移的现有代码（如 `pSlot[(uint64_t)rowStart_ * BLOCK_N]`）不受影响
+- **来源**：ScaledDotProductAttention fp32 路径 `SplitQ`/`SplitKV` 中两 sub-block 均写
+  `workspace[0]`，sub-block 1 覆盖 sub-block 0 的 Q/K/V hi/lo 数据 → AIC 加载到错乱的行 →
+  attention 权重全错 → 多 tile 精度 MRE=0.79~1.46。单 tile 碰巧通过（有效行数少且 padding
+  行覆盖不影响有效输出）。
+- **检查方法**：
+  ```
+  # 1. 找出所有 sub-block 写 workspace 的位置
+  grep -nE 'ProducerAcquire|SplitTileToWs|DataCopy.*Slot|DataCopy.*slot' op_kernel/*_vec*
+  # 2. 对每个写入点，确认目标地址包含 rowStart_ 偏移
+  grep -nE 'rowStart_' op_kernel/*_vec*
+  ```
+  - 若 ProducerAcquire 返回的 slot 直接传给 SplitTileToWs 或 DataCopy 而无 rowStart_ 偏移 → 记 P0
+  - 人工确认：源地址和目标地址是否都包含 sub-block 行偏移 → 缺任意一侧记 P0
+- **等级**：P0（导致 fp32 精度灾难性退化）
+
+---
+
 ## 扩展占位
 
 后续发现新的代码层常见问题，按上述格式追加条目：
 
-- 在已有类别下追加 `RK-XX<下一个编号>`（A 类下一个 RK-A05，B 类下一个 RK-B03，C 类下一个 RK-C02）
+- 在已有类别下追加 `RK-XX<下一个编号>`（A 类下一个 RK-A06，B 类下一个 RK-B03，C 类下一个 RK-C03，D 类下一个 RK-D02）
 - 若是新类别，新建"类别 X：xxx"小节，编号续接
 - 每条规则同时包含生成端约束（禁止/要求）和审查端方法（检查方法/等级），无需同步两份文件

@@ -424,3 +424,8 @@ AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(notifyId);
 - ❌ **CV 1:2 下两 AIV subBlock 都处理全范围**：Scatter/累加被两 subBlock 各做一遍 → 结果 2x。须按 subBlockIdx 切分行/块范围。
 - ❌ **softmaxMax/sum 读取 layout 错**：GM 紧凑 `(B,N,S,G)`，若当 `[dealRows,8]` Brcb 块读 → 行 i 用 G[i\*8] 而非 G[i]（行0 巧合对、行1+ 错）。须 DataCopyPad 紧凑读 + Brcb 行级广播。
 - ❌ **DataCopy(GM↔UB) batch/size 非 8/32B 对齐**：VEC illegal config / CCU address check crash。须 size AlignUp-8（或 32B）多搬，GM 输出段用 DataCopyPad 精确尾段（不可越界写用户输出 tensor）。
+- ❌ **AIV sub-block 写 workspace 目标地址缺 rowStart_ 偏移**：fp32 hi/lo 分片路径下，两 sub-block
+  均向 `workspace[0]` 写入 SplitTileToWs/DataCopy，sub-block 1 覆盖 sub-block 0 的数据 → AIC
+  读到错乱行 → fp32 多 tile 精度灾难（MRE≈1.0, cos≈0.2）。**正确做法**：目标地址必须包含
+  `(uint64_t)rowStart_ * dim` 偏移（如 `kvSlot[(uint64_t)rowStart_ * dimQK]`），确保 sub-block 0
+  写 rows 0-31、sub-block 1 写 rows 32-63。详见 `kernel-rules.md` RK-D01。

@@ -315,6 +315,9 @@ P67-P69 为 Vector 计算效率基础策略（Counter 模式、低延迟归约�
 | X18 | Fused img2col LoadData3D 随路展开（含 band 窗口化） | L2 | conv, im2col, cube, bandwidth-bound | 卷积 A 侧免 GM 物化：NC1HWC0 常驻 L1 + img2col LoadData3D 随路展开进 L0A；xNz 超 L1 时 band 行带窗口化（padTop'/padBottom' 重算保 Ho 光栅恒等）；硬件 k 序 (ci1,kh,kw,ci0) 须 one-hot 探针确认；W<24 窄图/kExtension>64 门控回退；消 70% im2col 占比，大 case 0.32→0.59 | discovered/disc_X18.md |
 | X19 | 1×1 Conv 翻转 GEMM（原始布局即操作数） | L2 | conv-1x1, pointwise, launch-bound | kH=kW=1/s=1/p=0 且 Ci%16==0、(H*W)%16==0 时：A=原始权重 [Co,Ci]、B=原始 x [Ci,H*W]，免 wrepack+im2col 两级发射，epilogue 通道行直写 NCHW；UB 中转解除对齐门控已证净负；实测 1.0~1.98× | discovered/disc_X19.md |
 | X20 | Host 侧权重预打包结果 LRU 缓存 | L2 | host-cache, weight-repack, inference, conv, matmul | conv/matmul 等带权重 repack 步骤的算子，repack 输出是确定函数，推理式重复调用按 (data_ptr+sizes+dtype+version+布局) 做 LRU 缓存，命中跳过整个 repack 发射；条目持 weight 强引用防地址复用；每次调用省 5-15us | discovered/disc_X20.md |
+| X21 | 910B2C Cube 化平台纪律 + 数据驱动 Kahan 精度路由 | L2 | conv3dbf, fp32, kahan, precision-routing | conv 类 fp32 算子 Cube 化时：平台纪律（GetCoreNum 保底、no_half_ufp16 指令表、fp16 3-GEMM）＋数据驱动精度路由（小数值走 fp16 直算、大数值走 Kahan 补偿），绕过 fp32-Cube 缺失并保精度 | discovered/disc_X21.md |
+| X22 | Depthwise 直接卷积（绕过 im2col+GEMM） | L2 | depthwise, conv2d, vector-conv, im2col-bypass | depthwise(groups==Cin,cig==1) 用单 AIV fp32 向量卷积直接算逐通道 kh*kw dot：无 im2col/GEMM/fp16 分裂/GM workspace/Cube；Tile=(image,co-block8,oh-block) 保 32B 对齐，对齐 interior 向量化+标量 head/tail 独立 corr 缓冲消 S/V hazard；depthwise gen-time 提升 18-84x | discovered/disc_X22.md |
+| X23 | Batched Spatial 全宽向量化 + 编译器驱动标量预取 | L2 | conv, cv_fusion, elementwise, s-pipe-latency-hiding | 滑窗卷积 kw==1/W 维逐点：把 P=floor(64/W) 个连续 oh 打包进 64-lane fp32 向量，每 (co,tap) 1 次权重标量读驱动 P*W 宽 Axpy（向量指令+标量读降 P 倍）；Boundary 零填充 + strided DataCopyPad；`#pragma unroll 4` 驱动编译器软件流水隐藏 ~43cy S-pipe 标量读延迟（⚠️手工多标量预取触发编译器误编译，禁用）；W%8==0 门控；geomean 0.36x→3.5x | discovered/disc_X23.md |
 
 ---
 

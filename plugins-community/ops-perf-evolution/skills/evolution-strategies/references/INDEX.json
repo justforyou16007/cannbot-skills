@@ -43,14 +43,14 @@
     ]
   },
   "stats": {
-    "cards": 174,
-    "active_cards": 161,
+    "cards": 178,
+    "active_cards": 165,
     "deprecated": 13,
     "preconditions": 131,
     "playbooks": 131,
     "families": 8,
-    "discovered": 21,
-    "okf": 28
+    "discovered": 23,
+    "okf": 32
   },
   "cards": [
     {
@@ -4090,6 +4090,55 @@
       "description": "在 910B2C（DAV_2201）上把 AIV 算子 Cube 化时，正确性杀手往往不是算法而是**平台纪律**： 四条独立实证的平台陷阱会静默产出垃圾/hang，且 CANN 不报错。逐一避坑后，Cube 路线 才能真正落地；对 fp32 L0C 累加必然超差的相消重元素 case，用**数据驱动预扫描**（非 shape 硬编码）按一般性能量规则分流到 Kahan 兜底，保住全量精度。 四条"
     },
     {
+      "source_key": "evolution-knowledge#okf/strategies/discovered/X22",
+      "id": "X22",
+      "title": "Depthwise 直接卷积（绕过 im2col+GEMM）",
+      "doc_path": "skills/evolution-knowledge/references/okf/strategies/discovered/disc_X22.md",
+      "kind": "discovered_strategy",
+      "confidence": "single_op",
+      "status": "active",
+      "op_families": [
+        "convolution"
+      ],
+      "bottlenecks": [
+        "scalar_compute",
+        "mte3_stall",
+        "compute_bound"
+      ],
+      "tags": [
+        "depthwise",
+        "conv2d",
+        "vector-conv",
+        "im2col-bypass"
+      ],
+      "description": "depthwise(groups==Cin, cig==1) 卷积用单 AIV fp32 向量卷积内核直接计算逐通道 kh*kw dot product，替代 im2col+GEMM 4 阶段流水线——无 im2col、无 GEMM、无 fp16 分裂、无 GM workspace、无 Cube。Tile=(image,co-block8,oh-block) 保证 32B 对齐存储；对齐 interior 向量化 + 标量 head/tail 独立 corr 缓冲消除 S/V hazard。"
+    },
+    {
+      "source_key": "evolution-knowledge#okf/strategies/discovered/X23",
+      "id": "X23",
+      "title": "X23: Batched Spatial 全宽向量化 + 编译器驱动标量预取",
+      "doc_path": "skills/evolution-knowledge/references/okf/strategies/discovered/disc_X23.md",
+      "kind": "discovered_strategy",
+      "confidence": "single_op",
+      "status": "active",
+      "op_families": [
+        "conv",
+        "cv_fusion",
+        "elementwise"
+      ],
+      "bottlenecks": [
+        "scalar_loading",
+        "scalar_compute"
+      ],
+      "tags": [
+        "batched-spatial",
+        "s-pipe-latency-hiding",
+        "pragma-unroll",
+        "full-width-vectorization"
+      ],
+      "description": ""
+    },
+    {
       "source_key": "evolution-knowledge#okf/strategies/discovered/X3",
       "id": "X3",
       "title": "端到端 dtype 直传下沉 (End-to-End Dtype Passthrough)",
@@ -4369,6 +4418,24 @@
       "tags": []
     },
     {
+      "source_key": "evolution-knowledge#okf/runbooks/proven-solutions/x23-batched-spatial-scalar-prefetch",
+      "id": "x23-batched-spatial-scalar-prefetch",
+      "title": "X23: Batched Spatial 全宽向量化 + 编译器驱动标量预取 (ConvStandard3d)",
+      "doc_path": "skills/evolution-knowledge/references/okf/runbooks/proven-solutions/x23-batched-spatial-scalar-prefetch.md",
+      "kind": "proven_solution",
+      "confidence": "single_op",
+      "status": "active",
+      "op_families": [
+        "conv",
+        "cv_fusion",
+        "elementwise"
+      ],
+      "strategy_ids": [
+        "X23"
+      ],
+      "tags": []
+    },
+    {
       "source_key": "evolution-knowledge#okf/runbooks/proven-solutions/x3-hardware-sort-engine-replacement-nms-topk",
       "id": "x3-hardware-sort-engine-replacement-nms-topk",
       "title": "X3: Hardware Sort Engine Replacement (NMS + TopK)",
@@ -4420,6 +4487,34 @@
         "precision",
         "dtype",
         "tail"
+      ]
+    },
+    {
+      "source_key": "evolution-knowledge#okf/runbooks/failure-patterns/f2-multikernel-cube-registration-breaks",
+      "id": "multi-kernel:cube_registration",
+      "title": "build_failure: P102 + P128",
+      "doc_path": "skills/evolution-knowledge/references/okf/runbooks/failure-patterns/f2-multikernel-cube-registration-breaks.md",
+      "kind": "failure_pattern",
+      "phenomenon": "build_failure",
+      "failed_combination": [
+        "P102",
+        "P128"
+      ],
+      "status": "active",
+      "severity": "blocking",
+      "operator_type": [
+        "conv",
+        "matmul",
+        "cv_fusion"
+      ],
+      "op_families": [],
+      "bottlenecks": [],
+      "tags": [
+        "multi-kernel",
+        "kernel-registration",
+        "cube",
+        "mix",
+        "environment"
       ]
     }
   ],
@@ -5849,6 +5944,16 @@
       "source_key": "evolution-strategies#discovered/disc_X21",
       "id": "X21",
       "doc_path": "discovered/disc_X21.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X22",
+      "id": "X22",
+      "doc_path": "discovered/disc_X22.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X23",
+      "id": "X23",
+      "doc_path": "discovered/disc_X23.md"
     },
     {
       "source_key": "evolution-strategies#discovered/disc_X3",

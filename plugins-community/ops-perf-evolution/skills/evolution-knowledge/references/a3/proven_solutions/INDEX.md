@@ -47,6 +47,7 @@ Each entry should follow this template:
 | reduction | X4: Hybrid Scalar/Vector Dispatch | GroupNorm evolution |
 | matmul | MatmulTransA: Cube Tiling Systematic Design | output_0725_v2 generation |
 | conv (backward-filter) | X21: 910B2C Cube 化平台纪律 + 数据驱动 Kahan 精度路由 | conv3dbf_cb evolution |
+| conv (kw==1, 小空间维) | X23: Batched Spatial 全宽向量化 + 编译器驱动标量预取 | 8_ConvStandard3d evolution |
 
 _新方案沉淀时按此格式追加行_
 
@@ -273,6 +274,36 @@ __global__ __aicore__ void conv_dw_cube_kernel(...) {
 - compare 工具判读陷阱：NaN 掩码不匹配时 MERE/MARE 默认 0.0，"MERE=0 但 FAIL" 不代表有限值精确
 
 **Strategy IDs**: X21（关联 X18 k 序探针纪律的 3D 推广）
+
+---
+
+### X23: Batched Spatial 全宽向量化 + 编译器驱动标量预取 (ConvStandard3d)
+
+**Source**: 8_ConvStandard3d evolution, round 1, parallel 2 (x0, open_exploration)
+**Speedup**: 0.36x → 3.51x geomean (60/60 精度 PASS; case46 3599us→5.1us)
+**Operator type**: conv (kw==1, W 维逐点 FMA), fp32 pure-Vector
+**Hardware**: Ascend910B2C (DAV_2201)
+
+**Technique description**:
+把多个连续空间位置打包进全宽 64-lane fp32 向量：task=(n,cg,od) 一次覆盖整条 od 行的全部 oh 输出，P=floor(64/W) 个连续 oh 打包，每个 (co,tap) 仅 1 次权重标量读驱动 P*W 宽 Axpy——向量指令数与 S-pipe 标量读同时降 P 倍。Boundary 用零填充 + strided DataCopyPad 加载合法子区间，compute 统一全宽（零有效性判断）。内层 co-loop 加 `#pragma unroll 4` 让编译器对 GetValue(Axpy) 链软件流水，隐藏 ~43cy S-pipe 标量读延迟。
+
+**Key code change**:
+```cpp
+// Before: task=(n,cg,od,oh), acc(G,W), 每 (co,tap) GetValue + W 宽 Axpy（lane 利用率 1/4~1/8）
+for (g...) { AscendC::Axpy(acc[g*WP_], xLocal_[tt*WP_], wLocal_.GetValue(g*TcP_+tt), W_); }
+
+// After: task=(n,cg,od), acc[G,Hout*W], P 个 oh 打包进 64-lane 全宽向量
+#pragma unroll 4   // ← 编译器软件流水隐藏 S-pipe 标量读延迟（⚠️手工多标量预取触发编译器误编译）
+for (g...) { AscendC::Axpy(acc[g*plane_], xBatch_[0], wLocal_.GetValue(g*K_+tap), P*W_); }
+// xBatch_ Duplicate 清零 + strided DataCopyPad 加载合法 oh 子区间
+```
+
+**Applicability conditions**:
+- 滑窗卷积 kw==1 / W 维逐点 FMA，W∈[8,32] 且 W%8==0（32B 对齐）
+- 任意「小空间维 + 标量权重驱动向量 FMA」的算子，GetValue S-pipe 串行化是主瓶颈（实测换立即数 ~170x）
+- 仅用 `#pragma unroll` 驱动流水；手工多标量预取会触发编译器误编译（结果错误、速度虚高）
+
+**Strategy IDs**: X23
 
 ---
 

@@ -487,6 +487,7 @@ cp -r output/{op_name}_evo_{timestamp}/shared/* \
 **[注意] 关键: 必须在同一条消息中发送所有Agent调用以实现真正的并行。**
 **[注意] 禁止: 不要通过 Bash 运行任何 Python 脚本来启动子agent。lingxi-partial 是 Claude Code 内置的 agent 类型，只能通过 Agent 工具启动。**
 **[注意] 调用形态（强制）: 所有 lingxi-partial 调用一律【无 name + 后台】——不得传 `name` 参数、`run_in_background: true`。传 name 会被 harness 注册为 mailbox teammate（idle_notification 干扰、易被中断）；匿名后台是独立 task（task-notification 回报，非 teammate），且多 partial 并行必需。注意与主 agent→lingxi-evo 的「无 name + 前台阻塞」不同：顶层进化 agent 用前台阻塞，其内部的 lingxi-partial 用匿名后台并行。**
+**[注意] `subagent_type` 必须显式传（强制）: 每次 Agent 调用必须显式携带 `subagent_type="lingxi-partial"`，禁止省略。漏传时 harness 会把该 Agent 调用解析为兜底的 `general-purpose`——即使 prompt 首行写了 "You are a lingxi-partial subagent"，实际注册类型仍是 general-purpose（拿不到 lingxi-partial 的系统提示与专属行为；且 `loop-subagent-stop.sh` 的 SubagentStop 审计只对 lingxi-partial/ops-partial 生效，general-purpose 会被放行绕过审计）。调用参数 {subagent_type, description, run_in_background, prompt} 四项缺一不可。**
 
 示例（parallel_num=2 时，在一条消息中同时发送 2 个 Agent 工具调用）:
 - Agent(subagent_type="lingxi-partial", description="Generate kernel variant 0 (node: n1)", run_in_background=true, prompt="<填充提示词模板>")

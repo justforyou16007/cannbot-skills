@@ -321,11 +321,12 @@ bash ops-lab/tilelang-to-ascendc/skills/tilelang2ascend-translator/scripts/evalu
 ```
 若精度验证失败：恢复 `best_kernel_snapshot`，`no_improve_streak += 1`，跳至 2.5。
 
-性能评测（设备侧精确计时）：
+性能评测（用 ops-profiling quick 模式；禁止手写自定义计时脚本）：
 ```bash
-    --output_dir {output_dir} --timing event --output {output_dir}/perf.json
+bash ops/ops-profiling/scripts/msprof_profile_run.sh --quick \
+    --output-dir={output_dir} --device={npu}
 ```
-从输出中提取 `new_speedup`。
+从生成的 `{output_dir}/performance.json` 提取 `new_speedup`（vs PyTorch 的 ref/asc 几何均值）。
 
 **2.4 收益判断**
 若 `new_speedup > best_speedup × 1.02`（提升 ≥ 2%）：

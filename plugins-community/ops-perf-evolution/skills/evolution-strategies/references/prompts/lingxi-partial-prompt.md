@@ -55,7 +55,8 @@ Do not stop at "the kernel already uses ReduceSum/Axpy/Muls". These are exactly 
 Steps:
 1. AscendC Translation - Translate TileLang design to AscendC kernel (ascendc-translator skill)
 2. Degeneration check - validate_ascendc_impl.py + evaluate_ascendc.sh. See [Optimization Approach] for strategy application.
-3. Functional verification - evaluate_ascendc.sh (accuracy) + lingxi_perf_driver.py (device-side perf)
+3. Functional verification - evaluate_ascendc.sh (accuracy) + 性能评测用 ops-profiling `msprof_profile_run.sh --quick --output-dir={output_dir} --device={npu}`（产出 performance.json / performance.log / perf_report.md）
+   [禁止] 禁止手写自定义计时脚本（自造 measure_perf.py / event_timing.py / op_only_timing.py 等）替代标准评测——性能数据一律以 ops-profiling quick 模式产出的 performance.json / performance.log 为准
    On failure: Conductor analysis (A/B/C classification) → targeted fix → retry (max 3 iterations)
 4. Local Refinement (MANDATORY):
    If Max Improve Rounds > 0 AND compilation_success=true AND precision_passed=true → execute inner refinement loop (see [Config])

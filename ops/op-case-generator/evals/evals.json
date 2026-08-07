@@ -1,0 +1,27 @@
+[
+  {
+    "input": "生成算子描述文件：op_name=25_GELU, 输出到 /tmp/test-op/",
+    "expected_modes": ["generate"],
+    "checks": ["py_exists", "json_exists", "static_pass", "runtime_pass"]
+  },
+  {
+    "input": "给 /tmp/test-op/25_GELU.py 补全测试用例",
+    "expected_modes": ["complete"],
+    "checks": ["json_exists", "static_pass", "runtime_pass"]
+  },
+  {
+    "input": "检查 /tmp/test-op/25_GELU.py 的完整性",
+    "expected_modes": ["evaluate"],
+    "checks": ["static_pass", "runtime_pass", "coverage_score"]
+  },
+  {
+    "input": "批量生成：1_Add, 2_Mul, 3_Sub, 输出到 /tmp/test-op/",
+    "expected_modes": ["batch"],
+    "checks": ["all_py_exist", "all_json_exist", "all_static_pass"]
+  },
+  {
+    "input": "评估 /tmp/test-op/25_GELU.py",
+    "expected_modes": ["evaluate"],
+    "checks": ["static_pass", "runtime_pass", "coverage_score", "suggestions"]
+  }
+]

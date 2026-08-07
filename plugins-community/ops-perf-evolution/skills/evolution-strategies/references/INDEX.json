@@ -43,14 +43,14 @@
     ]
   },
   "stats": {
-    "cards": 181,
-    "active_cards": 168,
+    "cards": 182,
+    "active_cards": 169,
     "deprecated": 13,
     "preconditions": 131,
     "playbooks": 131,
     "families": 8,
-    "discovered": 24,
-    "okf": 35
+    "discovered": 25,
+    "okf": 36
   },
   "cards": [
     {
@@ -4166,6 +4166,34 @@
       "description": ""
     },
     {
+      "source_key": "evolution-knowledge#okf/strategies/discovered/X25",
+      "id": "X25",
+      "title": "X25: 向量权重广播（Brcb + MulAddDst）替代 S-pipe 标量读",
+      "doc_path": "skills/evolution-knowledge/references/okf/strategies/discovered/disc_X25.md",
+      "kind": "discovered_strategy",
+      "confidence": "single_op",
+      "status": "active",
+      "op_families": [
+        "conv",
+        "cv_fusion",
+        "elementwise",
+        "matmul"
+      ],
+      "bottlenecks": [
+        "scalar_loading",
+        "scalar_compute"
+      ],
+      "tags": [
+        "vector-broadcast",
+        "brcb",
+        "muladddst",
+        "scalar-read-elimination",
+        "s-pipe-bypass",
+        "batched-spatial"
+      ],
+      "description": ""
+    },
+    {
       "source_key": "evolution-knowledge#okf/strategies/discovered/X3",
       "id": "X3",
       "title": "端到端 dtype 直传下沉 (End-to-End Dtype Passthrough)",
@@ -6029,6 +6057,11 @@
       "source_key": "evolution-strategies#discovered/disc_X24",
       "id": "X24",
       "doc_path": "discovered/disc_X24.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X25",
+      "id": "X25",
+      "doc_path": "discovered/disc_X25.md"
     },
     {
       "source_key": "evolution-strategies#discovered/disc_X3",

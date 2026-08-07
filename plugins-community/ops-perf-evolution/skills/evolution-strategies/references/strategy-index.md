@@ -319,6 +319,7 @@ P67-P69 为 Vector 计算效率基础策略（Counter 模式、低延迟归约�
 | X22 | Depthwise 直接卷积（绕过 im2col+GEMM） | L2 | depthwise, conv2d, vector-conv, im2col-bypass | depthwise(groups==Cin,cig==1) 用单 AIV fp32 向量卷积直接算逐通道 kh*kw dot：无 im2col/GEMM/fp16 分裂/GM workspace/Cube；Tile=(image,co-block8,oh-block) 保 32B 对齐，对齐 interior 向量化+标量 head/tail 独立 corr 缓冲消 S/V hazard；depthwise gen-time 提升 18-84x | discovered/disc_X22.md |
 | X23 | Batched Spatial 全宽向量化 + 编译器驱动标量预取 | L2 | conv, cv_fusion, elementwise, s-pipe-latency-hiding | 滑窗卷积 kw==1/W 维逐点：把 P=floor(64/W) 个连续 oh 打包进 64-lane fp32 向量，每 (co,tap) 1 次权重标量读驱动 P*W 宽 Axpy（向量指令+标量读降 P 倍）；Boundary 零填充 + strided DataCopyPad；`#pragma unroll 4` 驱动编译器软件流水隐藏 ~43cy S-pipe 标量读延迟（⚠️手工多标量预取触发编译器误编译，禁用）；W%8==0 门控；geomean 0.36x→3.5x | discovered/disc_X23.md |
 | X24 | AIC_ONLY 任务类型压设备 launch 地板（固定开销主导算子） | L2 | matmul, elementwise, reduction, aic-only, device-launch-floor | 微小 shape 固定开销主导算子（cube_util 极低、标量占比高）：任务类型从 MIX_AIC_1_2 改 `KERNEL_TYPE_AIC_ONLY` 去掉每 AIC 的 2 个空转 AIV，设备固定地板 ~7-8μs→~4.3-4.5μs；配 compact tiling 头（65→4 int32）；与手动 mmad 叠加 12.09→6.88μs（1.757x vs 基线）；上限：910B kernel launch 地板 ~4.3-5.6μs | discovered/disc_X24.md |
+| X25 | 向量权重广播（Brcb + MulAddDst）替代 S-pipe 标量读 | L2 | conv, cv_fusion, elementwise, matmul, scalar-read-elimination | 标量权重驱动向量 FMA 且权重跨 batch 复用：权重 GM 预展开 [Co,K,8]（每权重 8 副本），每 (g,tap) 一次 V-pipe `Brcb` 广播成 64-lane 权重向量驱动 numBatches 条 `MulAddDst`，彻底消除 S-pipe GetValue 标量读（~43cy）；wvec 2×64-lane ping-pong 破写后读；多 batch 摊销最大（case28 5.9x）；numBatches=1 高 K 无摊销收益被 8x 权重载入抵消 | discovered/disc_X25.md |
 
 ---
 

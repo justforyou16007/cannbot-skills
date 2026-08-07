@@ -1,0 +1,6 @@
+case_name,scenario,layout_q,layout_kv,batch_size,seq_len_q,seq_len_kv,n_heads_q,n_heads_kv,head_dim,topk,cmp_ratio,ori_mask_mode,cmp_mask_mode,ori_win_left,ori_win_right,dtype
+swa_decode,SWA,BSND,BSND,1,1,2048,128,1,512,,,4,3,127,0,bfloat16
+swa_prefill,SWA,BSND,BSND,1,16,256,64,1,512,,,4,3,127,0,bfloat16
+swa_nomask,SWA,BSND,BSND,2,8,64,64,1,512,,,0,3,-1,-1,float16
+hca_decode,HCA,BSND,BSND,1,1,1024,128,1,512,,4,4,3,127,0,bfloat16
+hca_prefill,HCA,BSND,BSND,2,4,64,64,1,512,,8,3,3,127,0,float16

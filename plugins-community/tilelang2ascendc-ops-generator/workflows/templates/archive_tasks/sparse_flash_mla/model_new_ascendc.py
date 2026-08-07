@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+# ----------------------------------------------------------------------------------------------------------
+# Copyright (c) 2026 Huawei Technologies Co., Ltd.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# ----------------------------------------------------------------------------------------------------------
+
+"""SparseFlashMla AscendC wrapper.
+
+SparseFlashMla is a packaged CANN operator (``cann_ops_transformer``): the
+host side first runs ``sparse_flash_mla_metadata`` to obtain the task
+partition result, then dispatches the main ``sparse_flash_mla`` op. This
+wrapper mirrors that two-step flow and decodes the same ``attrs`` tensor
+contract used by the reference ``model.py``.
+
+Two packaged-op contract details verified against the ops-transformer
+implementation (``sparse_flash_mla_tiling.cpp``) are handled here:
+
+* ``sinks`` is **required** by the tiling (``GetSinks`` rejects a nullptr),
+  although the product README lists it as optional. ``None`` is therefore
+  translated to a zeros vector, matching the golden's "no sinks" semantics.
+* ``cmp_residual_kv`` is **required** whenever ``cmp_kv`` is present with
+  ``cmp_mask_mode == 3`` and ``cmp_ratio != 1`` (``CheckSingleParaCmpResidualKv``).
+  It restores the pre-compression KV length used for the cmp-side causal
+  threshold: ``ori_len = cmp_len * cmp_ratio + residual``. For full-length
+  BSND tensors the wrapper derives ``seqused_ori_kv = [ori_seq]``,
+  ``seqused_cmp_kv = [cmp_seq]`` and ``cmp_residual_kv = [ori_seq % cmp_ratio]``
+  exactly as the reference pytest does.
+"""
+
+import torch
+import torch.nn as nn
+
+import cann_ops_transformer  # noqa: F401  (registers torch.ops.cann_ops_transformer.*)
+
+
+def _decode_attrs(attrs):
+    """Decode [softmax_scale, cmp_ratio, ori_mask_mode, cmp_mask_mode,
+    ori_win_left, ori_win_right] from the attribute tensor."""
+    if attrs is None:
+        return {
+            "softmax_scale": None,
+            "cmp_ratio": None,
+            "ori_mask_mode": 4,
+            "cmp_mask_mode": 3,
+            "ori_win_left": 127,
+            "ori_win_right": 0,
+        }
+    values = attrs.detach().cpu().float().reshape(-1).tolist()
+    return {
+        "softmax_scale": float(values[0]),
+        "cmp_ratio": int(values[1]) if values[1] >= 0 else None,
+        "ori_mask_mode": int(values[2]),
+        "cmp_mask_mode": int(values[3]),
+        "ori_win_left": int(values[4]),
+        "ori_win_right": int(values[5]),
+    }
+
+
+def sparse_flash_mla_ascendc(
+    q,
+    ori_kv,
+    cmp_kv=None,
+    cmp_sparse_indices=None,
+    sinks=None,
+    attrs=None,
+):
+    """Build metadata on host, then run the SparseFlashMla main op."""
+    attr = _decode_attrs(attrs)
+
+    if q.ndim != 4 or ori_kv.ndim != 4:
+        raise ValueError("q and ori_kv must be 4D [B, S, N, D]")
+    if q.shape[-1] != 512:
+        raise ValueError(f"SparseFlashMla requires D=512, got {q.shape[-1]}")
+    if ori_kv.shape[-2] != 1:
+        raise ValueError(f"SparseFlashMla requires KV_N=1, got {ori_kv.shape[-2]}")
+    if not all(t.is_contiguous() for t in (q, ori_kv)):
+        raise ValueError("q and ori_kv must be contiguous")
+    if cmp_kv is not None and not cmp_kv.is_contiguous():
+        raise ValueError("cmp_kv must be contiguous")
+    if cmp_sparse_indices is not None and not cmp_sparse_indices.is_contiguous():
+        raise ValueError("cmp_sparse_indices must be contiguous")
+
+    softmax_scale = attr["softmax_scale"]
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** -0.5
+    cmp_ratio = 1 if attr["cmp_ratio"] is None else attr["cmp_ratio"]
+
+    if cmp_kv is not None:
+        # full-length BSND tensors: expose the effective lengths explicitly so
+        # the op recovers the pre-compression length for the cmp-side causal
+        # threshold (cmp_len * cmp_ratio + residual == ori_seq). Required by
+        # the tiling when cmp_mask_mode == 3 and cmp_ratio != 1.
+        cmp_seq = int(cmp_kv.shape[1])
+        seqused_ori_kv = torch.tensor(
+            [int(ori_kv.shape[1])], dtype=torch.int32, device=q.device)
+        seqused_cmp_kv = torch.tensor(
+            [cmp_seq], dtype=torch.int32, device=q.device)
+        cmp_residual_kv = torch.tensor(
+            [int(ori_kv.shape[1]) % cmp_ratio], dtype=torch.int32,
+            device=q.device)
+    else:
+        seqused_ori_kv = None
+        seqused_cmp_kv = None
+        cmp_residual_kv = None
+
+    if sinks is None:
+        # the packaged op requires a non-empty sinks tensor (tiling rejects
+        # nullptr); zeros == "no sinks" in the golden semantics
+        sinks = torch.zeros((q.shape[2],), dtype=torch.float32, device=q.device)
+
+    # metadata-first: the task partition must exist before the main op runs
+    metadata = torch.ops.cann_ops_transformer.sparse_flash_mla_metadata(
+        int(q.shape[2]),          # num_heads_q
+        int(ori_kv.shape[2]),     # num_heads_kv
+        int(q.shape[3]),          # head_dim
+        seqused_q=None,
+        seqused_ori_kv=seqused_ori_kv,
+        seqused_cmp_kv=seqused_cmp_kv,
+        cmp_residual_kv=cmp_residual_kv,
+        batch_size=int(q.shape[0]),
+        max_seqlen_q=int(q.shape[1]),
+        max_seqlen_ori_kv=int(ori_kv.shape[1]),
+        max_seqlen_cmp_kv=int(cmp_kv.shape[1]) if cmp_kv is not None else 0,
+        ori_topk=0,
+        cmp_topk=int(cmp_sparse_indices.shape[-1]) if cmp_sparse_indices is not None else 0,
+        cmp_ratio=cmp_ratio,
+        ori_mask_mode=attr["ori_mask_mode"],
+        cmp_mask_mode=attr["cmp_mask_mode"],
+        ori_win_left=attr["ori_win_left"],
+        ori_win_right=attr["ori_win_right"],
+        layout_q="BSND",
+        layout_kv="BSND",
+        has_ori_kv=True,
+        has_cmp_kv=cmp_kv is not None,
+    )
+
+    return torch.ops.cann_ops_transformer.sparse_flash_mla(
+        q,
+        ori_kv=ori_kv,
+        cmp_kv=cmp_kv,
+        cmp_sparse_indices=cmp_sparse_indices,
+        ori_block_table=None,
+        cmp_block_table=None,
+        cu_seqlens_q=None,
+        cu_seqlens_ori_kv=None,
+        cu_seqlens_cmp_kv=None,
+        seqused_q=None,
+        seqused_ori_kv=seqused_ori_kv,
+        seqused_cmp_kv=seqused_cmp_kv,
+        cmp_residual_kv=cmp_residual_kv,
+        sinks=sinks,
+        metadata=metadata,
+        softmax_scale=float(softmax_scale),
+        cmp_ratio=cmp_ratio,
+        ori_mask_mode=attr["ori_mask_mode"],
+        cmp_mask_mode=attr["cmp_mask_mode"],
+        ori_win_left=attr["ori_win_left"],
+        ori_win_right=attr["ori_win_right"],
+        layout_q="BSND",
+        layout_kv="BSND",
+        topk_value_mode=1,
+        return_softmax_lse=False,
+    )
+
+
+class ModelNew(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        ori_kv: torch.Tensor,
+        cmp_kv=None,
+        cmp_sparse_indices=None,
+        sinks=None,
+        attrs=None,
+    ):
+        return sparse_flash_mla_ascendc(
+            q, ori_kv, cmp_kv=cmp_kv,
+            cmp_sparse_indices=cmp_sparse_indices, sinks=sinks, attrs=attrs,
+        )
+
+
+def get_init_inputs():
+    return []

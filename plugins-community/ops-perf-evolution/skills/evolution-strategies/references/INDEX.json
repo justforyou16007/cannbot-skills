@@ -43,14 +43,14 @@
     ]
   },
   "stats": {
-    "cards": 178,
-    "active_cards": 165,
+    "cards": 181,
+    "active_cards": 168,
     "deprecated": 13,
     "preconditions": 131,
     "playbooks": 131,
     "families": 8,
-    "discovered": 23,
-    "okf": 32
+    "discovered": 24,
+    "okf": 35
   },
   "cards": [
     {
@@ -4139,6 +4139,33 @@
       "description": ""
     },
     {
+      "source_key": "evolution-knowledge#okf/strategies/discovered/X24",
+      "id": "X24",
+      "title": "X24: AIC_ONLY 任务类型压设备 launch 地板（固定开销主导算子）",
+      "doc_path": "skills/evolution-knowledge/references/okf/strategies/discovered/disc_X24.md",
+      "kind": "discovered_strategy",
+      "confidence": "single_op",
+      "status": "active",
+      "op_families": [
+        "matmul",
+        "elementwise",
+        "reduction"
+      ],
+      "bottlenecks": [
+        "scalar_compute",
+        "no_overlap",
+        "compute_bound"
+      ],
+      "tags": [
+        "aic-only",
+        "device-launch-floor",
+        "fixed-overhead-dominated",
+        "tiny-shape",
+        "KERNEL_TYPE"
+      ],
+      "description": ""
+    },
+    {
       "source_key": "evolution-knowledge#okf/strategies/discovered/X3",
       "id": "X3",
       "title": "端到端 dtype 直传下沉 (End-to-End Dtype Passthrough)",
@@ -4436,6 +4463,23 @@
       "tags": []
     },
     {
+      "source_key": "evolution-knowledge#okf/runbooks/proven-solutions/x24-manual-mmad-break-matmulimpl-floor-910b",
+      "id": "x24-manual-mmad-break-matmulimpl-floor-910b",
+      "title": "X24: 手动 mmad 打破 MatmulImpl 固定开销地板（910B 微小 matmul）",
+      "doc_path": "skills/evolution-knowledge/references/okf/runbooks/proven-solutions/x24-manual-mmad-break-matmulimpl-floor-910b.md",
+      "kind": "proven_solution",
+      "confidence": "single_op",
+      "status": "active",
+      "op_families": [
+        "matmul"
+      ],
+      "strategy_ids": [
+        "P87",
+        "X24"
+      ],
+      "tags": []
+    },
+    {
       "source_key": "evolution-knowledge#okf/runbooks/proven-solutions/x3-hardware-sort-engine-replacement-nms-topk",
       "id": "x3-hardware-sort-engine-replacement-nms-topk",
       "title": "X3: Hardware Sort Engine Replacement (NMS + TopK)",
@@ -4515,6 +4559,32 @@
         "cube",
         "mix",
         "environment"
+      ]
+    },
+    {
+      "source_key": "evolution-knowledge#okf/runbooks/failure-patterns/f3-manual-mmad-loaddata3d-16x16-trap",
+      "id": "manual-mmad:loaddata3d-16x16-only",
+      "title": "precision_failure: P87",
+      "doc_path": "skills/evolution-knowledge/references/okf/runbooks/failure-patterns/f3-manual-mmad-loaddata3d-16x16-trap.md",
+      "kind": "failure_pattern",
+      "phenomenon": "precision_failure",
+      "failed_combination": [
+        "P87"
+      ],
+      "status": "active",
+      "severity": "blocking",
+      "operator_type": [
+        "matmul"
+      ],
+      "op_families": [],
+      "bottlenecks": [],
+      "tags": [
+        "manual-mmad",
+        "loaddata3d",
+        "fractal-loading",
+        "transpose",
+        "l0a",
+        "l0b"
       ]
     }
   ],
@@ -5954,6 +6024,11 @@
       "source_key": "evolution-strategies#discovered/disc_X23",
       "id": "X23",
       "doc_path": "discovered/disc_X23.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X24",
+      "id": "X24",
+      "doc_path": "discovered/disc_X24.md"
     },
     {
       "source_key": "evolution-strategies#discovered/disc_X3",

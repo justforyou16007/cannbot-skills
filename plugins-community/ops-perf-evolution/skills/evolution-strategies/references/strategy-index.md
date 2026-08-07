@@ -318,6 +318,7 @@ P67-P69 为 Vector 计算效率基础策略（Counter 模式、低延迟归约�
 | X21 | 910B2C Cube 化平台纪律 + 数据驱动 Kahan 精度路由 | L2 | conv3dbf, fp32, kahan, precision-routing | conv 类 fp32 算子 Cube 化时：平台纪律（GetCoreNum 保底、no_half_ufp16 指令表、fp16 3-GEMM）＋数据驱动精度路由（小数值走 fp16 直算、大数值走 Kahan 补偿），绕过 fp32-Cube 缺失并保精度 | discovered/disc_X21.md |
 | X22 | Depthwise 直接卷积（绕过 im2col+GEMM） | L2 | depthwise, conv2d, vector-conv, im2col-bypass | depthwise(groups==Cin,cig==1) 用单 AIV fp32 向量卷积直接算逐通道 kh*kw dot：无 im2col/GEMM/fp16 分裂/GM workspace/Cube；Tile=(image,co-block8,oh-block) 保 32B 对齐，对齐 interior 向量化+标量 head/tail 独立 corr 缓冲消 S/V hazard；depthwise gen-time 提升 18-84x | discovered/disc_X22.md |
 | X23 | Batched Spatial 全宽向量化 + 编译器驱动标量预取 | L2 | conv, cv_fusion, elementwise, s-pipe-latency-hiding | 滑窗卷积 kw==1/W 维逐点：把 P=floor(64/W) 个连续 oh 打包进 64-lane fp32 向量，每 (co,tap) 1 次权重标量读驱动 P*W 宽 Axpy（向量指令+标量读降 P 倍）；Boundary 零填充 + strided DataCopyPad；`#pragma unroll 4` 驱动编译器软件流水隐藏 ~43cy S-pipe 标量读延迟（⚠️手工多标量预取触发编译器误编译，禁用）；W%8==0 门控；geomean 0.36x→3.5x | discovered/disc_X23.md |
+| X24 | AIC_ONLY 任务类型压设备 launch 地板（固定开销主导算子） | L2 | matmul, elementwise, reduction, aic-only, device-launch-floor | 微小 shape 固定开销主导算子（cube_util 极低、标量占比高）：任务类型从 MIX_AIC_1_2 改 `KERNEL_TYPE_AIC_ONLY` 去掉每 AIC 的 2 个空转 AIV，设备固定地板 ~7-8μs→~4.3-4.5μs；配 compact tiling 头（65→4 int32）；与手动 mmad 叠加 12.09→6.88μs（1.757x vs 基线）；上限：910B kernel launch 地板 ~4.3-5.6μs | discovered/disc_X24.md |
 
 ---
 

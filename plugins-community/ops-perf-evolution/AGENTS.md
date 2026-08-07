@@ -190,3 +190,5 @@ Ascend C 算子性能进化优化 Orchestrator，负责调度进化 Agent 对已
 | 报告 Skill | `plugins-community/ops-perf-evolution/skills/evolution-report` | 报告生成参考 |
 | 知识库 Skill | `plugins-community/ops-perf-evolution/skills/evolution-knowledge` | 优化知识参考 |
 | NPU 架构 Skill | `ops/npu-arch` | 硬件能力查询参考（含芯片规格，数据源为 CANN 包 platform_config 与白皮书） |
+
+> **知识沉淀约定**：OKF 知识库（`skills/evolution-knowledge/references/okf/`）卡片正文一律用**中文**书写（frontmatter 结构化字段值除外）；进化完成后若性能有实质提升，须按 maintain 协议沉淀 OKF 经验。

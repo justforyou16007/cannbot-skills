@@ -25,6 +25,7 @@ CLI subcommands:
 """
 
 import argparse
+import glob
 import json
 import logging
 import math
@@ -1476,6 +1477,48 @@ class _RefineContext:
     round_failed: int = 0
     round_best_speedup: float = 0.0
     worst_quality: str = "good"
+    expected_cases: int | None = None
+
+
+def _expected_case_count(results_dir: str) -> int | None:
+    """全量 case 数（refine 的 case 子集守卫基准）。
+
+    从 results_dir 的兄弟目录 shared/ 推导：取每个 *.json.bak 备份对中
+    .bak 与 .json 行数的较大值之和；无 .bak 时退化为 shared/*.json
+    （排除 call_spec.json）。无法确定时返回 None（守卫跳过）。
+    """
+    shared = os.path.join(os.path.dirname(os.path.abspath(results_dir)), "shared")
+    if not os.path.isdir(shared):
+        return None
+
+    def _lines(path: str) -> int:
+        try:
+            with open(path, "rb") as f:
+                return sum(1 for _ in f)
+        except OSError:
+            return 0
+
+    total = 0
+    baks = sorted(glob.glob(os.path.join(shared, "*.json.bak")))
+    if baks:
+        for bak in baks:
+            total += max(_lines(bak), _lines(bak[: -len(".bak")]))
+    else:
+        for sj in sorted(glob.glob(os.path.join(shared, "*.json"))):
+            if os.path.basename(sj) == "call_spec.json":
+                continue
+            total += _lines(sj)
+    return total or None
+
+
+def _variant_case_count(eval_result: dict) -> int | None:
+    """变体实际评估的 case 数（缺失/非法返回 None）。"""
+    comp = eval_result.get("comparison", {}) if isinstance(eval_result, dict) else {}
+    for src in (eval_result, comp):
+        n = src.get("n_cases_total") if isinstance(src, dict) else None
+        if isinstance(n, int) and n > 0:
+            return n
+    return None
 
 
 def _reset_stale_in_progress(nodes: dict, current_node_ids: set) -> list:
@@ -1905,6 +1948,42 @@ def _process_one_variant(node_id: str, p_idx_str: str, ctx: _RefineContext):
     if _QUALITY_RANK.get(mq, 0) > _QUALITY_RANK.get(ctx.worst_quality, 0):
         ctx.worst_quality = mq
 
+    # ── Case 子集守卫：基于精简 case 的评估一律无效，记 failed ──
+    # 子 agent 曾将 1728 case 截断为 18 以加速评估，导致"假 pass"进入世界模型；
+    # 也有变体干脆不写 n_cases_total（自造指标），缺失同样视为无效。
+    if ctx.expected_cases:
+        n_cases = _variant_case_count(eval_result)
+        case_violation = None
+        if n_cases is None:
+            case_violation = (
+                f"case_evidence_missing: evaluation_results.json 缺少 "
+                f"n_cases_total，无法证明在全量 {ctx.expected_cases} case 上评估"
+            )
+        elif n_cases < ctx.expected_cases:
+            case_violation = (
+                f"case_subset_evaluation: n_cases_total={n_cases} < "
+                f"full={ctx.expected_cases}"
+            )
+        if case_violation:
+            node["status"] = "failed"
+            node["failure_reason"] = case_violation
+            ctx.round_failed += 1
+            ctx.pending_diagnosis.append({
+                "node_id": node_id,
+                "parallel_index": p_idx,
+                "compilation_success": compilation_ok,
+                "precision_passed": precision_ok,
+                "error": case_violation,
+                "implementation_note_path": os.path.join(
+                    ctx.results_dir, f"parallel_{p_idx}", "implementation_note.txt"
+                ),
+            })
+            ctx.summary_lines.append(
+                f"  p{p_idx} [{node_id}]: FAIL ({case_violation.split(':')[0]}"
+                + (f" {n_cases}/{ctx.expected_cases}" if n_cases else "") + ")"
+            )
+            return
+
     # ── Multi-shape pipeline: prefer new fields when present ──
     ms_active = _is_multi_shape_eval(eval_result)
     ms_aggregate = eval_result.get("aggregate") if ms_active else None
@@ -1996,6 +2075,7 @@ def refine(
         results_dir=results_dir,
         summary_lines=[],
         pending_diagnosis=[],
+        expected_cases=_expected_case_count(results_dir),
     )
     round_total = len(parallel_map)
 

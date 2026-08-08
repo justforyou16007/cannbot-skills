@@ -9,9 +9,10 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # ----------------------------------------------------------------------------------------------------------
 
-"""Golden (reference) implementation of Chunked Gated Delta Rule.
+"""bf16 三阶段参考实现（语义照抄官方 ops-transformer benchmark.py 的
+chunk_gdn_benchmark_opt：solve_triangular 求逆 + 中间量按 bf16 量化）。
 
-Interface matches the CANN ChunkGatedDeltaRule operator (TND layout):
+接口保持与验证脚本一致的 TND 布局：
     query            (T, Nk, Dk)  bfloat16
     key              (T, Nk, Dk)  bfloat16
     value            (T, Nv, Dv)  bfloat16
@@ -22,9 +23,12 @@ Interface matches the CANN ChunkGatedDeltaRule operator (TND layout):
     out              (T, Nv, Dv)  bfloat16
     final_state      (B, Nv, Dv, Dk)
 
-Each value head nv reads its own key head nv * Nk // Nv (head grouping,
-Nv % Nk == 0).  The state matrix lives in (Dv, Dk) layout, matching the
-kernel.  See README/design docs for the math.
+计算按三阶段（对应算子 stage1/2/3 的数据流），中间量 v_beta/q_prime/attn_1/
+k_cumdecay/kg/v_new/attn_inter/final_state/out 全部 bf16 量化，与官方 benchmark.py
+语义一致。scale 只乘在 q_prime（stage1）与 masked_qkt（stage3），与官方一致。
+
+每个 value head nv 读自己的 key head nv * Nk // Nv（head grouping，等价于官方
+repeat_interleave，Nv % Nk == 0）。state 矩阵为 (Dv, Dk) 布局。
 """
 
 import torch
@@ -35,96 +39,177 @@ import torch.nn.functional as F
 CHUNK_SIZE = 64
 
 
-def _b16(x):
-    """Quantize to bfloat16 (round to nearest) and keep fp32 for arithmetic.
+def _stage1(query, key, value, g, beta, scale, C):
+    """stage1：chunk 内 kkt/qkt/g_cum/求逆/v_inner/k_cumdecay/q_prime/kg。
 
-    Emulates the AscendC kernel's bf16 intermediate storage: the cube matmul
-    C output, stage-1/2/3 workspace tensors (vInner / kCumDecay / qPrime / kg /
-    qkt / attn inverse / state) are all bf16 in the CANN implementation.  The
-    golden follows the same numerics so the NPU verification gate matches.
+    照抄官方 benchmark stage1_opt。返回 (g_cum, k_cumdecay, v_inner, q_prime, kg, qkt)。
     """
-    return x.to(torch.bfloat16).to(torch.float32)
+    S, Nk, Dk = query.shape
+    _, Nv, Dv = value.shape
+    device = query.device
+
+    if Nv // Nk > 1:
+        query = query.repeat_interleave(Nv // Nk, dim=1)
+        key = key.repeat_interleave(Nv // Nk, dim=1)
+
+    padded = (S + C - 1) // C * C
+    n_chunks = padded // C
+    pad = padded - S
+
+    def pad_seq(t):
+        if pad > 0:
+            return F.pad(t, [0, 0] * (t.dim() - 1) + [0, pad])
+        return t
+
+    q_pad = pad_seq(query)  # (Sp, Nv, Dk)
+    k_pad = pad_seq(key)
+    v_pad = pad_seq(value)
+    g_pad = pad_seq(g)
+    b_pad = pad_seq(beta)
+
+    # Batch over all heads & chunks
+    q_all = q_pad.permute(1, 0, 2).reshape(Nv * n_chunks, C, Dk)
+    k_all = k_pad.permute(1, 0, 2).reshape(Nv * n_chunks, C, Dk)
+    v_all = v_pad.permute(1, 0, 2).reshape(Nv * n_chunks, C, Dv)
+    g_all = g_pad.permute(1, 0).reshape(Nv * n_chunks, C)
+    b_all = b_pad.permute(1, 0).reshape(Nv * n_chunks, C)
+
+    k_f = k_all.float()
+    b_f = b_all.float().unsqueeze(-1)
+
+    kkt = (k_all @ k_all.transpose(-1, -2)).float() * b_f  # (Nv*nc, C, C)
+    qkt = q_all @ k_all.transpose(-1, -2)  # (Nv*nc, C, C)
+
+    g_cum = g_all.cumsum(dim=-1)  # (Nv*nc, C)
+    g_cum_exp = g_cum.exp()  # (Nv*nc, C)
+
+    lower = torch.tril(torch.ones(C, C, dtype=torch.bool, device=device), diagonal=-1)
+    diff = g_cum[:, :, None] - g_cum[:, None, :]
+    attn = (diff * lower).exp() * lower  # (Nv*nc, C, C)
+
+    eye = torch.eye(C, dtype=torch.float32, device=device)
+    attn_1 = torch.linalg.solve_triangular(eye + kkt * attn, eye, upper=False)
+    attn_1 = attn_1.to(torch.bfloat16)  # (I-A)^{-1}，bf16
+
+    kg = (k_f * (g_cum[:, -1, None] - g_cum).exp()[..., None]).to(torch.bfloat16)
+    k_cumdecay = (b_f * g_cum_exp[:, :, None] * (-1) * k_f).to(torch.bfloat16)
+
+    v_beta = (v_all.float() * b_f).to(torch.bfloat16)
+    q_prime = (q_all.float() * scale * g_cum_exp[:, :, None]).to(torch.bfloat16)
+
+    v_inner = attn_1 @ v_beta  # (Nv*nc, C, Dv)
+    k_cumdecay = attn_1 @ k_cumdecay  # (Nv*nc, C, Dk)
+
+    g_cum = g_cum.reshape(Nv, padded)
+    k_cumdecay = k_cumdecay.reshape(Nv, padded, Dk)
+    v_inner = v_inner.reshape(Nv, padded, Dv)
+    q_prime = q_prime.reshape(Nv, padded, Dk)
+    kg = kg.reshape(Nv, padded, Dk)
+    qkt = qkt.reshape(Nv, padded, C)
+    return g_cum, k_cumdecay, v_inner, q_prime, kg, qkt
+
+
+def _stage2(q_prime, v_inner, g_cum, k_cumdecay, state, kg, C):
+    """stage2：inter-chunk，逐 chunk 串行更新 state。
+
+    照抄官方 benchmark stage2_opt。返回 (final_state, attn_inter, v_new)。
+    """
+    Nv, Sp, Dv = v_inner.shape
+    _, _, Dk = q_prime.shape
+    n_chunks = Sp // C
+    device = q_prime.device
+
+    attn_inter = torch.zeros((Nv, Sp, Dv), dtype=torch.bfloat16, device=device)
+    v_new = torch.zeros((Nv, Sp, Dv), dtype=torch.bfloat16, device=device)
+
+    cur_state = state  # (Nv, Dv, Dk) bf16
+    for idx in range(n_chunks):
+        s = idx * C
+        e = s + C
+
+        qg = q_prime[:, s:e, :]  # (Nv, C, Dk)
+        vi = v_inner[:, s:e, :]  # (Nv, C, Dv)
+        gc = g_cum[:, s:e]  # (Nv, C)
+        kcd = k_cumdecay[:, s:e, :]  # (Nv, C, Dk)
+        kgc = kg[:, s:e, :]  # (Nv, C, Dk)
+
+        state_f = cur_state.float()  # (Nv, Dv, Dk)
+        state_fT = state_f.transpose(-1, -2)  # (Nv, Dk, Dv)
+
+        attn_inter_chunk = (qg.float() @ state_fT).to(torch.bfloat16)  # (Nv, C, Dv)
+        v_prime = (kcd.float() @ state_fT).to(torch.bfloat16)  # (Nv, C, Dv)
+        v_new_chunk = vi + v_prime  # (Nv, C, Dv) bf16
+
+        state_out = v_new_chunk.transpose(-1, -2) @ kgc  # (Nv, Dv, Dk)
+        decay = gc.exp()[:, -1][:, None, None]  # (Nv, 1, 1)
+        state_old = (state_f * decay).to(torch.bfloat16)  # (Nv, Dv, Dk)
+        cur_state = state_old + state_out  # (Nv, Dv, Dk) bf16
+
+        attn_inter[:, s:e, :] = attn_inter_chunk
+        v_new[:, s:e, :] = v_new_chunk
+
+    final_state = cur_state.to(torch.bfloat16)
+    return final_state, attn_inter, v_new
+
+
+def _stage3(qkt, scale, g_cum, attn_inter, v_new, C):
+    """stage3：out = attn_inter + masked_qkt @ v_new。
+
+    照抄官方 benchmark stage3_opt。
+    """
+    Nv, Sp, Dv = attn_inter.shape
+    device = qkt.device
+    n_chunks = Sp // C
+
+    qkt_all = qkt.reshape(Nv * n_chunks, C, C)
+    g_all = g_cum.reshape(Nv * n_chunks, C)
+    ai_all = attn_inter.reshape(Nv * n_chunks, C, Dv)
+    vn_all = v_new.reshape(Nv * n_chunks, C, Dv)
+
+    lower = torch.tril(torch.ones(C, C, dtype=torch.bool, device=device), diagonal=0)
+    diff = g_all[:, :, None] - g_all[:, None, :]
+    decay = (diff * lower).exp() * lower.float()  # (Nv*nc, C, C)
+    masked_qkt = qkt_all.float() * scale * decay  # (Nv*nc, C, C)
+    attn_inner = masked_qkt.to(torch.bfloat16) @ vn_all  # (Nv*nc, C, Dv)
+    core_attn_out = (ai_all + attn_inner).to(torch.bfloat16)  # (Nv*nc, C, Dv)
+
+    attn_out = core_attn_out.reshape(Nv, Sp, Dv).permute(1, 0, 2)  # (Sp, Nv, Dv)
+    return attn_out
 
 
 def chunk_gated_delta_rule(query, key, value, beta, g, initial_state,
                            actual_seq_lengths, scale=1.0, chunk_size=CHUNK_SIZE):
-    """Reference (float32 + bf16-intermediate quantization) golden target."""
+    """bf16 三阶段参考实现（语义照抄官方 benchmark.py）。
+
+    interface 与验证脚本一致；state 沿 batch 逐条串行更新。
+    """
     T, Nk, Dk = query.shape
-    Nv, Dv = value.shape[1], value.shape[2]
-    B = initial_state.shape[0]
+    B, Nv, Dv, _ = initial_state.shape
     device, dtype = query.device, query.dtype
     C = int(chunk_size)
 
-    out = torch.zeros(T, Nv, Dv, dtype=dtype, device=device)
+    attn_out = torch.empty((T, Nv, Dv), dtype=dtype, device=device)
     final_state = torch.empty(B, Nv, Dv, Dk, dtype=initial_state.dtype, device=device)
 
-    q = query.float() * scale
-    k = key.float()
-    v = value.float()
-    beta_f = beta.float()
-    g_f = g.float()
+    start = 0
+    for bid in range(B):
+        L = int(actual_seq_lengths[bid].item())
+        end = start + L
+        cur_state = initial_state[bid].to(torch.bfloat16).clone()  # (Nv, Dv, Dk)
 
-    seq_start = 0
-    for b in range(B):
-        L = int(actual_seq_lengths[b].item())
-        seq_end = seq_start + L
-        S = initial_state[b].float()  # (Nv, Dv, Dk)
-        n_chunks = (L + C - 1) // C
-        for ci in range(n_chunks):
-            s0 = seq_start + ci * C
-            s1 = min(seq_end, s0 + C)
-            cur = s1 - s0
-            for nv in range(Nv):
-                nk_h = (nv * Nk) // Nv
-                qc = q[s0:s1, nk_h, :].contiguous()          # (cur, Dk)
-                kc = k[s0:s1, nk_h, :].contiguous()          # (cur, Dk)
-                vc = v[s0:s1, nv, :].contiguous()            # (cur, Dv)
-                bc = beta_f[s0:s1, nv].contiguous()          # (cur,)
-                gc = g_f[s0:s1, nv].contiguous()             # (cur,)
-                Snv = S[nv]                                  # (Dv, Dk)
-                if cur < C:
-                    qc = F.pad(qc, (0, 0, 0, C - cur))
-                    kc = F.pad(kc, (0, 0, 0, C - cur))
-                    vc = F.pad(vc, (0, 0, 0, C - cur))
-                    bc = F.pad(bc, (0, C - cur))
-                    gc = F.pad(gc, (0, C - cur))
+        g_cum, k_cum_decay, v_inner, q_prime, kg, qkt = _stage1(
+            query[start:end], key[start:end], value[start:end],
+            g[start:end], beta[start:end], scale, C)
 
-                # --- within-chunk ---
-                g_cum = torch.cumsum(gc, dim=0)                        # (C,)   fp32 (gCum fp32)
-                g_cum_exp = torch.exp(g_cum)                           # (C,)   fp32 (gCumExp fp32)
-                decay = torch.exp(g_cum.unsqueeze(-1) - g_cum.unsqueeze(-2))
-                decay_mask = torch.tril(decay)                         # (C, C) fp32
-                kb = _b16(kc * bc.unsqueeze(-1))                       # k*beta, stored bf16
-                vb = _b16(vc * bc.unsqueeze(-1))                       # v*beta (vBeta), stored bf16
-                kbt = _b16(kb @ kc.t())                                # kk matmul C, bf16
-                A = _b16((-kbt * decay_mask).tril(-1))                 # strictly lower, attnWs bf16
-                attn = A.clone()
-                for i in range(1, C):                                  # (I-A)^{-1}
-                    attn[i, :i] = A[i, :i] + A[i, :i] @ attn[:i, :i]
-                attn = _b16(attn + torch.eye(C, dtype=torch.float32, device=device))  # inverseRes bf16
-                v_inner = _b16(attn @ vb)                              # matmul C, bf16
-                kbe = _b16(kb * g_cum_exp.unsqueeze(-1))               # gBK stored bf16
-                k_cumdecay = _b16(attn @ kbe)                          # matmul C, bf16
+        cur_state, attn_inter, v_new = _stage2(
+            q_prime, v_inner, g_cum, k_cum_decay, cur_state, kg, C)
 
-                # --- inter-chunk ---
-                qkt = _b16(qc @ kc.t())                                # qkt matmul C, bf16 (qK)
-                attn_c = _b16((qkt * decay_mask).tril())               # keep j <= i, bf16
-                v_prime = _b16(k_cumdecay @ Snv.t())                   # matmul C, bf16
-                v_new = _b16(v_inner - v_prime)                        # matmul B operand, bf16
-                qg = _b16(qc * g_cum_exp.unsqueeze(-1))                # qPrime stored bf16
-                attn_inter = _b16(qg @ Snv.t())                        # matmul C, bf16
-                out_c = attn_inter + _b16(attn_c @ v_new)              # matmul C, bf16
-                out[s0:s1, nv, :] = out_c[:cur].to(dtype)
+        final_state[bid] = cur_state.to(initial_state.dtype)
+        attn_out_padded = _stage3(qkt, scale, g_cum, attn_inter, v_new, C)
+        attn_out[start:end, ...] = attn_out_padded[:L]
+        start = end
 
-                # --- state update: S = exp(g_last)*S + (k*exp(g_last-g_cum))^T @ v_new ---
-                g_last = g_cum[-1]
-                k_aug = _b16(kc * torch.exp(g_last - g_cum).unsqueeze(-1))   # kg stored bf16
-                Snv = _b16(torch.exp(g_last) * Snv + (v_new.t() @ k_aug))    # state bf16 (curStateBf16)
-                S[nv] = Snv
-        final_state[b] = S.to(initial_state.dtype)
-        seq_start = seq_end
-
-    return out, final_state
+    return attn_out, final_state
 
 
 class Model(nn.Module):

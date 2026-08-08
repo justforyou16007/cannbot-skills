@@ -9,96 +9,92 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # ----------------------------------------------------------------------------------------------------------
 
-"""Block-level 设计：Stage2 — 跨 chunk 递推（独立 jit kernel，对应 tile-level `stage2_ker`）。
+"""Block-level 设计：Stage2 — 跨 chunk 递推（单 kernel 内的 T.macro 骨架）。
 
-对应 AscendC `Stage2`（stage2.h）。消费 Stage1 workspace（kCumDecay/vInner/qPrime/gCum/kg）
-与当前状态 S，对当前 chunk 计算依赖状态的部分，更新 S。满足 `BlockLevelDesign-quality-checklist.md`。
+对应 AscendC `Stage2`（stage2.h），**C/V 分工与同步完全照抄**。细算在
+`design/tile_level/stage2.py` 落地（TODO(tile-level)）。
+**任务分片封装在 stage 内部**（照抄 stage2.h `Stage2::Process`）：`nvPerCore = ceil(Nv/core)` 按
+`coreId` 切核，核内 `for cId` 串行整条 chunk 链。状态 S 直接走 GM `initial_state`/`final_state`
+（`curState = (gi==0 && cId==0) ? initState : finalState`，即 stage2.h `Process` 的 `curState` +
+入口 `RunStage2(cg, curState, finalState[b])`），组间经 `final_state` 串行。满足 checklist #4/#5/#6/#7。
 
-## C/V 子阶段（checklist #4）
+## C/V 子阶段（照抄 AscendC 分工，checklist #4）
 
-    V0'  g_last = exp(g_cum[C-1])；S ← g_last·S            （先衰减，向量）
-    C3   v_prime  = k_cumdecay @ S^T                        （cube，T.gemm_v0）
-         attn_inter = qPrime @ S^T    → 写 out 的历史贡献   （cube）
-    V2   v_new = v_inner - v_prime                          （逐元素）
-    V3   S ← S + v_new^T @ kg   → 写 S/final_state          （外积累加，可 cube）
+    C3   attn_inter = qPrime @ S^T → 直写 out                          （cube，↔ CalAttnInter）
+         v_inner += k_cumdecay @ S^T（gemm→L0C → atomic_add 到 ws_v_inner） （cube，↔ CalVPrime）
+    V3b  g_last = exp(g_cum[C-1])；final_state = g_last * S（普通写）     （向量，↔ CopyOutState）
+    C3'' final_state += ws_v_inner^T @ kg（gemm→L0C → atomic_add 到 final_state）（cube，↔ CalStateNew）
 
-## workspace 读/写（checklist #6）
+final_state 由 **V3b（写 g_last·S）+ C3''（atomic_add 累加 dstate）协作完成**，照抄 AscendC 的
+AIV `CopyOutState` + AIC `CalStateNew`（`IterateAll(finalState, enAtomic=ATOMIC_ADD)`）。
+v_new 不单独落 GM：`ws_v_inner` 被 C3 原子加更新后即 v_new（↔ AscendC `CalVPrime` 累加 vInner）。
+tilelang 的 `T.tile.atomic_add(L0C → GM)` ↔ AscendC `SetAtomicAdd + CopyCubeOut`
+（见 stage2_math_and_block_level_alignment.md §5）。**无 V2 / ws_v_prime / ws_v_new / ws_attn_inter / ws_dstate**。
 
-    读：ws_gcumexp / ws_kcumdecay / ws_vinner / ws_qprime / ws_kg（stage1 产）
-    写：out（attn_inter 部分）、S / final_state
+## 同步（checklist #5，AIC↔AIV 并行，与 AscendC 0x2/0x5/0x4 一一对应、每轮无条件）
 
-## 块内遍历（checklist #2）
+每轮 cId 内，C scope（AIC）与 V scope（AIV）**并行执行**，靠 3 个 cross_flag 握手：
 
-    with T.Kernel(used_core_num):
-        for unit in 分给本 kernel 的 (b, head) 集合:
-            if b == 当前 batch 且 属于本 chunk:
-                # 每单元：V0'(衰减 S) -> C3 -> V2 -> V3
+    C scope（AIC）: 读 curState；gemm attn_inter / v_inner累加 → set 6（↔ 0x2 读完 → V 可写）
+    V scope（AIV）:  wait 6（↔ 0x2）；读 curState；final_state = g_last*S → set 8（↔ 0x5 写完 → C 可累加）
+                    → wait 10（↔ 0x4 等本轮 C 累加完，下轮 V 读 final_state 安全）
+    C scope（AIC）:  wait 8（↔ 0x5）；atomic_add dstate 进 final_state → set 10（↔ 0x4 累加完 → V 下轮读）
+
+flag 编号：6 ↔ 0x2、8 ↔ 0x5、10 ↔ 0x4。阶段边界由入口 `T.sync_all()` 兜底。
+编号避开 stage1（0/1/2）、stage3（9/7）。
 """
 
-import tilelang
 import tilelang.language as T
 
-from design.chunk_gated_delta_rule_common import CHUNK_SIZE, pass_configs
 
+@T.macro(hygienic=False)
+def run_stage2(cid, used_core_num, group_chunks,
+               nk, nv, dk, dv, C,
+               b, gi, gpos, cg_len, num_chunk,
+               ws_k_cumdecay, ws_qprime, ws_v_inner, ws_kg,
+               initial_state, final_state, out,
+               ws_g_exp):
+    """跨 chunk 递推（骨架；任务分片照抄 stage2.h Process，细算见 tile_level/stage2.py）。"""
+    # ---- AscendC Stage2::Process：nvPerCore = ceil(Nv/coreNum) 切核，核内串行 cId ----
+    nv_per_core = (nv + used_core_num - 1) // used_core_num
+    nv_start = cid * nv_per_core
+    nv_end = T.if_then_else(nv_start + nv_per_core < nv, nv_start + nv_per_core, nv)
 
-@tilelang.jit(out_idx=[], workspace_idx=[], pass_configs=pass_configs)
-def stage2_ker(batch, seq_len, nk, nv, dk, dv, chunk_size=CHUNK_SIZE):
-    C = chunk_size
-    total_units = batch * nv
-    used_core_num = min(20, total_units)
+    for nvId in T.serial(nv):
+        if nvId >= nv_start and nvId < nv_end:
+            for cId in T.serial(group_chunks):
+                if cId < num_chunk:
+                    s0 = gpos + cId * C
+                    valid = T.if_then_else(cg_len - cId * C < C, cg_len - cId * C, C)
+                    row = cId * C
 
-    @T.prim_func
-    def main(
-        ws_gcumexp: T.Tensor((C,), "float32"),
-        ws_kcumdecay: T.Tensor((C, dk), "bfloat16"),
-        ws_vinner: T.Tensor((C, dv), "bfloat16"),
-        ws_qprime: T.Tensor((C, dk), "bfloat16"),
-        ws_kg: T.Tensor((C, dk), "bfloat16"),
-        S: T.Tensor((nv, dv, dk), "float32"),
-        ci: T.Tensor((1,), "int32"),
-        bb: T.Tensor((1,), "int32"),
-        Lb: T.Tensor((1,), "int32"),
-        out: T.Tensor((seq_len, nv, dv), "bfloat16"),
-        final_state: T.Tensor((nv, dv, dk), "bfloat16"),
-    ):
-        with T.Kernel(used_core_num, is_npu=True) as (cid, vid):
-            # TODO(tile-level): unit 分配；`h=unit%nv, kh=(h*nk)//nv, s0=base[b]+ci[0]*C`
-            #                   `valid=T.if_then_else(...)`；`if b==bb[0]:`；curState=S[h] 或初值
+                    # ---- C3（C scope / AIC，并行）：读 curState，gemm attn_inter + v_inner 累加 ----
+                    with T.Scope("C"):
+                        # TODO(tile-level): curState = (gi==0 && cId==0) ? initial_state[b,nvId]
+                        #                                   : final_state[b,nvId]
+                        #                   attn_inter = ws_qprime @ curState^T（gemm→L0C）
+                        #                                → 直写 out[s0:s0+valid, nvId, 0:dv]（↔ CalAttnInter）
+                        #                   vi  = ws_k_cumdecay @ curState^T（gemm→L0C，k_cumdecay 带负号）
+                        #                   T.tile.atomic_add(ws_v_inner[nvId,row], vi)（↔ CalVPrime，v_inner +=）
+                        pass
+                    T.set_cross_flag("FIX", 6)          # C 读完 curState -> V 可写 final_state（↔ 0x2，防覆盖）
 
-            # V0'：g_last = exp(ws_gcumexp[C-1])；S[h] ← g_last·S[h]
-            with T.Scope("V"):
-                # TODO(tile-level): T.tile.mul(S[h], S[h], g_last)
-                pass
+                    # ---- V3b（V scope / AIV，并行）：wait 0x2，写 g_last*S，set 0x5，wait 0x4 ----
+                    with T.Scope("V"):
+                        T.wait_cross_flag(6)            # ↔ 0x2：C 读完 curState -> 可写 final_state
+                        # TODO(tile-level): g_last = g_exp[C-1]；final_state = g_last * curState
+                        #                   （普通写，只写衰减部分；同 curState 来源，↔ CopyOutState）
+                        pass
+                        # ↔ AscendC AIV 分支：CopyOutState 后 set 0x5、wait 0x4（等本轮 C 累加完，
+                        # 下轮 V 的 CopyIn 读 final_state 才安全）。set/wait 放 V scope 内 = AIV 流。
+                        T.set_cross_flag("MTE3", 8)     # V 写完 g_last*S -> C 可 atomic_add（↔ 0x5）
+                        T.wait_cross_flag(10)           # ↔ 0x4：等本轮 C 累加完 -> 下轮 V 读安全
 
-            # C3：v_prime = k_cumdecay @ S[h]^T；attn_inter = qPrime @ S[h]^T（写 out）
-            with T.Scope("C"):
-                # TODO(tile-level):
-                #   T.gemm_v0(ws_kcumdecay, S[h], v_prime, transpose_B=True)
-                #   T.gemm_v0(ws_qprime, S[h], attn_inter, transpose_B=True)
-                #   T.copy 降型(attn_inter) -> out[s0:s0+valid, h, 0:dv]
-                pass
-            # C↔V 同步（checklist #5）：C3 的 v_prime 就绪 -> V2
-            T.set_cross_flag("FIX", 3)          # C -> V
-
-            # V2：v_new = v_inner - v_prime
-            with T.Scope("V"):
-                T.wait_cross_flag(3)             # 等 C3 的 v_prime 就绪
-                # TODO(tile-level): T.tile.sub(v_new, ws_vinner, v_prime)
-                pass
-            T.set_cross_flag("MTE3", 4)          # V -> C：v_new 就绪
-
-            # C3'：dstate = v_new^T @ kg（状态更新的 matmul 部分）
-            with T.Scope("C"):
-                T.wait_cross_flag(4)             # 等 V2 的 v_new 就绪
-                # TODO(tile-level): T.gemm_v0(v_new, ws_kg, dstate, transpose_A=True)
-                pass
-            T.set_cross_flag("FIX", 5)          # C -> V：dstate 就绪
-
-            # V3：S[h] ← S[h] + dstate；写 final_state[h]（降型）
-            with T.Scope("V"):
-                T.wait_cross_flag(5)             # 等 C3' 的 dstate 就绪
-                # TODO(tile-level):
-                #   S[h] = T.tile.add(S[h], dstate)；写 final_state[h]（降型）
-                pass
-
-    return main
+                    # ---- C3''（C scope / AIC，并行）：wait 0x5，atomic_add dstate，set 0x4 ----
+                    with T.Scope("C"):
+                        T.wait_cross_flag(8)            # ↔ 0x5：V 写完 g_last*S -> 可 atomic_add
+                        # TODO(tile-level): T.gemm_v0(ws_v_inner[nvId,row], ws_kg[nvId,row], ds_l0,
+                        #                   transpose_A=True, init=True)   # v_new 已由 C3 累加进 ws_v_inner
+                        #                   T.tile.atomic_add(final_state[b,nvId], ds_l0)  # L0C -> GM 原子加（↔ CalStateNew）
+                        pass
+                        T.set_cross_flag("FIX", 10)     # C 累加完 -> V 下轮读 final_state（↔ 0x4）

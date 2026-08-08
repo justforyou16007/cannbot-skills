@@ -39,6 +39,12 @@ import tilelang.language as T
 CHUNK_SIZE = 64
 NUM_PHYSICAL_CORES = 20
 
+# ---- chunk-group 协作模型常量（对齐 AscendC tiling，chunk_gated_delta_rule.cpp）----
+P_NUM = 2                              # AscendC `P_NUM`：group 长度因子，maxGroupLength = P_NUM*aiCoreNum*chunkSize
+STAGE_ONE_PARA_NUM = 4                 # AscendC `STAGE_ONE_PARA_NUM`：stage1 任务循环步进 paraNum（一次流水 4 个 chunk）
+MAX_GROUP_LENGTH = P_NUM * NUM_PHYSICAL_CORES * CHUNK_SIZE   # maxGroupLength：一组覆盖行数
+GROUP_CHUNKS = MAX_GROUP_LENGTH // CHUNK_SIZE                # 组内最大 chunk 数
+
 pass_configs = {
     tilelang.PassConfigKey.TL_ASCEND_MEMORY_PLANNING: True,
     tilelang.PassConfigKey.TL_ASCEND_AUTO_SYNC: True,

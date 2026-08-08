@@ -16,7 +16,7 @@ import torch
 import torch.nn as nn
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from design.tile_level.chunk_gated_delta_rule import chunk_gated_delta_rule as tl_cgdr
+from design.tile_level.chunk_gated_delta_rule import chunk_gated_delta_rule_host
 
 
 def _build_kernel(query, key, value, actual_seq_lengths):
@@ -26,7 +26,9 @@ def _build_kernel(query, key, value, actual_seq_lengths):
     nv = value.shape[1]
     dv = value.shape[2]
     batch = int(actual_seq_lengths.shape[0])
-    return tl_cgdr(
+    # 手动传参 wrapper：host 分配全部 workspace/out/final_state 并显式传入
+    # （tilelang 自动分配路径实测有首次运行竞态）。
+    return chunk_gated_delta_rule_host(
         batch, seq_len, nk, nv, dk, dv,
         chunk_size=64,
         scale=1.0,

@@ -11,40 +11,27 @@
 
 """Tile-level Stage2 - 跨 chunk 递推（单 kernel 内的函数，非独立 jit）。
 
-Mirrors block_level/stage2.py / AscendC `Stage2`, but *inlined* into the single
-`chunk_gated_delta_rule` prim_func (no separate kernel).  For one `unit` and one
-chunk it consumes the Stage1 workspace frag + the carried state `S` (GM
-`ws_S[unit]`) and computes:
+Mirrors block_level/stage2.py / AscendC `Stage2`（stage2.h），但为单 kernel 内联函数。
+**C/V 分工与同步完全照抄 AscendC（AIC/AIV 并行，3 flag）**。
+**任务分片封装在此函数内部**（对应 stage2.h `Stage2::Process`）：`nvPerCore = ceil(Nv/core)`
+按 `coreId` 切核，核内 `for cId` 串行整条 chunk 链。状态 S **直接走 GM
+`initial_state`/`final_state`**：`curState = (gi==0 && cId==0) ? initial_state[b,nvId]
+: final_state[b,nvId]`；组间经 `final_state` 串行。workspace 行偏移 `row = cId * C`。
 
-    C3   v_prime    = k_cumdecay @ S^T            -> ws_v_prime   (AIC / cube)
-         attn_inter = qPrime @ S^T                -> ws_attn_inter (AIC / cube)
-    V2   v_new      = v_inner - v_prime           -> ws_v_new     (AIV / vector)
-    C3'  dstate     = v_new^T @ kg                -> ws_dstate     (AIC / cube)
-    V3   g_last     = exp(g_cum[C-1])             (AIV / scalar)
-         S = g_last*S + dstate                    -> ws_S[unit] (carried)   (AIV / vector)
-         out        <- attn_inter ; final_state[b,h] <- S
+    C3   attn_inter = qPrime @ S^T → 直写 out                        （cube，↔ CalAttnInter）
+         v_inner += k_cumdecay @ S^T（gemm→L0C → atomic_add 到 ws_v_inner）（cube，↔ CalVPrime）
+    V3b  g_last = exp(g_cum[C-1])；final_state = g_last * S（普通写）  （向量，↔ CopyOutState）
+    C3'' final_state += ws_v_inner^T @ kg（gemm→L0C → atomic_add 到 final_state）（cube，↔ CalStateNew）
 
-Correspondence to AscendC `Stage2` (chunk_gated_delta_rule_stage2.h):
-    AIC (cube, T.Scope("C")) : CalVPrime / CalAttnInter (C3), CalStateNew (C3') --
-        v_prime/attn_inter/dstate 均为 T.gemm_v0; rhs 是 S 转置 read, trans = 真 S 布局 (Dv,Dk).
-    AIV (vector, T.Scope("V")) : CalGCumExp 取 g_last(Muls: S←g_last·S) + V2 减法 + V3 累加.
-        S = g_last*S + dstate 拆为 T.tile.mul(S, S, gl) + T.tile.add(S, S, dstate)
-        (AscendC 把 g_last·S 放 AIV、+dstate 由 AIC IterateAll accumulate 折入 finalState).
-    同步: C3 产物经 GM + cross_flag 3 (=AIC CrossCoreSetFlag(0x2)/AIV WaitFlag(0x2)),
-          V2 产物经 cross_flag 4 (=AIV SetFlag(0x5)/AIC WaitFlag(0x5)),
-          C3' 产物经 cross_flag 5 (=AIC SetFlag(0x4)/AIV WaitFlag(0x4)).
+final_state 由 **V3b（写 g_last·S）+ C3''（atomic_add 累加 dstate）协作**。v_new 不落 GM：
+`ws_v_inner` 被 C3 原子加更新后即 v_new（stage3 直接读它）。无 V2 / ws_v_prime / ws_v_new /
+ws_attn_inter / ws_dstate。
 
-State transport (学 AscendC `curState`): S lives in the persistent GM tensor
-`ws_S`, initialised once per unit from `initial_state[b,h]` before the chunk
-loop and read/written here across chunks.  Cross-chunk dependency is ordered by
-the enclosing kernel's chunk loop; a `T.barrier_all()` before/after guarantees
-stage-1 product completeness and that the updated S isn't read early.
+同步 3 flag（每轮 cId 无条件）：6↔0x2（C 读完→V 可写，防覆盖）、8↔0x5（V 写完→C 可累加）、
+10↔0x4（C 累加完→V 下轮读）。V3b 内 set 8 后 wait 10（照抄 AscendC AIV 分支）。
 
-UB reuse (学 AscendC `tmpBuff_`): every `T.alloc_ub` temporal is declared inside
-this function, so the planner can overlap them with stage1/3 temporaries on the
-same physical UB (per-stage peak, not the union).
-
-C<->V handoff per chunk via GM + cross-flag IDs 3,4,5, re-armed each iteration.
+**buffer 分配纪律**：本 stage 全部 on-chip buffer 在函数顶部一次分配（静态），任务分片循环
+（`for nvId / for cId`）内只复用，不再 alloc。
 """
 
 
@@ -52,92 +39,92 @@ import tilelang.language as T
 
 
 @T.macro(hygienic=False)
-def run_stage2(nk, nv, dk, dv, C,
-               unit, b, h, s0, valid,
+def run_stage2(cid, used_core_num, group_chunks,
+               nk, nv, dk, dv, C,
+               b, gi, gpos, cg_len, num_chunk,
                ws_k_cumdecay, ws_qprime, ws_v_inner, ws_kg,
-               ws_S, out, final_state,
-               ws_v_prime, ws_attn_inter, ws_v_new, ws_dstate, ws_g_exp):
-    # ---- C3 : v_prime / attn_inter (cube) ----
-    with T.Scope("C"):
-        kcd_l1 = T.alloc_L1((C, dk), "bfloat16")
-        sp_s_l1 = T.alloc_L1((dv, dk), "bfloat16")
-        T.copy(ws_k_cumdecay[unit, 0, 0], kcd_l1)
-        T.copy(ws_S[unit, 0, 0], sp_s_l1)
-        vp_l0 = T.alloc_L0C((C, dv), "float32")
-        T.gemm_v0(kcd_l1, sp_s_l1, vp_l0, transpose_B=True, init=True)
-        T.copy(vp_l0, ws_v_prime[unit, 0, 0])
-        qprime_l1 = T.alloc_L1((C, dk), "bfloat16")
-        ai_l0 = T.alloc_L0C((C, dv), "float32")
-        T.copy(ws_qprime[unit, 0, 0], qprime_l1)
-        T.gemm_v0(qprime_l1, sp_s_l1, ai_l0, transpose_B=True, init=True)
-        T.copy(ai_l0, ws_attn_inter[unit, 0, 0])
-        T.set_cross_flag("FIX", 3)          # C -> V
+               initial_state, final_state, out,
+               ws_g_exp):
+    # ---- 统一分配本 stage 全部 on-chip buffer（函数顶部，分片循环外静态复用）----
+    # C3 attn_inter 直写 out + v_inner 原子加累加
+    kcd_l1 = T.alloc_L1((C, dk), "bfloat16")
+    sp_s_l1 = T.alloc_L1((dv, dk), "bfloat16")      # curState (dv, dk)
+    qprime_l1 = T.alloc_L1((C, dk), "bfloat16")
+    ai_l0 = T.alloc_L0C((C, dv), "float32")
+    vi2_l0 = T.alloc_L0C((C, dv), "float32")
+    # V3b final_state = g_last * S（普通写衰减部分）
+    g_exp_s2 = T.alloc_ub((C,), "float32")
+    state_bf_s2 = T.alloc_ub((dv, dk), "bfloat16")
+    state_s2 = T.alloc_ub((dv, dk), "float32")
+    # C3'' final_state += v_new^T @ kg（原子加 dstate）
+    vn_l1_s2 = T.alloc_L1((C, dv), "bfloat16")      # v_new = ws_v_inner
+    kg_l1 = T.alloc_L1((C, dk), "bfloat16")
+    ds_l0 = T.alloc_L0C((dv, dk), "float32")
 
-    # ---- V2 : v_new = v_inner - v_prime (AIV vector, 学 AscendC FIX 子块) ----
-    with T.Scope("V"):
-        T.wait_cross_flag(3)
-        vinner_bf = T.alloc_ub((C, dv), "bfloat16")
-        vprime_bf = T.alloc_ub((C, dv), "bfloat16")
-        vinner_ub = T.alloc_ub((C, dv), "float32")
-        vprime_ub = T.alloc_ub((C, dv), "float32")
-        vnew_ub = T.alloc_ub((C, dv), "float32")
-        # v_inner (bf16 via two-stage T.copy)
-        T.copy(ws_v_inner[unit, 0, 0], vinner_bf)
-        T.copy(vinner_bf, vinner_ub)
-        # v_prime (bf16 via two-stage T.copy)
-        T.copy(ws_v_prime[unit, 0, 0], vprime_bf)
-        T.copy(vprime_bf, vprime_ub)
-        # v_new = v_inner - v_prime  (vectorized, no scalar loop)
-        T.tile.sub(vnew_ub, vinner_ub, vprime_ub)
-        vnew_bf = T.alloc_ub((C, dv), "bfloat16")
-        T.copy(vnew_ub, vnew_bf)
-        T.copy(vnew_bf, ws_v_new[unit, 0, 0])
-        T.set_cross_flag("MTE3", 4)         # V -> C
+    # ---- AscendC Stage2::Process：nvPerCore = ceil(Nv/coreNum) 切核，核内串行 cId ----
+    nv_per_core = (nv + used_core_num - 1) // used_core_num
+    nv_start = cid * nv_per_core
+    nv_end = T.if_then_else(nv_start + nv_per_core < nv, nv_start + nv_per_core, nv)
 
-    # ---- C3' : dstate = v_new^T @ kg ----
-    with T.Scope("C"):
-        T.wait_cross_flag(4)
-        vn_l1_s2 = T.alloc_L1((C, dv), "bfloat16")
-        kg_l1 = T.alloc_L1((C, dk), "bfloat16")
-        T.copy(ws_v_new[unit, 0, 0], vn_l1_s2)
-        T.copy(ws_kg[unit, 0, 0], kg_l1)
-        # dstate = v_new^T @ kg  ->  (dv, dk), i.e. state layout directly
-        # (was (dk,dv) requiring a transpose read in the update below).
-        ds_l0 = T.alloc_L0C((dv, dk), "float32")
-        T.gemm_v0(vn_l1_s2, kg_l1, ds_l0, transpose_A=True, init=True)
-        T.copy(ds_l0, ws_dstate[unit, 0, 0])
-        T.set_cross_flag("FIX", 5)         # C -> V
+    for nvId in T.serial(nv):
+        if nvId >= nv_start and nvId < nv_end:
+            for cId in T.serial(group_chunks):
+                if cId < num_chunk:
+                    s0 = gpos + cId * C
+                    valid = T.if_then_else(cg_len - cId * C < C, cg_len - cId * C, C)
+                    row = cId * C
 
-    # ---- V3a : out <- attn_inter ----
-    with T.Scope("V"):
-        T.wait_cross_flag(5)
-        ai_bf = T.alloc_ub((C, dv), "bfloat16")
-        out_ub_s2 = T.alloc_ub((C, dv), "float32")
-        out_bf_s2 = T.alloc_ub((C, dv), "bfloat16")
-        T.copy(ws_attn_inter[unit, 0, 0], ai_bf)
-        T.copy(ai_bf, out_ub_s2)
-        T.copy(out_ub_s2, out_bf_s2)
-        T.copy(out_bf_s2[0:valid, 0:dv], out[s0:s0 + valid, h, 0:dv])
-    T.barrier_all()
-    # ---- V3b : S = g_last*S + dstate (separate scope so the planner frees the
-    # out-write buffers before aliasing these) ----
-    with T.Scope("V"):
-        # g_last = exp(g_cum[C-1]) (学 AscendC CalGCumExp 取最后一位)
-        g_exp_s2 = T.alloc_ub((C,), "float32")
-        T.copy(ws_g_exp[unit, 0], g_exp_s2)
-        gl = g_exp_s2[C - 1]
-        state_bf_s2 = T.alloc_ub((dv, dk), "bfloat16")
-        state_s2 = T.alloc_ub((dv, dk), "float32")
-        T.copy(ws_S[unit, 0, 0], state_bf_s2)
-        T.copy(state_bf_s2, state_s2)
-        # S = g_last * S   (vector scale, 学 AscendC CalGCumExp Muls)
-        T.tile.mul(state_s2, state_s2, gl)
-        ds_bf = T.alloc_ub((dv, dk), "bfloat16")
-        ds_ub = T.alloc_ub((dv, dk), "float32")
-        T.copy(ws_dstate[unit, 0, 0], ds_bf)
-        T.copy(ds_bf, ds_ub)
-        # S = S + dstate   (vector accumulate, 学 AscendC CalStateNew 累加)
-        T.tile.add(state_s2, state_s2, ds_ub)
-        T.copy(state_s2, state_bf_s2)
-        T.copy(state_bf_s2, ws_S[unit, 0, 0])
-        T.copy(state_bf_s2, final_state[b, h, :, :])
+                    # ---- C3（C scope / AIC）：attn_inter 直写 out + v_inner 原子加累加（读 curState）----
+                    with T.Scope("C"):
+                        # curState = (gi==0 && cId==0) ? initial_state[b,nvId] : final_state[b,nvId]
+                        if cId == 0:
+                            if gi == 0:
+                                T.copy(initial_state[b, nvId, 0, 0], sp_s_l1)
+                            else:
+                                T.copy(final_state[b, nvId, 0, 0], sp_s_l1)
+                        else:
+                            T.copy(final_state[b, nvId, 0, 0], sp_s_l1)
+                        # attn_inter = qPrime @ S^T -> L0C -> 直写 out（↔ CalAttnInter）
+                        T.copy(ws_qprime[nvId, row, 0], qprime_l1)
+                        T.gemm_v0(qprime_l1, sp_s_l1, ai_l0, transpose_B=True, init=True)
+                        T.copy(ai_l0, out[s0:s0 + valid, nvId, 0:dv])
+                        # v_inner += k_cumdecay @ S^T（L0C→GM 原子加，↔ CalVPrime；tilelang 已放宽 L0C 原子加 dtype 检查）
+                        T.copy(ws_k_cumdecay[nvId, row, 0], kcd_l1)
+                        T.gemm_v0(kcd_l1, sp_s_l1, vi2_l0, transpose_B=True, init=True)
+                        T.tile.atomic_add(ws_v_inner[nvId, row, 0], vi2_l0)
+                        T.set_cross_flag("FIX", 6)          # C 读完 curState -> V 可写 final_state（↔ 0x2，防覆盖，C scope 内 = AIC 侧）
+
+                    # ---- V3b（V scope / AIV）：wait 0x2；v_inner 累加；写 g_last*S；set 0x5 ----
+                    with T.Scope("V"):
+                        T.wait_cross_flag(6)            # ↔ 0x2：C 读完 -> 可写 final_state
+                        T.copy(ws_g_exp[nvId, row], g_exp_s2)
+                        gl = g_exp_s2[C - 1]            # g_last = exp(g_cum[C-1])
+                        # curState 同 C3 来源
+                        if cId == 0:
+                            if gi == 0:
+                                T.copy(initial_state[b, nvId, 0, 0], state_bf_s2)
+                            else:
+                                T.copy(final_state[b, nvId, 0, 0], state_bf_s2)
+                        else:
+                            T.copy(final_state[b, nvId, 0, 0], state_bf_s2)
+                        T.copy(state_bf_s2, state_s2)
+                        T.tile.mul(state_s2, state_s2, gl)      # S = g_last * S
+                        T.copy(state_s2, state_bf_s2)
+                        T.copy(state_bf_s2, final_state[b, nvId, 0, 0])   # 普通写，只写衰减部分（↔ CopyOutState）
+                        # set 放 V scope 内（AIV 流），照抄 AscendC AIV 分支。
+                        T.set_cross_flag("MTE3", 8)     # V 写完 g_last*S -> C 可 atomic_add（↔ 0x5）
+
+                    # ---- C3''（C scope / AIC）：wait 0x5；原子加 dstate；set 0x4 ----
+                    with T.Scope("C"):
+                        T.wait_cross_flag(8)            # ↔ 0x5：V 写完 g_last*S -> 可 atomic_add
+                        # v_new = ws_v_inner（C3 已把 k_cumdecay@S^T 原子加进它）
+                        T.copy(ws_v_inner[nvId, row, 0], vn_l1_s2)
+                        T.copy(ws_kg[nvId, row, 0], kg_l1)
+                        T.gemm_v0(vn_l1_s2, kg_l1, ds_l0, transpose_A=True, init=True)  # (dv, dk)
+                        T.tile.atomic_add(final_state[b, nvId, 0, 0], ds_l0)   # final_state += dstate（↔ CalStateNew，L0C→GM 原子加）
+                        T.set_cross_flag("FIX", 10)     # C 累加完 -> V 下轮读 final_state（↔ 0x4，C scope 内 = AIC 侧）
+
+                    # ---- V3c（V scope / AIV）：wait 0x4（C 累加完 -> 下轮 V 读安全）----
+                    with T.Scope("V"):
+                        T.wait_cross_flag(10)           # ↔ 0x4：等本轮 C3'' 累加完 -> 下轮 V 读 final_state 安全
+                        pass

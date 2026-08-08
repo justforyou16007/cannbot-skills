@@ -9,104 +9,132 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # ----------------------------------------------------------------------------------------------------------
 
-"""Block-level 设计：Stage1 — within-chunk 预计算（独立 jit kernel，对应 tile-level `stage1_ker`）。
+"""Block-level 设计：Stage1 — within-chunk 预计算（单 kernel 内的 T.macro 骨架）。
 
-对应 AscendC `Stage1`（stage1.h）。对当前 chunk（行窗口 `[s0, s0+valid)`）计算所有
-「只依赖本 chunk、不依赖历史状态」的量，写 workspace（bf16/fp32）供 Stage2/3 用。
-满足 `BlockLevelDesign-quality-checklist.md`（C/V 分工 #4、workspace #6、TODO #7、GEMM #10）。
+对应 AscendC `Stage1`（stage1.h），**C/V 分工与同步完全照抄（AIC/AIV 并行流水）**。细算在
+`design/tile_level/stage1.py` 落地（TODO(tile-level)）。
+**任务分片封装在 stage 内部**（照抄 stage1.h `Stage1::Process`）：`totalChunk = nv × num_chunk`
+按 `coreIdx` 均分（former/tail），`taskId` 反解 `(nvId, cgId)`；workspace 为 AscendC 布局
+`(Nv, maxGroupLength, ...)`，本 chunk 行偏移 `row = cgId * C`（stage1.h `SetChunkOffset` 的
+`chunkRowBase`）。满足 checklist #4/#5/#6/#7/#10。
 
-## C/V 子阶段（checklist #4）
+## C/V 子阶段（照抄 AscendC 分工，checklist #4）
 
-    V0  g_cum=cumsum(g)；g_exp/g_exp_neg=exp(±g_cum)      （向量）
-    C1  kbt = kb @ k^T   （kb=k·β，cube matmul，T.gemm_v0）
-    V1  decay[i][j]=g_exp[i]·g_exp_neg[j] (j<=i)
-        A = -(kbt·decay) 下三角；X = (I-A)^{-1}（前代）；kb/vb/kbe/qPrime/kg（逐元素）
-    C2  v_inner = X @ vb；k_cumdecay = X @ kbe            （cube matmul）
+    V0a  prep 连续化：ws_q = q*scale；ws_k = k                            （向量，↔ QKPreProcess）
+    C1   kkt = k @ k^T → ws_kbt；qkt = q @ k^T → ws_qkt                    （cube，↔ kkt + qkt）
+    V0b  g_cum = cumsum(g)；g_exp/g_exp_neg = exp(±g_cum)                  （向量，↔ GCumExp，与 C1 并行）
+    V1a  attn_1 = ws_kbt · β · decay（decay=g_exp[i]·g_exp_neg[j], j<=i）；A=-(attn_1).tril(-1)；
+         X 对角子块前代 + off-diag M10 暂存到 ws_x                        （向量，↔ KKBeta + Gamma + InverseCompute）
+    C2a  off-diag 求逆 X10 = X11·M10·X00（覆盖 ws_x 为完整 X）              （cube，↔ AttnInverseMMCompute）
+    V2   ws_kbe = -β·g_exp·k（gBK 带负号）；ws_vb = v·β；ws_kg             （向量，↔ GBK + VBeta）
+    C2b  k_cumdecay = X @ ws_kbe；v_inner = X @ ws_vb                      （cube，↔ k_cumdecay + v_inner）
+    V3   ws_qprime = q·scale·g_exp                                        （向量，↔ QPrimeCompute）
 
-## 块内遍历（checklist #2）
+注：kkt 用**纯 k**（beta 在 V1a 广播乘，照抄 AscendC KKBetaCompute），故无 ws_kb；
+ws_kbe 存 **gBK（-β·g_exp·k，带负号）**，C2b 直接 gemm 得 k_cumdecay（对应 AscendC `attn@gBK`）。
 
-    with T.Kernel(used_core_num):
-        for unit in 分给本 kernel 的 (b, head) 集合:
-            if b == 当前 batch 且 属于本 chunk:
-                # 每单元：加载 chunk -> V0/C1/V1/C2 -> 写 workspace
+## 同步（checklist #5，AIC↔AIV 并行，6 flag 与 AscendC 一一对应）
 
-## workspace 写（checklist #6）
+    - flag 0 ↔ 0x9：V0a prep 写完 → C1 可算 kkt/qkt
+    - flag 1 ↔ 0x8：C1 kkt 写完 → V1a 可算 KKBeta/求逆
+    - flag 5 ↔ 0xA：C1 qkt 写完 → V3 wait（stage1 完成）
+    - flag 2 ↔ 0x7：V1a 求逆对角写完 → C2a 可算 off-diag
+    - flag 3 ↔ 0x6：V2 gBK 写完 → C2b 可算 k_cumdecay
+    - flag 4 ↔ 0x5：V2 vb 写完 → C2b 可算 v_inner
 
-    ws_gcumexp(C) fp32 | ws_kcumdecay(C,Dk) ws_vinner(C,Dv) ws_qprime(C,Dk) ws_qkt(C,C) ws_kg(C,Dk) bf16
-
-## GEMM（checklist #10）
-
-    kbt: (C,Dk)@(Dk,C)；v_inner: (C,C)@(C,Dv)；k_cumdecay: (C,C)@(C,Dk)——block 维 64/128 ≥ 16。
+阶段边界由入口 `T.sync_all()` 兜底。编号避开 stage2（6/8/10）、stage3（9/7）。
 """
 
-import tilelang
 import tilelang.language as T
 
-from design.chunk_gated_delta_rule_common import CHUNK_SIZE, pass_configs
 
+@T.macro(hygienic=False)
+def run_stage1(cid, used_core_num, group_chunks,
+               nk, nv, dk, dv, C, scale,
+               gpos, cg_len, num_chunk,
+               query, key, value, beta, g,
+               ws_q, ws_k, ws_kbe, ws_qprime, ws_kg, ws_vb,
+               ws_kbt, ws_qkt, ws_x, ws_v_inner, ws_k_cumdecay,
+               ws_g_exp, ws_g_exp_neg):
+    """within-chunk 预计算（骨架；任务分片照抄 stage1.h Process，细算见 tile_level/stage1.py）。"""
+    # ---- AscendC Stage1::Process：totalChunk = nv*num_chunk 按 coreIdx 均分 ----
+    #   `for taskId = start; taskId < end; taskId += paraNum(4)`，taskId 反解 (nvId, cgId)
+    total_chunk = nv * num_chunk
+    tail_chunk_num = total_chunk // used_core_num
+    former_core_num = total_chunk % used_core_num
+    former_chunk_num = tail_chunk_num + 1
+    start = T.if_then_else(cid < former_core_num,
+                           cid * former_chunk_num,
+                           former_core_num * former_chunk_num
+                           + (cid - former_core_num) * tail_chunk_num)
+    end = start + T.if_then_else(cid < former_core_num, former_chunk_num, tail_chunk_num)
 
-@tilelang.jit(out_idx=[], workspace_idx=[], pass_configs=pass_configs)
-def stage1_ker(batch, seq_len, nk, nv, dk, dv, chunk_size=CHUNK_SIZE, scale=1.0):
-    C = chunk_size
-    total_units = batch * nv
-    used_core_num = min(20, total_units)   # 可换平台核数
+    for taskId in T.serial(nv * group_chunks):
+        if taskId >= start and taskId < end:
+            nvId = taskId % nv
+            cgId = taskId // nv
+            s0 = gpos + cgId * C
+            valid = T.if_then_else(cg_len - cgId * C < C, cg_len - cgId * C, C)
+            row = cgId * C
+            kh = (nvId * nk) // nv      # 该 value head 读的 key head（head 分组）
 
-    @T.prim_func
-    def main(
-        query: T.Tensor((seq_len, nk, dk), "bfloat16"),
-        key: T.Tensor((seq_len, nk, dk), "bfloat16"),
-        value: T.Tensor((seq_len, nv, dv), "bfloat16"),
-        beta: T.Tensor((seq_len, nv), "bfloat16"),
-        g: T.Tensor((seq_len, nv), "float32"),
-        ci: T.Tensor((1,), "int32"),
-        bb: T.Tensor((1,), "int32"),
-        Lb: T.Tensor((1,), "int32"),
-        ws_gcumexp: T.Tensor((C,), "float32"),
-        ws_kcumdecay: T.Tensor((C, dk), "bfloat16"),
-        ws_vinner: T.Tensor((C, dv), "bfloat16"),
-        ws_qprime: T.Tensor((C, dk), "bfloat16"),
-        ws_qkt: T.Tensor((C, C), "bfloat16"),
-        ws_kg: T.Tensor((C, dk), "bfloat16"),
-    ):
-        with T.Kernel(used_core_num, is_npu=True) as (cid, vid):
-            # TODO(tile-level): persistent 分配 unit，`b=unit//nv, h=unit%nv, kh=(h*nk)//nv`
-            #                   `s0=base[b]+ci[0]*C, valid=T.if_then_else(Lb[0]-ci[0]*C<C, ...)`
-            #                   `if b==bb[0]:` 只处理当前 batch
-
-            # V0：加载 chunk 的 q/k/v/β/g（bf16→fp32 升型，逐标量 β/g，切片写全最后一维）
+            # ---- V0a : prep 连续化（↔ QKPreProcess）----
             with T.Scope("V"):
-                # TODO(tile-level):
-                #   qc/kc/vc = T.copy(query[s0:s0+valid, kh, 0:dk], ...) 升型
-                #   bc/gc = 逐标量 beta[s0+t,h:h+1] / g[s0+t,h:h+1] -> [1] -> 升型
-                #   g_cum=cumsum(gc)；g_exp/g_exp_neg=T.tile.exp(±g_cum)
-                #   kb=kc*bc；vb=vc*bc；kbe=kb*g_exp；qPrime=qc*scale*g_exp；kg=kc*exp(g_last-g_cum)
+                # TODO(tile-level): 加载 chunk q/k（s0..s0+valid, kh）+ v（nvId）
+                #                   ws_q = q*scale；ws_k = k（连续化落 GM）
                 pass
-            # C↔V 同步（checklist #5）：V0 产物（kb/vb）就绪 -> C1
-            T.set_cross_flag("MTE3", 0)          # V0 -> C1
+            T.set_cross_flag("MTE3", 0)          # ↔ 0x9：prep 写完 -> C1 可算 kkt/qkt
 
-            # C1：kbt = kb @ k^T
+            # ---- C1 : kkt / qkt（↔ AIC kkt + qkt，与 V0b 的 g_cum 并行）----
             with T.Scope("C"):
-                T.wait_cross_flag(0)             # 等 V0 的 kb 就绪
-                # TODO(tile-level): T.gemm_v0(kb, kT, kbt)  # kT = k^T (dk, C)
+                T.wait_cross_flag(0)
+                # TODO(tile-level): T.gemm_v0(ws_k, ws_k, ws_kbt, transpose_B=True)   # kkt = k@k^T（纯 k）
+                #                   T.gemm_v0(ws_q, ws_k, ws_qkt, transpose_B=True)   # qkt = q@k^T
                 pass
-            T.set_cross_flag("FIX", 1)          # C1 -> V1：kbt 就绪
+            T.set_cross_flag("FIX", 1)          # ↔ 0x8：kkt 写完 -> V1a 可算 KKBeta/求逆
+            T.set_cross_flag("FIX", 5)          # ↔ 0xA：qkt 写完 -> V3 wait（stage1 完成）
 
-            # V1：A / X 前代 / 各逐元素量
+            # ---- V0b : g_cum / g_exp / g_exp_neg（↔ GCumExp，与 C1 并行）----
             with T.Scope("V"):
-                T.wait_cross_flag(1)             # 等 C1 的 kbt 就绪
-                # TODO(tile-level):
-                #   decay[i][j]=g_exp[i]*g_exp_neg[j] (j<=i)
-                #   A = -(kbt*decay).tril(-1)
-                #   X = (I-A)^{-1} forward substitution（对角=1）
+                # TODO(tile-level): 加载 β/g（逐标量）；g_cum=cumsum(g)
+                #                   ws_g_exp = T.tile.exp(g_cum)；ws_g_exp_neg = T.tile.exp(-g_cum)
                 pass
-            T.set_cross_flag("MTE3", 2)          # V1 -> C2：X 就绪
 
-            # C2：v_inner / k_cumdecay（写 workspace，bf16 降型）
+            # ---- V1a : KKBeta + Gamma + Inverse 对角（↔ KKBeta + InverseCompute）----
+            with T.Scope("V"):
+                T.wait_cross_flag(1)
+                # TODO(tile-level): decay[i][j] = ws_g_exp[i]*ws_g_exp_neg[j] (j<=i)
+                #                   attn_1 = ws_kbt * β * decay（β 广播，↔ KKBeta+Gamma）
+                #                   A = -(attn_1).tril(-1)；X 对角子块 AIV 向量前代
+                #                   + off-diag M10（负值）暂存 -> ws_x
+                pass
+            T.set_cross_flag("MTE3", 2)         # ↔ 0x7：求逆对角写完 -> C2a 可算 off-diag
+
+            # ---- C2a : off-diag 求逆（↔ AttnInverseMMCompute）----
             with T.Scope("C"):
-                T.wait_cross_flag(2)             # 等 V1 的 X 就绪
-                # TODO(tile-level):
-                #   T.gemm_v0(X, vb, v_inner)；T.gemm_v0(X, kbe, k_cumdecay)
-                #   T.copy 降型 -> ws_kcumdecay / ws_vinner / ws_qprime / ws_qkt / ws_kg
+                T.wait_cross_flag(2)
+                # TODO(tile-level): X10 = X11 @ M10 @ X00（gemm）覆盖 ws_x 的 off-diag，ws_x 变完整 X
                 pass
 
-    return main
+            # ---- V2 : gBK / vb / kg（↔ GBK + VBeta，与 C2a 并行）----
+            with T.Scope("V"):
+                # TODO(tile-level): ws_kbe = -β·g_exp·k（gBK 带负号，供 C2b 算 k_cumdecay）
+                #                   ws_vb = v·β
+                #                   ws_kg = k·g_exp[C-1]·g_exp_neg
+                pass
+            T.set_cross_flag("MTE3", 3)         # ↔ 0x6：gBK 写完 -> C2b 可算 k_cumdecay
+            T.set_cross_flag("MTE3", 4)         # ↔ 0x5：vb 写完 -> C2b 可算 v_inner
+
+            # ---- C2b : k_cumdecay / v_inner（↔ AIC k_cumdecay + v_inner）----
+            with T.Scope("C"):
+                T.wait_cross_flag(3)
+                T.wait_cross_flag(4)
+                # TODO(tile-level): T.gemm_v0(ws_x, ws_kbe, ws_k_cumdecay)   # X @ gBK（gBK 带负号）
+                #                   T.gemm_v0(ws_x, ws_vb, ws_v_inner)      # X @ vb
+                pass
+
+            # ---- V3 : qPrime（↔ QPrimeCompute）----
+            with T.Scope("V"):
+                T.wait_cross_flag(5)            # ↔ 0xA：等 C1 写完 qkt（stage1 完成）
+                # TODO(tile-level): ws_qprime = q·scale·g_exp（读 GM q 或 ws_q）
+                pass

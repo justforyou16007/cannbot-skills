@@ -85,7 +85,6 @@ def run_stage1(cid, used_core_num, group_chunks,
     kkt_ub = T.alloc_ub((C, C), "float32")
     g_expb = T.alloc_ub((C,), "float32")
     g_exp_negb = T.alloc_ub((C,), "float32")
-    a_bf = T.alloc_ub((C, C), "bfloat16")
     attn_ub = T.alloc_ub((C, C), "float32")
     acc1 = T.alloc_ub((1,), "float32")
     x_bf = T.alloc_ub((C, C), "bfloat16")
@@ -201,10 +200,8 @@ def run_stage1(cid, used_core_num, group_chunks,
                                 kkt_ub[i, j] = -(kkt_ub[i, j] * bc[i] * g_expb[i] * g_exp_negb[j])
                             else:
                                 kkt_ub[i, j] = 0.0
-                    # golden quantizes A to bf16 before the forward-sub; round A through a
-                    # bf16 staging to match numerics.
-                    T.copy(kkt_ub, a_bf)
-                    T.copy(a_bf, kkt_ub)
+                    # A 保持 fp32 直接进求逆（照抄 KKBetaCompute+InverseCompute：
+                    # attnUbFloat 乘完 beta/exp(差) 后不进 bf16，直接 InverseAIV）。
                     for i in T.serial(C):
                         for j in T.serial(C):
                             attn_ub[i, j] = kkt_ub[i, j]

@@ -308,3 +308,9 @@ tail:
 - `C1/C2` 与 `V1/V2` 不再按单个分块完全串行执行
 - 不同分块的不同阶段可以在稳态中重叠
 - steady-state 中 Cube 和 Vector 的等待会明显减少
+
+## 算子实例
+
+| 算子 | 特点 | 设计文档 |
+| --- | --- | --- |
+| Chunked Gated Delta Rule（GDR） | stateful 线性注意力：状态沿 chunk 递推 → chunk-group 协作模型；三 stage C/V 流水 + 原子加直写 out/final_state | `GDRBlockLevelDesign.md` |

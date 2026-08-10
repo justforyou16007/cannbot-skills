@@ -27,7 +27,7 @@ WORKDIR = SCRIPT_DIR.parent
 # Import shared utility functions from the canonical AscendC verification module.
 # Canonical source: tilelang2ascend-translator/scripts/verification_ascendc.py
 _ASCENDC_SCRIPTS = (
-    Path(__file__).resolve().parents[1] / "tilelang2ascend-translator" / "scripts"
+    Path(__file__).resolve().parents[2] / "tilelang2ascend-translator" / "scripts"
 )
 if str(_ASCENDC_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_ASCENDC_SCRIPTS))

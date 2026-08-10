@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 # 从 validate_ascendc_impl 导入共享常量、AST 工具和检查函数
 _ASCENDC_SCRIPTS = (
-    Path(__file__).resolve().parents[1] / "tilelang2ascend-translator" / "scripts"
+    Path(__file__).resolve().parents[2] / "tilelang2ascend-translator" / "scripts"
 )
 if str(_ASCENDC_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_ASCENDC_SCRIPTS))

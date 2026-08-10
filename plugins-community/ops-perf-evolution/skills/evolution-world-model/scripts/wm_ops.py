@@ -1504,6 +1504,10 @@ class _RefineContext:
     round_best_speedup: float = 0.0
     worst_quality: str = "good"
     expected_cases: int | None = None
+    # P8: canonical PyTorch 参考时间（baseline_evaluation.base_time_ms_avg），
+    # 用于统一 score 基准；score_scale_alerts 记录 base 异常需归一的变体。
+    pytorch_time_ms: float = 0.0
+    score_scale_alerts: list = None
 
 
 def _expected_case_count(results_dir: str) -> int | None:
@@ -1777,6 +1781,17 @@ def _gen_children_for_passed(node: dict, node_id: str, nodes: dict,
         _gen_oe_child(node, node_id, nodes, speedup, substantial)
     elif mode == "profiling_driven":
         _gen_pd_continue_child(node, node_id, nodes, speedup, substantial)
+    elif mode == "workflow_guided":
+        # P1: workflow_guided 分支延续——passed 后复用 strategy_guided 派生逻辑生成
+        # 子节点，并让子节点继承 workflow_ref，使 FA workflow 分支可持续推进
+        # （此前无此分支，workflow_guided 通过后无子节点、workflow 链一轮即断）。
+        _gen_sg_children(node, node_id, nodes, speedup, substantial)
+        wf_ref = node.get("workflow_ref")
+        if wf_ref:
+            for cid in node.get("children", []):
+                child = nodes.get(cid)
+                if child and child.get("parent_id") == node_id:
+                    child["workflow_ref"] = wf_ref
 
     _gen_profiling_driven_child(node, node_id, nodes, bottleneck, one_liner)
 
@@ -1866,6 +1881,25 @@ class _VariantEvalInput:
     speedup: float
 
 
+def _note_infeasible_hits(note_text: str) -> list:
+    """P5: 从 implementation_note 提取"验证不可行"判断的标记。
+
+    强标记直接命中；"不可行"需排除否定语境（如"无不可行判断"、"未发现不可行"），
+    避免 passed 节点的普通叙述被误判为不可行结论。
+    """
+    strong_marks = ("必然失精度", "平台约束", "无法实现", "崩溃回退", "不兼容")
+    hits = [m for m in strong_marks if m in note_text]
+    neg_prefixes = ("无", "没有", "未", "不是")
+    idx = note_text.find("不可行")
+    while idx != -1:
+        prefix = note_text[max(0, idx - 2):idx]
+        if not any(neg in prefix for neg in neg_prefixes):
+            hits.append("不可行")
+            break
+        idx = note_text.find("不可行", idx + 1)
+    return hits
+
+
 def _process_passed_variant(vei: _VariantEvalInput, ctx: _RefineContext):
     """处理 PASSED 变体：填字段、profiling_insight、evidence、子节点。"""
     node, node_id, p_idx, eval_result, speedup = (
@@ -1905,6 +1939,28 @@ def _process_passed_variant(vei: _VariantEvalInput, ctx: _RefineContext):
                              _PassedEvalInfo(speedup, mq, one_liner, bottleneck))
     _merge_evidence_into_children(node, node_id, ctx.nodes)
     _inject_shape_spec_into_children(node, ctx.nodes)
+
+    # P5: passed 节点若 implementation_note 记录"验证不可行"判断，也进 pending_diagnosis
+    # （供 4.4.2 按 failure_pattern 沉淀，避免可复用失败教训因节点 passed 而丢失）。
+    note_path = os.path.join(ctx.results_dir, f"parallel_{p_idx}", "implementation_note.txt")
+    note_hits = []
+    if os.path.isfile(note_path):
+        try:
+            with open(note_path, "r", encoding="utf-8", errors="ignore") as _f:
+                note_text = _f.read()
+            note_hits = _note_infeasible_hits(note_text)
+        except OSError:
+            note_hits = []
+    if note_hits:
+        ctx.pending_diagnosis.append({
+            "node_id": node_id,
+            "parallel_index": p_idx,
+            "compilation_success": True,
+            "precision_passed": True,
+            "phenomenon": "impl_verdict_infeasible",
+            "error": f"implementation_note 记录不可行判断: {'/'.join(note_hits)}",
+            "implementation_note_path": note_path,
+        })
 
     ctx.summary_lines.append(
         f"  p{p_idx} [{node_id}]: PASS {speedup:.2f}x "
@@ -2019,6 +2075,33 @@ def _process_one_variant(node_id: str, p_idx_str: str, ctx: _RefineContext):
         if isinstance(ms_min, (int, float)) and ms_min > 0:
             speedup = ms_min
 
+    # ── P8: 统一 score 基准为 vs PyTorch ──
+    # comparison.speedup 的 base_time_ms 可能被污染为父/基线内核时间（ref_base 缺失、
+    # base 与 canonical PyTorch 参考偏差 >±20%）。此时用 canonical pytorch_time_ms /
+    # gen_time_ms 重算 score，并记录 alert 供审计，避免 vs 基线 / vs PyTorch 混存导致
+    # 最优判定错误（MQA 会话实证：n8 的 vs 基线 0.9451 被误判为 vs PyTorch 最优）。
+    if not ms_active and ctx.pytorch_time_ms > 0:
+        gen_ms = comp.get("gen_time_ms")
+        base_ms = comp.get("base_time_ms")
+        ref_base = comp.get("ref_base", "missing")
+        base_ok = (
+            ref_base == "pytorch"
+            and isinstance(base_ms, (int, float)) and base_ms > 0
+            and abs(float(base_ms) - ctx.pytorch_time_ms) <= 0.2 * ctx.pytorch_time_ms
+        )
+        if not base_ok and isinstance(gen_ms, (int, float)) and gen_ms > 0:
+            norm_speedup = ctx.pytorch_time_ms / gen_ms
+            ctx.score_scale_alerts.append({
+                "node_id": node_id, "parallel_index": p_idx,
+                "base_time_ms": base_ms, "gen_time_ms": gen_ms,
+                "ref_base": ref_base,
+                "canonical_pytorch_ms": round(ctx.pytorch_time_ms, 4),
+                "raw_speedup": round(speedup, 4),
+                "normalized_speedup": round(norm_speedup, 4),
+                "note": "base_time_ms 偏离 canonical PyTorch 参考（可能用父/基线内核作 base），score 已按 canonical PyTorch 重算",
+            })
+            speedup = norm_speedup
+
     if compilation_ok and precision_ok and speedup > 0:
         _process_passed_variant(
             _VariantEvalInput(node, node_id, p_idx, eval_result, speedup), ctx)
@@ -2103,6 +2186,18 @@ def refine(
         pending_diagnosis=[],
         expected_cases=_expected_case_count(results_dir),
     )
+    # P8: 读取 baseline_evaluation.json 的 canonical PyTorch 参考时间
+    # (base_time_ms_avg = ref 平均耗时, 单位 ms)，用于统一 score 基准。
+    baseline_eval_path = os.path.join(
+        os.path.dirname(results_dir.rstrip(os.sep)), "baseline_evaluation.json")
+    if os.path.isfile(baseline_eval_path):
+        try:
+            with open(baseline_eval_path, "r", encoding="utf-8") as _f:
+                _be = json.load(_f)
+            ctx.pytorch_time_ms = float(_be.get("base_time_ms_avg", 0) or 0)
+        except (OSError, json.JSONDecodeError, ValueError):
+            ctx.pytorch_time_ms = 0.0
+    ctx.score_scale_alerts = []
     round_total = len(parallel_map)
 
     for p_idx_str, node_id in parallel_map.items():
@@ -2139,6 +2234,7 @@ def refine(
         "best_score_before": best_score_before,
         "best_score_after": best_score_after,
         "worst_quality": ctx.worst_quality,
+        "score_scale_alerts": ctx.score_scale_alerts,
     }
 
 
@@ -2441,6 +2537,18 @@ def cmd_refine(args: argparse.Namespace) -> None:
         with open(diag_path, "w", encoding="utf-8") as f:
             json.dump(result["pending_diagnosis"], f, ensure_ascii=False, indent=2)
         LOGGER.info("Pending diagnosis written to: %s", diag_path)
+
+    # P8: 写 score_scale_alerts.json + 告警（base_time_ms 偏离 canonical PyTorch 的变体）
+    if result.get("score_scale_alerts"):
+        alert_path = os.path.join(args.results_dir, "score_scale_alerts.json")
+        with open(alert_path, "w", encoding="utf-8") as f:
+            json.dump(result["score_scale_alerts"], f, ensure_ascii=False, indent=2)
+        for a in result["score_scale_alerts"]:
+            LOGGER.warning(
+                "[P8] score scale alert: node %s (p%s) base_time_ms=%s 偏离 canonical PyTorch %s → score 重算 %s (ref_base=%s)",
+                a.get("node_id"), a.get("parallel_index"), a.get("base_time_ms"),
+                a.get("canonical_pytorch_ms"), a.get("normalized_speedup"),
+                a.get("ref_base"))
 
     # Print round summary
     DATA_LOGGER.info("%s", result["round_summary"])

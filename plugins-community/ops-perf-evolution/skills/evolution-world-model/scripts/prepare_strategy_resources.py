@@ -151,15 +151,50 @@ def step_3_get_excluded(evo_dir: str) -> str:
     return proc.stdout.strip()
 
 
+def _find_fallback_strategies(
+    excluded_ids: list[str], count: int = 2,
+) -> list[str]:
+    """P2: 从 INDEX.json 选"永不触发 Preconditions"的替代策略。
+
+    全部候选被 Preconditions 过滤时，优先注入这些替代策略（保证再次过滤也会通过），
+    而不是直接降级 open_exploration。候选 = 未废弃 + 无 preconditions 文件的策略，
+    按是否覆盖 attention/flash_attention 排序（常见进化目标）。
+    """
+    index_path = PLUGIN_ROOT / "skills/evolution-strategies/references/INDEX.json"
+    if not index_path.exists():
+        return []
+    try:
+        with open(index_path, "r", encoding="utf-8") as f:
+            idx = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return []
+    excluded = set(excluded_ids)
+    cards = idx.get("cards", [])
+    fallback = [
+        c for c in cards
+        if c.get("id") and c["id"] not in excluded
+        and not c.get("deprecated")
+        and not c.get("has_preconditions")
+    ]
+    # 排序：attention/flash_attention 相关优先，其次按 id
+    fallback.sort(key=lambda c: (
+        not ({"attention", "flash_attention"} & set(c.get("op_families") or [])),
+        c.get("id", "")))
+    return [c["id"] for c in fallback[:count]]
+
+
 def step_override_node_in_wm(
     wm_path: str, node_id: str,
     original_strategies: list[str],
     filter_reasons: str,
+    fallback_strategies: list[str] = None,
 ) -> bool:
     """当所有候选策略被过滤时，主动改写 world_model.json 中的节点。
 
-    将 strategy_combination 清空、mode 切换为 open_exploration，
-    并写入 _mode_overridden 标记供事后审计。
+    - 有 fallback_strategies：注入替代策略（保持 strategy_guided 模式），带
+      _replaced_from 审计标记，避免退化为无策略的 open_exploration。
+    - 无 fallback_strategies：strategy_combination 清空、mode 切换为
+      open_exploration，写入 _mode_overridden 标记供事后审计。
 
     返回 True 表示改写成功，False 表示跳过（wm_path 或 node_id 缺失、节点不存在）。
     """
@@ -187,24 +222,31 @@ def step_override_node_in_wm(
         return False
 
     # 记录原始状态供事后审计
-    node["_mode_overridden"] = True
     node["_original_strategies"] = list(original_strategies)
     node["_override_reason"] = filter_reasons
-
-    # 硬改写：清空策略组合 + 切换为开放探索
-    node["strategy_combination"] = []
-    node["mode"] = "open_exploration"
-
-    # 更新描述
     original_desc = node.get("description", "")
-    override_note = (
-        f"[MODE OVERRIDE: 全部策略 ({', '.join(original_strategies)}) "
-        f"被 Preconditions 过滤 → 切换 open_exploration]"
-    )
-    if original_desc:
-        node["description"] = override_note + " " + original_desc
+
+    if fallback_strategies:
+        # P2: 注入替代策略，保持 strategy_guided 方向，避免退化为 open_exploration
+        node["strategy_combination"] = list(fallback_strategies)
+        node["_replaced_from"] = list(original_strategies)
+        replace_note = (
+            f"[P2: 策略替换] 原策略 ({', '.join(original_strategies)}) "
+            f"被 Preconditions 过滤 → 注入替代 {', '.join(fallback_strategies)}]"
+        )
+        node["description"] = (
+            replace_note + (" " + original_desc if original_desc else ""))
     else:
-        node["description"] = override_note
+        # 硬改写：清空策略组合 + 切换为开放探索
+        node["_mode_overridden"] = True
+        node["strategy_combination"] = []
+        node["mode"] = "open_exploration"
+        override_note = (
+            f"[MODE OVERRIDE: 全部策略 ({', '.join(original_strategies)}) "
+            f"被 Preconditions 过滤且无替代 → 切换 open_exploration]"
+        )
+        node["description"] = (
+            override_note + (" " + original_desc if original_desc else ""))
 
     try:
         with open(wm_file, "w", encoding="utf-8") as f:
@@ -533,10 +575,19 @@ def main() -> int:
     # ── v3.2 C7-fix: passed 为空时，主动改写 wm.json 节点 ──
     if not passed and candidate_ids:
         filter_reasons = _format_filter_reasons(failed)
+        # P2: 先尝试注入替代策略（无 precondition、不会再被过滤），避免直接退化为
+        # open_exploration；无替代时才降级 open。
+        fallback = _find_fallback_strategies(
+            candidate_ids + [f.get("id", "") for f in failed])
+        if fallback:
+            passed = fallback
+            LOGGER.info("[P2] 原策略全被 Preconditions 过滤，注入替代策略 %s (原: %s)",
+                        fallback, candidate_ids)
         step_override_node_in_wm(
             args.wm_path, args.node_id,
             original_strategies=candidate_ids,
             filter_reasons=filter_reasons,
+            fallback_strategies=passed if fallback else None,
         )
 
     # Step 2: load playbooks（passed 为空时跳过）

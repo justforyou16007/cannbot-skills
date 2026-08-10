@@ -57,6 +57,7 @@ Steps:
 2. Degeneration check - validate_ascendc_impl.py + evaluate_ascendc.sh. See [Optimization Approach] for strategy application.
 3. Functional verification - evaluate_ascendc.sh (accuracy) + 性能评测用 ops-profiling `msprof_profile_run.sh --quick --output-dir={output_dir} --device={npu}`（产出 performance.json / performance.log / perf_report.md）
    [禁止] 禁止手写自定义计时脚本（自造 measure_perf.py / event_timing.py / op_only_timing.py 等）替代标准评测——性能数据一律以 ops-profiling quick 模式产出的 performance.json / performance.log 为准
+   [评估基准约束] evaluation_results.json 的 comparison 必须含 `ref_base: "pytorch"`；`base_time_ms` 必须是 `shared/model.py`（PyTorch 参考实现）测得的时间，`gen_time_ms` 是变体内核时间。**禁止**用父内核/基线内核作 base（否则 speedup 变成"变体 vs 父内核"，污染世界模型 score，导致最优判定错误）。缺 `ref_base` 或 base_time_ms 非 PyTorch 时间视为评估不合格。
    On failure: Conductor analysis (A/B/C classification) → targeted fix → retry (max 3 iterations)
 4. Local Refinement (MANDATORY):
    If Max Improve Rounds > 0 AND compilation_success=true AND precision_passed=true → execute inner refinement loop (see [Config])

@@ -100,7 +100,7 @@ LINGXI进化支持基线内核模式（用户提供现有AscendC内核项目目�
 - **算子名称**: 简短标识符 (例如: "FastGELU", "Tril")
 - **[基线模式] 基线内核路径**: 现有AscendC内核项目目录路径 (例如: `output/FastGELU_evo_xxx/round_2/parallel_1` 或手写内核目录)
 - **最大轮数** (默认: 2, 推荐: 2-3)；**并行数量**: 每轮并行候选数 (默认: 3, 推荐: 3-5)；**目标加速比** (默认: 3x)
-- **[重要] 目标加速比语义**: `target_speedup` 是**相对 PyTorch** 的加速比（`evaluation_results.json` 的 `speedup` 字段 = Ref_time / Asc_time），**不是**相对基线内核（`comparison.speedup`）。节点 `score` / `best_score` 是 **vs 基线**尺度；判定达标、或计算 `best_score < target_speedup × N` 这类阈值时必须换算：vs PyTorch 加速比 ≈ `comparison.speedup × baseline_vs_pytorch_speedup`，等价地 `effective_target_vs_baseline = target_speedup / baseline_vs_pytorch_speedup`（例：baseline vs PyTorch 0.29x、目标 2.0x → 需相对基线提升 ~6.9x）
+- **[重要] 目标加速比语义**: `target_speedup` 是**相对 PyTorch** 的加速比。**节点 `score` / `best_score` = vs PyTorch 统一尺度**（P8 修复：`wm_ops.py refine` 落 score 时用 canonical PyTorch 参考时间归一，`score = baseline_evaluation.base_time_ms_avg / comparison.gen_time_ms`，不直接信任 `comparison.speedup`；若变体 `base_time_ms` 偏离 canonical ±20% 会输出 `score_scale_alerts.json` 告警并重算 score）。达标判定直接 `best_score ≥ target_speedup`。**注意**：evolution-report 的"加速比"列是**相对基线内核**（`baseline_time_us / evolved_time_us`），与 score 是不同口径，禁止混用排序。
 - **停滞窗口** (可选): 连续多少轮无显著提升（< 2%）后提前终止 (默认自动计算 = `max(1, min(ceil(max_rounds / 2), max_rounds - 1))`，该公式确保 window < max_rounds，使停滞检测有机会在上限前触发)
 - **改进轮数** (可选): Local Refinement 内层循环最多执行次数 (默认: 3，设为0可禁用)；**改进停滞窗口** (可选): Local Refinement 连续多少轮无显著提升（< 2%）后退出 (默认: 2)
 
@@ -275,13 +275,21 @@ with open('$EVO_DIR/shared/call_spec.json', 'w') as f:
 **执行过程**:
 
 1. 读取 `output/{op_name}_evo_{timestamp}/shared/model.py` 和 `shared/design/tile_level/`
-2. **OKF 知识库查询**: 用 `evolution-knowledge-query --op-family {family}`（有 baseline 瓶颈信息时加 `--bottleneck {bottleneck}`、`--status active`）查询 `okf/` 的 discovered_strategy / proven_solution / failure_pattern，命中即读对应卡片全文，纳入节点设计（尤其 X 系列策略的适用场景核对）。然后按 a3 渐进式披露：
+2. **OKF 知识库查询**: 用 `evolution-knowledge-query --op-family {family}`（有 baseline 瓶颈信息时加 `--bottleneck {bottleneck}`、`--status active`）查询 `okf/` 的 discovered_strategy / proven_solution / failure_pattern，命中即读对应卡片全文，纳入节点设计（尤其 X 系列策略的适用场景核对）。**【固化规则】命中 `kind=discovered_strategy` 的 X 系列时，必须把 `X{n}` 写入至少 1 个 strategy_guided 节点的 `strategy_combination`（作为候选策略，非仅参考文本）**——避免 OKF 命中却未进入任何被执行的变体（MQA 会话实证：X14 对症但只出现在未被 SELECT 选中的 Supervisor 建议里）。然后按 a3 渐进式披露：
    **必读知识库**: 读取 `plugins-community/ops-perf-evolution/skills/evolution-knowledge/references/a3/hardware/guide.md` 和 `a3/optimization_patterns/guide.md`；算子匹配特定族（attention/reduction/elementwise）时额外读取 `a3/algorithm_insights/{family}.md`；`a3/proven_solutions/INDEX.md` 中有同类算子方案时读取对应条目
 3. 分析算子特性: 内存密集型 vs 计算密集型？尾块对齐问题（形状非32字节整数倍）？数据类型特殊处理（FP16/BF16精度）？并读取 `plugins-community/ops-perf-evolution/skills/evolution-strategies/references/strategy-index.md` 识别最相关策略
 4. **模式B特殊处理**: `baseline_performance` 填入实际测量值（来自步骤3B.3），**必须包含 `time_us` 字段**（evolution-report 读取的关键字段）:
    ```json
    "baseline_performance": { "speedup": {baseline_speedup}, "precision_passed": {baseline_precision_passed}, "compilation_success": {baseline_compilation_success}, "time_us": {baseline_time_us} }
    ```
+4.5 **目标可达性预检（P6，必须执行）**：用 `check_target_feasibility.py` 检查目标是否物理可达（设备 launch 地板来自 OKF proven_solutions 的 `device_floor_us`，如 910B ~4.3-5.6μs）：
+   ```bash
+   python3 plugins-community/ops-perf-evolution/skills/evolution-world-model/scripts/check_target_feasibility.py \
+       --baseline-eval "$EVO_DIR/baseline_evaluation.json" \
+       --target-speedup {target_speedup} \
+       --op-family {family}
+   ```
+   若输出 `feasible: false` 或 `alarm` 非空：把告警写入 `open_questions`（标注"目标可能物理不可达，先确认可行性"），**不硬性阻断进化**。
 5. 设计节点：`parallel_num × 2` 个策略导向节点（`mode="strategy_guided"`）+ `max(1, ⌈parallel_num / 4⌉)` 个开放探索节点（`mode="open_exploration"`），确保:
    - 策略多样性（各 strategy_guided 节点 strategy_combination 不完全相同）、难度梯度（difficulty 2-4 均有覆盖）、类型覆盖（P系列性能、D系列数据类型、A系列精度，按需选择）
    - **X 系列策略必读全文**：strategy_combination 中包含 X 系列（`X{n}`，来自 strategy-index.md"探索发现策略"分类）时，必须先读取对应的 `plugins-community/ops-perf-evolution/skills/evolution-strategies/references/discovered/disc_X{n}.md` 全文，确认其适用场景与当前算子匹配后再纳入组合；X 系列无 Preconditions/Playbook，资源注入由 prepare_strategy_resources.py 自动完成

@@ -12,6 +12,7 @@ op_families: [matmul]
 strategy_ids: [P87, X24]
 bottlenecks: [scalar_compute, no_overlap, compute_bound]
 tags: [manual-mmad, transpose-workaround, aic-only, fixpipe-noquant, fractal-loading]
+device_floor_us: "4.3-5.6"
 ---
 
 ### X24: 手动 mmad 打破 MatmulImpl 固定开销地板（910B 微小 matmul）

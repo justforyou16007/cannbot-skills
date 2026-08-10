@@ -48,6 +48,7 @@ Each entry should follow this template:
 | matmul | MatmulTransA: Cube Tiling Systematic Design | output_0725_v2 generation |
 | conv (backward-filter) | X21: 910B2C Cube 化平台纪律 + 数据驱动 Kahan 精度路由 | conv3dbf_cb evolution |
 | conv (kw==1, 小空间维) | X23: Batched Spatial 全宽向量化 + 编译器驱动标量预取 | 8_ConvStandard3d evolution |
+| conv-transpose / deconv (col2im 散射) | X26: Col2im Tap-Batch 事件化 | 10_ConvTranspose2d evolution |
 
 _新方案沉淀时按此格式追加行_
 
@@ -304,6 +305,72 @@ for (g...) { AscendC::Axpy(acc[g*plane_], xBatch_[0], wLocal_.GetValue(g*K_+tap)
 - 仅用 `#pragma unroll` 驱动流水；手工多标量预取会触发编译器误编译（结果错误、速度虚高）
 
 **Strategy IDs**: X23
+
+---
+
+### X26: Col2im Tap-Batch 事件化 (ConvTranspose/deconv 散射)
+
+**Source**: 10_ConvTranspose2d evolution, round 1, parallel 2 (x0, open_exploration)
+**Speedup**: 0.417x → 0.535x geomean vs PyTorch (1.28x vs baseline); col2im 316us → 277us
+**Operator type**: conv-transpose / deconv (col2im 散射), fp32, Cube GEMM + Vector col2im 两阶段
+**Hardware**: Ascend910B2C (DAV_2201)
+
+**Technique description**:
+Cube 化 GEMM 后 col2im 成为新瓶颈（最差 274us vs GEMM 9us，GM-load-instruction bound：
+每输出行 ~8 个 64B 微小 G-row DataCopyPad）。基线每 tap 一次 `PipeBarrier<PIPE_ALL>`
+（~16/行）把 MTE2/MTE3/V 三管道完全串行化。重构为 tap-batch：一次发出该行所有有效
+tap 的 MTE2 加载（排队重叠）→ 1 次 barrier → V 管道 in-order 背靠背 Gather+Add →
+1 次 barrier 保护下一行复用。barrier 从 ~16/行降到 2/行。对齐 zero slot 在 V 管道
+一次性初始化（规避 S-pipe SetValue 与 V-pipe Gather 的 S/V 无保序问题）；行级 B1/B4
+保守保留 PIPE_ALL（MTE3 copyout WAR）。
+
+**Key code change**:
+```cpp
+// Before: 每 (kh,kw) tap: LoadGmToUb(src) + PipeBarrier<PIPE_ALL> + Gather + Add + PipeBarrier<PIPE_ALL>
+for (kh...) { for (kw...) { LoadGmToUb(src, G[m*ngPad+base], wi);
+    PipeBarrier<PIPE_ALL>(); Gather(tmp, src, off[...], 0, woA);
+    Add(acc, acc, tmp, woA); PipeBarrier<PIPE_ALL>(); } }
+
+// After: tap-batch —— 所有 tap 加载发出后 1 barrier，V 管道连续 Gather+Add 后 1 barrier
+for (kh...) for (kw...) LoadGmToUb(srcs[t], G[m*ngPad+base], wi);  // MTE2 排队重叠
+PipeBarrier<PIPE_ALL>();  // 全部加载就绪
+for (t...) { Gather(tmp[t], srcs[t], off[...], 0, woA); Add(acc, acc, tmp[t], woA); }
+PipeBarrier<PIPE_ALL>();  // WAR 保护下一行
+```
+
+**Applicability conditions**:
+- 逐输出行循环内有多个独立 tap/源片段、每 tap 一次全管道 barrier 的散射算子
+  （col2im、deconv、scatter-add）
+- 特征：mte2_instructions 高 + 单次搬运 <16KB（undersize_transfer）
+- 前提：同一累加器的串行 Add 可在 V 管道 in-order 完成（V 管道保序）
+- 禁忌：strided 多块 DataCopyPad（blockCount>1）在 dav-2201 挂死硬件
+
+**Strategy IDs**: X26
+
+---
+
+### X27: transpose-on-load 分形加载 + 全 shape 手动 mmad 二维 tile 网格（免 host 预转置）
+
+**Source**: 5_MatmulTransB KB 验证轮 evolution, round 1, parallel 2 (x0, open_exploration)
+**Speedup**: 0.35x → 0.771x vs PyTorch (2.40x vs baseline); 设备 13.68μs → 5.70μs; fp32[64,128]=6.3μs vs x24 11.2μs
+**Operator type**: matmul (transB 存储, 微小→中 shape, 固定开销主导)
+**Hardware**: Ascend910B2C (DAV_2201)
+
+**Technique description**:
+transB 类 matmul 手动 mmad 的完整覆盖形态：B 转置由 `LoadToL0B<LOAD2D> isBTranspose=true` 在 L1→L0B 分形加载时完成（免 host workspace 预转置 pass，910B2C 任意 M/N/K 正确）；输出 C 按 gridM×gridN 16 对齐 tile、每 tile FULL K 单条 Mmad；并行度扩展启发式摊到更多 core。全 50 shape 无一走 MatmulImpl fallback。
+
+**Key code change**:
+```cpp
+// Before (x24): host 侧 B 预转置 Bt[K,N] 入 workspace + TQue CopyIn
+// After (X27): LoadToL0B<LOAD2D>(l0b, l1B, l0bLoad, isBTranspose=true);  // transB 在读入时完成
+```
+
+**Applicability conditions**:
+- transB 类 matmul 微小→中 shape：免 host 预转置 workspace pass
+- 全 shape 手动覆盖：二维 tile 网格 + 并行度扩展启发式
+- 前提：910B2C LoadToL0B LOAD2D isBTranspose=true 已实证正确（区别于 f3 LoadData3D 陷阱）
+
+**Strategy IDs**: X24, X27
 
 ---
 

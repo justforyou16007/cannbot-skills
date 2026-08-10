@@ -7,14 +7,16 @@ severity: blocking
 status: active
 failed_combination: [P87]
 operator_type: [matmul]
-occurrences: 2
+occurrences: 3
 created_at: '2026-08-07T16:30:00Z'
-updated_at: '2026-08-07T16:30:00Z'
-tags: [manual-mmad, loaddata3d, fractal-loading, transpose, l0a, l0b]
+updated_at: '2026-08-07T16:56:00Z'
+tags: [manual-mmad, loaddata3d, fractal-loading, transpose, l0a, l0b, all-zero-l0c, fp32-cube, matmulimpl]
 ---
 
 ## Symptom
 手动 mmad kernel 用 `LoadData3D`（L1→L0A/L0B 的 tile 加载辅助函数）做分形搬运时，**只对 16x16x16 identity 输出正确**；对真实 shape（32x128、32x48、13x29 等）输出错误。无编译错误、无报错，静默精度失败。为保精度被迫 `useManual=0` 全退回 MatmulImpl fallback，手动 kernel 从未真正 dispatch（5_MatmulTransB 上 P87 两次尝试均因此失败）。
+
+**变体（更严重）**：10_ConvTranspose2d round_1/parallel_1（P128，CANN 8.5.1 / Ascend910B2C）——`LoadData3D`（LoadNzL1ToZzL0A / ZnL0B）的 L1→L0 路径产出**全零操作数**（147456 个 G 元素非零数 = 0，实测），而非错误值。无论 L0 管理方式（TBuf/TQue）、dtype（bf16/fp16）、是否 K-tiling，输出恒为 0。附带：`ACLRT_LAUNCH_KERNEL` 启动 AIC-only kernel 会挂起，必须用 triple-chevron。结论：**910B2C 上手动 raw-Mmad Cube 路径不可行，唯一可用 Cube 入口是 MatmulImpl 高阶 API（P46，fp32 NORMAL bit-exact）**。
 
 ## Root cause class
 API 误用/实现缺陷——`LoadData3D` 的参数模型只对单个 16×16 cube tile（identity）正确，**无法泛化到多 16-tile、非 16 对齐的任意 M/N/K 分形布局**（L0A 的 Nz、L0B 的 Zn）。这是「手动 mmad 分形加载」的经典坑，不是硬件限制。
@@ -34,7 +36,8 @@ API 误用/实现缺陷——`LoadData3D` 的参数模型只对单个 16×16 cub
 - 参照 X24 proven_solution（已完整跑通任意 shape 的正确实现形态）。
 
 ## Evidence
-5_MatmulTransB evolution：round_2/parallel_2（x0_x1，P87 首败）、round_3/parallel_0（n1_cont_cont，P87 再败）。实现笔记原文：「实测 manual kernel 仅 16x16x16 identity 正确；对 32x128/32x48 等真实 shape 输出错误（L1→L0A/L0B 的 LoadData3D 参数无法泛化到多 16-tile）」。后续手动 mmad 攻坚轮用 TQue CopyIn 方案 50/50 全 shape 跑通（见 x24 proven_solution），实证本坑可绕。
+- 5_MatmulTransB evolution：round_2/parallel_2（x0_x1，P87 首败）、round_3/parallel_0（n1_cont_cont，P87 再败）。实现笔记原文：「实测 manual kernel 仅 16x16x16 identity 正确；对 32x128/32x48 等真实 shape 输出错误（L1→L0A/L0B 的 LoadData3D 参数无法泛化到多 16-tile）」。后续手动 mmad 攻坚轮用 TQue CopyIn 方案 50/50 全 shape 跑通（见 x24 proven_solution），实证本坑可绕。
+- 10_ConvTranspose2d evolution：round_1/parallel_1（n6，P128 raw-Mmad fp16/bf16 hi/lo）——LoadData3D L1→L0 产出全零操作数（147456/147456 非零数=0），强制回退基线 AIV 路径 0.417x。同轮 parallel_2（x0）用 MatmulImpl fp32 NORMAL 验证 bit-exact（max_abs_diff=0, GEMM 5-9us），实证「仅 MatmulImpl 可走 Cube」。
 
 ## Related
 - X24（手动 mmad 打破 MatmulImpl 固定开销地板，正确分形加载形态）

@@ -43,14 +43,14 @@
     ]
   },
   "stats": {
-    "cards": 182,
-    "active_cards": 169,
+    "cards": 185,
+    "active_cards": 172,
     "deprecated": 13,
     "preconditions": 131,
     "playbooks": 131,
     "families": 8,
-    "discovered": 25,
-    "okf": 36
+    "discovered": 27,
+    "okf": 39
   },
   "cards": [
     {
@@ -4194,6 +4194,59 @@
       "description": ""
     },
     {
+      "source_key": "evolution-knowledge#okf/strategies/discovered/X26",
+      "id": "X26",
+      "title": "X26",
+      "doc_path": "skills/evolution-knowledge/references/okf/strategies/discovered/disc_X26.md",
+      "kind": "discovered_strategy",
+      "confidence": "single_op",
+      "status": "active",
+      "op_families": [
+        "conv",
+        "deconv",
+        "scatter",
+        "gather"
+      ],
+      "bottlenecks": [
+        "mte2_stall",
+        "undersize_transfer"
+      ],
+      "tags": [
+        "col2im",
+        "tap-batch",
+        "pipeline-barrier",
+        "event-sync",
+        "dav-2201"
+      ],
+      "description": ""
+    },
+    {
+      "source_key": "evolution-knowledge#okf/strategies/discovered/X27",
+      "id": "X27",
+      "title": "X27",
+      "doc_path": "skills/evolution-knowledge/references/okf/strategies/discovered/disc_X27.md",
+      "kind": "discovered_strategy",
+      "confidence": "single_op",
+      "status": "active",
+      "op_families": [
+        "matmul"
+      ],
+      "bottlenecks": [
+        "fixed_overhead_dominated",
+        "scalar_compute",
+        "compute_bound"
+      ],
+      "tags": [
+        "manual-mmad",
+        "transpose-on-load",
+        "full-shape-grid",
+        "aic-only",
+        "no-host-transpose",
+        "LoadToL0B"
+      ],
+      "description": ""
+    },
+    {
       "source_key": "evolution-knowledge#okf/strategies/discovered/X3",
       "id": "X3",
       "title": "端到端 dtype 直传下沉 (End-to-End Dtype Passthrough)",
@@ -4508,6 +4561,23 @@
       "tags": []
     },
     {
+      "source_key": "evolution-knowledge#okf/runbooks/proven-solutions/x27-transpose-on-load-full-shape-manual-mmad",
+      "id": "x27-transpose-on-load-full-shape-manual-mmad",
+      "title": "X27: transpose-on-load 分形加载 + 全 shape 手动 mmad 二维 tile 网格（免 host 预转置）",
+      "doc_path": "skills/evolution-knowledge/references/okf/runbooks/proven-solutions/x27-transpose-on-load-full-shape-manual-mmad.md",
+      "kind": "proven_solution",
+      "confidence": "single_op",
+      "status": "active",
+      "op_families": [
+        "matmul"
+      ],
+      "strategy_ids": [
+        "X24",
+        "X27"
+      ],
+      "tags": []
+    },
+    {
       "source_key": "evolution-knowledge#okf/runbooks/proven-solutions/x3-hardware-sort-engine-replacement-nms-topk",
       "id": "x3-hardware-sort-engine-replacement-nms-topk",
       "title": "X3: Hardware Sort Engine Replacement (NMS + TopK)",
@@ -4612,7 +4682,10 @@
         "fractal-loading",
         "transpose",
         "l0a",
-        "l0b"
+        "l0b",
+        "all-zero-l0c",
+        "fp32-cube",
+        "matmulimpl"
       ]
     }
   ],
@@ -6062,6 +6135,16 @@
       "source_key": "evolution-strategies#discovered/disc_X25",
       "id": "X25",
       "doc_path": "discovered/disc_X25.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X26",
+      "id": "X26",
+      "doc_path": "discovered/disc_X26.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X27",
+      "id": "X27",
+      "doc_path": "discovered/disc_X27.md"
     },
     {
       "source_key": "evolution-strategies#discovered/disc_X3",

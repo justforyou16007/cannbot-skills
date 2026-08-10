@@ -308,3 +308,19 @@ tail:
 - `C1/C2` 与 `V1/V2` 不再按单个分块完全串行执行
 - 不同分块的不同阶段可以在稳态中重叠
 - steady-state 中 Cube 和 Vector 的等待会明显减少
+
+## 算子实例
+
+通用指南之外的**完整算子 block-level 设计实例**：
+
+| 算子 | 特点 | 设计文档 |
+| --- | --- | --- |
+| Chunked Gated Delta Rule（GDR） | stateful 线性注意力：状态沿 chunk 递推 → chunk-group 协作模型；三 stage C/V 流水 + 原子加直写 out/final_state | `GDRBlockLevelDesign.md` |
+
+GDR 实例展示了本指南没有展开的两个点：
+
+- **串行依赖的块级组织**：当输出块之间存在递推依赖（状态沿 chunk 递推）时，如何退化为
+  chunk-group 串行 + group 内并行，并把不同维度分片交给三个 stage（stage1/3 均分 `(nv, chunk)`、
+  stage2 按 nv 切核 + 核内串行 chunk 链）。
+- **精简 workspace 的取舍**：哪些中间量可以直接原子加进最终输出/状态（`attn_inter` 直写 out、
+  `v_new` 复用 `v_inner`、`dstate` 复用 `final_state`），从而省掉一批独立 workspace。

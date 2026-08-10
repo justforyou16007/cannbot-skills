@@ -75,6 +75,7 @@ argument-hint: >
 |------|------|----------|
 | `ops/tilelang-op-design/references/BlockLevelDesign.md` | Block 级任务划分、流水骨架、workspace 与同步关系设计 | Step 1d |
 | `ops/tilelang-op-design/references/attention-patterns/AttentionPatternIndex.md` | Attention / FlashAttention 类算子的模式路由索引（TND、paged KV cache、mask/causal、GQA/MQA、MLA、topk sparse KV、sink attention） | Step 0 |
+| `skills/tilelang2ascend-tilelang-designer/references/quant-patterns/QuantDesignIndex.md` | 量化/反量化类算子的设计路由（量化形态定位、block/tile 结构、反量化顺序/公式设计、PERF_DESIGN quant 待验证清单）；实现细节主库在 `translator/references/quant-patterns/` | Step 0-Q |
 | `ops/tilelang-op-design/references/ascend-constraints.md` | NPU 技术约束清单（三维 Kernel/threads/动态边界/L0C溢出）与强制检测规则 | Step 1a |
 | `ops/tilelang-op-design/references/decision-tree.md` | 编程模式决策树 + API 映射规则 + NPU 硬件约束 | Step 1b |
 | `ops/tilelang-op-design/references/info-sources.md` | 信息收集步骤与优先级（搜索 examples/、确认 API 可用性） | Step 1c |
@@ -112,7 +113,7 @@ argument-hint: >
 
 ## 流程
 
-🛑 **执行以下各步骤前，必须先完成步骤 0（Attention 类）与步骤 0.5（Conv 类）的强制查阅（按算子类型各取其一）。未完成对应步骤全部 checklist 前，禁止 Edit/Write 任何 `{output_dir}/design/` 下的代码文件。**
+🛑 **执行以下各步骤前，必须先完成步骤 0（Attention 类）、步骤 0.5（Conv 类）与步骤 0-Q（Quant 类）的强制查阅（按算子类型各取其一）。未完成对应步骤全部 checklist 前，禁止 Edit/Write 任何 `{output_dir}/design/` 下的代码文件。**
 
 ---
 
@@ -211,6 +212,56 @@ argument-hint: >
 - "archive 先例 / 与 archive conv2d_base 同结构"论断必须附 grep 证据
   （archive conv2d_base 全部 kernel 零 SetValue/GetValue、含 xtrans/fused 结构），无证据视为未验证
 - 禁止凭记忆或经验跳过本步骤直接设计
+
+---
+
+### 🛑 步骤 0-Q: Quant 算子设计路由（量化/反量化类算子强制执行）
+
+```
+⚠️ 本步骤是硬性门禁。如果 model.py 是量化/反量化类算子，
+   必须逐个完成以下 checklist 后才能进入步骤 1。禁止跳过。
+```
+
+**触发条件**：`{output_dir}/model.py` 的 forward() 中包含以下任一特征：
+- 调用 `torch_npu.npu_quant_matmul` / `npu_dynamic_quant` / `npu_dequant_*` / `npu_quant_*`
+- 类名/算子名包含 `Quant` / `Dequant` / `QuantMatmul` / `DynamicQuant` / `AntiQuant`
+- 输入含量化参数：`scale` / `pertoken_scale` / `offset` / `weight_scale` / `group_sizes` / `group_list`
+- 输入 dtype 为 int8/int4，或输出 int8/int16 + scale（量化输出）
+
+**强制执行清单**：
+
+```
+0-Q.1 🛑 读取 QuantDesignIndex.md（必须，不可跳过）:
+    Read skills/tilelang2ascend-tilelang-designer/references/quant-patterns/QuantDesignIndex.md
+    按第 1 节识别条件定位量化形态；实现细节按需读主库
+    skills/tilelang2ascend-translator/references/quant-patterns/ 对应 pattern 的
+    「核心规则 / 实现要点」段（同插件内允许读取）
+
+0-Q.2 🛑 逐条回答量化 7 问，记录命中的形态:
+    1. 量化对象是 activation / weight / KV-cache / output？
+    2. scale 粒度 per-tensor / per-channel / per-token / per-group？
+    3. 对称还是非对称（有 offset）？
+    4. scale 是 static（预设）还是 dynamic（运行时 absmax）？
+    5. dtype 是 int8 / int4 / fp8 / MX？
+    6. 输出是高精度（dequant）还是再量化（int+scale）？
+    7. 是否与激活（SiLU/SwiGLU/GELU）或 matmul 融合？
+
+0-Q.3 🛑 设计期确定反量化/量化顺序与公式（写入 PERF_DESIGN.md）:
+    - 反量化顺序 `(acc×scale)×pertoken`、int32 bias 前 / float bias 后（quant-design-index §4）
+    - 量化公式（对称 127 / 非对称 255·15 / 动态 range）
+    - 输出 cast（fp16 CAST_NONE / bf16·int32 CAST_RINT / int8 两步）
+
+0-Q.4 🛑 在思考中确认:
+    - 已定位的量化形态与对应的 block/tile 结构（quant-design-index §3）
+    - dequant epilogue 的 V 核任务划分与 workspace C→V 交接
+    - 性能设计（1e/2e）时按 QuantDesignIndex §5 追加 quant 待验证清单到 PERF_DESIGN.md
+```
+
+**门禁规则**：
+- 触发条件满足但 0-Q.1-0-Q.4 未完成 → **禁止**进入步骤 1，**禁止**生成任何 design/ 下的代码
+- 触发条件不满足 → 跳过步骤 0-Q，直接进入步骤 1
+- 禁止凭记忆或经验跳过模式文档直接设计
+- 设计期定错反量化顺序（scale/pertoken 反序）→ 必须在 Phase 4 前修正，避免 D 类返工
 
 ---
 

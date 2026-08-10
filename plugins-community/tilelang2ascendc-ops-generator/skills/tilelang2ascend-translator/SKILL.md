@@ -66,6 +66,7 @@ argument-hint: >
 - `.claude/skills/tilelang2ascend-translator/references/scalar-to-vector.md` — 标量计算向量化指南
 - `.claude/skills/tilelang2ascend-translator/references/AscendCVerification.md` — AscendC 验证指南
 - `.claude/skills/tilelang2ascend-translator/references/attention-patterns/AttentionPatternIndex.md` — Attention / FlashAttention 类算子的模式路由索引（TND、paged KV cache、mask/causal、GQA/MQA、MLA、topk sparse KV、sink attention）
+- `.claude/skills/tilelang2ascend-translator/references/quant-patterns/QuantPatternIndex.md` — 量化/反量化类算子的模式路由索引（quantize/dequantize、quant_matmul、weight-group-quant、kv-cache-quant、fused-quant、anti-quant）+ 共享参考（决策表/公式/Cast 矩阵/精度铁律/验证标准）
 - `.claude/skills/tilelang2ascend-translator/scripts/evaluate_ascendc.sh` — AscendC 评测脚本
 - `workflows/templates/archive_tasks/` — 历史成功任务，host/kernel 完整参考实现（**编译/运行时错误时优先查阅**）
 
@@ -133,6 +134,62 @@ argument-hint: >
 **门禁规则**：
 - 如果触发条件满足但 0-A.1-0-A.4 未完成 → **禁止**进入步骤 1，**禁止**编写任何 kernel/ 代码
 - 如果触发条件不满足 → 跳过步骤 0-A，直接进入步骤 0-B
+- 禁止凭记忆或经验跳过模式文档直接转译
+
+---
+
+### 🛑 步骤 0-Q: Quant 算子模式路由（量化/反量化类算子强制执行）
+
+🛑 **无论算子类型如何，第一步必须读取 model.py**：
+   Read `{output_dir}/model.py` 的 forward() 方法，逐行检查计算逻辑。
+   转译阶段的输入固然是 tile_level 设计文件，但判断算子是否属于 Quant 类
+   必须回到 model.py 的原始计算逻辑。**禁止**凭 tile_level 文件名或记忆跳过此步。
+
+**触发条件**：读取 model.py 后，检查 forward() 是否包含以下任一特征：
+- 调用 `torch_npu.npu_quant_matmul` / `npu_dynamic_quant` / `npu_dequant_*` / `npu_quant_*`
+- 类名/算子名包含 `Quant` / `Dequant` / `QuantMatmul` / `DynamicQuant` / `AntiQuant`
+- 输入含量化参数：`scale` / `pertoken_scale` / `offset` / `weight_scale` / `group_sizes` / `group_list`
+- 输入 dtype 为 int8/int4，或输出 int8/int16 + scale（量化输出）
+
+如果触发条件满足，必须逐个完成以下 checklist：
+
+```
+0-Q.1 🛑 读取 QuantPatternIndex.md（必须，不可跳过）:
+    Read .claude/skills/tilelang2ascend-translator/references/quant-patterns/QuantPatternIndex.md
+
+0-Q.2 🛑 逐条回答"生成前问题"中的 7 个诊断问题，记录命中的 pattern:
+    1. 量化对象是 activation / weight / KV-cache / output？
+    2. scale 粒度 per-tensor / per-channel / per-token / per-group？
+    3. 对称还是非对称（有 offset / zero-point）？
+    4. scale 是 static（预设）还是 dynamic（运行时 absmax）？
+    5. dtype 是 int8 / int4 / fp8 / MX？
+    6. 输出是高精度（dequant，int→fp）还是再量化（fp→int+scale）？
+    7. 是否与激活（SiLU/SwiGLU/GELU）或 matmul 融合？
+
+    命中 pattern → 下一步 0-Q.3 读对应的 pattern 文档（可组合）
+
+0-Q.3 🛑 只读取命中的文档（渐进式披露，只读需要的）:
+    - patterns/quantize-dequantize.md   （纯量化/反量化、per-token 动态量化）
+    - patterns/quant-matmul.md          （int8 gemm + dequant epilogue）
+    - patterns/weight-group-quant.md    （per-group 权重量化 SetQuantVector / a8w4 MSD / MX）
+    - patterns/kv-cache-quant.md        （KV cache 量化存储 + scale 传递）
+    - patterns/fused-quant.md           （dequant + activation + quant 三段式）
+    - patterns/anti-quant.md            （FA / sparse FA 反量化）
+    - 共享参考（按需）：quant-decision-table / quant-formulas / quant-cast-round /
+      quant-precision-rules / quant-verification
+
+0-Q.4 🛑 在思考中确认:
+    - 已读的 pattern 文档列表及其关键约束
+    - 反量化顺序 `(acc×scale)×pertoken`、bias 位置（int32 前 / float 后）、
+      cast RoundMode（bf16/int32 必须 CAST_RINT，int8 两步 RINT）是否对齐
+      quant-precision-rules.md
+    - 平台路径：910B2C 量化 matmul 必须纯 Cube 高阶 API + 纯 AIV dequant 双 kernel
+      （禁止手写 Mmad）
+```
+
+**门禁规则**：
+- 如果触发条件满足但 0-Q.1-0-Q.4 未完成 → **禁止**进入步骤 1，**禁止**编写任何 kernel/ 代码
+- 如果触发条件不满足 → 跳过步骤 0-Q，直接进入步骤 0-B
 - 禁止凭记忆或经验跳过模式文档直接转译
 
 ---
@@ -302,6 +359,8 @@ argument-hint: >
 - `conversion`：文件名/类名含 `Transpose`；forward 中出现 `tensor.transpose`、`tensor.permute`、`torch.transpose`
 - `conv`：文件名/类名含 `Conv`/`Conv2d`/`Convolution`；forward 中出现 `nn.Conv1d`/`nn.Conv2d`/`nn.Conv3d`、`F.conv1d`/`F.conv2d`/`F.conv3d`
 
+> ⚠️ 若同时命中量化特征（输入含 `scale`/`pertoken_scale`/`offset`/`group_sizes`，或 dtype 为 int8/int4，或输出 int8+scale），必须**先**完成步骤 0-Q（Quant 路由）再进入 0-T。`quant_matmul` 虽归 matmul 类别，但转译必须遵循 `references/quant-patterns/patterns/quant-matmul.md`（反量化 epilogue 与纯 Cube 平台配方）。
+
 如果触发条件满足，必须逐个完成以下 checklist：
 
 ```
@@ -396,7 +455,7 @@ argument-hint: >
 ---
 
 ## 流程
-执行以下各步骤前，必须先完成 **步骤 0-A（如触发）、步骤 0-B、步骤 0-C（如触发）和步骤 0-T（如触发）的全部查阅**，再开始实现、验证与迭代。
+执行以下各步骤前，必须先完成 **步骤 0-A（如触发）、步骤 0-Q（如触发）、步骤 0-B、步骤 0-C（如触发）和步骤 0-T（如触发）的全部查阅**，再开始实现、验证与迭代。
 
 ### 步骤 1: TileLang 转译成 AscendC
 

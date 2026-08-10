@@ -287,6 +287,7 @@ npu-smi info -t board -i ${npu} 2>/dev/null || npu-smi info 2>/dev/null
 | 类别 | 关键词 / 特征 | 对应 ascendc-tiling-design 文档 |
 |------|--------------|--------------------------------|
 | `matmul` | 文件名/类名含 `Matmul`/`MatMul`/`BatchMatMul`/`GroupedMatmul`；forward 中出现 `torch.matmul`、`F.linear`、`@`、`torch.mm`、`torch.bmm`、`torch.addmm`；融合形态如 `matmul+leakyrelu`、`quant_matmul`、`matmul_bias` | `references/matmul/patterns.md` + `references/matmul/ascendc-api-matmul-tiling.md` |
+| `quant` | 文件名/类名含 `Quant`/`Dequant`/`QuantMatmul`/`DynamicQuant`/`AntiQuant`；forward 中出现 `torch_npu.npu_quant_matmul`、`npu_dynamic_quant`、`npu_dequant_*`；输入含 `scale`/`pertoken_scale`/`offset`/`weight_scale`/`group_sizes` 或 dtype 为 int8/int4，输出 int8/int16 + scale | 复用 `matmul` 的 tiling 文档（`references/matmul/patterns.md`）；转译/设计阶段遵循 **0-Q 门禁**（`translator/references/quant-patterns/QuantPatternIndex.md`） |
 | `flashattention` | 文件名/类名含 `Attention`/`FlashAttention`/`SDPA`；forward 中出现 `scaled_dot_product_attention`、`softmax(Q @ K^T / sqrt(d)) @ V` | `references/flashattention/patterns.md` |
 | `reduction` | 文件名/类名含 `Reduce`、`Softmax`、`LayerNorm`、`RMSNorm`、`ArgMax`、`ArgMin`、`ReduceSum`、`ReduceMean`；forward 中出现 `torch.sum`、`torch.mean`、`torch.softmax`、`F.softmax`、`F.layer_norm`、`F.rms_norm` | `references/reduction/patterns.md` + `references/reduction/algorithms.md` |
 | `sort` | 文件名/类名含 `Sort`/`TopK`/`ArgSort`；forward 中出现 `torch.sort`、`torch.topk` | `references/sort/patterns.md` + `references/sort/alg-two-level-mrgsort.md` |
@@ -295,6 +296,7 @@ npu-smi info -t board -i ${npu} 2>/dev/null || npu-smi info 2>/dev/null
 | `conversion` | 文件名/类名含 `Transpose`；forward 中出现 `tensor.transpose`、`tensor.permute`、`torch.transpose` | `references/conversion/patterns.md`（当前仅 Transpose 部分支持） |
 
 - 若算子同时命中多个类别（如 `MatMul` + `Bias` 融合），以**主计算类别**为准，通常 `matmul` > `flashattention` > `reduction` > `sort` > `broadcast` > `elementwise` > `conversion`。
+- `quant` 是**跨类别标记**（不参与优先级竞争）：无论主类别是 `matmul` 还是 `reduction`/`elementwise`，只要命中 `quant` 特征，就必须同时设置 `quant_subclass = true`，并在 Phase 3-C / 4-C 执行 **0-Q 门禁**（`translator/references/quant-patterns/QuantPatternIndex.md`）。
 - 若不属于上述任何类别，`tiling_design_category = null`，跳过 Tiling 路由门禁。
 
 当 `tiling_design_category != null` 时：
@@ -546,6 +548,7 @@ max_p_retries = 3      # 性能迭代预算上限
   - 本算子的 `tiling_design_category` 及对应类别
   - 必须遵循 `ascendc-tiling-design` 中该类别的 Tiling 指南
   - 提供 0-T.4 中确认的 Tiling 策略摘要
+  - 若 `quant_subclass == true`：必须同时遵循 `tilelang2ascend-tilelang-designer/references/quant-patterns/QuantDesignIndex.md` 的 0-Q 设计路由（公式选择 + dequant epilogue 结构 + PERF_DESIGN quant 待验证清单）
 
 **门禁规则**：
 - 如果 `tiling_design_category != null` 但 0-T.1-0-T.5 未完成 → **禁止**进入 Block/Tile 层级设计，**禁止**生成任何 `design/` 下的代码
@@ -805,6 +808,7 @@ elif op_type == "complex":
   - 本算子的 `tiling_design_category` 及对应类别
   - 必须遵循 `ascendc-tiling-design` 中该类别的指南和 0-T.2 的约束
   - 要求生成的 `op_host/<op>.cpp` 和 `op_kernel/<op>.cpp` 满足上述 checklist
+  - 若 `quant_subclass == true`：必须遵循 translator 步骤 0-Q（`translator/references/quant-patterns/QuantPatternIndex.md`），不得跳过
 
 **门禁规则**：
 - 如果 `tiling_design_category != null` 但 0-T.1-0-T.3 未完成 → **禁止**调用 `tilelang2ascend-translator`，**禁止**编写任何 `kernel/` 下的代码

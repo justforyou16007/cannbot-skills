@@ -18,9 +18,11 @@
 | C-2 fp32 输入 | dtype==fp32 且 Cube 仅支持 fp16/bf16 | **P128**（hi/lo 拆分 3-GEMM：Cube 吞吐 + ~1e-4 精度）；配套单趟 split-xtrans | 容差不允许 ~1e-4 相对误差 |
 | C-3 一般 kHkW>1 | 常规卷积核 | **P129**（fused img2col LoadData3D 随路展开，A 侧不落地，消 70% im2col 物化）；特征图超 L1 → band 窗口化支路 | 窄特征图（W<24）LoadData3D 病理性慢 → 回 im2col 物化路径；kExtension 保持 ≤64 |
 | C-4 推理重复调用 | 同一权重反复卷积（评测/推理循环） | **P131**（host 侧 repack LRU 缓存，跳过 repack kernel 发射） | 权重每次变化 |
-| C-5 depthwise | `groups==Cin` | **覆盖缺口**：GEMM 退化为逐通道向量乘加，走通用前置 + 瓶颈驱动 | — |
+| C-5 depthwise | `groups==Cin` | **X22**（Depthwise 直接卷积：单 AIV fp32 向量卷积直算逐通道 kh\*kw 点积，绕 im2col/GEMM/workspace/Cube；sW==1、W≥8、Co%8==0 时实测 gen-time 提升 18-84x） | 不满足 X22 前置（sW≠1 / W<8 / Co%8≠0）→ 通用前置 + 瓶颈驱动 |
 | C-6 conv3d | 三维滑窗 | **覆盖缺口**：按 C-3 思路推广（LoadData3D 支持 3D），无沉淀卡 | — |
-| C-7 ConvTranspose | 分数步长/col2im 形态 | **覆盖缺口**：col2im+GEMM 结构，结合 matmul workflow 的 CV 支路（[matmul.md](matmul.md) M1/M7：P46/P16/P51） | — |
+| C-7 ConvTranspose | 分数步长/col2im 形态 | **主路径 X29**（stride==1 shift-free dense，case0 1.003x、case7 2.43x）；**X26**（col2im tap-batch）；**大 spatial/stride-2 fallback → X18/P129**（fused img2col LoadData3D，A 侧不落地消 GM 往返 70% + stride 硬件处理；W<24 门控回退物化）；**禁用通用 im2col+GEMM**（P46/P16，全量 geomean ~0.28x 已证伪） | X29 仅 stride==1；stride≥2/大 spatial 走 X18/P129，勿用通用 GEMM fallback |
+
+> **C-7 实测结论（2026-08）**：X29 是唯一有效的 stride-1 主路径（case0 1.003x、小 shape 2-2.5x）；通用 im2col+GEMM（P46/P16）全量 geomean ~0.28x，已证伪禁用。stride≥2/大 spatial 是主要缺口，方向 = **X18/P129 fused img2col**（LoadData3D 消 GM 往返 70% + stride 硬件处理，W<24 门控回退）。相关 OKF：X29、X18、X26。
 
 ## Step 3 — GEMM 主干的族内收尾
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""evolution-knowledge-query — 轻量结构化 OKF 查询。
+"""evolution-knowledge（query CLI）— 轻量结构化 OKF 查询。
 
 只读操作。从 skills/evolution-strategies/references/INDEX.json 中读取 OKF 卡片元数据，
 按 kind / op_family / bottleneck / phenomenon / tags / keyword 过滤，输出 JSON。

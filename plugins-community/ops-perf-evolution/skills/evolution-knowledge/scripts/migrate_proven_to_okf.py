@@ -2,7 +2,7 @@
 """批量迁移 proven_solutions/INDEX.md 条目到 OKF 单文件。
 
 用法：
-    python3 skills/evolution-knowledge-maintain/scripts/migrate_proven_to_okf.py
+    python3 skills/evolution-knowledge/scripts/migrate_proven_to_okf.py
 """
 
 from __future__ import annotations

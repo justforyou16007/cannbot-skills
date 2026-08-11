@@ -56,9 +56,9 @@ references/
 
 运行期读取**先走 OKF**（结构化可检索），未命中再回落经典 a3：
 
-1. **按算子族/瓶颈查 OKF**：用 `evolution-knowledge-query` skill
+1. **按算子族/瓶颈查 OKF**：用本 skill 的查询脚本（CLI 详见「查询 CLI」节）
    ```bash
-   python3 skills/evolution-knowledge-query/scripts/query.py \
+   python3 skills/evolution-knowledge/scripts/query.py \
        --op-family attention --bottleneck compute_bound --status active
    ```
    - `--kind` 可限定 `discovered_strategy` / `proven_solution` / `failure_pattern`
@@ -87,13 +87,67 @@ references/
 
 （OKF 为进化沉淀的结构化卡，优先级最高；a3 为人工策展参考；strategy 库为 P/D/A/R 系列策略卡片。）
 
+## 查询 CLI（OKF 结构化检索）
+
+`skills/evolution-knowledge/scripts/query.py` 是 OKF 卡片的**只读结构化检索入口**（纯 stdlib、确定性、无外部依赖）。
+
+**数据源**：`skills/evolution-strategies/references/INDEX.json`（由 `skills/evolution-strategies/scripts/generate_index_json.py` 的 `discover_okf()` 扫描 `references/okf/` 生成，`source_key` 前缀 `evolution-knowledge#okf/`）。
+
+**检索维度**（INDEX.json 中 OKF 卡的结构化字段）：
+
+- `kind`：`discovered_strategy` | `proven_solution` | `failure_pattern`
+- `op_families` / `bottlenecks`：来自 vocabulary（如 attention / compute_bound）
+- `phenomenon`：失败现象（compile_error / precision_failure / perf_regression）
+- `tags`：自由标签
+- `confidence`：single_op | cross_op_verified
+- `status`：stub | active | deprecated | retracted
+
+**命令**：
+
+```bash
+# 按算子族 + 瓶颈检索（Init/SELECT 海选）
+python3 skills/evolution-knowledge/scripts/query.py \
+    --kind discovered_strategy --op-family attention --bottleneck compute_bound --status active
+# 按失败组合反查（4.4.2 失败诊断）
+python3 skills/evolution-knowledge/scripts/query.py \
+    --kind failure_pattern --phenomenon precision_failure --failed-combination P22,A1
+# 全文关键词检索（轻量 grep）
+python3 skills/evolution-knowledge/scripts/query.py --keyword "GQA decode"
+```
+
+**证据强度规则（sufficiency rule）**：查询结果须满足以下任一条件才能作为决策依据：
+
+- 至少 1 条 `confidence: cross_op_verified` 且 `status: active` 的条目
+- 或至少 2 条 `confidence: single_op` / `status: active` 的条目互相支撑
+- `status: stub` 的条目不能单独支撑结论，只能作为调查线索（查询默认 `--status active` 排除 stub，需显式 `--status all` 才查得到）
+
+**输出**：JSON `{query, results[], sufficiency}`；`results[].path` 为 OKF 卡 doc 路径，命中即读卡全文纳入决策。
+
+**与 X 系列 compat 层关系**：优先检索 OKF 增强版（`okf/strategies/discovered/`，带结构化字段）；OKF 缺失某 X ID 时回退 `skills/evolution-strategies/references/discovered/`（只读兼容层）；新 X 必须双轨写入并重建索引。
+
 ## 写入协议
 
-- **OKF 层（首选）**：进化产生的策略/方案/失败模式一律经 `evolution-knowledge-maintain` skill 写入
+- **OKF 层（首选）**：进化产生的策略/方案/失败模式一律经本 skill 的维护协议写入
   `references/okf/`（查重 → frontmatter 校验 → 置信度提升 → **重建 INDEX.json**）。
   触发点：lingxi-evo/ops-evo 的 **4.4.2 失败诊断**（新 failure_pattern）与 **4.5.3 策略提炼**（新 disc_X + proven，双轨写 compat + OKF）。
 - **经典层**：`a3/proven_solutions/INDEX.md` 在策略提炼出跨算子通用方案时追加条目（compat 层）；其他文件为只读参考。
 - **新发现的 X 必须双轨**：compat `discovered/disc_X{n}.md` **和** OKF `okf/strategies/discovered/disc_X{n}.md` 都写，并重建索引。
+
+### 维护协议（OKF 写入）
+
+写入脚本：`skills/evolution-knowledge/scripts/migrate_discovered_to_okf.py`（X 系列 disc → OKF 增强版）、`skills/evolution-knowledge/scripts/migrate_proven_to_okf.py`（proven INDEX.md → OKF 单文件）。
+
+1. **查重**：discovered_strategy 按 `id`、proven_solution 按 `title`/`key`、failure_pattern 按 `key` 查重；命中同概念条目 → 增量 update（保留已有内容、补充新来源/证据），不新建、不整体覆盖。
+2. **新建条目路径**：
+   - discovered_strategy → `okf/strategies/discovered/disc_X{n}.md`
+   - proven_solution → `okf/runbooks/proven-solutions/{kebab-title}.md`
+   - failure_pattern → `okf/runbooks/failure-patterns/F{n}-{kebab-key}.md`
+3. **frontmatter 规范**：`schema_version: okf.v1` + `kind` + 类型特有字段（discovered_strategy 带 `id/origin/confidence/status/op_families/bottlenecks/tags/discovered_round/base_speedup`；failure_pattern 带 `key/phenomenon/severity/failed_combination/operator_type/occurrences/created_at/updated_at`；proven_solution 带 `strategy_ids`）。
+4. **置信度提升**：discovered_strategy 的 `reuse_stats.ops` ≥2 个算子且 `passed>0` → `cross_op_verified`；failure_pattern `occurrences≥2` 且跨 ≥2 算子 → `active`；proven_solution `Source` ≥2 算子 → `cross_op_verified`。
+5. **矛盾处理**：不静默覆盖，正文追加 `> ⚠️ 矛盾标记：新来源 XXX 在 Y 场景下结论相反，待进一步验证` + 日期/来源；严重冲突新建 `status: stub` 候选条目，原条目保持不变。
+6. **索引重建**：每次写入/更新后必须 `python3 skills/evolution-strategies/scripts/generate_index_json.py`（扫描 `references/okf/` 合并进 INDEX.json）。
+
+> 不要人工直接写 OKF 文件；所有写入通过本 skill 维护协议或等价 agent 流程（4.4.2 / 4.5.3 / 每轮 refine 后）完成，保证 frontmatter 一致性与索引同步。
 
 ## 架构选择
 

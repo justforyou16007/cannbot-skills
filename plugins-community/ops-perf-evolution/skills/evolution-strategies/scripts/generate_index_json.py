@@ -209,7 +209,7 @@ def discover_okf() -> list[dict]:
     """扫描 OKF 知识库（evolution-knowledge/references/okf/）生成卡片条目。
 
     三类卡片合并进 INDEX.json 的 cards 数组，source_key 前缀
-    evolution-knowledge#okf/ 供 evolution-knowledge-query 检索（按 kind /
+    evolution-knowledge#okf/ 供 evolution-knowledge 检索（按 kind /
     op_families / bottlenecks / phenomenon / failed_combination 过滤）：
       - discovered_strategy（X 系列，OKF 增强版，与 discovered/ 双轨保留）
       - proven_solution（跨算子已验证方案）

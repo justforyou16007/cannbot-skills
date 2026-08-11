@@ -11,5 +11,5 @@
 - `bottlenecks`: 来自 INDEX.json vocabulary 的瓶颈标签列表
 - `tags`: 自由标签
 
-检索入口：`evolution-knowledge-query` skill。
-写入入口：`evolution-knowledge-maintain` skill。
+检索入口：`evolution-knowledge` skill 的查询脚本（`skills/evolution-knowledge/scripts/query.py`）。
+写入入口：`evolution-knowledge` skill 的维护协议（`skills/evolution-knowledge/scripts/migrate_discovered_to_okf.py`）。

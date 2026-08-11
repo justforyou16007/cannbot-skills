@@ -18,7 +18,7 @@ OKF（Open Knowledge Format）把这套经验落成**带结构化 frontmatter �
 ```
 进化第 N 轮 ──4.4.2/4.5.3──▶ 写 OKF 卡 ──generate_index_json──▶ 重建 INDEX.json
      ▲                                                              │
-     │                                            evolution-knowledge-query（Init/4.4.2/4.5.3）
+     │                                            evolution-knowledge（Init/4.4.2/4.5.3）
      │                                                              ▼
    第 N+1 轮 ◀──prepare_strategy_resources.py 注入── 同族算子/同瓶颈 命中卡片
 ```
@@ -43,8 +43,8 @@ skills/evolution-strategies/references/
 ├── discovered/disc_X*.md        # compat 层（只读，21 条，与 OKF 双轨保留）
 └── INDEX.json                   # ★ 机器可读索引（cards=174 含 okf=28）
 
-skills/evolution-knowledge-query/SKILL.md + scripts/query.py       # 读取入口
-skills/evolution-knowledge-maintain/SKILL.md + scripts/migrate_*.py  # 写入入口 + 迁移
+skills/evolution-knowledge/SKILL.md + scripts/query.py       # 读取入口
+skills/evolution-knowledge/SKILL.md + scripts/migrate_*.py  # 写入入口 + 迁移
 ```
 
 **双轨原则**：新发现的 X 必须**同时**写入 compat `discovered/` 和 OKF `strategies/discovered/`；读取优先 OKF，OKF 缺失时回退 compat。compat 层保证旧逻辑（只读 `discovered` 数组）不破坏，OKF 层提供结构化检索。
@@ -124,7 +124,7 @@ while should_continue and r <= max_rounds:
 1. 本轮有失败节点（`pending_diagnosis.json` 存在且非空）
 2. 该失败节点 `strategy_combination` **未命中** OKF failure-pattern 库（完全匹配才命中；库内现有组合少，新失败基本都算未命中）
 
-动作：按 `evolution-knowledge-maintain` 协议写 `okf/runbooks/failure-patterns/f{n}-*.md`（`status: stub`、`occurrences: 1`）→ 重建索引。
+动作：按 `evolution-knowledge` 协议写 `okf/runbooks/failure-patterns/f{n}-*.md`（`status: stub`、`occurrences: 1`）→ 重建索引。
 
 ### 沉淀 ②：disc_X + proven —— 门槛最高（4.5.3 策略提炼）
 
@@ -161,7 +161,7 @@ while should_continue and r <= max_rounds:
 位置：`agents/lingxi-evo.md:250`（知识库查询协议）、`agents/ops-evo.md:308`
 
 ```bash
-python3 skills/evolution-knowledge-query/scripts/query.py \
+python3 skills/evolution-knowledge/scripts/query.py \
     --op-family attention --bottleneck compute_bound --status active
 ```
 
@@ -172,14 +172,14 @@ python3 skills/evolution-knowledge-query/scripts/query.py \
 诊断前先查 failure-pattern：命中 → 复用 Resolution；未命中 → 沉淀（见沉淀①）。
 
 ```bash
-python3 skills/evolution-knowledge-query/scripts/query.py \
+python3 skills/evolution-knowledge/scripts/query.py \
     --kind failure_pattern --failed-combination P22,A1 --status all
 ```
 
 ### 3. 4.5.3 新颖性判断 —— 防重复注册
 
 ```bash
-python3 skills/evolution-knowledge-query/scripts/query.py \
+python3 skills/evolution-knowledge/scripts/query.py \
     --kind discovered_strategy --keyword "{手法关键词}"
 ```
 
@@ -207,7 +207,7 @@ python3 skills/evolution-knowledge-query/scripts/query.py \
 python3 skills/evolution-strategies/scripts/generate_index_json.py
 ```
 
-### 查询 CLI（evolution-knowledge-query）
+### 查询 CLI（evolution-knowledge）
 
 | 参数 | 说明 |
 |---|---|
@@ -246,11 +246,11 @@ python3 -c "import json; d=json.load(open('skills/evolution-strategies/reference
 # → 期望 cards=174, okf=28, discovered=21
 
 # 2. 查询命中
-python3 skills/evolution-knowledge-query/scripts/query.py --kind discovered_strategy --op-family attention --bottleneck compute_bound
+python3 skills/evolution-knowledge/scripts/query.py --kind discovered_strategy --op-family attention --bottleneck compute_bound
 # → 期望返回 X4/X5/X6/X7/X8，sufficiency=true
 
 # 3. 失败反查
-python3 skills/evolution-knowledge-query/scripts/query.py --kind failure_pattern --failed-combination P22,A1 --status all
+python3 skills/evolution-knowledge/scripts/query.py --kind failure_pattern --failed-combination P22,A1 --status all
 # → 期望命中 F1（P22+A1:reduction:tail_precision）
 
 # 4. 资源注入（含 X 全文 + 失败 anti）
@@ -283,7 +283,7 @@ f1 的 `status: stub`，query 默认 `--status active` 会排除。加 `--status
 
 ### Q4：如何把历史的一条"待验证经验"（如 `references/pending/` 里的笔记）正式纳入？
 
-按 `evolution-knowledge-maintain` 协议手工落卡：判断它属于三类卡的哪类 → 写 stub 卡（`status: stub`）→ 重建索引。满足提升条件后（跨算子复现）自然升 active。
+按 `evolution-knowledge` 协议手工落卡：判断它属于三类卡的哪类 → 写 stub 卡（`status: stub`）→ 重建索引。满足提升条件后（跨算子复现）自然升 active。
 
 ---
 
@@ -293,8 +293,8 @@ f1 的 `status: stub`，query 默认 `--status active` 会排除。加 `--status
 |---|---|---|
 | `agents/lingxi-evo.md` | lingxi 路径 agent 触发描述（知识库协议 / Init / 4.4.2 / 4.5.3） | lingxi-evo 子代理 |
 | `agents/ops-evo.md` | ops 路径同上 | ops-evo 子代理 |
-| `skills/evolution-knowledge-maintain/SKILL.md` | 写入协议：查重 / frontmatter / 置信度 / 索引重建 | 4.4.2、4.5.3 写卡时 |
-| `skills/evolution-knowledge-query/SKILL.md` + `query.py` | 结构化查询 + sufficiency rule | Init / 4.4.2 / 4.5.3 |
+| `skills/evolution-knowledge/SKILL.md` | 写入协议：查重 / frontmatter / 置信度 / 索引重建 | 4.4.2、4.5.3 写卡时 |
+| `skills/evolution-knowledge/SKILL.md` + `query.py` | 结构化查询 + sufficiency rule | Init / 4.4.2 / 4.5.3 |
 | `skills/evolution-strategies/scripts/generate_index_json.py` | `discover_okf()` 扫描 OKF → INDEX.json | 每次写卡后 |
 | `skills/evolution-world-model/scripts/prepare_strategy_resources.py` | OKF 优先注入 X 全文 + 失败 anti | partial 启动前 |
 | `skills/evolution-knowledge/references/okf/` | OKF 卡片仓库（首选读取/写入目标） | 上述全部 |

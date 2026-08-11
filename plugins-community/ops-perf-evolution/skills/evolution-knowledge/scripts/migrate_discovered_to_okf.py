@@ -2,7 +2,7 @@
 """批量迁移 disc_X*.md 到 OKF 双轨，增强 frontmatter。
 
 用法：
-    python3 skills/evolution-knowledge-maintain/scripts/migrate_discovered_to_okf.py
+    python3 skills/evolution-knowledge/scripts/migrate_discovered_to_okf.py
 """
 
 from __future__ import annotations

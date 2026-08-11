@@ -27,7 +27,7 @@ okf/
 
 ## 写入协议
 
-所有写入由 `evolution-knowledge-maintain` skill 代理完成，遵循：
+所有写入由 `evolution-knowledge` skill 代理完成，遵循：
 - 先查重（按 kind + key 字段），命中则 update 而非 new
 - 增量更新：在既有卡上补充，不整体覆盖
 - 矛盾不静默覆盖：并存 + `> ⚠️ 矛盾标记` + 日期/来源

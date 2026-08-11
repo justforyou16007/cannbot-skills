@@ -429,3 +429,21 @@ AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(notifyId);
   读到错乱行 → fp32 多 tile 精度灾难（MRE≈1.0, cos≈0.2）。**正确做法**：目标地址必须包含
   `(uint64_t)rowStart_ * dim` 偏移（如 `kvSlot[(uint64_t)rowStart_ * dimQK]`），确保 sub-block 0
   写 rows 0-31、sub-block 1 写 rows 32-63。详见 `kernel-rules.md` RK-D01。
+- ❌ **fp16/bf16 的 P（softmax 输出）单次 Cast 后直接 MMA**：P cast 到 fp16/bf16 有固有精度边界
+  （尾数截断），单 tile 碰巧通过，多 tile 在线累加误差增长 → 大 Skv case matched_ratio≈0.88~0.90、
+  MERE 超阈值，误差分布呈全面 1 ULP（非局部错行）。**正确做法（P hi/lo 拆分双 MMA）**：
+  P_fp32 先 Cast 到 P_hi（fp16/bf16），再 `P_lo = Cast(P_fp32 - Cast_back(P_hi))`，
+  PV 用两次 Mmad 累加（`O += P_hi·V; O += P_lo·V`），等价于 P 以 ~2 倍尾数位宽参与 MMA，
+  matched_ratio 0.899→1.0、MERE 1.1e-2→1.6e-5。三个配套约束缺一不可：
+  1. **启用条件统一为 `sizeof(QType)==2`**（fp16 和 bf16 都需要，不要只给 bf16 —— 否则 fp16
+     大 Skv case 全量验证回归）；buffer 分配（如 pBufL1b_）与 Get 的条件必须同口径，
+     防止"只给 bf16 分配但 Get 无条件执行"的 fp16 报错。
+  2. **Cast 写 P_lo 后、DataCopy 前必须 `SetWaitFlag<V_MTE3>` 同步**（命中流水线同步陷阱表
+     第一项）：缺同步则 P_lo 读到未完成 Cast 的结果 → 双 MMA 后全错（err 1~2），且单看
+     双 MMA 通路隔离实验（第二次 Mmad 改用 P_hi，ratio=2.0）是正确的，极易误判方向。
+  3. fp32 路径无此问题（无 Cast 截断），保持单 MMA。
+  来源：ScaledDotProductAttention case[7] bf16 [2,8,577,128→136] 及全量 case[17]/[44] fp16。
+- 💡 **fp32 Vector matmul 无性能出路时的降精度方向**：fp32 无 MMA 硬件支持，Vector fp32 matmul
+  吞吐约为 Cube 的 1/20~1/50（实测 897×921×136 case：2484us vs ref 118us，speedup 0.042x）。
+  若精度容差允许，可将 P hi/lo 同思路扩展到 QK/PV 两侧（Q/K/V 各拆 hi/lo bf16 走 Cube MMA），
+  是把 fp32 大 case 拉回 1.0x 附近的唯一已知路径；TileLang 层无法收敛。

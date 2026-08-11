@@ -126,7 +126,7 @@ def sparse_flash_mla_fwd(
         sinks: T.Tensor([heads], "float"),
         output: T.Tensor(out_shape, dtype),
     ):
-        with T.Kernel(batch, is_npu=True) as (bz,):
+        with T.Kernel(batch, is_npu=True) as (bz, vid):
             # block-level pseudo-body; real math lives in tile_level/
             # (kept as a compilable skeleton so the design stays executable)
             for t in T.serial(T.ceildiv(ori_seq + cmp_seq, BLOCK_N)):

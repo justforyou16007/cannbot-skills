@@ -111,7 +111,8 @@ class ModelNew(nn.Module):
 
         if cmp_kv is None:
             # pure SWA: pass a dummy cmp_kv (never read, cmp_blocks == 0)
-            cmp_kv = q.new_zeros(batch, 1, 1, dim)
+            cmp_kv = torch.zeros((batch, 1, 1, dim), dtype=q.dtype,
+                                 device=q.device)
             cmp_seq = 0
             cmp_ratio = 1
         if sinks is None:
@@ -123,14 +124,16 @@ class ModelNew(nn.Module):
         # and are masked out by the kernel.
         ori_pad = ((ori_seq + BLOCK_N - 1) // BLOCK_N) * BLOCK_N
         if ori_pad != ori_seq:
-            pad = ori_pad - ori_seq
-            ori_kv = torch.cat(
-                [ori_kv, ori_kv.new_zeros(batch, pad, 1, dim)], dim=1)
+            padded = torch.zeros((batch, ori_pad, 1, dim), dtype=q.dtype,
+                                 device=q.device)
+            padded[:, :ori_seq, :, :] = ori_kv
+            ori_kv = padded
         cmp_pad = max(((cmp_seq + BLOCK_N - 1) // BLOCK_N) * BLOCK_N, 1)
         if cmp_pad != cmp_seq:
-            pad = cmp_pad - cmp_seq
-            cmp_kv = torch.cat(
-                [cmp_kv, cmp_kv.new_zeros(batch, pad, 1, dim)], dim=1)
+            padded = torch.zeros((batch, cmp_pad, 1, dim), dtype=q.dtype,
+                                 device=q.device)
+            padded[:, :cmp_seq, :, :] = cmp_kv
+            cmp_kv = padded
 
         cfg = SparseFlashMlaConfig(
             batch=batch,
@@ -148,9 +151,14 @@ class ModelNew(nn.Module):
             dtype=dtype_str,
         )
         kernel = tl_sparse_flash_mla_fwd(cfg)
-        # single KV stream [ori_pad | cmp_pad] (kernel walks it in one loop),
-        # pre-allocated output + mask-index constant (kernel writes in place)
-        kv_all = torch.cat([ori_kv, cmp_kv], dim=1)
+        # single KV stream [B, ori_pad | cmp_pad, D] (the design declares the
+        # S dimensions concatenated as one 3D tensor; the kv-head dim of 1 is
+        # squeezed), pre-allocated output + mask-index constant (the kernel
+        # writes the output in place)
+        kv_all = torch.zeros((batch, ori_pad + cmp_pad, dim), dtype=q.dtype,
+                             device=q.device)
+        kv_all[:, :ori_pad, :] = ori_kv[:, :, 0, :]
+        kv_all[:, ori_pad:, :] = cmp_kv[:, :, 0, :]
         output = torch.empty((batch, q_seq, heads, dim),
                              dtype=q.dtype, device=q.device)
         idx = torch.arange(BLOCK_N, dtype=torch.float32, device=q.device)

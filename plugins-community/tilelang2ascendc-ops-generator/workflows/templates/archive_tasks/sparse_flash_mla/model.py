@@ -309,65 +309,103 @@ def _parse_row(row):
     }
 
 
+def _read_case_csvs():
+    """Read basic_case.csv + general_case.csv into a list of parsed param dicts.
+
+    Both files sit next to model.py and share the header documented in
+    ``_parse_row``. basic_case.csv holds one canonical case (decode SWA); the
+    general set covers prefill / HCA / CSA variations.
+    """
+    task_dir = Path(__file__).resolve().parent
+    rows = []
+    for name in ("basic_case.csv", "general_case.csv"):
+        csv_path = task_dir / name
+        if not csv_path.is_file():
+            continue
+        with csv_path.open(newline="", encoding="utf-8") as f:
+            rows.extend(_parse_row(row) for row in csv.DictReader(f))
+    return rows
+
+
+def get_inputs_from_case(cfg: dict) -> list:
+    """根据CSV测试用例参数构造一组 [q, ori_kv, cmp_kv, cmp_sparse_indices,
+    sinks, attrs] 输入;可选输入在场景不用时置 ``None``。"""
+    dtype_map = {"float16": torch.float16, "bfloat16": torch.bfloat16}
+    dtype = dtype_map[cfg["dtype"]]
+    b, s1, s2 = cfg["batch_size"], cfg["seq_len_q"], cfg["seq_len_kv"]
+    n1, n2, d = cfg["n_heads_q"], cfg["n_heads_kv"], cfg["head_dim"]
+
+    torch.manual_seed(hash(cfg["case_name"]) & 0x7FFFFFFF)
+    q = (torch.rand(b, s1, n1, d) * 4 - 2).to(dtype)
+    ori_kv = (torch.rand(b, s2, n2, d) * 4 - 2).to(dtype)
+
+    cmp_kv = None
+    cmp_sparse_indices = None
+    if cfg["scenario"] in ("HCA", "CSA"):
+        # compressed length is the *effective* length floor(s2 / ratio)
+        # (the op derives seqused_cmp_kv the same way); a ceil here
+        # would make the cmp-side causal threshold (recovered as
+        # cmp_len * ratio + residual) exceed the true ori_len.
+        cmp_seq = max(s2 // cfg["cmp_ratio"], 1)
+        cmp_kv = (torch.rand(b, cmp_seq, n2, d) * 4 - 2).to(dtype)
+    if cfg["scenario"] == "CSA":
+        # per (batch, query, kv-head) row: random permutation of the
+        # valid compressed positions, padded with -1 up to `topk`. The
+        # golden/op only scan the first min(K, threshold) entries and
+        # stop at the first -1 (see gather_cmp_indices).
+        indices = torch.full((b, s1, n2, cfg["topk"]), -1, dtype=torch.int32)
+        for ib in range(b):
+            for is1 in range(s1):
+                for in2 in range(n2):
+                    valid = cmp_seq
+                    count = min(valid, cfg["topk"])
+                    if count > 0:
+                        indices[ib, is1, in2, :count] = torch.randperm(valid)[:count]
+        cmp_sparse_indices = indices
+
+    sinks = (torch.rand(n1) * 0.4 - 0.2).to(torch.float32)
+    attrs = torch.tensor(
+        [
+            d ** -0.5,
+            float(cfg["cmp_ratio"]) if cfg["cmp_ratio"] is not None else -1.0,
+            float(cfg["ori_mask_mode"]),
+            float(cfg["cmp_mask_mode"]),
+            float(cfg["ori_win_left"]),
+            float(cfg["ori_win_right"]),
+        ],
+        dtype=torch.float32,
+    )
+    return [q, ori_kv, cmp_kv, cmp_sparse_indices, sinks, attrs]
+
+
 def get_input_groups():
-    """Build input groups from general_case.csv.
+    """Build input groups from basic_case.csv + general_case.csv (all
+    scenarios incl. CSA) for AscendC verification.
 
     Each group is ``[q, ori_kv, cmp_kv, cmp_sparse_indices, sinks, attrs]``;
     optional inputs are ``None`` when the scenario does not use them.
     """
-    case_path = Path(__file__).resolve().parent / "general_case.csv"
-    dtype_map = {"float16": torch.float16, "bfloat16": torch.bfloat16}
+    return [get_inputs_from_case(cfg) for cfg in _read_case_csvs()]
 
-    input_groups = []
-    with case_path.open(newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            cfg = _parse_row(row)
-            dtype = dtype_map[cfg["dtype"]]
-            b, s1, s2 = cfg["batch_size"], cfg["seq_len_q"], cfg["seq_len_kv"]
-            n1, n2, d = cfg["n_heads_q"], cfg["n_heads_kv"], cfg["head_dim"]
 
-            torch.manual_seed(hash(cfg["case_name"]) & 0x7FFFFFFF)
-            q = (torch.rand(b, s1, n1, d) * 4 - 2).to(dtype)
-            ori_kv = (torch.rand(b, s2, n2, d) * 4 - 2).to(dtype)
+def get_input_groups_tilelang():
+    """TileLang-only input groups: SWA/HCA cases.
 
-            cmp_kv = None
-            cmp_sparse_indices = None
-            if cfg["scenario"] in ("HCA", "CSA"):
-                # compressed length is the *effective* length floor(s2 / ratio)
-                # (the op derives seqused_cmp_kv the same way); a ceil here
-                # would make the cmp-side causal threshold (recovered as
-                # cmp_len * ratio + residual) exceed the true ori_len.
-                cmp_seq = max(s2 // cfg["cmp_ratio"], 1)
-                cmp_kv = (torch.rand(b, cmp_seq, n2, d) * 4 - 2).to(dtype)
-            if cfg["scenario"] == "CSA":
-                # per (batch, query, kv-head) row: random permutation of the
-                # valid compressed positions, padded with -1 up to `topk`. The
-                # golden/op only scan the first min(K, threshold) entries and
-                # stop at the first -1 (see gather_cmp_indices).
-                indices = torch.full((b, s1, n2, cfg["topk"]), -1, dtype=torch.int32)
-                for ib in range(b):
-                    for is1 in range(s1):
-                        for in2 in range(n2):
-                            valid = cmp_seq
-                            count = min(valid, cfg["topk"])
-                            if count > 0:
-                                indices[ib, is1, in2, :count] = torch.randperm(valid)[:count]
-                cmp_sparse_indices = indices
+    The TileLang design covers SWA and HCA but not CSA (per-query topk
+    gather); verification_tilelang.py prefers this selector when present so
+    the TileLang path never sees CSA inputs, while the AscendC path keeps the
+    full CSV set from ``get_input_groups()``.
+    """
+    return [
+        get_inputs_from_case(cfg)
+        for cfg in _read_case_csvs()
+        if cfg["scenario"] != "CSA"
+    ]
 
-            sinks = (torch.rand(n1) * 0.4 - 0.2).to(torch.float32)
-            attrs = torch.tensor(
-                [
-                    d ** -0.5,
-                    float(cfg["cmp_ratio"]) if cfg["cmp_ratio"] is not None else -1.0,
-                    float(cfg["ori_mask_mode"]),
-                    float(cfg["cmp_mask_mode"]),
-                    float(cfg["ori_win_left"]),
-                    float(cfg["ori_win_right"]),
-                ],
-                dtype=torch.float32,
-            )
-            input_groups.append([q, ori_kv, cmp_kv, cmp_sparse_indices, sinks, attrs])
-    return input_groups
+
+def get_init_inputs_from_case(params: dict) -> list:
+    """根据CSV测试用例参数构造模型初始化参数"""
+    return []
 
 
 def get_init_inputs():

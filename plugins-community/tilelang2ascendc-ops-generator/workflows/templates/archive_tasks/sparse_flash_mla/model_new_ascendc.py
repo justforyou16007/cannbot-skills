@@ -9,13 +9,20 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # ----------------------------------------------------------------------------------------------------------
 
-"""SparseFlashMla AscendC wrapper.
+"""SparseFlashMla AscendC wrapper (local direct call).
 
-SparseFlashMla is a packaged CANN operator (``cann_ops_transformer``): the
-host side first runs ``sparse_flash_mla_metadata`` to obtain the task
-partition result, then dispatches the main ``sparse_flash_mla`` op. This
-wrapper mirrors that two-step flow and decodes the same ``attrs`` tensor
-contract used by the reference ``model.py``.
+The operator is a CANN-framework packaged op: the kernel sources live in
+``kernel/op_host`` + ``kernel/op_kernel`` and are built by the ops-transformer
+framework build (``-DASCEND_OP_NAME=sparse_flash_mla,sparse_flash_mla_metadata``,
+see ``kernel/README.md``), which installs a ``custom_transformer`` vendor into
+the CANN OPP and provides the aclnn interface (``aclnnSparseFlashMla`` +
+``aclnnSparseFlashMlaMetadata`` in ``libcust_opapi.so``).
+
+This wrapper loads the torch extension ``kernel/build/sparse_flash_mla_ext*``
+(see ``kernel/op_host/sparse_flash_mla.cpp`` and ``kernel/register.cpp``),
+which registers ``torch.ops.npu.sparse_flash_mla_metadata`` and
+``torch.ops.npu.sparse_flash_mla`` backed by those aclnn calls, then mirrors
+the two-step flow: metadata first (task partition), then the main op.
 
 Two packaged-op contract details verified against the ops-transformer
 implementation (``sparse_flash_mla_tiling.cpp``) are handled here:
@@ -32,10 +39,25 @@ implementation (``sparse_flash_mla_tiling.cpp``) are handled here:
   exactly as the reference pytest does.
 """
 
+import glob
+import sys
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 
-import cann_ops_transformer  # noqa: F401  (registers torch.ops.cann_ops_transformer.*)
+_KERNEL_BUILD = Path(__file__).resolve().parent / "kernel" / "build"
+_LIB_PATTERN = str(_KERNEL_BUILD / "sparse_flash_mla_ext*")
+
+# Prefer whl import (triggers TORCH_LIBRARY registration in register.cpp)
+try:
+    import sparse_flash_mla_ext  # noqa: F401
+except ImportError:
+    # Fallback: direct .so loading from kernel/build/
+    if _LIB_PATTERN not in "".join(sys.path):
+        _libs = glob.glob(_LIB_PATTERN)
+        if _libs:
+            torch.ops.load_library(_libs[0])
 
 
 def _decode_attrs(attrs):
@@ -114,7 +136,7 @@ def sparse_flash_mla_ascendc(
         sinks = torch.zeros((q.shape[2],), dtype=torch.float32, device=q.device)
 
     # metadata-first: the task partition must exist before the main op runs
-    metadata = torch.ops.cann_ops_transformer.sparse_flash_mla_metadata(
+    metadata = torch.ops.npu.sparse_flash_mla_metadata(
         int(q.shape[2]),          # num_heads_q
         int(ori_kv.shape[2]),     # num_heads_kv
         int(q.shape[3]),          # head_dim
@@ -139,7 +161,7 @@ def sparse_flash_mla_ascendc(
         has_cmp_kv=cmp_kv is not None,
     )
 
-    return torch.ops.cann_ops_transformer.sparse_flash_mla(
+    out, _lse = torch.ops.npu.sparse_flash_mla(
         q,
         ori_kv=ori_kv,
         cmp_kv=cmp_kv,
@@ -166,6 +188,7 @@ def sparse_flash_mla_ascendc(
         topk_value_mode=1,
         return_softmax_lse=False,
     )
+    return out
 
 
 class ModelNew(nn.Module):

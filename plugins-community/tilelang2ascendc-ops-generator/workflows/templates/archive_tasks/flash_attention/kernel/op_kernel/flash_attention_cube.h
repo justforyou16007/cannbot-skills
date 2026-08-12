@@ -273,7 +273,7 @@ private:
     }
 
     // Helper: Fixpipe for main MM2 tiles
-    __aicore__ inline void FixpipeMM2Main(LocalTensor<float> &oSlot, LocalTensor<float> &cL0,
+    __aicore__ inline void FixpipeMM2Main(GlobalTensor<float> &oSlot, LocalTensor<float> &cL0,
                                            uint32_t ni, uint32_t mActAlign)
     {
         SetWaitFlag<HardEvent::M_FIX>();
@@ -291,7 +291,7 @@ private:
     }
 
     // Helper: Fixpipe for remainder MM2 tile
-    __aicore__ inline void FixpipeMM2Remainder(LocalTensor<float> &oSlot, LocalTensor<float> &cL0,
+    __aicore__ inline void FixpipeMM2Remainder(GlobalTensor<float> &oSlot, LocalTensor<float> &cL0,
                                                 uint32_t nTiles, uint32_t nAligned)
     {
         SetWaitFlag<HardEvent::M_FIX>();

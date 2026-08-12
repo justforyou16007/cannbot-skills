@@ -231,7 +231,7 @@ private:
     }
 
     // Process one chunk in Vec2: load O, merge prev accumulator, save or finalize.
-    __aicore__ inline void ProcessVec2Chunk(LocalTensor<float> &oSlot, uint32_t ci,
+    __aicore__ inline void ProcessVec2Chunk(GlobalTensor<float> &oSlot, uint32_t ci,
                                              uint32_t slot, bool isFirst, bool isLast,
                                              uint32_t mChunk, uint32_t numChunks,
                                              uint32_t tailChunk, uint32_t dim)

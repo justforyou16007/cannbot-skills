@@ -105,9 +105,10 @@ output/{op_name}_evo_{timestamp}/world_model.json
   // 归族 workflow 分支引用（workflow_guided 节点必填，其余节点为 null）。
   // 非 null 时结构：{ "family": "conv", "workflow_file": "convolution.md",
   //                   "branch": "C-6", "branch_condition": "conv3d 三维滑窗",
+  //                   "traits": ["causal", "paged/decode"],  // 正交 trait 列表（可空数组缺省 []）：phase=fwd|bwd / causal / sparse-blocktable / sparse-window / paged-decode / quant / transpose-layout 等
   //                   "stage_order": ["_common-prerequisites.md C1-C5", "C-6 branch ...", "matmul.md Step 3 GEMM 收尾"] }
   // 作用：1) 记录该节点遵循的族 workflow 分支；2) SELECT 据此保底 1 槽；
-  //       3) lingxi-partial prompt 据此注入 workflow 分支的阶段顺序，子 agent 按序优化。
+  //       3) lingxi-partial prompt 据此注入 workflow 分支的阶段顺序 + trait 追加卡，子 agent 按序优化。
 
   "optimization_type": "bandwidth",
   // 性能优化类型标签，取值: "bandwidth" | "tiling" | "algorithm" | "register_opt" | "vf_fusion" | "instruction_sched"
@@ -430,7 +431,7 @@ output/{op_name}_evo_{timestamp}/world_model.json
 | `best_score` | float | 始终 ≥ 1.0（至少等于基线） |
 | `hw_params` | object 或 null | null 表示硬件查询失败；非 null 时含 chip_model、ub_size_bytes、core_num、peak_bw_gbps 等字段 |
 | `mode` | string | 节点字段，必须是 strategy_guided、open_exploration、profiling_driven 或 workflow_guided 之一；缺省视为 strategy_guided |
-| `workflow_ref` | object 或 null | workflow_guided 节点必填：{family, workflow_file, branch, branch_condition, stage_order}；其余节点为 null。SELECT 为带 workflow_ref 的节点保底 1 槽 |
+| `workflow_ref` | object 或 null | workflow_guided 节点必填：{family, workflow_file, branch, branch_condition, traits, stage_order}；traits 为 string[] 可空数组（缺省视为 []，记录该分支正交 trait：phase=causal/sparse/paged/quant/transpose 等）；其余节点为 null。SELECT 为带 workflow_ref 的节点保底 1 槽 |
 | `optimization_type` | string | 必须是 bandwidth/tiling/algorithm 之一 |
 | `discovered_strategies` | string[] | 顶层字段，X 前缀策略 ID 列表；空列表表示本次运行尚未发现新策略 |
 | `session` | object 或 null | session 身份锚定，非 null 时含 session_id、start_time、requested_rounds、actual_rounds_completed、evo_dir、op_name |

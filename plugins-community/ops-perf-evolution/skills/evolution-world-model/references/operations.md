@@ -61,8 +61,9 @@
      * Init 必须先归族（scenario-routing 判定表），若算子命中某族 workflow 的任一分支
        （如 conv C-1~C-7 / matmul M1~Mn / FA 阶段表 / reduction 分轴模式），
        必须生成**至少 1 个** `workflow_guided` 节点（mode="workflow_guided"）。
-     * 该节点必须带 `workflow_ref` 字段：`{ family, workflow_file, branch, branch_condition, stage_order }`，
-       其中 `stage_order` 列出该分支的工作流阶段顺序（先过 `_common-prerequisites.md` C1-C5，
+     * 该节点必须带 `workflow_ref` 字段：`{ family, workflow_file, branch, branch_condition, traits, stage_order }`，
+       其中 `traits` 记录该分支正交 trait（可空数组，如 `["causal","paged/decode"]`，缺省视为 []），
+       `stage_order` 列出该分支的工作流阶段顺序（先过 `_common-prerequisites.md` C1-C5，
        再按分支专用路径选 L1 策略，最后转 GEMM 收尾 / 瓶颈驱动）。
      * 节点 strategy_combination 取该分支的专用路径策略（如 conv C-2 → P128、C-6 → P102/P129）。
      * 目的：确保归族命中的 workflow 分支有**专门变体**按 workflow 顺序优化，不被通用节点挤掉。

@@ -1,6 +1,6 @@
 # Convolution 优化工作流（Conv1d/2d/3d、Depthwise、ConvTranspose）
 
-> 适用：滑窗局部加权和类算子。conv 的本质是 im2col+GEMM，**先按几何模式分发，再决定用哪张卡**——不同 kernel 形状的最优结构完全不同。
+> 适用：滑窗局部加权和类算子。conv 的本质是 im2col+GEMM，**先按几何模式分发（C-1~C-7），再走基础链收尾，最后按正交 trait 叠加**——不同 kernel 形状的最优结构完全不同。结构对齐 flashattention.md：分支路由 → 基础链 → 正交 trait 追加表。
 
 ## Step 0 — 族判定确认
 
@@ -20,13 +20,24 @@
 | C-4 推理重复调用 | 同一权重反复卷积（评测/推理循环） | **P131**（host 侧 repack LRU 缓存，跳过 repack kernel 发射） | 权重每次变化 |
 | C-5 depthwise | `groups==Cin` | **X22**（Depthwise 直接卷积：单 AIV fp32 向量卷积直算逐通道 kh\*kw 点积，绕 im2col/GEMM/workspace/Cube；sW==1、W≥8、Co%8==0 时实测 gen-time 提升 18-84x） | 不满足 X22 前置（sW≠1 / W<8 / Co%8≠0）→ 通用前置 + 瓶颈驱动 |
 | C-6 conv3d | 三维滑窗 | **覆盖缺口**：按 C-3 思路推广（LoadData3D 支持 3D），无沉淀卡 | — |
-| C-7 ConvTranspose | 分数步长/col2im 形态 | **主路径 X29**（stride==1 shift-free dense，case0 1.003x、case7 2.43x）；**X26**（col2im tap-batch）；**大 spatial/stride-2 fallback → X18/P129**（fused img2col LoadData3D，A 侧不落地消 GM 往返 70% + stride 硬件处理；W<24 门控回退物化）；**禁用通用 im2col+GEMM**（P46/P16，全量 geomean ~0.28x 已证伪） | X29 仅 stride==1；stride≥2/大 spatial 走 X18/P129，勿用通用 GEMM fallback |
+| C-7 ConvTranspose | 分数步长/col2im 形态 | **主路径 X29**（stride==1 shift-free dense，case0 1.003x、case7 2.43x）；**大 spatial/stride-2 → X34**（col2im 相位化行归约：散射→相位内 K²/s² 条 G 行全长对齐向量 Add 归约，case2 4.66x、全量 +18%）；**X26**（col2im tap-batch）；**X18/P129 已证伪**（fused img2col：kh==4 散射错位、stride-2 挂死、性能中性）；**禁用通用 im2col+GEMM**（P46/P16，全量 ~0.28x 已证伪） | X29 仅 stride==1；stride≥2/大 spatial 走 X34，勿用 X18/P129（910B2C 不可行）或通用 GEMM fallback |
 
-> **C-7 实测结论（2026-08）**：X29 是唯一有效的 stride-1 主路径（case0 1.003x、小 shape 2-2.5x）；通用 im2col+GEMM（P46/P16）全量 geomean ~0.28x，已证伪禁用。stride≥2/大 spatial 是主要缺口，方向 = **X18/P129 fused img2col**（LoadData3D 消 GM 往返 70% + stride 硬件处理，W<24 门控回退）。相关 OKF：X29、X18、X26。
+> **C-7 实测结论（2026-08）**：X29 是唯一有效的 stride-1 主路径（case0 1.003x、小 shape 2-2.5x）；通用 im2col+GEMM 全量 ~0.28x 已证伪禁用；X18/P129（fused img2col LoadData3D）经 v5 实证在 910B2C 不可行（kh==4 散射错位、stride-2 上采样挂死、性能中性）已封锁。stride≥2/大 spatial 方向 = **X34 col2im 相位化行归约**（case2 4.66x、全量 +18%）。相关 OKF：X29、X34、X26、X18。
 
-## Step 3 — GEMM 主干的族内收尾
+## Step 3 — 基础链（GEMM 主干的族内收尾）
 
 im2col/fused 展开后本质是 GEMM：多核切分、L2 复用、CV 流水等转入 [matmul.md](matmul.md) 的 M2/M3/M7 阶段（P104/P105/P16/P51），注意权重 ws 的 k 序必须与 img2col 硬件展开序 `(ci1,kh,kw,ci0)` 一致（P129 要点）。
+
+## Step 4 — 正交 trait 追加表（可叠加，不重排分支顺序）
+
+| trait | 判定条件 | 追加卡 | 跳过条件 |
+|---|---|---|---|
+| 量化 | int8/fp8 权重或输出 + scale | 转 [quantization.md](quantization.md) 支路（D4/P48/P49/P70），量化是 trait 不换族 | 无量化 |
+| 后处理融合 | bias / activation（如 SwiGLU）/ 残差尾处理 | P50（SwiGLU 融合）、P16/P17（CV 块设计）、P73/P75（AIC:AIV 核配比） | 纯卷积无融合 |
+| fp32 精度 | dtype==fp32 且 Cube 仅支持 fp16/bf16 | **已由 C-2 分支覆盖**（P128 hi/lo 3-GEMM + ~1e-4 精度）——dtype 类分支保留在分支表（编号稳定） | 容差不允许 ~1e-4 |
+| 推理重复调用 | 同一权重反复推理/评测循环 | **已由 C-4 分支覆盖**（P131 repack LRU 缓存）——使用类分支保留在分支表 | 权重每次变化 |
+
+> C-2 fp32 / C-4 推理重复本质是 dtype/使用 trait，但保留在分支表（C-1~C-7 编号被 lingxi-evo 与 workflow_ref 引用，保持稳定）；其余正交 trait（量化/后处理融合）在此追加。`workflow_ref.traits` 记录命中 trait。
 
 ## 门控纪律（继承 X 卡实测教训）
 

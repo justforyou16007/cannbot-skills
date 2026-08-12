@@ -100,3 +100,22 @@ Additional skip vs. standard causal: blocks far behind the window
 3. **Block size selection**: Must align with Cube unit's matmul granularity (typically 16×16 or 32×32 tiles).
 
 4. **Pre/next token parameters**: Ascend attention APIs use `preTokens` and `nextTokens` to define the attention window, equivalent to a band mask.
+
+### MLA (Multi-head Latent Attention)
+- KV 由 latent c 压缩重建：`c → W^U → [nope | rope] → K/V`，KV 不经 head 维直接存 latent。
+- 判据：存在 latent 压缩 matmul（`c→K/V` 升维），decode 阶段侧重。
+- 优化：nope/rope 拼成单 GEMM K 维（P124），跨任务预取（P125），GM 任务表变长调度（P126）。
+
+### GDN-KDA（Gated Delta Rule，无 QK^T）
+- delta rule：`S ← β⊙(k⊗v − corr) + S`（含 corr 修正项），状态沿序列 chunk-scan。
+- 判据：无 QK^T、无 softmax；有 `solve_triangular`/求逆/`corr` 修正项。
+- 优化：三阶段 chunk 分解（P132）、块内 CV 流水（P133）、求逆分治（P135）。
+
+### GLA（Gated Linear Attention，无 QK^T）
+- 门控衰减：`S = α⊙S + k⊗v`（含衰减门 α，无修正项），Mamba2 的 SSD 是其一种。
+- 判据：无 QK^T、无 softmax；有 `cumprod` 衰减/门控 α，无 corr 修正项。
+- 优化：三阶段 chunk 分解（P132，cumprod 替代求逆）、CV 流水（P133）、任务划分（P134）、bf16 量化（P136）。
+
+### 通道注意力（SE/SK/Triplet/CBAM 等）—— 不是 attention 计算
+- 形态：`global pool → FC → sigmoid/softmax → 通道 scale`，**无 QK^T、无 head 结构**。
+- 判定：不归 attention 族，落 reduction / elementwise。

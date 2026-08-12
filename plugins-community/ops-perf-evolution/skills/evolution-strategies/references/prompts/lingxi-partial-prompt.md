@@ -92,7 +92,7 @@ If Mode=profiling_driven:
   e. In implementation_note: state what profiling bottleneck was targeted and how
 
 If Mode=workflow_guided:
-  本变体是归族 workflow 分支的专门变体。必须严格按下方 [WORKFLOW_REF] 中的 stage_order 阶段顺序优化，不得跳过任一阶段：
+  本变体是归族 workflow 分支的专门变体。必须严格按下方 [WORKFLOW_REF] 中的 stage_order 阶段顺序优化，不得跳过任一阶段；[WORKFLOW_REF] 中若含 `traits`（正交 trait 列表，如 causal/sparse-blocktable/paged-decode/phase=bwd），按其对应的 workflow trait 追加表叠加对应策略（不改变主链顺序）：
   a. Read the family workflow file at: {workflow_file_path}（如 skills/evolution-strategies/references/scenario-routing/convolution.md）
   b. 阶段 0 — 通用前置：过 _common-prerequisites.md C1-C5（命中用卡、未命中跳过）
   c. 阶段 1 — 分支专用路径：按 {branch} 分支的「判定条件 → 专用路径」实现（如 conv C-2 → P128 hi/lo bf16 3-GEMM、C-6 → im2col+Cube GEMM）

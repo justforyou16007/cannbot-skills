@@ -313,6 +313,7 @@ OP_FAMILIES = [
     "flash_attention", "cv_fusion", "matmul", "moe", "quantization",
     "pooling_gather", "optimizer", "index_scatter", "broadcast_mask",
     "special", "datapath",
+    "ssm", "linear_attention", "recurrent",
 ]
 
 

@@ -181,7 +181,8 @@ P119 ──→ P38
 | MHA cube 化实战链 | P120 + P121 + P122 + P123 | 向量点积→mmad 重写 + SplitFuse CV 流水 + KV 堆叠大块化 + causal 跳过边界特化 |
 | MLA decode 实战链 | P120 + P121 + P124 + P125 + P126 | mmad 重写 + CV 流水 + nope/rope K 维拼接 + 跨任务预取 + GM 任务表变长调度 |
 | Conv 实战链 | P128 + P129 + P130 + P131 | fp32 hi/lo 3-GEMM + fused im2col + 1×1 翻转 GEMM + repack LRU 缓存（按几何模式分发，见 scenario-routing/convolution.md） |
-| FA 族全链路 SOP | S1: P119+P120(+P124) → S2: P121/P14 → S3: P122/P18/P38 → S4: P123/P118 → S5: P116/P117/P126 | 任意 FA 变体（MHA/GQA/MLA/Sparse/Paged）的标准优化顺序；分轮逐阶段落地而非单轮平铺，阶段依赖与互斥见 §1/§2，完整 SOP 见 scenario-routing/flashattention.md |
+| FA 族全链路 SOP | 分支路由（standard/gqa/mla）→ 基础链 S1: P119+P120(+P124) → S2: P121/P14 → S3: P122/P18/P38 → S4: P123/P118 → S5: P116/P117/P126 → S6 收尾 + trait 追加（phase=causal/sparse/paged/quant） | 任意 softmax 注意力变体（MHA/GQA/MLA/Sparse/Paged）的标准优化顺序；分轮逐阶段落地而非单轮平铺，阶段依赖与互斥见 §1/§2，完整 SOP 见 scenario-routing/flashattention.md |
+| SSM/Scan 链（GDN-KDA/GLA） | P132 三阶段分解 → P133 块内 CV 流水 → P134 任务划分 → P135 求逆分治（仅 GDN-KDA）→ P136 bf16 量化 | 无 QK^T/无 softmax 的线性递归 chunk-scan；GLA 跳过 P135（cumprod 替代求逆）；完整 SOP 见 scenario-routing/ssm-scan.md |
 
 ## §4 UB 内存压力指南
 

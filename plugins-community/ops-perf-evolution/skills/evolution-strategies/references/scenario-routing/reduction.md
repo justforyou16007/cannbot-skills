@@ -4,7 +4,7 @@
 
 ## Step 0 — 族判定确认
 
-命中 [README.md](README.md) 判定表第 5 行（沿轴归约 / 减均值除方差 / Reduce API 证据）即归本族。独立 softmax 归此；夹在 QK^T 与 PV 之间的 softmax 归 FA 族。
+命中 [README.md](README.md) 判定表第 6 行（沿轴归约 / 减均值除方差 / Reduce API 证据）即归本族。独立 softmax 归此；夹在 QK^T 与 PV 之间的 softmax 归 Attention 系；**通道注意力（SE/SK/Triplet/CBAM：global pool→FC→scale）有 softmax/sigmoid 但无 QK^T → 归本族**（纯 scale 则归 elementwise）。
 
 ## Step 1 — 通用前置
 

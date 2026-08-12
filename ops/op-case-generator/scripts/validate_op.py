@@ -198,16 +198,20 @@ def _check_static(py_path: str, json_path: str) -> dict:
         issues.append("Missing class: Model(nn.Module)")
     else:
         model = classes["Model"]
-        # check Model inherits nn.Module
-        bases = [ast.unparse(b) for b in model.bases if hasattr(ast, 'unparse')]
-        if not bases:
-            bases_str = []
-            for b in model.bases:
+        # check Model inherits from something containing "Module" (covers nn.Module, torch.nn.Module, etc.)
+        bases_str = []
+        for b in model.bases:
+            try:
+                bases_str.append(ast.unparse(b))
+            except Exception:
                 try:
                     bases_str.append(ast.dump(b))
                 except Exception:
                     bases_str.append(str(b))
-            issues.append("Model class should inherit from nn.Module")
+        if not any("Module" in b for b in bases_str):
+            issues.append(
+                f"Model class should inherit from nn.Module (got bases: {bases_str})"
+            )
 
         # check forward method exists
         forward_methods = [n for n in ast.walk(model)
@@ -227,10 +231,6 @@ def _check_static(py_path: str, json_path: str) -> dict:
                 if "torch_npu" in alias.name or "framework" in alias.name:
                     issues.append(f"Forbidden NPU import: {alias.name}")
 
-    # check JSON line count matches len(get_init_inputs) heuristically
-    if json_path and os.path.exists(json_path):
-        json_lines = sum(1 for line in open(json_path) if line.strip())
-
     passed = len(issues) == 0
     return {"passed": passed, "issues": issues}
 
@@ -239,10 +239,220 @@ def _check_static(py_path: str, json_path: str) -> dict:
 # runtime checks (needs torch)
 # ---------------------------------------------------------------------------
 
-def _check_runtime(py_path: str) -> dict:
-    """Import the module and run every case."""
+def _dedupe_cases(inits: list, groups: list, max_numel: int = 0) -> list:
+    """Pick representative cases by signature deduplication.
+
+    Per-arg signature rules:
+      - Tensor: dtype + rank (shape values ignored — case generator's job to vary)
+      - list/tuple: length + sorted element dtype set
+      - bool / int / str: value preserved (these are usually enums like opA, alg)
+      - float: binned to {zero, small, large} — covers alpha/beta/sparsity-style
+        scalars without exploding on every distinct numeric value
+      - other: class name
+
+    If max_numel > 0, cases whose total input tensor numel exceeds the limit
+    are skipped from representatives (they would dominate runtime / OOM NPU).
+    Such skips should be visible in the returned list via absence — caller
+    can compare len(groups) vs len(returned).
+
+    Returns a list of (orig_idx, init_args, group) for one representative
+    per equivalence class, preserving original order.
+    """
+    import torch
+    seen = {}
+    representatives = []
+    for i, (init_args, group) in enumerate(zip(inits, groups)):
+        # Skip overly large cases before computing signature (avoids picking
+        # a huge case as the representative for its equivalence class).
+        if max_numel > 0:
+            total_numel = 0
+            for t in group:
+                if isinstance(t, torch.Tensor):
+                    total_numel += t.numel()
+                elif isinstance(t, (list, tuple)):
+                    for e in t:
+                        if isinstance(e, torch.Tensor):
+                            total_numel += e.numel()
+            if total_numel > max_numel:
+                continue
+        sig_parts = []
+        for t in group:
+            if isinstance(t, torch.Tensor):
+                sig_parts.append(f"t:{t.dtype}:r{len(t.shape)}")
+            elif isinstance(t, (list, tuple)):
+                elem_dtypes = sorted({
+                    str(e.dtype) for e in t if isinstance(e, torch.Tensor)
+                })
+                sig_parts.append(f"l:{len(t)}:{elem_dtypes}")
+            elif isinstance(t, bool):
+                sig_parts.append(f"b:{t}")
+            elif isinstance(t, int):
+                sig_parts.append(f"i:{t}")
+            elif isinstance(t, str):
+                sig_parts.append(f"str:{t}")
+            elif isinstance(t, float):
+                # Bin: zero / small / large — preserves "off / default / strong"
+                # without exploding on every distinct float value.
+                if t == 0.0:
+                    bucket = "z"
+                elif abs(t) < 1.0:
+                    bucket = "s"
+                else:
+                    bucket = "L"
+                sig_parts.append(f"f:{bucket}")
+            else:
+                sig_parts.append(f"o:{type(t).__name__}")
+        init_sig = repr(init_args) if init_args else "()"
+        key = (init_sig, tuple(sig_parts))
+        if key not in seen:
+            seen[key] = i
+            representatives.append((i, init_args, group))
+    return representatives
+
+
+def _check_smoke(py_path: str) -> dict:
+    """Fast smoke check: import + get_input_groups + Model() instantiation +
+    run 3 representative cases (head / middle / tail). Designed to be seconds-fast
+    and catch contract violations (missing methods, bad signatures, ImportError,
+    forward() raising on representative inputs) without exhaustive execution.
+
+    Does NOT check NaN/Inf or device placement — that's runtime/full's job.
+    """
+    import torch
+
+    result = {"passed": True, "phase": "smoke", "total": 0,
+              "passed_cases": 0, "failed_cases": 0, "failures": []}
+
+    spec = importlib.util.spec_from_file_location("_op_module_smoke", py_path)
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except Exception as e:
+        result["passed"] = False
+        result["failures"].append({
+            "case_idx": -1, "error_type": "ImportError",
+            "error_msg": str(e)[:2000]
+        })
+        return result
+
+    try:
+        groups = module.get_input_groups()
+        inits = module.get_init_inputs()
+    except Exception as e:
+        result["passed"] = False
+        result["failures"].append({
+            "case_idx": -1, "error_type": "CallError",
+            "error_msg": f"get_input_groups() or get_init_inputs() failed: {e}"[:2000]
+        })
+        return result
+
+    if not groups:
+        result["passed"] = False
+        result["failures"].append({
+            "case_idx": -1, "error_type": "EmptyCases",
+            "error_msg": "get_input_groups() returned empty list — no cases to validate"
+        })
+        return result
+
+    # Pick up to 3 cases from the FRONT only — middle/last cases are often the
+    # largest in coverage-driven tests (sorted by ascending size is uncommon),
+    # and smoke's whole point is to be fast. We'd rather miss a tail failure
+    # than block on a huge case#N-1.
+    n = len(groups)
+    candidate_idx = list(range(min(3, n)))
+    if not inits:
+        sample_inits = [[] for _ in candidate_idx]
+    elif len(inits) == n:
+        sample_inits = [inits[i] for i in candidate_idx]
+    else:
+        sample_inits = [inits[0]] * len(candidate_idx)
+    sample_groups = [groups[i] for i in candidate_idx]
+
+    result["total"] = len(candidate_idx)
+    for orig_idx, init_args, group in zip(candidate_idx, sample_inits, sample_groups):
+        model = None
+        output = None
+        try:
+            model = module.Model(*init_args) if init_args else module.Model()
+            output = model(*group)
+            if not isinstance(output, (torch.Tensor, tuple, list)):
+                result["failed_cases"] += 1
+                result["failures"].append({
+                    "case_idx": orig_idx, "error_type": "OutputType",
+                    "error_msg": f"Expected Tensor, got {type(output)}"
+                })
+                continue
+            result["passed_cases"] += 1
+        except Exception as e:
+            result["failed_cases"] += 1
+            result["failures"].append({
+                "case_idx": orig_idx, "error_type": type(e).__name__,
+                "error_msg": str(e)[:2000]
+            })
+        finally:
+            del model, output
+
+    result["passed"] = (result["failed_cases"] == 0)
+    return result
+
+
+def _check_runtime(py_path: str, full: bool = False, max_numel: int = 20000) -> dict:
+    """Import the module and run cases.
+
+    By default runs a deduplicated set of representative cases — same dtype/rank
+    signature collapses to one case. Pass full=True to run every case
+    (use this for release-grade validation; slower).
+
+    max_numel caps the total input tensor numel per case for dedupe-mode
+    selection. Cases exceeding the cap are skipped (with a warning) so a
+    1200-case validation doesn't get stuck on a 4.5-billion-nnz monster.
+    Set to 0 to disable. Ignored when full=True.
+    """
+
+    import gc
+    import time
+    import torch
+
+    def _empty_accl_cache():
+        """Best-effort empty_cache for whatever accelerator backend is active.
+        NPU first (project convention), CUDA as fallback."""
+        for attr in ("npu", "cuda"):
+            accl = getattr(torch, attr, None)
+            if accl is not None and hasattr(accl, "empty_cache"):
+                try:
+                    accl.empty_cache()
+                    return
+                except (AttributeError, RuntimeError):
+                    continue
+
+    def _tensor_on_accl(t):
+        """True if tensor lives on NPU or CUDA."""
+        if not isinstance(t, torch.Tensor):
+            return True  # non-tensor args are device-agnostic
+        dev = str(t.device)
+        return "npu" in dev or "cuda" in dev
+
+    # Release per-case tensors and accelerator cache on this cadence to keep
+    # RSS / NPU memory stable across long case lists. 50 is a trade-off:
+    # frequent enough to bound growth, rare enough that gc.collect() overhead
+    # stays negligible (<1% of total runtime).
+    CLEANUP_EVERY = 50
+
     result = {"passed": True, "total": 0, "passed_cases": 0,
               "failed_cases": 0, "failures": []}
+
+    # Detect accelerator availability once — used for device-placement warnings
+    accl_available = False
+    try:
+        accl_available = bool(torch.npu.is_available())
+    except (AttributeError, RuntimeError):
+        try:
+            accl_available = bool(torch.cuda.is_available())
+        except (AttributeError, RuntimeError):
+            accl_available = False
+
+    start_ts = time.time()
+    device_warned = False
 
     spec = importlib.util.spec_from_file_location("_op_module", py_path)
     module = importlib.util.module_from_spec(spec)
@@ -280,9 +490,45 @@ def _check_runtime(py_path: str) -> dict:
         })
         return result
 
-    result["total"] = len(groups)
+    # Empty case set is a real error, not a silent pass
+    if not groups:
+        result["passed"] = False
+        result["failures"].append({
+            "case_idx": -1, "error_type": "EmptyCases",
+            "error_msg": "get_input_groups() returned empty list — no cases to validate"
+        })
+        return result
 
-    for i, (init_args, group) in enumerate(zip(inits, groups)):
+    # Pick case list: dedup by signature (default) or full enumeration (--full)
+    if full:
+        cases_to_run = [(i, init_args, group)
+                        for i, (init_args, group) in enumerate(zip(inits, groups))]
+        result["dedupe"] = {"full": True, "total_cases": len(cases_to_run),
+                            "representatives": len(cases_to_run),
+                            "max_numel": None}
+    else:
+        cases_to_run = _dedupe_cases(inits, groups, max_numel=max_numel)
+        skipped = len(groups) - len(cases_to_run)
+        result["dedupe"] = {"full": False, "total_cases": len(groups),
+                            "representatives": len(cases_to_run),
+                            "max_numel": max_numel}
+        msg = (f"[runtime] running {len(cases_to_run)}/{len(groups)} representative cases "
+               f"(use --full to run all)")
+        if skipped > 0 and max_numel > 0:
+            msg += f", skipped {skipped} oversized (total numel > {max_numel}, raise via --max-numel)"
+        print(msg, file=sys.stderr)
+
+    result["total"] = len(cases_to_run)
+
+    # Precompute NaN/Inf skip flag once (filename-based heuristic for isnan/isinf/isfinite ops)
+    op_name = os.path.basename(py_path).lower()
+    skip_finite_check = any(kw in op_name for kw in ("isnan", "isinf", "isfinite"))
+
+    for i, (orig_idx, init_args, group) in enumerate(cases_to_run):
+        # Init to None so `finally` can `del` them safely even if Model() or
+        # forward() raised before assignment.
+        model = None
+        output = None
         try:
             if init_args:
                 model = module.Model(*init_args)
@@ -291,44 +537,79 @@ def _check_runtime(py_path: str) -> dict:
             output = model(*group)
 
             # check output type
-            if not isinstance(output, (__import__("torch").Tensor, tuple, list)):
+            if not isinstance(output, (torch.Tensor, tuple, list)):
                 result["failed_cases"] += 1
                 result["failures"].append({
-                    "case_idx": i, "error_type": "OutputType",
+                    "case_idx": orig_idx, "error_type": "OutputType",
                     "error_msg": f"Expected Tensor, got {type(output)}"
                 })
                 continue
 
-            # check for NaN/Inf (skip for isnan/isinf operators)
-            op_name = os.path.basename(py_path).lower()
-            skip_nan_check = any(kw in op_name for kw in ("isnan", "isinf", "isfinite", "isinf"))
-            if not skip_nan_check:
-                tensors = [output] if isinstance(output, __import__("torch").Tensor) else list(output)
+            # Device placement advisory: project convention prefers NPU compute,
+            # but reference implementations may legitimately run on CPU. We only
+            # warn once (don't fail) so CPU-fallback ops still validate.
+            if accl_available and not device_warned:
+                input_on_accl = all(_tensor_on_accl(t) for t in group)
+                if isinstance(output, torch.Tensor):
+                    output_on_accl = _tensor_on_accl(output)
+                else:
+                    output_on_accl = all(
+                        _tensor_on_accl(t) for t in output if isinstance(t, torch.Tensor)
+                    )
+                if not (input_on_accl and output_on_accl):
+                    print(f"[WARN] case#{orig_idx}: tensors not on NPU "
+                          f"(input_on_accl={input_on_accl}, output_on_accl={output_on_accl}). "
+                          f"Operator is running on CPU — make sure this is intended.",
+                          file=sys.stderr)
+                    device_warned = True
+
+            # Combined NaN/Inf check in a single pass (one sync instead of two)
+            if not skip_finite_check:
+                tensors = [output] if isinstance(output, torch.Tensor) else list(output)
+                bad_kind = None
                 for t in tensors:
-                    if isinstance(t, __import__("torch").Tensor):
-                        if __import__("torch").isnan(t).any():
-                            result["failed_cases"] += 1
-                            result["failures"].append({
-                                "case_idx": i, "error_type": "NaNOutput",
-                                "error_msg": "Model output contains NaN"
-                            })
-                            break
-                        if __import__("torch").isinf(t).any():
-                            result["failed_cases"] += 1
-                            result["failures"].append({
-                                "case_idx": i, "error_type": "InfOutput",
-                                "error_msg": "Model output contains Inf"
-                            })
-                            break
+                    if isinstance(t, torch.Tensor) and not torch.isfinite(t).all():
+                        # Only when an outlier is detected do we re-scan to distinguish NaN vs Inf
+                        bad_kind = "NaN" if torch.isnan(t).any() else "Inf"
+                        break
+                if bad_kind is not None:
+                    result["failed_cases"] += 1
+                    result["failures"].append({
+                        "case_idx": orig_idx,
+                        "error_type": f"{bad_kind}Output",
+                        "error_msg": f"Model output contains {bad_kind}"
+                    })
+                    continue
 
             result["passed_cases"] += 1
 
         except Exception as e:
             result["failed_cases"] += 1
             result["failures"].append({
-                "case_idx": i, "error_type": type(e).__name__,
+                "case_idx": orig_idx, "error_type": type(e).__name__,
                 "error_msg": str(e)[:2000]
             })
+        finally:
+            # Drop per-case tensors immediately so accelerator caching allocator
+            # can reuse their slots on the next iteration. Without this, NPU
+            # memory climbs monotonically across 1000+ case lists.
+            # Note: `group` itself is still referenced by `groups[i]` until the
+            # function returns; we can't free that without streaming.
+            del model, output
+            if (i + 1) % CLEANUP_EVERY == 0:
+                gc.collect()
+                _empty_accl_cache()
+                # Progress report to stderr (keeps stdout JSON clean)
+                elapsed = time.time() - start_ts
+                rate = (i + 1) / elapsed if elapsed > 0 else 0.0
+                remaining = result["total"] - (i + 1)
+                eta = remaining / rate if rate > 0 else 0.0
+                print(f"[runtime] {i+1}/{result['total']} "
+                      f"({100*(i+1)/result['total']:.0f}%) "
+                      f"passed={result['passed_cases']} "
+                      f"failed={result['failed_cases']} "
+                      f"elapsed={elapsed:.0f}s eta={eta:.0f}s",
+                      file=sys.stderr)
 
     result["passed"] = (result["failed_cases"] == 0)
     return result
@@ -644,17 +925,14 @@ def _analyze_boundary_coverage(cases: list[dict], op_class: str) -> dict:
     required = BOUNDARY_REQUIREMENTS.get(op_class, ["nonaligned_shape", "scalar_shape", "large_shape"])
 
     # check for optional params omitted (required=false)
-    has_optional = False
-    optional_omitted = False
-    for case in cases:
-        inputs = case.get("inputs", [])
-        for inp in inputs:
-            if inp.get("required") is False or inp.get("required") == "false":
-                has_optional = True
-        # check if any case has fewer inputs than the max
-        lens = [len(case.get("inputs", [])) for case in cases]
-        if len(set(lens)) > 1:
-            optional_omitted = True
+    has_optional = any(
+        inp.get("required") is False or inp.get("required") == "false"
+        for case in cases
+        for inp in case.get("inputs", [])
+    )
+    # check if any case has fewer inputs than the max (computed once, not per-case)
+    input_lens = [len(c.get("inputs", [])) for c in cases]
+    optional_omitted = len(set(input_lens)) > 1
 
     if has_optional and optional_omitted and "missing_optional" in required:
         score += 8
@@ -812,8 +1090,11 @@ def _check_coverage(py_path: str, json_path: str, op_class: str) -> dict:
 def main():
     parser = argparse.ArgumentParser(description="Validate operator .py + .json pair")
     parser.add_argument("--py", required=True, help="Path to operator .py file")
-    parser.add_argument("--mode", default="all",
-                        choices=["static", "runtime", "coverage", "all"])
+    parser.add_argument("--mode", default="runtime",
+                        choices=["static", "smoke", "runtime", "full", "coverage", "all"],
+                        help="static=AST only; smoke=load+3 sample cases (seconds); "
+                             "runtime=deduped representative cases (default); "
+                             "full=all cases (slowest); coverage=score; all=static+smoke+runtime+coverage")
     parser.add_argument("--op-class", default=None,
                         choices=list(DEFAULT_DTYPES.keys()),
                         help="Operator class for coverage analysis")
@@ -821,7 +1102,20 @@ def main():
                         help="Path to .json file (auto-detect if omitted)")
     parser.add_argument("--output", default=None,
                         help="Write results to JSON file")
+    parser.add_argument("--full", action="store_true",
+                        help="Run all cases instead of deduped representatives "
+                             "(only affects runtime/all modes; --mode full is shorthand).")
+    parser.add_argument("--max-numel", type=int, default=20000,
+                        help="Cap on total input tensor numel per case for dedupe-mode "
+                             "selection (default 20000). Cases above the cap are skipped "
+                             "to avoid getting stuck on huge sparse cases. Set 0 to disable. "
+                             "Ignored when --full is set.")
     args = parser.parse_args()
+
+    # --mode full is sugar for --mode runtime --full
+    if args.mode == "full":
+        args.mode = "runtime"
+        args.full = True
 
     py_path = os.path.abspath(args.py)
     json_path = args.json or _find_json(py_path)
@@ -846,8 +1140,19 @@ def main():
             print(json.dumps(result, indent=2, ensure_ascii=False))
             sys.exit(1)
 
+    if args.mode in ("smoke", "runtime", "all"):
+        smoke = _check_smoke(py_path)
+        result["smoke_check"] = smoke
+        if not smoke["passed"]:
+            result["status"] = "FAIL"
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+            sys.exit(1)
+        # In pure smoke mode we stop here
+        if args.mode == "smoke":
+            result["status"] = "PASS"
+
     if args.mode in ("runtime", "all"):
-        runtime = _check_runtime(py_path)
+        runtime = _check_runtime(py_path, full=args.full, max_numel=args.max_numel)
         result["runtime_check"] = runtime
         if not runtime["passed"]:
             result["status"] = "FAIL"

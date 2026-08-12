@@ -1,0 +1,23 @@
+strategy_id: P139
+description: 多槽（预发射）流水 workspace 是否只初始化部分槽/漏初始化 padded 行 — 防 NaN 随机崩溃的适用性判断
+checks:
+  - id: has_multi_slot_pipeline
+    type: grep_count
+    pattern: "kPreloadNum|BUFFER_NUM\\s*=\\s*2|preload\\s*=\\s*2|double.*buffer|pingpong"
+    files: [kernel, header]
+    expected: ">= 1"
+    fail_msg: "未发现多槽/双缓冲流水 → P139（多槽零初始化）不适用"
+
+  - id: has_workspace_pad_read
+    type: grep_count
+    pattern: "validCount|padded|laneBegin|laneEnd|memset|ZeroWorkspace|Zero.*Rows|SetValue.*0"
+    files: [kernel, header]
+    expected: ">= 1"
+    fail_msg: "未发现紧凑写+整块读的 workspace（validCount/padded/零初始化）→ 确认 P139 是否有落点"
+
+  - id: zero_init_all_slots
+    type: grep_count
+    pattern: "for\\s*\\(.*slot.*kPreloadNum|slot\\s*<\\s*kPreloadNum|Zero.*\\[slot\\]"
+    files: [kernel, header]
+    expected: "== 0"
+    fail_msg: "已发现遍历全部槽的零初始化（slot<kPreloadNum）→ P139 可能已应用"

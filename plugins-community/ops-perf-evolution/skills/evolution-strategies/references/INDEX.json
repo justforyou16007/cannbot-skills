@@ -16,7 +16,9 @@
       "icache_miss",
       "bus_contention",
       "l2_cache_thrash",
-      "ub_memory_pressure"
+      "ub_memory_pressure",
+      "cube_bound",
+      "db_not_effective"
     ],
     "op_families": [
       "elementwise",
@@ -46,11 +48,11 @@
     ]
   },
   "stats": {
-    "cards": 206,
-    "active_cards": 193,
+    "cards": 210,
+    "active_cards": 197,
     "deprecated": 13,
-    "preconditions": 136,
-    "playbooks": 136,
+    "preconditions": 140,
+    "playbooks": 140,
     "families": 8,
     "discovered": 34,
     "okf": 55
@@ -1474,6 +1476,92 @@
       "quantified_gain": []
     },
     {
+      "source_key": "evolution-strategies#card/P137_sparse_topk_compact_gather_to_cube",
+      "id": "P137",
+      "title": "P137: Token 级稀疏 Attention 的 workspace 紧凑化走 Cube（top-k 不再回退 Vector）",
+      "doc_path": "cards/P137_sparse_topk_compact_gather_to_cube.md",
+      "complexity": "L2",
+      "op_families": [
+        "attention",
+        "flash_attention"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "scalar_loading",
+          "cube_bound"
+        ]
+      },
+      "conflicts_with": [],
+      "synergizes_with": [
+        "P110",
+        "P14",
+        "P129"
+      ],
+      "requires": [],
+      "has_preconditions": true,
+      "has_playbook": true,
+      "quantified_gain": [
+        "shape: \"SparseFlashAttention GQA topK512 Dk128 kvSeq4096（case1, 910B2C→910c）\""
+      ]
+    },
+    {
+      "source_key": "evolution-strategies#card/P138_host_tiling_l0_capacity_guard",
+      "id": "P138",
+      "title": "P138: host tiling 查询 L0A/L0C 容量并按需自适应降维（跨硬件稳定性）",
+      "doc_path": "cards/P138_host_tiling_l0_capacity_guard.md",
+      "complexity": "L1",
+      "op_families": [
+        "attention",
+        "flash_attention",
+        "matmul"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "near_optimal",
+          "db_not_effective"
+        ]
+      },
+      "conflicts_with": [],
+      "synergizes_with": [
+        "P135"
+      ],
+      "requires": [],
+      "has_preconditions": true,
+      "has_playbook": true,
+      "quantified_gain": [
+        "shape: \"SparseFlashAttention 20-case 910c（BenchSite 同 kernel 复测）\""
+      ]
+    },
+    {
+      "source_key": "evolution-strategies#card/P139_multi_slot_workspace_zero_init",
+      "id": "P139",
+      "title": "P139: 多槽流水 workspace 全槽零初始化（防 padded 行 NaN → 偶发崩溃）",
+      "doc_path": "cards/P139_multi_slot_workspace_zero_init.md",
+      "complexity": "L1",
+      "op_families": [
+        "flash_attention",
+        "attention",
+        "elementwise"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "near_optimal"
+        ]
+      },
+      "conflicts_with": [],
+      "synergizes_with": [
+        "P14",
+        "P40",
+        "P137"
+      ],
+      "requires": [],
+      "has_preconditions": true,
+      "has_playbook": true,
+      "quantified_gain": [
+        "shape: \"SparseFlashAttention 20-case 910c（同 kernel 连续复测）\""
+      ]
+    },
+    {
       "source_key": "evolution-strategies#card/P13_special_algorithms",
       "id": "P13",
       "title": "P13: Special Algorithms & High-Level AscendC APIs (特殊算法与高阶API)",
@@ -1495,6 +1583,37 @@
       "quantified_gain": [],
       "deprecated": true,
       "deprecated_reason": "Title is vague 'Special Algorithms'. Content is actually FakeQuant DAG scheduling (very specific, not L0 universal)."
+    },
+    {
+      "source_key": "evolution-strategies#card/P140_mla_large_m_tile",
+      "id": "P140",
+      "title": "P140: MLA（kvHeads=1）的 M-tile 放大到 qHeads（UB/L0 自适应）",
+      "doc_path": "cards/P140_mla_large_m_tile.md",
+      "complexity": "L1",
+      "op_families": [
+        "attention",
+        "flash_attention"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "cube_bound",
+          "scalar_loading"
+        ]
+      },
+      "conflicts_with": [],
+      "synergizes_with": [
+        "P137",
+        "P138",
+        "P110"
+      ],
+      "requires": [
+        "P138"
+      ],
+      "has_preconditions": true,
+      "has_playbook": true,
+      "quantified_gain": [
+        "shape: \"SparseFlashAttention MLA case9/11/13（Dk512 kvHeads=1, 910c）\""
+      ]
     },
     {
       "source_key": "evolution-strategies#card/P14_cv_pipeline_preload",
@@ -5056,7 +5175,7 @@
     {
       "source_key": "evolution-knowledge#okf/runbooks/proven-solutions/x33-elementwise-workflow-tiny-shape-broadcast",
       "id": "x33-elementwise-workflow-tiny-shape-broadcast",
-      "title": "Elementwise 工作流全流程优化 tiny-shape launch 主导 elementwise（单 kernel 融合 + Duplicate 广播 + 64 对齐 Select）",
+      "title": "Elementwise 工作流全流程优化 tiny-shape launch 主导 elementwise（单 kernel 融合 + 多 block 拷贝合并 + 多核并行）",
       "doc_path": "skills/evolution-knowledge/references/okf/runbooks/proven-solutions/x33-elementwise-workflow-tiny-shape-broadcast.md",
       "kind": "proven_solution",
       "confidence": "single_op",
@@ -5075,7 +5194,10 @@
         "P1",
         "P5",
         "P7",
-        "P8"
+        "P8",
+        "X3",
+        "D1",
+        "D2"
       ],
       "tags": []
     },
@@ -5523,9 +5645,29 @@
       "doc_path": "preconditions/P136_ssm_intermediate_bf16_quant.yaml"
     },
     {
+      "source_key": "evolution-strategies#preconditions/P137",
+      "id": "P137",
+      "doc_path": "preconditions/P137.yaml"
+    },
+    {
+      "source_key": "evolution-strategies#preconditions/P138",
+      "id": "P138",
+      "doc_path": "preconditions/P138.yaml"
+    },
+    {
+      "source_key": "evolution-strategies#preconditions/P139",
+      "id": "P139",
+      "doc_path": "preconditions/P139.yaml"
+    },
+    {
       "source_key": "evolution-strategies#preconditions/P14",
       "id": "P14",
       "doc_path": "preconditions/P14.yaml"
+    },
+    {
+      "source_key": "evolution-strategies#preconditions/P140",
+      "id": "P140",
+      "doc_path": "preconditions/P140.yaml"
     },
     {
       "source_key": "evolution-strategies#preconditions/P16",
@@ -6198,6 +6340,26 @@
       "source_key": "evolution-strategies#playbook/P136_ssm_intermediate_bf16_quant",
       "id": "P136",
       "doc_path": "playbooks/P136_ssm_intermediate_bf16_quant.md"
+    },
+    {
+      "source_key": "evolution-strategies#playbook/P137_sparse_topk_compact_gather_to_cube",
+      "id": "P137",
+      "doc_path": "playbooks/P137_sparse_topk_compact_gather_to_cube.md"
+    },
+    {
+      "source_key": "evolution-strategies#playbook/P138_host_tiling_l0_capacity_guard",
+      "id": "P138",
+      "doc_path": "playbooks/P138_host_tiling_l0_capacity_guard.md"
+    },
+    {
+      "source_key": "evolution-strategies#playbook/P139_multi_slot_workspace_zero_init",
+      "id": "P139",
+      "doc_path": "playbooks/P139_multi_slot_workspace_zero_init.md"
+    },
+    {
+      "source_key": "evolution-strategies#playbook/P140_mla_large_m_tile",
+      "id": "P140",
+      "doc_path": "playbooks/P140_mla_large_m_tile.md"
     },
     {
       "source_key": "evolution-strategies#playbook/P14_cv_pipeline_preload",

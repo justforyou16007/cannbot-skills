@@ -29,7 +29,7 @@
 
 ## Ascend C Sort Tiling 系统化设计
 
-> 来源：[`ops/ascendc-tiling-design/references/sort/patterns.md`](../../../../../ops/ascendc-tiling-design/references/sort/patterns.md)、[`alg-two-level-mrgsort.md`](../../../../../ops/ascendc-tiling-design/references/sort/alg-two-level-mrgsort.md)
+> 来源：插件本地 [`tiling-design/sort/patterns.md`](../tiling-design/sort/patterns.md)、[`alg-two-level-mrgsort.md`](../tiling-design/sort/alg-two-level-mrgsort.md)
 >
 > 本章节沉淀 Sort / TopK 族在 Ascend C 上的 Tiling 与归并设计方法论。
 

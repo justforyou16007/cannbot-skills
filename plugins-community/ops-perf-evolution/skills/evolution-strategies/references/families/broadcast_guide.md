@@ -31,7 +31,7 @@
 
 ## Ascend C Broadcast Tiling 系统化设计
 
-> 来源：[`ops/ascendc-tiling-design/references/broadcast/patterns.md`](../../../../../ops/ascendc-tiling-design/references/broadcast/patterns.md)
+> 来源：插件本地 [`tiling-design/broadcast/patterns.md`](../tiling-design/broadcast/patterns.md)
 >
 > 本章节沉淀 Broadcast 族在 Ascend C 上的 Tiling 设计方法论。
 

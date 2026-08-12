@@ -151,7 +151,7 @@ If Mode=strategy_guided (default):
 - 没有 Playbook 的策略不强制 Step 段落
 
 [TILING DESIGN CHECKLIST]
-若算子属于 ascendc-tiling-design 已覆盖族，在实现优化前必须逐项确认对应类别的 Tiling 设计要点：
+若算子属于 ascendc-tiling-design 已覆盖族，在实现优化前必须逐项确认对应类别的 Tiling 设计要点（插件本地副本：`plugins-community/ops-perf-evolution/skills/evolution-strategies/references/tiling-design/{family}/`，可自行修改维护）：
 
 - **MatMul 类** (P104-P108)
   - [ ] Host tiling 使用 `MatmulApiTiling::GetTiling(TCubeTiling&)`，正确覆写 singleCoreM/N/Ka/Kb、baseM/N/K、usedCoreNum

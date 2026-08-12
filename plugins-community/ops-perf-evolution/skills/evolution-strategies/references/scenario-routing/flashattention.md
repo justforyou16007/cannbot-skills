@@ -19,7 +19,7 @@
 |---|---|---|---|
 | standard | `num_q_heads == num_kv_heads`（MHA/self/cross） | 基础链 S1（P119/P120）→ S2 → S3 → S4/S5 | 已是 online softmax + cube 路径则跳过 S1 |
 | gqa | `num_q_heads == G×num_kv_heads (G>1)`；`num_kv_heads==1` → MQA（G=num_q 特例） | P115（GQA tiling 路由）+ 基础链；S5 用 **P116**（G→M 合并）+ **P126**（变长调度）；decode 侧重 **X5/X4** | 非 grouped head |
-| mla | KV 经 latent c 压缩（`c→[nope\|rope]→K/V` 升维 matmul），decode 特征 | S1 **P124**（nope/rope 拼 K 维）+ P120；S5 P126；decode 侧重 P57/P58 | 非 latent 结构 |
+| mla | KV 经 latent c 压缩（`c→[nope\|rope]→K/V` 升维 matmul），decode 特征 | S1 **P124**（nope/rope 拼 K 维）+ P120 + **P140**（kvHeads=1 M-tile 放大到 qHeads）；S5 P126；decode 侧重 P57/P58 | 非 latent 结构 |
 
 > ⚠️ 小 S launch-bound 优先 host 侧（P54/X28），勿机械套 tiling/流水（P-GQA-7 教训）。
 
@@ -41,7 +41,7 @@
 | phase=fwd（默认） | 正向传播 | 走正向基础链 S1-S6 | — |
 | phase=bwd | 反向传播（FlashAttentionBwd / SDPA-Bwd / BlockSparseAttnBwd） | **切换阶段组**为反向链：重算 softmax P → dS=dO@V^T、dV=P^T@dO → dP=softmax 反向 → dQ=dS@K、dK=dS^T@Q → P91；mask/稀疏 trait 照常叠加 | 非反向算子 |
 | causal | 下三角 mask | S4 P123 + P118 | 全 attention 无 mask |
-| sparse:block_table | block_table/block_size 分块稀疏加载（SFA/FlashSparse 形态） | 类似 paged block-table 加载路径 P76/P77 + block_table 稀疏加载 = **覆盖缺口**（需沉淀） | 稠密 attention |
+| sparse:block_table | block_table/block_size 分块稀疏加载（SFA/FlashSparse 形态，7_SparseFlashAttention） | **P137**（紧凑化走 Cube：top-k 经 AIV gather 搬成紧凑 tile 再喂 AIC mmad，不再回退 Vector）+ P76/P77 + 稳定性 **P138**（L0 容量守卫）/ **P139**（多槽零初始化） | 稠密 attention |
 | sparse:causal-window | band/窗口/stride mask skip | S4 P123 + P118 | 稠密 attention |
 | paged/decode | Q len=1 + paged KV cache | S3 P60 + P61；S5 P126 + P57/P58 | prefill 全量 |
 | 量化 | dtype∈{int8/fp8}、有 scale | 转 [quantization.md](quantization.md) 支路（P48/P49/P70），量化是 trait 不换族 | 无量化 |

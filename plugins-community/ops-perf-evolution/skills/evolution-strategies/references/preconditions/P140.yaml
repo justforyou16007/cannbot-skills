@@ -1,0 +1,23 @@
+strategy_id: P140
+description: MLA（kvHeads=1）且 M-tile 被小值封顶 — 放大共享-KV 的 M-tile 的适用性判断
+checks:
+  - id: has_shared_kv_ratio
+    type: grep_count
+    pattern: "kvHeads|qHeads\\s*/\\s*kvHeads|groupSize|N2|groupTile"
+    files: [host, tiling]
+    expected: ">= 1"
+    fail_msg: "未发现 qHeads/kvHeads 共享 K/V 关系 → P140（按共享行数定 M-tile）不适用"
+
+  - id: mla_like_small_kv
+    type: grep_value
+    pattern: "kvHeads\\s*[=]\\s*1|kvHeadNum\\s*[=]\\s*1"
+    files: [host, tiling, kernel]
+    expected_value: "1"
+    fail_msg: "kvHeads>1（GQA/MHA），共享行数小，P140 的放大收益有限——确认是否仍需要"
+
+  - id: m_tile_capped_small
+    type: grep_value
+    pattern: "kCubeMaxM\\s*=\\s*(\\d+)"
+    files: [header, tiling]
+    expected_value: "128"
+    fail_msg: "kCubeMaxM 非 128（可能仍被 64/32 封顶）→ P140 可考虑放大；若已是运行时 mTileCap 自适应则已应用"

@@ -290,6 +290,17 @@ P67-P69 为 Vector 计算效率基础策略（Counter 模式、低延迟归约�
 | P135 | delta-rule 矩阵求逆分治 | L2 | ssm, delta-rule, matmul | (I-A)^{-1} 整块串行求逆：对角子块向量前代 + 非对角 X10=X11·M10·X00 cube MM，O(C³) 求逆并行化（GLA 用 cumprod 无求逆） | playbooks/P135_delta_rule_inverse_divide_conquer.md |
 | P136 | SSM 中间量 bf16 量化 + 状态常驻 | L1 | ssm, ub-memory, bf16 | 中间量全 fp32/状态每 chunk 搬 GM：块间传递全程 bf16（求逆/衰减核心留 fp32）+ state (Dv,Dk) UB 常驻 + head grouping Nv//Nk | playbooks/P136_ssm_intermediate_bf16_quant.md |
 
+## 性能优化策略 — SparseFlashAttention 实战优化 (P137-P140) [Layer: L1-L2]
+
+覆盖 token 级稀疏（top-k）与 MLA 的 SFA 优化。来源：Z-Search cannbench-evo 实测沉淀。P137 是稀疏主路径（紧凑化走 Cube）；P138/P139 是稳定性加固（L0 容量守卫 / 多槽零初始化）；P140 是 MLA M-tile 放大（依赖 P138）。
+
+| ID | Strategy | Layer | Tags | When to Apply | Detail File |
+|----|----------|-------|------|---------------|-------------|
+| P137 | 稀疏 top-k 紧凑化走 Cube | L2 | flash_attention, sparse, cube | token 级稀疏（topK）被误认"不规则索引无法用 Cube"：AIV 标量 gather 搬成 workspace 紧凑 tile（有效行前置 + 尾部零填充）再喂 AIC mmad，稀疏只加搬运契约不改 Cube 结论（17.28x） | playbooks/P137_sparse_topk_compact_gather_to_cube.md |
+| P138 | host tiling L0 容量守卫 | L1 | flash_attention, matmul, stability | Cube tiling 用写死的 L0 尺寸 → 更小 L0 芯片 InitBuffer 溢出随机 SIGSEGV：`GetCoreMemSize(L0_A/L0_C)` 运行时查询 + groupTile 自适应减半（跨硬件稳定性） | playbooks/P138_host_tiling_l0_capacity_guard.md |
+| P139 | 多槽流水 workspace 全槽零初始化 | L1 | flash_attention, stability | 预发射多槽流水只初始化 slot0 → 后续槽 padded 行残留 NaN/inf 偶发崩溃：零初始化遍历全部槽 + AIC 直读的 score/prob padded 区（防 NaN 稳定性） | playbooks/P139_multi_slot_workspace_zero_init.md |
+| P140 | MLA（kvHeads=1）M-tile 放大 | L1 | flash_attention, mla, tiling | M-tile 上限 = 共享 K/V 的查询行数：GQA 只有 groupSize（小）硬拉无益，MLA（kvHeads=1）可到 qHeads 放大一个数量级，UB/L0 自适应（配合 P138）（1.95x） | playbooks/P140_mla_large_m_tile.md |
+
 ## 精度优化策略 (A1-A8) [Layer: L0]
 
 | ID | Strategy | Layer | Tags | When to Apply | Detail File |

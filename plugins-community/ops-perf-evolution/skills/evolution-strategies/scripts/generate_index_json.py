@@ -306,6 +306,7 @@ BOTTLENECK_LABELS = [
     "near_optimal", "no_overlap", "partial_overlap",
     "undersize_transfer", "icache_miss", "bus_contention",
     "l2_cache_thrash", "ub_memory_pressure",
+    "cube_bound", "db_not_effective",
 ]
 
 OP_FAMILIES = [

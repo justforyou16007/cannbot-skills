@@ -27,7 +27,7 @@
 
 ## Ascend C Transpose Tiling 设计
 
-> 来源：[`ops/ascendc-tiling-design/references/conversion/patterns.md`](../../../../../ops/ascendc-tiling-design/references/conversion/patterns.md)
+> 来源：插件本地 [`tiling-design/conversion/patterns.md`](../tiling-design/conversion/patterns.md)
 >
 > 本章节沉淀 small-channel transpose 类算子在 Ascend C 上的 Tiling 设计方法论。
 

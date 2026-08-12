@@ -68,7 +68,7 @@
 
 ## Ascend C Elementwise Tiling 系统化设计
 
-> 来源：[`ops/ascendc-tiling-design/references/elewise/patterns.md`](../../../../../ops/ascendc-tiling-design/references/elewise/patterns.md)
+> 来源：插件本地 [`tiling-design/elewise/patterns.md`](../tiling-design/elewise/patterns.md)
 >
 > 本章节沉淀 Elementwise 族在 Ascend C 上的 Tiling 设计方法论。
 

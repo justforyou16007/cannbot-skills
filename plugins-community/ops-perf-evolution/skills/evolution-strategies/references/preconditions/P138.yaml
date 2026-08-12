@@ -1,0 +1,23 @@
+strategy_id: P138
+description: host tiling 是否用写死的 L0 尺寸或缺 L0 容量查询 — 跨硬件可移植性/稳定性加固的适用性判断
+checks:
+  - id: has_cube_tiling_params
+    type: grep_count
+    pattern: "groupTile|baseM|baseN|tiling|numBlocks|workspaceBytes|Calc.*Tiling"
+    files: [host, tiling]
+    expected: ">= 1"
+    fail_msg: "host/tiling 未发现 Cube tiling 参数（groupTile/baseM 等）→ P138 不适用"
+
+  - id: hardcoded_tile_literal
+    type: grep_count
+    pattern: "groupTile\\s*=\\s*[0-9]+|kCubeMaxM\\s*=\\s*[0-9]+|baseM\\s*=\\s*[0-9]+|constexpr.*k.*Tile\\s*=\\s*[0-9]+"
+    files: [host, tiling, header]
+    expected: ">= 1"
+    fail_msg: "未发现写死的 tile 常量 → P138 加固点可能不适用（确认是否已用运行时容量）"
+
+  - id: lacks_l0_query
+    type: grep_count
+    pattern: "GetCoreMemSize.*L0|L0_A|L0_C|l0cSize|L0C_SIZE"
+    files: [host, tiling]
+    expected: "== 0"
+    fail_msg: "已存在 L0 容量查询/检查（L0_A/L0_C）→ P138 可能已应用"

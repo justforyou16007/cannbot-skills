@@ -50,7 +50,7 @@
 
 ## Ascend C Reduction Tiling 系统化设计
 
-> 来源：[`ops/ascendc-tiling-design/references/reduction/patterns.md`](../../../../../ops/ascendc-tiling-design/references/reduction/patterns.md)、[`algorithms.md`](../../../../../ops/ascendc-tiling-design/references/reduction/algorithms.md)
+> 来源：插件本地 [`tiling-design/reduction/patterns.md`](../tiling-design/reduction/patterns.md)、[`algorithms.md`](../tiling-design/reduction/algorithms.md)
 >
 > 本章节沉淀 reduction 族在 Ascend C 上的 Tiling 设计方法论，供进化优化时直接引用。
 
@@ -104,7 +104,7 @@ ReduceMax<float, Pattern::Reduce::RA>(resultLocal, xLocal, tmpLocal, srcShape, t
 
 ### 4. 多轴归约
 
-合轴后为 A/R 交替序列（如 ARARA）时，使用 [multi-axis-transform.md](../../../../../ops/ascendc-tiling-design/references/reduction/multi-axis-transform.md) 提供的 Shape 三步变换，把问题展开为嵌套循环，每个 R 维单独按 AR/ARA 处理。
+合轴后为 A/R 交替序列（如 ARARA）时，使用 [multi-axis-transform.md](../tiling-design/reduction/multi-axis-transform.md) 提供的 Shape 三步变换，把问题展开为嵌套循环，每个 R 维单独按 AR/ARA 处理。
 
 ### 5. 算法选择
 

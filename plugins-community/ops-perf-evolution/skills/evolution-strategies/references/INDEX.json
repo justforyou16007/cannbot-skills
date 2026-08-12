@@ -48,14 +48,14 @@
     ]
   },
   "stats": {
-    "cards": 210,
-    "active_cards": 197,
+    "cards": 216,
+    "active_cards": 203,
     "deprecated": 13,
     "preconditions": 140,
     "playbooks": 140,
     "families": 8,
-    "discovered": 34,
-    "okf": 55
+    "discovered": 38,
+    "okf": 61
   },
   "cards": [
     {
@@ -4761,6 +4761,118 @@
       "description": "反卷积 fallback 路径（GEMM + col2im）的真正瓶颈不是 im2col 带宽而是 col2im 散射（逐输出行 undersize 加载 + Gather + parity 过滤 + PIPE_ALL 屏障）。把 col2im 从'逐输出行散射'改为'每相位对相位内 K²/s² 条 G 行做全长对齐向量 Add 归约 → 相位平面 → 行粒度批量写回'。列移位经 DataCopyPad src offset + left/rightPadding 落地（AIV 全 32B 对齐，绕开 odd-shift 对齐封锁）。case2 [2,32,16,16] 548→118us (4.7x)。"
     },
     {
+      "source_key": "evolution-knowledge#okf/strategies/discovered/X35",
+      "id": "X35",
+      "title": "MatmulImpl Host 固定开销消除 + 全覆盖串行多 tile",
+      "doc_path": "skills/evolution-knowledge/references/okf/strategies/discovered/disc_X35.md",
+      "kind": "discovered_strategy",
+      "confidence": "single_op",
+      "status": "active",
+      "op_families": [
+        "matmul"
+      ],
+      "bottlenecks": [
+        "scalar_loading",
+        "tiling_imbalance",
+        "no_overlap",
+        "mte2_stall"
+      ],
+      "tags": [
+        "matmul",
+        "host-overhead",
+        "launch-bound",
+        "workspace",
+        "tiling-cache",
+        "multi-core",
+        "serial-tile"
+      ],
+      "description": "MatmulImpl 高阶 API 每次调用含固定 host/device 开销（GetTiling + TilingHeader H2D + workspace at::zeros 清零 ~6.5us/次），对小到中 shape（输出 ≤4×L0C）是 launch-bound 主因。消除四类固定开销：workspace at::empty（位精确验证）、per-shape tiling 缓存、workspace 缓存复用、kernel 核内串行多 tile 遍历（for tile+=blockDim，End 只调一次，修复 totalBlock>blockDim 漏算并保证全核忙碌）。配套自适应 core re-grid（L0C 约束 + 目标 totalBlock∈[8,24]，大 shape 保留对齐 tile 避免 Cube 掩码浪费）。"
+    },
+    {
+      "source_key": "evolution-knowledge#okf/strategies/discovered/X36",
+      "id": "X36",
+      "title": "Zero-Host-Padding AIV Small-Matmul",
+      "doc_path": "skills/evolution-knowledge/references/okf/strategies/discovered/disc_X36.md",
+      "kind": "discovered_strategy",
+      "confidence": "single_op",
+      "status": "active",
+      "op_families": [
+        "matmul"
+      ],
+      "bottlenecks": [
+        "undersize_transfer",
+        "fake_mte2_bound",
+        "scalar_loading"
+      ],
+      "tags": [
+        "aiv",
+        "vector",
+        "host-padding",
+        "small-shape",
+        "zero-pad"
+      ],
+      "description": ""
+    },
+    {
+      "source_key": "evolution-knowledge#okf/strategies/discovered/X37",
+      "id": "X37",
+      "title": "FP32-via-FP16 Hi/Lo 4-GEMM Cube Decomposition",
+      "doc_path": "skills/evolution-knowledge/references/okf/strategies/discovered/disc_X37.md",
+      "kind": "discovered_strategy",
+      "confidence": "single_op",
+      "status": "active",
+      "op_families": [
+        "flash_attention",
+        "matmul",
+        "conv"
+      ],
+      "bottlenecks": [
+        "scalar_compute",
+        "compute_bound"
+      ],
+      "tags": [
+        "fp32",
+        "fp16",
+        "cube",
+        "hi-lo",
+        "decomposition",
+        "precision"
+      ],
+      "description": ""
+    },
+    {
+      "source_key": "evolution-knowledge#okf/strategies/discovered/X38",
+      "id": "X38",
+      "title": "GM-Workspace-Ring KV-tile 宽度缩放 + Host 批量权重打包",
+      "doc_path": "skills/evolution-knowledge/references/okf/strategies/discovered/disc_X38.md",
+      "kind": "discovered_strategy",
+      "confidence": "single_op",
+      "status": "active",
+      "op_families": [
+        "flash_attention",
+        "attention",
+        "matmul"
+      ],
+      "bottlenecks": [
+        "scalar_loading",
+        "scalar_compute",
+        "mte2_stall",
+        "undersize_transfer",
+        "compute_bound"
+      ],
+      "tags": [
+        "flash_attention",
+        "workspace-ring",
+        "kv-tile",
+        "host-packing",
+        "scalar_loading",
+        "cube-efficiency",
+        "causal",
+        "gqa"
+      ],
+      "description": "针对采用 GM workspace ring 队列（AIC 写 S/P/O 经 GM 中转给 AIV）的 FA 算子，每 KV tile 固定握手开销主导（AIC scalar_ratio~0.8, AIV~0.7, cube MAC 仅 4-6%）时：1) kvN 自适应（seq<=64 用 64 避免尾块浪费，seq>64 用 128）直接减半 GM ring 往返次数 + 翻倍 MM1/MM2 cube GEMM 尺寸，workspace/buffer 按 128 max 分配仅 slot stride/MM n-k/fixpipe/softmax srcK/mask 变运行时 kvN，sPad align_up(seq,kvN) 修越界；2) host 侧融合投影的 per-head 权重打包 copy-storm（48+ 次 narrow().copy_()，fp32 case 占墙钟~40%）批量化为 cat+pad+reshape+单次 strided copy（heads 多时），输出改 at::empty。FlashAttentionV2 mean 0.579→0.856（geomean 0.530→0.794）。"
+    },
+    {
       "source_key": "evolution-knowledge#okf/strategies/discovered/X4",
       "id": "X4",
       "title": "Concat-Fused Strided DMA + Two-Level Skv Reduction",
@@ -5028,6 +5140,41 @@
       ],
       "strategy_ids": [
         "X23"
+      ],
+      "tags": []
+    },
+    {
+      "source_key": "evolution-knowledge#okf/runbooks/proven-solutions/x23-zero-host-padding-aiv-small-matmul",
+      "id": "x23-zero-host-padding-aiv-small-matmul",
+      "title": "Zero-Host-Padding AIV Small-Matmul",
+      "doc_path": "skills/evolution-knowledge/references/okf/runbooks/proven-solutions/x23-zero-host-padding-aiv-small-matmul.md",
+      "kind": "proven_solution",
+      "confidence": "single_op",
+      "status": "active",
+      "op_families": [
+        "matmul"
+      ],
+      "strategy_ids": [
+        "X23"
+      ],
+      "tags": []
+    },
+    {
+      "source_key": "evolution-knowledge#okf/runbooks/proven-solutions/x24-fp32-via-fp16-hi-lo-4gemm-cube",
+      "id": "x24-fp32-via-fp16-hi-lo-4gemm-cube",
+      "title": "FP32-via-FP16 Hi/Lo 4-GEMM Cube Decomposition",
+      "doc_path": "skills/evolution-knowledge/references/okf/runbooks/proven-solutions/x24-fp32-via-fp16-hi-lo-4gemm-cube.md",
+      "kind": "proven_solution",
+      "confidence": "single_op",
+      "status": "active",
+      "op_families": [
+        "flash_attention",
+        "matmul",
+        "conv"
+      ],
+      "strategy_ids": [
+        "X24",
+        "P128"
       ],
       "tags": []
     },
@@ -6969,6 +7116,26 @@
       "source_key": "evolution-strategies#discovered/disc_X34",
       "id": "X34",
       "doc_path": "discovered/disc_X34.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X35",
+      "id": "X35",
+      "doc_path": "discovered/disc_X35.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X36",
+      "id": "X36",
+      "doc_path": "discovered/disc_X36.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X37",
+      "id": "X37",
+      "doc_path": "discovered/disc_X37.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X38",
+      "id": "X38",
+      "doc_path": "discovered/disc_X38.md"
     },
     {
       "source_key": "evolution-strategies#discovered/disc_X4",

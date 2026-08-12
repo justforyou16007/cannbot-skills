@@ -7,7 +7,14 @@ This directory ships the **canonical AscendC implementation** of
 
 ```
 kernel/
-├── op_host/                  # 打包算子 host 侧（照搬）
+├── CMakeLists.txt                 # 直调适配层构建（torch 扩展，见下）
+├── build.sh                       # 一键构建适配层扩展（前置：vendor 已部署）
+├── setup.py                       # → archive_tasks/_kernel_setup_common.kernel_setup
+├── ops.h                          # op_api:: 声明（adapter + register 共用）
+├── register.cpp                   # TORCH_LIBRARY_FRAGMENT(npu) 注册 torch.ops.npu.*
+├── utils/aclnn_common.h           # aclnn 调用公共头（照搬 ops-transformer，CANN Open License）
+├── op_host/                       # 打包算子 host 侧（照搬）
+│   ├── sparse_flash_mla.cpp       # 直调适配层：aclnnSparseFlashMla/Metadata 的 C API 包装
 │   ├── sparse_flash_mla_def.cpp     # OpDef（输入/输出/属性定义）
 │   ├── sparse_flash_mla_proto.cpp   # RegisterOperator 注册
 │   ├── sparse_flash_mla_tiling.cpp  # tiling（metadata 任务划分 + tiling 数据）
@@ -48,7 +55,8 @@ cmake --build . --target op_host_aclnn cust_opapi optiling cust_opmaster \
 # 4) 组装并安装 custom_transformer vendor 到 CANN OPP
 cmake --build . --target install -j $(nproc)
 cd /home/y00889327/ops-transformer/build_out && bash install.sh
-# 5) 运行期环境
+# 5) 运行期环境（两个都必须，缺一个就是对应算子起不来）
+export ASCEND_CUSTOM_OPP_PATH=$ASCEND_HOME_PATH/opp/vendors/custom_transformer
 export LD_LIBRARY_PATH=$ASCEND_HOME_PATH/opp/vendors/custom_transformer/op_api/lib:${LD_LIBRARY_PATH}
 ```
 
@@ -86,11 +94,20 @@ out, _lse = torch.ops.npu.sparse_flash_mla(
 )
 ```
 
-`torch.ops.npu.*` 由 kernel/build 下构建的 torch 扩展注册（直调适配层，见
-`kernel/op_host/sparse_flash_mla.cpp` + `kernel/register.cpp`，aclnn 调用照搬
-ops-transformer `torch_extension/cann_ops_transformer/ops/csrc/sparse_flash_mla.cpp`
-模式；`model_new_ascendc.py` 优先 import 该扩展，也可回退到 CANN 打包的
-`cann_ops_transformer` 同名接口）。
+`torch.ops.npu.*` 由 kernel/build 下构建的 torch 扩展注册（直调适配层）：
+`kernel/op_host/sparse_flash_mla.cpp` 用 aclnn C API
+（`aclnnSparseFlashMla(Metadata)GetWorkspaceSize` + 执行，`utils/aclnn_common.h`
+提供 `at::Tensor` → `aclTensor` 转换，照搬 ops-transformer 同文件），
+`kernel/register.cpp` 以 `TORCH_LIBRARY_FRAGMENT(npu)` + catchall 内核注册
+`torch.ops.npu.sparse_flash_mla_metadata`（零 tensor 参数算子也能直调，无需
+dispatch key）与 `torch.ops.npu.sparse_flash_mla`。构建：
+
+```bash
+cd kernel && bash build.sh    # 前置：vendor 已部署（见上），产物 kernel/build/sparse_flash_mla_ext*.so
+```
+
+`model_new_ascendc.py` 优先 import 该扩展（kernel/build），也可回退到 CANN
+打包的 `cann_ops_transformer` 同名接口。
 
 ### 与打包实现核对过的契约细节
 
@@ -127,11 +144,23 @@ ops-transformer `torch_extension/cann_ops_transformer/ops/csrc/sparse_flash_mla.
   `libcust_opmaster_rt2.0.so` 在 `op_impl/ai_core/tbe/` 下，AICPU kernel
   （metadata）在 `op_impl/cpu/aicpu_kernel/impl/`，配置在
   `op_impl/cpu/config/`；
+- **`ASCEND_CUSTOM_OPP_PATH` 是 metadata 算子（AICPU）的必需环境变量**：
+  AICPU 引擎（`libaicpu_ascend_engine.so`）只从该变量扫描
+  `op_impl/cpu/config/cust_aicpu_kernel.json`，不会自动遍历 vendor。
+  不设时 `aclrtBinaryGetFunction` 报 `0x7080001` / `107000`（
+  `BinaryGetFunction failed, kernel_name=SparseFlashMlaMetadata`），
+  且设错时可能 core dump（`ASCEND_LAUNCH_BLOCKING=1` 下表现为段错误）；
 - 运行期 `BinaryGetFunction` 失败排查：确认 `binary_info_config.json`
   （kernel 注册表，`op_impl/ai_core/tbe/kernel/config/ascend910b/`）由
   `ops_config_ascend910b` 目标重新生成（旧构建配置生成的 json 只含当时
-  配置的算子）、AICPU kernel json 已随 install 安装、LD_LIBRARY_PATH 含
-  vendored `op_api/lib`。
+  配置的算子；本次踩坑即旧 json 只有 MhcPreCmhc/MhcPreSinkhorn，主算子
+  报 `AclNN_Parameter_Error(EZ1001)` regInfo 失败）、AICPU kernel json
+  已随 install 安装、LD_LIBRARY_PATH 含 vendored `op_api/lib`；
+- 本机 910B2C 直调验证（2026-08-11）：`model_new_ascendc.py` 全链路
+  （metadata → 主算子）跑通，swa_decode 用例与 golden 最大误差 0.0078
+  （阈值 0.1），metadata 任务表仅 FA slot0 一个核（decode 单核覆盖全部
+  gS1 任务，`nextGs1Idx==0 && s2EndIdx==0` 编码末核语义，见
+  `sparse_flash_mla_swa_kernel.h::ProcessMainLoop`）。
 
 ## TileLang 设计发射快照
 

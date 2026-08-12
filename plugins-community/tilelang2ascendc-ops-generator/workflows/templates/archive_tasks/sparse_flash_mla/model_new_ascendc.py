@@ -40,11 +40,25 @@ implementation (``sparse_flash_mla_tiling.cpp``) are handled here:
 """
 
 import glob
+import os
 import sys
 from pathlib import Path
 
 import torch
 import torch.nn as nn
+
+# --- 运行期 vendor 环境 ---
+# ASCEND_CUSTOM_OPP_PATH：AICPU 引擎（metadata 算子）唯一扫描
+# op_impl/cpu/config/cust_aicpu_kernel.json 的入口，不自动遍历 vendor，
+# 缺失时 metadata 算子报 BinaryGetFunction 0x7080001。GE 在首次 NPU op
+# 时才读取，故进程内 setdefault 有效；LD_LIBRARY_PATH（vendored
+# libcust_opapi.so）需在 shell 里导出（见 kernel/README.md 步骤 5）。
+if not os.environ.get("ASCEND_CUSTOM_OPP_PATH"):
+    _opp = os.environ.get("ASCEND_OPP_PATH",
+                          "/usr/local/Ascend/cann-9.0.0/opp")
+    _vendor = os.path.join(_opp, "vendors", "custom_transformer")
+    if os.path.isdir(_vendor):
+        os.environ["ASCEND_CUSTOM_OPP_PATH"] = _vendor
 
 _KERNEL_BUILD = Path(__file__).resolve().parent / "kernel" / "build"
 _LIB_PATTERN = str(_KERNEL_BUILD / "sparse_flash_mla_ext*")

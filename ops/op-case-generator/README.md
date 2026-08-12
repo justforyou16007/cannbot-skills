@@ -192,9 +192,69 @@ skill 解析 `.py` 的 forward 签名和 get_input_groups 逻辑，按覆盖规�
 
 ## 命令行自检（不使用 skill）
 
+### 模式分层（按速度从快到慢）
+
+| 模式 | 做什么 | 耗时（大 case 集估算） | 适用场景 |
+|------|-------|----------------------|---------|
+| `static` | AST 结构检查（不调 torch） | <1s | CI 第一道门 |
+| `smoke` | 加载模块 + 跑前 3 个 case | 秒级 | 改了 .py 后的快速回归 |
+| **`runtime`（默认）** | smoke + **去重代表 case** 全跑 | ~1 分钟 | 日常验证、CI |
+| `full` | smoke + 全量 case 跑 | 几十分钟 | 发布前完整回归 |
+| `coverage` | 五维度评分（dtype/shape/attr/boundary/annotation） | 几分钟 | 评估 case 质量 |
+| `all` | static + smoke + runtime + coverage | 几分钟 | 一次性全套 |
+
+### 命令示例
+
 ```bash
-python3 scripts/validate_op.py --py <file.py> --mode static    # AST 静态检查
-python3 scripts/validate_op.py --py <file.py> --mode runtime   # 全 case 跑通性
-python3 scripts/validate_op.py --py <file.py> --mode coverage  # 覆盖率评分
-python3 scripts/validate_op.py --py <file.py> --mode all       # 以上全部
+# 默认：smoke + 去重代表 case（适合日常，自动跑 smoke 后再跑代表 case）
+python3 scripts/validate_op.py --py <file.py>
+
+# 秒级快速加载验证（只跑前 3 个 case）
+python3 scripts/validate_op.py --py <file.py> --mode smoke
+
+# AST 结构检查（不调 torch）
+python3 scripts/validate_op.py --py <file.py> --mode static
+
+# 全量 case 跑（发布前完整验证；--mode full 等价于 --mode runtime --full）
+python3 scripts/validate_op.py --py <file.py> --mode full
+
+# 覆盖率评分
+python3 scripts/validate_op.py --py <file.py> --mode coverage --op-class normalization
+
+# 全套检查（static + smoke + runtime + coverage）
+python3 scripts/validate_op.py --py <file.py> --mode all
 ```
+
+### 关键 flag
+
+| Flag | 作用 |
+|------|------|
+| `--full` | 在 `runtime` / `all` 模式下跑全量 case，等价于切到 `full` 模式 |
+| `--max-numel N` | 去重模式下跳过总输入 numel > N 的超大 case（默认 20000，避免被 monster case 卡死；设 0 关闭） |
+| `--op-class <name>` | 指定算子类型（elementwise/matmul/normalization/...），影响 coverage 评分基线 |
+| `--json <path>` | 指定 `.json` 路径（默认按 `.py` 同名自动发现） |
+| `--output <path>` | 把验证结果写到文件（默认只打到 stdout） |
+
+### Case 去重机制（默认 runtime 模式）
+
+按签名去重，避免 case 集中重复跑同一条代码路径：
+
+- **Tensor**：dtype + rank（shape 数值不参与签名 —— shape 变化是 case 生成器的职责）
+- **bool / int / str**：保留值（如 `opA=0` vs `opA=1` 是不同代表）
+- **float**：分桶 `{zero, small, large}`（覆盖 alpha/beta/sparsity 等的极端值而不爆炸）
+- **list/tuple**：长度 + 元素 dtype 集合
+
+实测对 cusparseSpMV 这种 case 较多的算子，去重后代表数显著下降（典型 10~50 倍），**总时间从几十分钟降到 ~1 分钟**。
+
+### Device 检查（仅 WARN，不强制）
+
+如果检测到 NPU 可用，但 case 输入或输出张量实际在 CPU 上跑（参考实现没调 `.npu()`），脚本会打一条 `[WARN]` 提示，但**不会判失败**。便于发现"CPU fallback 实现"，但允许参考实现合法地在 CPU 跑。
+
+### 内存管理
+
+长 case 列表场景下，脚本会在循环中：
+
+- 每个 case 末尾 `del model, output`
+- 每 50 case 触发 `gc.collect()` + `torch.npu.empty_cache()` / `torch.cuda.empty_cache()`
+- 每 50 case 打印进度到 stderr（`[runtime] 50/47 (42%) passed=... elapsed=...s eta=...s`），不污染 stdout JSON
+

@@ -1,17 +1,23 @@
 #!/usr/bin/env python3
 """Operator description file and test case validator.
 
-Modes:
-  static   – AST-level structural checks (no torch needed)
-  runtime  – import + execute every case (needs torch)
-  coverage – analyze dtype/shape/attr/boundary/annotation completeness
-  all      – static + runtime + coverage
+Modes (default = runtime):
+  static   – AST structural checks only (no torch needed)
+  smoke    – load module + run first 3 cases (seconds, fail-fast on contract bugs)
+  runtime  – smoke + deduplicated representative cases (signature-aware, fast)
+  full     – smoke + every case (slowest, release-grade)
+  coverage – dtype/shape/attr/boundary/annotation completeness scoring
+  all      – static + smoke + runtime + coverage
+
+Flags:
+  --full          run all cases instead of deduped reps (shorthand for --mode full)
+  --max-numel N   skip oversized cases in dedupe mode (default 20000; 0 = disable)
 
 Usage:
-  python3 validate_op.py --py /path/to/10_LayerNorm.py --mode static
-  python3 validate_op.py --py /path/to/10_LayerNorm.py --mode runtime
-  python3 validate_op.py --py /path/to/10_LayerNorm.py --mode coverage --op-class normalization
-  python3 validate_op.py --py /path/to/10_LayerNorm.py --mode all --op-class normalization
+  python3 validate_op.py --py 10_LayerNorm.py                          # default: smoke + dedupe reps
+  python3 validate_op.py --py 10_LayerNorm.py --mode smoke             # quick load check
+  python3 validate_op.py --py 10_LayerNorm.py --mode full              # all cases
+  python3 validate_op.py --py 10_LayerNorm.py --mode coverage --op-class normalization
 """
 
 import argparse
@@ -21,7 +27,6 @@ import json
 import math
 import os
 import sys
-from pathlib import Path
 
 
 # ---------------------------------------------------------------------------
@@ -55,15 +60,6 @@ def _load_json_lines(json_path: str) -> list[dict]:
                 continue
             cases.append(json.loads(line))
     return cases
-
-
-def _extract_id_and_name(py_path: str) -> tuple[str, str]:
-    """Extract (id_prefix, op_name) from filename like '10_LayerNorm.py'."""
-    fname = os.path.splitext(os.path.basename(py_path))[0]
-    parts = fname.split("_", 1)
-    if len(parts) == 2 and parts[0].isdigit():
-        return parts[0], parts[1]
-    return "", fname
 
 
 def _make_tensor_probe(dtype_str: str, shape: list, device=None):
@@ -405,7 +401,7 @@ def _check_runtime(py_path: str, full: bool = False, max_numel: int = 20000) -> 
 
     max_numel caps the total input tensor numel per case for dedupe-mode
     selection. Cases exceeding the cap are skipped (with a warning) so a
-    1200-case validation doesn't get stuck on a 4.5-billion-nnz monster.
+    large-case-list validation doesn't get stuck on multi-billion-nnz monsters.
     Set to 0 to disable. Ignored when full=True.
     """
 

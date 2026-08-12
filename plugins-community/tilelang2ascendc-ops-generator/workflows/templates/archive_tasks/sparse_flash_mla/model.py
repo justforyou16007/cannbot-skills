@@ -382,16 +382,6 @@ def get_inputs_from_case(cfg: dict) -> list:
     return [q, ori_kv, cmp_kv, cmp_sparse_indices, sinks, attrs]
 
 
-def get_input_groups():
-    """Build input groups from basic_case.csv + general_case.csv (all
-    scenarios incl. CSA) for AscendC verification.
-
-    Each group is ``[q, ori_kv, cmp_kv, cmp_sparse_indices, sinks, attrs]``;
-    optional inputs are ``None`` when the scenario does not use them.
-    """
-    return [get_inputs_from_case(cfg) for cfg in _read_case_csvs()]
-
-
 def _ascendc_supported(cfg):
     """910B packaged-op subset of the CSV cases.
 
@@ -400,9 +390,8 @@ def _ascendc_supported(cfg):
     cmp_mask_mode==3; and per scenario cmp_ratio/topk:
     no cmp_kv -> cmp_ratio==1; HCA (cmp_topk==0) -> cmp_ratio==128;
     CSA (cmp_topk>0) -> cmp_ratio==4 and topk in {512, 1024}.
-    Cases outside this set (e.g. ori_mask_mode==0 no-mask SWA, causal
-    prefill, small-topk CSA) run only on Ascend950 or in the golden /
-    TileLang paths; evaluate_ascendc.sh prefers this selector when present.
+    Cases outside this set (no-mask SWA, causal prefill, small-topk CSA)
+    run only on Ascend950 or in the golden / TileLang paths.
     """
     if cfg["ori_mask_mode"] != 4 or cfg["ori_win_left"] != 127 or cfg["ori_win_right"] != 0:
         return False
@@ -417,13 +406,18 @@ def _ascendc_supported(cfg):
     return False
 
 
-def get_input_groups_ascendc():
-    """910B direct-call subset for evaluate_ascendc.sh.
+def get_input_groups():
+    """Return a list of input groups for AscendC direct-call verification.
 
-    Mirrors ``get_input_groups_tilelang``: the AscendC verification pipeline
-    prefers this selector when present, so the packaged-op direct call only
-    sees cases its aclnn check accepts on the target SoC, while
-    ``get_input_groups()`` keeps the full CSV set for the golden path.
+    The cases are loaded from basic_case.csv + general_case.csv and built by
+    get_inputs_from_case(). verification_ascendc.py runs every returned group
+    on NPU and compares it against the golden Model. The CSV keeps the full
+    semantic set (golden / TileLang paths); this function returns only the
+    910B packaged-op supported subset (see ``_ascendc_supported``) so the
+    direct call never hits the aclnn EZ0024 parameter check.
+
+    Each group is ``[q, ori_kv, cmp_kv, cmp_sparse_indices, sinks, attrs]``;
+    optional inputs are ``None`` when the scenario does not use them.
     """
     return [
         get_inputs_from_case(cfg)
@@ -437,8 +431,9 @@ def get_input_groups_tilelang():
 
     The TileLang design covers SWA and HCA but not CSA (per-query topk
     gather); verification_tilelang.py prefers this selector when present so
-    the TileLang path never sees CSA inputs, while the AscendC path keeps the
-    full CSV set from ``get_input_groups()``.
+    the TileLang path never sees CSA inputs, while the AscendC direct-call
+    path uses ``get_input_groups()`` (910B subset) and the golden path uses
+    ``get_input_groups_all()`` (full CSV set).
     """
     return [
         get_inputs_from_case(cfg)

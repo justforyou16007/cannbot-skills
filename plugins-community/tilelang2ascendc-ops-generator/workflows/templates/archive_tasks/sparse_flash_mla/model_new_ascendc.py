@@ -130,14 +130,16 @@ def sparse_flash_mla_ascendc(
         # full-length BSND tensors: expose the effective lengths explicitly so
         # the op recovers the pre-compression length for the cmp-side causal
         # threshold (cmp_len * cmp_ratio + residual == ori_seq). Required by
-        # the tiling when cmp_mask_mode == 3 and cmp_ratio != 1.
+        # the tiling when cmp_mask_mode == 3 and cmp_ratio != 1. The aclnn
+        # check requires per-batch lengths (shape size == batch_size).
+        batch = int(q.shape[0])
         cmp_seq = int(cmp_kv.shape[1])
         seqused_ori_kv = torch.tensor(
-            [int(ori_kv.shape[1])], dtype=torch.int32, device=q.device)
+            [int(ori_kv.shape[1])] * batch, dtype=torch.int32, device=q.device)
         seqused_cmp_kv = torch.tensor(
-            [cmp_seq], dtype=torch.int32, device=q.device)
+            [cmp_seq] * batch, dtype=torch.int32, device=q.device)
         cmp_residual_kv = torch.tensor(
-            [int(ori_kv.shape[1]) % cmp_ratio], dtype=torch.int32,
+            [int(ori_kv.shape[1]) % cmp_ratio] * batch, dtype=torch.int32,
             device=q.device)
     else:
         seqused_ori_kv = None

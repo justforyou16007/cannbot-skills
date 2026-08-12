@@ -17,6 +17,7 @@ namespace ascend_kernel {
 
 at::Tensor flash_attention_fp16(const at::Tensor &q, const at::Tensor &k, const at::Tensor &v);
 at::Tensor flash_attention_bf16(const at::Tensor &q, const at::Tensor &k, const at::Tensor &v);
+at::Tensor flash_attention_fp32(const at::Tensor &q, const at::Tensor &k, const at::Tensor &v);
 
 } // namespace ascend_kernel
 

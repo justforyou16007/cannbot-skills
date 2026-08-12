@@ -37,6 +37,8 @@ class ModelNew(nn.Module):
             return torch.ops.npu.flash_attention_fp16(q, k, v)
         elif q.dtype == torch.bfloat16:
             return torch.ops.npu.flash_attention_bf16(q, k, v)
+        elif q.dtype == torch.float32:
+            return torch.ops.npu.flash_attention_fp32(q, k, v)
         else:
             raise ValueError(f"Unsupported dtype: {q.dtype}")
 

@@ -26,6 +26,7 @@ include(${ASCENDC_CMAKE_DIR}/ascendc.cmake)
 ascendc_library(kernels STATIC
     ${CMAKE_CURRENT_SOURCE_DIR}/op_kernel/flash_attention_bf16.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/op_kernel/flash_attention_fp16.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/op_kernel/flash_attention_fp32.cpp
 )
 
 ascendc_include_directories(kernels PRIVATE

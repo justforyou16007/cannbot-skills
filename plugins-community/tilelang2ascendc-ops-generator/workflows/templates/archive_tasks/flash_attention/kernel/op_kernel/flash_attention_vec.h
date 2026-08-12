@@ -27,6 +27,7 @@ class FlashAttentionVec {
     static constexpr uint32_t C0 = 32 / sizeof(QType);
     static constexpr uint16_t BRCB_NUM = 32 / sizeof(float);
     static constexpr uint32_t VEC2_M_CHUNK = 8;
+    static constexpr bool IS_FP32 = std::is_same_v<QType, float>;
 
 public:
     __aicore__ inline FlashAttentionVec() {}
@@ -123,17 +124,22 @@ public:
 
         ComputeSoftmaxAndStoreMeta(sUb, slot, isFirst);
 
-        LocalTensor<QType> pHalf = outputQue1_.AllocTensor<QType>();
-        Cast(pHalf, sUb, RoundMode::CAST_ROUND, tileSize);
-        outputQue1_.EnQue(pHalf);
-        pHalf = outputQue1_.DeQue<QType>();
-
         auto pSlot = pQueue_.ProducerAcquire();
         uint64_t pOffset = (uint64_t)rowStart_ * BLOCK_N;
-        DataCopy(pSlot[pOffset], pHalf, tileSize);
-        outputQue1_.FreeTensor(pHalf);
+        if constexpr (IS_FP32) {
+            SetWaitFlag<HardEvent::V_MTE3>();
+            DataCopy(pSlot[pOffset], sUb, tileSize);
+            SetWaitFlag<HardEvent::MTE3_MTE2>();
+        } else {
+            LocalTensor<QType> pHalf = outputQue1_.AllocTensor<QType>();
+            Cast(pHalf, sUb, RoundMode::CAST_ROUND, tileSize);
+            outputQue1_.EnQue(pHalf);
+            pHalf = outputQue1_.DeQue<QType>();
+            DataCopy(pSlot[pOffset], pHalf, tileSize);
+            outputQue1_.FreeTensor(pHalf);
+            SetWaitFlag<HardEvent::MTE3_MTE2>();
+        }
         inputQue1_.FreeTensor(sUb);
-        SetWaitFlag<HardEvent::MTE3_MTE2>();
 
         pQueue_.ProducerReleaseMte3();
     }
@@ -339,31 +345,49 @@ private:
 
         LocalTensor<QType> outHalf = outputQue1_.AllocTensor<QType>();
 
-        if (dim == actualDim) {
-            Cast(outHalf, oUb, RoundMode::CAST_ROUND, dealRows * dim);
-            PipeBarrier<PIPE_V>();
-
-            uint64_t outBase = ((uint64_t)curBz_ * tiling_.heads * qSeqLen +
-                                (uint64_t)curBy_ * qSeqLen +
-                                (uint64_t)curBx_ * BLOCK_M +
-                                (uint64_t)startRow) * actualDim;
-            DataCopy(outGm_[outBase], outHalf, dealRows * actualDim);
+        if constexpr (IS_FP32) {
+            if (dim == actualDim) {
+                uint64_t outBase = ((uint64_t)curBz_ * tiling_.heads * qSeqLen +
+                                    (uint64_t)curBy_ * qSeqLen +
+                                    (uint64_t)curBx_ * BLOCK_M +
+                                    (uint64_t)startRow) * actualDim;
+                DataCopy(outGm_[outBase], oUb, dealRows * actualDim);
+            } else {
+                uint64_t outBase = ((uint64_t)curBz_ * tiling_.heads * qSeqLen +
+                                    (uint64_t)curBy_ * qSeqLen +
+                                    (uint64_t)curBx_ * BLOCK_M +
+                                    (uint64_t)startRow) * actualDim;
+                for (uint32_t i = 0; i < dealRows; i++) {
+                    DataCopy(outGm_[outBase + i * actualDim], oUb[i * dim], actualDim);
+                }
+            }
+            SetWaitFlag<HardEvent::MTE3_V>();
         } else {
-            for (uint32_t i = 0; i < dealRows; i++) {
-                Cast(outHalf[i * actualDim], oUb[i * dim], RoundMode::CAST_ROUND, actualDim);
-            }
-            PipeBarrier<PIPE_V>();
+            if (dim == actualDim) {
+                Cast(outHalf, oUb, RoundMode::CAST_ROUND, dealRows * dim);
+                PipeBarrier<PIPE_V>();
 
-            uint64_t outBase = ((uint64_t)curBz_ * tiling_.heads * qSeqLen +
-                                (uint64_t)curBy_ * qSeqLen +
-                                (uint64_t)curBx_ * BLOCK_M +
-                                (uint64_t)startRow) * actualDim;
-            for (uint32_t i = 0; i < dealRows; i++) {
-                DataCopy(outGm_[outBase + i * actualDim], outHalf[i * actualDim], actualDim);
+                uint64_t outBase = ((uint64_t)curBz_ * tiling_.heads * qSeqLen +
+                                    (uint64_t)curBy_ * qSeqLen +
+                                    (uint64_t)curBx_ * BLOCK_M +
+                                    (uint64_t)startRow) * actualDim;
+                DataCopy(outGm_[outBase], outHalf, dealRows * actualDim);
+            } else {
+                for (uint32_t i = 0; i < dealRows; i++) {
+                    Cast(outHalf[i * actualDim], oUb[i * dim], RoundMode::CAST_ROUND, actualDim);
+                }
+                PipeBarrier<PIPE_V>();
+
+                uint64_t outBase = ((uint64_t)curBz_ * tiling_.heads * qSeqLen +
+                                    (uint64_t)curBy_ * qSeqLen +
+                                    (uint64_t)curBx_ * BLOCK_M +
+                                    (uint64_t)startRow) * actualDim;
+                for (uint32_t i = 0; i < dealRows; i++) {
+                    DataCopy(outGm_[outBase + i * actualDim], outHalf[i * actualDim], actualDim);
+                }
             }
+            SetWaitFlag<HardEvent::MTE3_V>();
         }
-
-        SetWaitFlag<HardEvent::MTE3_V>();
 
         outputQue1_.FreeTensor(outHalf);
     }

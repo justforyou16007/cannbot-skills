@@ -22,6 +22,13 @@ using namespace AscendC;
 template <typename QType>
 class FlashAttentionCube {
     static constexpr uint32_t C0 = 32 / sizeof(QType);  // 16
+    static constexpr bool IS_FP32 = std::is_same_v<QType, float>;
+    static constexpr uint32_t MMAD_ALIGN = IS_FP32 ? 16U : C0;
+
+    __aicore__ inline uint32_t AlignForMmad(uint32_t v) const
+    {
+        return AlignUp(v, MMAD_ALIGN);
+    }
 
 public:
     __aicore__ inline FlashAttentionCube() {}
@@ -80,7 +87,7 @@ public:
 
         uint32_t rowStart  = t * BLOCK_N;
         uint32_t kvRows      = (tailValid != 0 && rowStart + BLOCK_N > kvSeqLen) ? tailValid : BLOCK_N;
-        uint32_t kvRowsAlign = AlignUp(kvRows, C0);
+        uint32_t kvRowsAlign = AlignForMmad(kvRows);
 
         LocalTensor<QType> kvL1 = kvBufL1_.Get<QType>();
         uint64_t kOffset = ((uint64_t)bz * tiling_.heads * kvSeqLen
@@ -93,7 +100,7 @@ public:
         LocalTensor<QType>  qL1  = qBufL1_.Get<QType>();
 
         uint32_t kTiles      = dim / BASE_K;
-        uint32_t mActAlign   = AlignUp(BLOCK_M, C0);
+        uint32_t mActAlign   = AlignForMmad(BLOCK_M);
 
         for (uint32_t ki = 0; ki < kTiles; ki++) {
             DoMM1Tile(cL0, qL1, kvL1,
@@ -105,7 +112,7 @@ public:
 
         uint32_t kRemain = dim % BASE_K;
         if (kRemain > 0) {
-            uint32_t kAligned = AlignUp(kRemain, C0);
+            uint32_t kAligned = AlignForMmad(kRemain);
             DoMM1Tile(cL0, qL1, kvL1,
                       (uint64_t)kTiles * BLOCK_M * BASE_K,
                       (uint64_t)kTiles * kvRowsAlign * BASE_K,
@@ -162,13 +169,13 @@ public:
         auto oSlot = oQueue_.ProducerAcquire();
         uint32_t rowStart   = t * BLOCK_N;
         uint32_t kvRows     = (tailValid != 0 && rowStart + BLOCK_N > kvSeqLen) ? tailValid : BLOCK_N;
-        uint32_t kvRowsAlign = AlignUp(kvRows, C0);
+        uint32_t kvRowsAlign = AlignForMmad(kvRows);
         uint64_t vOffset = ((uint64_t)bz * tiling_.heads * kvSeqLen
                           + (uint64_t)by * kvSeqLen
                           + (uint64_t)rowStart) * dim;
         LocalTensor<QType> kvL1 = kvBufL1_.Get<QType>();
         uint32_t nTiles    = dim / BASE_K;
-        uint32_t mActAlign = AlignUp(BLOCK_M, C0);
+        uint32_t mActAlign = AlignForMmad(BLOCK_M);
 
         for (uint32_t ni = 0; ni < nTiles; ni++) {
             uint64_t vSliceOffset = vOffset + (uint64_t)ni * BASE_K;
@@ -180,7 +187,7 @@ public:
 
         uint32_t nRemain = dim % BASE_K;
         if (nRemain > 0) {
-            uint32_t nAligned = AlignUp(nRemain, C0);
+            uint32_t nAligned = AlignForMmad(nRemain);
             uint64_t vSliceOffset = vOffset + (uint64_t)nTiles * BASE_K;
             ComputeMM2Tile(pL1, kvL1, kvRows, kvRowsAlign, nAligned, vSliceOffset);
             LocalTensor<float> cL0 = queL0C_.DeQue<float>();
@@ -230,6 +237,7 @@ private:
         mp.k = kSize;
         mp.cmatrixInitVal = isFirst;
         mp.cmatrixSource  = false;
+        if constexpr (IS_FP32) { mp.kDirectionAlign = true; }
         SetWaitFlag<HardEvent::MTE1_M>();
         PipeBarrier<PIPE_M>();
         Mmad(cL0, aL0, bL0, cL0, mp);
@@ -264,6 +272,7 @@ private:
         mp.k = kvRowsAlign;
         mp.cmatrixInitVal = true;
         mp.cmatrixSource  = false;
+        if constexpr (IS_FP32) { mp.kDirectionAlign = true; }
         SetWaitFlag<HardEvent::MTE1_M>();
         PipeBarrier<PIPE_M>();
         Mmad(cL0, aL0, bL0, mp);

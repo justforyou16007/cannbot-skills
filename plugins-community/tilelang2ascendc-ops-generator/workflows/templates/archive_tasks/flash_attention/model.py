@@ -40,6 +40,7 @@ def get_input_groups():
             dtype = {
                 "float16": torch.float16,
                 "bfloat16": torch.bfloat16,
+                "float32": torch.float32,
             }[row["dtype"]]
             q = torch.rand(batch_size, n_heads, seq_len_q, d_k, dtype=dtype)
             k = torch.rand(batch_size, n_heads, seq_len_kv, d_k, dtype=dtype)

@@ -13,15 +13,26 @@
 
 打开 [_common-prerequisites.md](_common-prerequisites.md) 过 C1-C5。FA 族常见命中：**C1**（老版纯向量点积实现 → 直接转 S1 的 P120，它就是 P102 在 FA 的落地配方）、**C5**（softmax 必配 A5）。
 
-## Step 2 — 分支路由（先判 head 结构，按序路由）
+## Step 2 — 分支路由（先判 head 结构 / 小类，按序路由）
 
-| 分支 | 判定条件 | 专用路径 | 跳过条件 |
-|---|---|---|---|
-| standard | `num_q_heads == num_kv_heads`（MHA/self/cross） | 基础链 S1（P119/P120）→ S2 → S3 → S4/S5 | 已是 online softmax + cube 路径则跳过 S1 |
-| gqa | `num_q_heads == G×num_kv_heads (G>1)`；`num_kv_heads==1` → MQA（G=num_q 特例） | P115（GQA tiling 路由）+ 基础链；S5 用 **P116**（G→M 合并）+ **P126**（变长调度）；decode 侧重 **X5/X4** | 非 grouped head |
-| mla | KV 经 latent c 压缩（`c→[nope\|rope]→K/V` 升维 matmul），decode 特征 | S1 **P124**（nope/rope 拼 K 维）+ P120 + **P140**（kvHeads=1 M-tile 放大到 qHeads）；S5 P126；decode 侧重 P57/P58 | 非 latent 结构 |
+**小类映射**（源自 [attention_family.md](../../../evolution-knowledge/references/a3/algorithm_insights/attention_family.md) 分类，小类 → 分支 + 推荐策略）：
+
+| 小类（计算模式） | 分支 | 推荐策略 |
+|---|---|---|
+| **MHA / FA**（CP1 稠密 / CP2 流式分块） | standard | S1 **P119**（online softmax）+ **P120**（vec-dot→cube mmad）→ S2 P121（CV 流水）→ S3 P122（KV 大块化） |
+| **GQA / MQA**（CP1+CP3 / CP1，head 共享） | gqa | **P115**（GQA tiling）+ **P116**（G→M 合并）+ **X5/X4**（decode GEMV→GEMM）+ **P126**（变长调度） |
+| **MLA**（CP3+CP4+CP11，latent 压缩） | mla | **P124**（nope/rope 拼 K）+ P120 + **P140**（M-tile 放大）+ P125（跨任务预取）+ P126 |
+| **Sparse-掩码型**（CP1，全量算+掩码） | standard + sparse:causal-window | **P123**（skip + 边界 mask）+ **P118**（mask 预生成独立 AIV） |
+| **Sparse-块跳过型**（CP3，子集遍历） | standard + sparse:block_table | **P137**（紧凑化走 Cube）+ P138/P139（L0 守卫/多槽零填充）+ P76/P77 |
+| **Sparse-展开型**（CP9，unfold 邻域） | standard | 特殊：unfold 邻域骨架，通用前置 + 瓶颈驱动 |
+| **Paged**（CP4，分页 KV） | standard + paged/decode | **P60/P61**（KV NZ/L2）+ **P126** + P57/P58（decode 分区） |
+| **SageAttention**（CP10，量化） | standard + 量化 | P48/P49/P70（量化支路，QK int8 / PV fp16） |
+| **HSTU**（CP12，去 softmax） | standard | 无 online-softmax：跳过 S4，直接 P120 mmad + P121 流水 |
+| **CV-Attn-空间自注意力**（CP1，视觉语义） | standard | 同 standard 优化；按视觉特征图语义处理 |
 
 > ⚠️ 小 S launch-bound 优先 host 侧（P54/X28），勿机械套 tiling/流水（P-GQA-7 教训）。
+
+按 head 结构的精确判定（`num_q_heads` vs `num_kv_heads`）与 mla latent 判据见下方基础链前的前置确认；正交 trait（sparse/paged/量化）在 Step 4 追加。
 
 ## Step 3 — 基础链（S1→S6 按序推进）
 

@@ -17,10 +17,17 @@
 
 ## Step 2 — 分支路由（按序）
 
-| 分支 | 判定条件 | 专用路径 | 跳过条件 |
-|---|---|---|---|
-| GDN-KDA | delta rule `S ← β⊙(k⊗v − corr) + S`（含 corr 修正项） | P132 三阶段分解 → P133 块内 CV 流水 → **P135 求逆分治** → P134 任务划分 → P136 bf16 量化 | 非 delta rule |
-| GLA | 门控衰减 `S = α⊙S + k⊗v`（含衰减门 α，无修正项） | P132 三阶段分解（**cumprod 替代求逆**）→ P133 CV 流水 → P134 任务划分 → P136 bf16 量化 | 非门控衰减 |
+**小类映射**（源自 [attention_family.md](../../../evolution-knowledge/references/a3/algorithm_insights/attention_family.md) 分类，小类 → 分支 + 推荐策略）：
+
+| 小类（计算模式） | 分支 | 推荐策略 |
+|---|---|---|
+| **KDA**（CP7，逐通道门控 + beta 误差修正） | delta-rule | P132 三阶段 → P133 块内 CV → **P135 求逆分治** → P134 任务划分 → P136 bf16 |
+| **GDN**（CP7，门控 DeltaNet，同 delta rule 族） | delta-rule | 同上（对标 fla/gdn2 + OlmoHybrid） |
+| **GLA**（CP7，标量衰减，每 head 一个 gamma） | gla | P132 三阶段（**cumprod 替代求逆**）→ P133 CV → P134 任务 → P136 bf16（跳过 P135） |
+| **Mamba2**（CP7，SSD 状态空间 + D 跳连） | gla | 同上（标量衰减；注意 dt 预处理链 softplus→clamp→exp） |
+| **Linear**（CP5+CP6，低秩/Nyström/核映射，**无 chunk 状态递推**） | 边缘 | 非标准 chunk-scan：LinearAttention → gla 分支；Nyström/Linformer（降维后仍 softmax）→ 标准 Softmax 路径 |
+
+> 区分要点：**KDA/GDN** 逐通道向量门控 + 求逆（P135）；**GLA/Mamba2** 标量衰减 + cumprod（无求逆，跳过 P135）；**Linear** 无状态递推，归边缘。
 
 ## Step 3 — chunk-scan 共享基础链（以 P132-P136 为主线，按序推进）
 

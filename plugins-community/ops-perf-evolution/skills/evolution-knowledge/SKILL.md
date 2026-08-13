@@ -135,7 +135,7 @@ python3 skills/evolution-knowledge/scripts/query.py --keyword "GQA decode"
 
 ### 维护协议（OKF 写入）
 
-写入脚本：`skills/evolution-knowledge/scripts/migrate_discovered_to_okf.py`（X 系列 disc → OKF 增强版）、`skills/evolution-knowledge/scripts/migrate_proven_to_okf.py`（proven INDEX.md → OKF 单文件）。
+写入由 agent 按下列协议直接写 OKF 卡（双轨：compat + OKF），无迁移脚本；历史数据一次性迁移已完成。
 
 1. **查重**：discovered_strategy 按 `id`、proven_solution 按 `title`/`key`、failure_pattern 按 `key` 查重；命中同概念条目 → 增量 update（保留已有内容、补充新来源/证据），不新建、不整体覆盖。
 2. **新建条目路径**：

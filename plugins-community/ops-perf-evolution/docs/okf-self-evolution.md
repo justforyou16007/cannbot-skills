@@ -220,10 +220,9 @@ python3 skills/evolution-strategies/scripts/generate_index_json.py
 
 输出带 `sufficiency` 布尔（证据门槛是否满足）。
 
-### 迁移脚本（一次性历史数据搬运）
+### 历史数据迁移（一次性，已完成）
 
-- `migrate_discovered_to_okf.py`：21 条 compat disc → OKF，关键词推断 `op_families/bottlenecks`
-- `migrate_proven_to_okf.py`：INDEX.md 6 条 proven → OKF 单文件
+X1-X27 等历史 compat 数据已迁移为 OKF 格式（关键词推断 `op_families/bottlenecks`）。后续沉淀由 agent 按维护协议直接写卡，不再走迁移脚本。
 
 ---
 

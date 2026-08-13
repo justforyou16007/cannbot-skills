@@ -63,6 +63,11 @@ bash scripts/msprof_profile_run.sh --quick --mfu --impl=asc --output-dir=./outpu
 
 - **前置条件**：算子目录下存在 `flops.py`（约定 `def flops(case: dict) -> float`，返回该 case 的
   理论 FLOPs）；不存在时只采集耗时并在日志提示跳过 MFU。
+- **缺少 flops.py 时的处理**：不要就此跳过 MFU。先阅读算子目录的 `model.py`（算子语义）与
+  测试用例的 shape/dtype，按 [`references/mfu-guide.md`](references/mfu-guide.md) 的统一口径
+  （GEMM `2*M*K*N`；attention 只算 `Q@K^T`+`P@V`，softmax/mask/scale 不计；稀疏算子按实际选中
+  元素数）编写 `flops.py` 放入算子目录，再执行 `--mfu` 采集。公式只需统计语义必需的核心 GEMM
+  计算量，不得把实现里的冗余计算算入。
 - **shape 自动选择**：默认按理论 FLOPs 降序只取 **top-3 大 shape**（MFU 随规模饱和，大 shape 即
   代表峰值水平，同时省去小 case 采集时间）；`--mfu-top-k=N` 调整，显式 `--cases/--max-cases` 可覆盖。
 - **芯片峰值自动推导**：platform_config ini / npu-smi；推导失败用 `--mfu-peak=<TFLOPS>` 显式指定。

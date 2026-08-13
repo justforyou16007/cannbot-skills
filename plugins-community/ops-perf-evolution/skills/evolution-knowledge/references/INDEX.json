@@ -15,8 +15,8 @@
     ]
   },
   "stats": {
-    "a3": 23,
-    "total": 23
+    "a3": 24,
+    "total": 24
   },
   "entries": [
     {
@@ -154,6 +154,14 @@
       "is_index": false,
       "is_guide": false,
       "doc_path": "a3/optimization_patterns/pipeline_overlap.md"
+    },
+    {
+      "source_key": "evolution-knowledge#a3/optimization_patterns/scalar_to_vector",
+      "kind": "a3",
+      "category": "optimization_patterns",
+      "is_index": false,
+      "is_guide": false,
+      "doc_path": "a3/optimization_patterns/scalar_to_vector.md"
     },
     {
       "source_key": "evolution-knowledge#a3/optimization_patterns/shape_specialization",

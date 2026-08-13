@@ -100,6 +100,12 @@ Mode: {mode}
   - 读取提示中的 `[Profiling Context]` 瓶颈诊断
   - 设计针对性优化，不限于策略库
 
+- **workflow_guided 模式**（归族 workflow 分支保底）:
+  - 严格按 prompt 中 `[WORKFLOW_REF]` 的 `stage_order` 阶段顺序优化（通用前置 C1-C5 → 分支专用路径 → 族内收尾 → 门控纪律）
+  - 读取 `[WORKFLOW_REF].workflow_file` 指向的族 workflow 文件（如 scenario-routing/convolution.md）
+  - 分支专用路径的策略 Playbook 在 `[STRATEGY RESOURCES]` 段，按 Step 1-5 执行
+  - implementation_note 以 `## Workflow: {workflow_file} {branch}` 开头，逐阶段记录
+
 **父节点代码参考规则**:
 - 若 `parent_solution_ref` **非空**:
   - 先读取父变体的 AscendC kernel: `{parent_solution_ref}/kernel/`
@@ -237,24 +243,27 @@ while ac_iteration < max_ac_iterations:
 
 **1.5.1 运行 msprof 采集**
 
-使用 `msprof_perf_summary.py --lingxi` 对 lingxi-evo 输出目录跑 msprof，产出 `op_summary_*.csv` 和 pipeline JSON：
+使用 `msprof_perf_summary.py --compare` 对 lingxi-evo 输出目录跑 msprof **完整采集（8 轮：7 组 aic-metrics + sample）**，产出 `op_summary_*.csv` 和对比报告：
 
 ```bash
-python3 ops/ops-profiling/scripts/msprof_perf_summary.py --lingxi \
-    --lingxi-output-dir {output_dir} \
-    --task-type {task_type} \
-    --output "{output_dir}/profiling/lingxi_msprof_summary.json"
+python3 ops/ops-profiling/scripts/msprof_perf_summary.py --compare \
+    --output-dir {output_dir}
 ```
 
-- **成功**：在 `{output_dir}/profiling/` 下生成 `op_summary_*.csv`，并在 `lingxi_msprof_summary.json` 内含扁平化 `pipeline` dict
-- **失败**（退出码 0 但 `lingxi_msprof_summary.json` 内含 `error` 字段，或 `pipeline` 为 null）：记录失败但不终止；后续 `evolved.pipeline` 会写 `null`，`wm_ops.refine` 会在 profiling 缺席时回退到不注入策略推荐
+> **注意**：当前 `msprof_perf_summary.py` **不支持** `--lingxi / --lingxi-output-dir / --task-type` 参数。能产出 `op_summary_*.csv`（即 pipeline 证据）的完整采集入口是 **`--compare`**；`--quick` 只采集 kernel 时间（无 aic-metrics），产不出 `op_summary_*.csv`，不满足 R9 profiling 门控。
+
+- **成功**：在 `{output_dir}/PROF_GROUP_<timestamp>/PROF_*/` 下生成各 metric 的 `op_summary_*.csv`，并写出 `{output_dir}/performance.json`、`performance.log`、`perf_report.md`（`perf_report.md` 含 pipe 比值，如 `aiv_mte2_ratio`）。随后将 op_summary 证据归置到 `profiling/` 下（R9 检查 `parallel_K/profiling/**/op_summary_*.csv`）：
+  ```bash
+  mkdir -p {output_dir}/profiling
+  cp -r {output_dir}/PROF_GROUP_* {output_dir}/profiling/
+  ```
+- **失败**（msprof 不可用、超时、脚本报错，或退出码非 0）：记录失败但不终止；后续 `evolved.pipeline` 会写 `null`，`wm_ops.refine` 会在 profiling 缺席时回退到不注入策略推荐
 
 **1.5.2 写入 evaluation_results.json 的 `evolved.pipeline`（必须）**
 
-- 读取 `{output_dir}/profiling/lingxi_msprof_summary.json`
-- 提取顶层 `pipeline` 字段（扁平 dict，包含 `aiv_mte2_ratio` 等 ratio 键）
+- 从 `--compare` 产物中提取 pipeline 信息：`perf_report.md` 的 pipe 比值段（如 `aiv_mte2_ratio`），或 `profiling/PROF_GROUP_*/` 的 `op_summary_*.csv` 指标（当前脚本不产出独立的 `lingxi_msprof_summary.json`，需要 partial 自行提炼）
 - 写入 `evaluation_results.json` 的 `"evolved": {"pipeline": {...}}` 字段；若 JSON 中已存在 `evolved` 结构，仅追加/更新 `pipeline` 子键
-- 若 msprof 失败或 pipeline 为 null：仍必须写入 `"evolved": {"pipeline": null}` 显式标记
+- 若 msprof 失败或无结构化 pipeline 可提取：仍必须写入 `"evolved": {"pipeline": null}` 显式标记
 - 该字段是主 Agent `wm_ops.py refine` 提取 `profiling_insight.recommended_strategies` 的**唯一数据源**，不得省略
 
 **Phase 1.5 完成检查（必须）**：确认 `evaluation_results.json` 中已含 `evolved.pipeline` 键（值可为 dict 或 null）。
@@ -278,30 +287,24 @@ python3 ops/ops-profiling/scripts/msprof_perf_summary.py --lingxi \
 
 **2.1 性能瓶颈诊断（必须执行，允许失败）**
 
-> msprof 采集已在 Phase 1.5 完成，`{output_dir}/profiling/op_summary_*.csv` 必已存在（或明确失败）。本阶段直接消费该产物；如果 Phase 2 后续 2.4 命中新版本，需在 2.4 末尾重跑 Phase 1.5 刷新 pipeline。
+> msprof 采集已在 Phase 1.5 完成，`{output_dir}/profiling/PROF_GROUP_*/PROF_*/op_summary_*.csv` 必已存在（或明确失败）。本阶段直接消费该产物；如果 Phase 2 后续 2.4 命中新版本，需在 2.4 末尾重跑 Phase 1.5 刷新 pipeline。
 
 **第一层：CSV 级快速诊断**
 
+> **注意**：当前 `msprof_perf_summary.py` **不支持 `--diagnose`**。诊断基于 Phase 1.5 `--compare` 已产出的数据（`perf_report.md` 的 pipe 比值、`performance.json` 的 per_case、`profiling/PROF_GROUP_*/PROF_*/op_summary_*.csv` 的 aic/aiv 指标），由 partial 自行读取提炼 `bottleneck`：
+
 ```bash
-python3 ops/ops-profiling/scripts/msprof_perf_summary.py --diagnose \
-    --profiling-dir "./profiling" \
-    --task-type {task_type} \
-    --output "./profiling_latest_analysis.json"
+# 无独立 --diagnose 命令；直接读取 --compare 产物判断瓶颈
+ls profiling/PROF_GROUP_*/PROF_*/op_summary_*.csv     # pipeline/指标原始数据
+grep -E "aiv_mte2_ratio|aiv_mte3_ratio|aic_fixpipe_ratio" perf_report.md
 ```
 
-- **成功**：提取 `bottleneck`、`recommended_strategies`、`optimization_hints`、`pipeline_summary`
-- **失败**：`bottleneck = null`，跳过诊断，继续改进循环
+- **成功**：提炼 `bottleneck`、`recommended_strategies`、`optimization_hints`、`pipeline_summary`
+- **失败**（数据缺失或无法判断）：`bottleneck = null`，跳过诊断，继续改进循环
 
 **第二层：指令级深度分析（降级触发）**
 
-若 `bottleneck = "balanced"` 且 `best_speedup < 目标加速比 × 0.7`：
-
-```bash
-python3 ops/ops-profiling/scripts/msprof_perf_summary.py --diagnose \
-    --profiling-dir "./profiling" \
-    --task-type {task_type} \
-    --output "./deep_profiling_result.json"
-```
+若 `bottleneck = "balanced"` 且 `best_speedup < 目标加速比 × 0.7`，对 Phase 1.5 的 `profiling/PROF_GROUP_*/` 原始数据做指令级细化分析（读取 `op_summary_*.csv` 各 metric 指标定位空泡/瓶颈），产出 `./deep_profiling_result.json`。
 
 **改进循环**（`improve_i` 从 1 到 `Max Improve Rounds`）：
 
@@ -318,11 +321,12 @@ bash ops-lab/tilelang-to-ascendc/skills/tilelang2ascend-translator/scripts/evalu
 ```
 若精度验证失败：恢复 `best_kernel_snapshot`，`no_improve_streak += 1`，跳至 2.5。
 
-性能评测（设备侧精确计时）：
+性能评测（用 ops-profiling quick 模式；禁止手写自定义计时脚本）：
 ```bash
-    --output_dir {output_dir} --timing event --output {output_dir}/perf.json
+bash ops/ops-profiling/scripts/msprof_profile_run.sh --quick \
+    --output-dir={output_dir} --device={npu}
 ```
-从输出中提取 `new_speedup`。
+从生成的 `{output_dir}/performance.json` 提取 `new_speedup`（vs PyTorch 的 ref/asc 几何均值）。
 
 **2.4 收益判断**
 若 `new_speedup > best_speedup × 1.02`（提升 ≥ 2%）：
@@ -337,7 +341,7 @@ bash ops-lab/tilelang-to-ascendc/skills/tilelang2ascend-translator/scripts/evalu
 
 **循环结束**：
 - 确认磁盘上的 kernel 文件为最优版本
-- **若 `best_speedup` 相比 `initial_speedup` 有更新**（至少命中过一次 2.4 的提升分支）：重新运行 Phase 1.5（`msprof_perf_summary.py --lingxi` + 写入 `evolved.pipeline`），确保 `evaluation_results.json.evolved.pipeline` 反映最终最优内核的 pipeline，而不是 Phase 1 初始版本的
+- **若 `best_speedup` 相比 `initial_speedup` 有更新**（至少命中过一次 2.4 的提升分支）：重新运行 Phase 1.5（`msprof_perf_summary.py --compare --output-dir {output_dir}` + 归置 op_summary 到 `profiling/` + 写入 `evolved.pipeline`），确保 `evaluation_results.json.evolved.pipeline` 反映最终最优内核的 pipeline，而不是 Phase 1 初始版本的
 - 更新 `evaluation_results.json`：
   - `"local_refinement_rounds": {实际执行轮数}`
   - `"local_refinement_gain": {best_speedup / initial_speedup:.3f}`

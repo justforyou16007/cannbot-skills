@@ -63,6 +63,7 @@ DATA_LOGGER.setLevel(logging.INFO)
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent.parent.parent.parent
+PLUGIN_ROOT = PROJECT_ROOT / "plugins-community/ops-perf-evolution"
 SKILL_SCRIPTS = PROJECT_ROOT / "plugins-community/ops-perf-evolution/skills/evolution-strategies/scripts"
 WM_OPS = SCRIPT_DIR / "wm_ops.py"
 STATE_OPS = SCRIPT_DIR / "state_ops.py"
@@ -150,15 +151,50 @@ def step_3_get_excluded(evo_dir: str) -> str:
     return proc.stdout.strip()
 
 
+def _find_fallback_strategies(
+    excluded_ids: list[str], count: int = 2,
+) -> list[str]:
+    """P2: 从 INDEX.json 选"永不触发 Preconditions"的替代策略。
+
+    全部候选被 Preconditions 过滤时，优先注入这些替代策略（保证再次过滤也会通过），
+    而不是直接降级 open_exploration。候选 = 未废弃 + 无 preconditions 文件的策略，
+    按是否覆盖 attention/flash_attention 排序（常见进化目标）。
+    """
+    index_path = PLUGIN_ROOT / "skills/evolution-strategies/references/INDEX.json"
+    if not index_path.exists():
+        return []
+    try:
+        with open(index_path, "r", encoding="utf-8") as f:
+            idx = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return []
+    excluded = set(excluded_ids)
+    cards = idx.get("cards", [])
+    fallback = [
+        c for c in cards
+        if c.get("id") and c["id"] not in excluded
+        and not c.get("deprecated")
+        and not c.get("has_preconditions")
+    ]
+    # 排序：attention/flash_attention 相关优先，其次按 id
+    fallback.sort(key=lambda c: (
+        not ({"attention", "flash_attention"} & set(c.get("op_families") or [])),
+        c.get("id", "")))
+    return [c["id"] for c in fallback[:count]]
+
+
 def step_override_node_in_wm(
     wm_path: str, node_id: str,
     original_strategies: list[str],
     filter_reasons: str,
+    fallback_strategies: list[str] = None,
 ) -> bool:
     """当所有候选策略被过滤时，主动改写 world_model.json 中的节点。
 
-    将 strategy_combination 清空、mode 切换为 open_exploration，
-    并写入 _mode_overridden 标记供事后审计。
+    - 有 fallback_strategies：注入替代策略（保持 strategy_guided 模式），带
+      _replaced_from 审计标记，避免退化为无策略的 open_exploration。
+    - 无 fallback_strategies：strategy_combination 清空、mode 切换为
+      open_exploration，写入 _mode_overridden 标记供事后审计。
 
     返回 True 表示改写成功，False 表示跳过（wm_path 或 node_id 缺失、节点不存在）。
     """
@@ -186,24 +222,31 @@ def step_override_node_in_wm(
         return False
 
     # 记录原始状态供事后审计
-    node["_mode_overridden"] = True
     node["_original_strategies"] = list(original_strategies)
     node["_override_reason"] = filter_reasons
-
-    # 硬改写：清空策略组合 + 切换为开放探索
-    node["strategy_combination"] = []
-    node["mode"] = "open_exploration"
-
-    # 更新描述
     original_desc = node.get("description", "")
-    override_note = (
-        f"[MODE OVERRIDE: 全部策略 ({', '.join(original_strategies)}) "
-        f"被 Preconditions 过滤 → 切换 open_exploration]"
-    )
-    if original_desc:
-        node["description"] = override_note + " " + original_desc
+
+    if fallback_strategies:
+        # P2: 注入替代策略，保持 strategy_guided 方向，避免退化为 open_exploration
+        node["strategy_combination"] = list(fallback_strategies)
+        node["_replaced_from"] = list(original_strategies)
+        replace_note = (
+            f"[P2: 策略替换] 原策略 ({', '.join(original_strategies)}) "
+            f"被 Preconditions 过滤 → 注入替代 {', '.join(fallback_strategies)}]"
+        )
+        node["description"] = (
+            replace_note + (" " + original_desc if original_desc else ""))
     else:
-        node["description"] = override_note
+        # 硬改写：清空策略组合 + 切换为开放探索
+        node["_mode_overridden"] = True
+        node["strategy_combination"] = []
+        node["mode"] = "open_exploration"
+        override_note = (
+            f"[MODE OVERRIDE: 全部策略 ({', '.join(original_strategies)}) "
+            f"被 Preconditions 过滤且无替代 → 切换 open_exploration]"
+        )
+        node["description"] = (
+            override_note + (" " + original_desc if original_desc else ""))
 
     try:
         with open(wm_file, "w", encoding="utf-8") as f:
@@ -289,22 +332,31 @@ def _build_external_references_md(passed_ids: list[str]) -> str:
 def _build_discovered_md(passed_ids: list[str]) -> str:
     """把 passed 中的 X 系列（进化发现策略）全文注入资源块。
 
-    X 系列没有 Preconditions / Playbook 文件，实体内容在
-    evolution-strategies/references/discovered/disc_X{n}.md，
-    通过 INDEX.json 的 discovered 数组解析 doc_path。
+    X 系列没有 Preconditions / Playbook 文件。优先读取 OKF 增强版
+    （evolution-knowledge/references/okf/strategies/discovered/，经 INDEX.json
+    cards 数组中 kind=discovered_strategy 的卡反查 doc_path），未迁移到 OKF
+    的回落兼容层（evolution-strategies/references/discovered/ 的 discovered 数组）。
     """
     idx = _load_strategy_index()
-    disc_entries = {e.get("id"): e.get("doc_path") for e in idx.get("discovered", [])}
-    refs_root = (
+    # OKF 增强版（优先）：cards 数组中 kind=discovered_strategy 的卡
+    okf_disc = {
+        c.get("id"): c.get("doc_path")
+        for c in idx.get("cards", [])
+        if c.get("kind") == "discovered_strategy"
+    }
+    # 兼容层：discovered 数组 doc_path（相对 evolution-strategies/references）
+    compat_disc = {e.get("id"): e.get("doc_path") for e in idx.get("discovered", [])}
+    compat_root = (
         PROJECT_ROOT
         / "plugins-community/ops-perf-evolution/skills/evolution-strategies/references"
     )
     sections = []
     for pid in passed_ids:
-        doc_path = disc_entries.get(pid)
+        doc_path = okf_disc.get(pid) or compat_disc.get(pid)
         if not doc_path:
             continue
-        fpath = refs_root / doc_path
+        # OKF doc_path 相对插件根；兼容层 doc_path 相对 evolution-strategies/references
+        fpath = (PLUGIN_ROOT / doc_path) if pid in okf_disc else (compat_root / doc_path)
         try:
             content = fpath.read_text(encoding="utf-8").strip()
         except OSError:
@@ -338,6 +390,46 @@ class RenderContext:
     playbook_md: str
     excluded_md: str
     discovered_md: str
+    failure_anti_md: str
+
+
+def _build_failure_patterns_anti_md(passed_ids: list[str]) -> str:
+    """策略组合命中已知失败模式时，注入 anti 提示。
+
+    从 INDEX.json cards 中 kind=failure_pattern 的卡，查找 failed_combination
+    完全被 passed_ids 覆盖的组合，输出警告 + Resolution 指引，防止复用
+    既往已证实会失败的策略组合（OKF runbooks/failure-patterns/）。
+    """
+    if not passed_ids:
+        return ""
+    idx = _load_strategy_index()
+    passed_set = set(passed_ids)
+    alerts = []
+    for c in idx.get("cards", []):
+        if c.get("kind") != "failure_pattern":
+            continue
+        fc = c.get("failed_combination") or []
+        if not fc or not set(fc).issubset(passed_set):
+            continue
+        alerts.append(c)
+    if not alerts:
+        return ""
+
+    lines = [
+        "",
+        "---",
+        "",
+        "## ⚠️ Failure Pattern Alerts（策略组合命中已知失败模式）",
+        "",
+        "以下组合在既往进化中被证实会失败，请避开或按 Resolution 处理：",
+        "",
+    ]
+    for a in alerts:
+        lines.append(f"- **{a.get('id', '?')}** [{a.get('status', '')}]: "
+                     f"组合 `{' + '.join(a.get('failed_combination', []))}` → "
+                     f"{a.get('phenomenon', '?')}（severity: {a.get('severity', '?')}）")
+        lines.append(f"  - 详见 `{a.get('doc_path', '')}`，先读其中的 Resolution 再决定是否规避。")
+    return "\n".join(lines) + "\n"
 
 
 def _render_guided_block(ctx: RenderContext, parts: list[str]):
@@ -426,6 +518,10 @@ def render_block(ctx: RenderContext) -> str:
     else:
         _render_exploration_block(ctx, parts)
 
+    # ── 失败模式 anti 提示（策略组合命中已知失败组合时）──
+    if ctx.failure_anti_md:
+        parts.append(ctx.failure_anti_md)
+
     # ── Excluded 段（两种分支共用）──
     if ctx.excluded_md and "暂无已读" not in ctx.excluded_md:
         parts.append("")
@@ -479,10 +575,19 @@ def main() -> int:
     # ── v3.2 C7-fix: passed 为空时，主动改写 wm.json 节点 ──
     if not passed and candidate_ids:
         filter_reasons = _format_filter_reasons(failed)
+        # P2: 先尝试注入替代策略（无 precondition、不会再被过滤），避免直接退化为
+        # open_exploration；无替代时才降级 open。
+        fallback = _find_fallback_strategies(
+            candidate_ids + [f.get("id", "") for f in failed])
+        if fallback:
+            passed = fallback
+            LOGGER.info("[P2] 原策略全被 Preconditions 过滤，注入替代策略 %s (原: %s)",
+                        fallback, candidate_ids)
         step_override_node_in_wm(
             args.wm_path, args.node_id,
             original_strategies=candidate_ids,
             filter_reasons=filter_reasons,
+            fallback_strategies=passed if fallback else None,
         )
 
     # Step 2: load playbooks（passed 为空时跳过）
@@ -499,6 +604,7 @@ def main() -> int:
         playbook_md=playbook_md,
         excluded_md=excluded_md,
         discovered_md=_build_discovered_md(passed),
+        failure_anti_md=_build_failure_patterns_anti_md(passed),
     ))
 
     # Output

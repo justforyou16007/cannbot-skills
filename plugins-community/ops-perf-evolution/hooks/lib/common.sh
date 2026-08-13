@@ -68,6 +68,13 @@ hook_allow() {
 # Echoes the directory containing it, or empty string if not found.
 find_evo_dir() {
     local start="${1:-$PWD}"
+    # Explicit per-session override: a loop session exports LINGXI_EVO_DIR so
+    # this hook guards exactly that run. Takes precedence over the walk-up /
+    # anchor scan and makes the guard session-scoped.
+    if [[ -n "${LINGXI_EVO_DIR:-}" && -f "${LINGXI_EVO_DIR}/state.json" ]]; then
+        echo "${LINGXI_EVO_DIR}"
+        return
+    fi
     if [[ ! -f "${STATE_OPS_PY}" ]]; then
         # state_ops.py not present (e.g. fresh clone before installation) → noop
         echo ""

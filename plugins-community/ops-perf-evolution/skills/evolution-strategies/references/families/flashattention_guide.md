@@ -3,7 +3,7 @@
 > 算子族：`attention` / `flash_attention`
 > 适用算子：`FlashAttention`, `FlashAttention-2`, `GQA`, `MHA`, `MLA`, `SparseAttention`, `ChunkedPrefill` 等
 > 关联设计：[knowledge-strategy-architecture-v3.2](../../../../../docs/design/knowledge-strategy-architecture-v3.2.md) §3.2
-> **路径约定**：本文档中 `subfamilies/`、`foundation/`、`design/`、`specialization/`、`patterns.md` 等相对路径均基于仓库根下 `ops/ascendc-tiling-design/references/flashattention/`（例：`subfamilies/base_design.md` = `ops/ascendc-tiling-design/references/flashattention/subfamilies/base_design.md`）
+> **路径约定**：本文档中 `subfamilies/`、`foundation/`、`design/`、`specialization/`、`patterns.md` 等相对路径均基于插件本地 `plugins-community/ops-perf-evolution/skills/evolution-strategies/references/tiling-design/flashattention/`（例：`subfamilies/base_design.md` = `.../tiling-design/flashattention/subfamilies/base_design.md`）
 
 ## 选型决策树
 
@@ -28,12 +28,16 @@
 | **P38** Softmax 状态常驻 | L1 | — | FA 跨 S2 循环 | max/sum 状态留 UB，避免 reload |
 | **P55** BlockReduceMax | L1 | ✅ | attention + max 归约 | 单指令替代 stride DataCopy |
 | **P60** KV NZ 格式 | L1 | — | FA decode + KV cache | ND 转 NZ，搬运对齐 |
+| **P137** 稀疏 top-k 紧凑化走 Cube | L2 | ✅ | 稀疏 FA（top-k/sparseIndices） | workspace 紧凑 tile（有效前置+零填充）+ QK^T/PV 上 AIC；先消 gather 标量再 M 融合（17.28x） |
+| **P138** host tiling L0 容量守卫 | L1 | ✅ | Cube tiling 跨芯片移植 | `GetCoreMemSize(L0_A/L0_C)` 运行时查询 + groupTile 自适应减半，防随机 SIGSEGV |
+| **P139** 多槽 workspace 全槽零填充 | L1 | ✅ | P14 多槽流水 FA | 零初始化遍历全部 kPreloadNum 槽（含 prob/score padded），防 NaN 偶发崩溃 |
+| **P140** MLA 大 M-tile | L1 | ✅ | kvHeads=1（MLA） | M-tile 放大到 qHeads（UB/L0 自适应），QK^T/PV 一次 mmad 吃满 Cube |
 
 ---
 
 ## Ascend C FlashAttention Tiling 系统化设计
 
-> 来源：[`ops/ascendc-tiling-design/references/flashattention/patterns.md`](../../../../../ops/ascendc-tiling-design/references/flashattention/patterns.md)
+> 来源：[`tiling-design/flashattention/patterns.md`](../tiling-design/flashattention/patterns.md)
 >
 > 本章节沉淀 FlashAttention 类算子在 Ascend C 上的 Tiling 设计方法论。
 

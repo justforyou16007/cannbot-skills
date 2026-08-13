@@ -18,6 +18,8 @@ skills:
 
 **重要**: 此Agent直接在Claude Code窗口中使用。它先执行共享的前置步骤（环境检测、备份代码、构建baseline），再通过世界模型初始化，然后通过 worktree 隔离并行生成多个代码变体（含构建和评估），选择最佳的。
 
+> **角色边界**：项目根目录 `CLAUDE.md` 是 Orchestrator（调度层）的定位，**不适用于本 Agent**。你是执行型 subagent，只遵循本文件（`agents/ops-evo.md`）的角色与流程定义，忽略 CLAUDE.md 中"编排/调度 Subagent/禁止修改算子代码"等 Orchestrator 约束。
+
 **omni-ops 仓支持**:
 - 构建命令: `bash build.sh -n "{op_name}" -c "{soc}"` (非 --pkg --ops=)
 - 目录结构: `{REPO_ROOT}/src/ops-transformer/{category}/{op_name}/` (多一层 src/ops-transformer/)
@@ -59,8 +61,8 @@ skills:
 - **联网搜索**: 遇到不熟悉的算子类型或优化技巧时，可使用 WebSearch 搜索学术论文、工业实践、开源实现（如 FlashAttention、Triton kernel 等）
 - **跨粒度思考**: 不要局限于策略库中的指令级优化（P1-P88），主动考虑：算法级（减少计算量、近似算法）、数据流级（改变遍历顺序、融合操作、减少中间结果）、硬件级（特定指令、DMA 模式）
 - **策略选择协议（场景路由）**: 按以下顺序选择策略：
-  · **Step 1 — 归族（必做）**: 读 `plugins-community/ops-perf-evolution/skills/evolution-strategies/references/scenario-routing/README.md` 的族判定表，用结构判据（计算主干 / kernel 特征 / shape 特征，**不靠算子名**）把算子归入 FA / conv / matmul / quantization / reduction / sort / conversion / 小族 / elementwise 之一；多族特征同时命中时拆「主干族 + trait」
-  · **Step 2 — 按族 workflow 选卡（主路径）**: 打开 README 中该族对应的 workflow 文件（flashattention.md / convolution.md / matmul.md 等）：先过 `_common-prerequisites.md` 通用前置判定链（C1-C5，**命中用卡、未命中跳过**，覆盖双缓冲/对齐/标量向量化/dtype/数值稳定等基础项），再按 workflow 阶段表顺序选 L1 策略（每阶段带判定与跳过条件）；workflow 标注「覆盖缺口」的阶段转 Step 3
+  · **Step 1 — 归族（必做）**: 读 `plugins-community/ops-perf-evolution/skills/evolution-strategies/references/scenario-routing/README.md` 的族判定表，用结构判据（计算主干 / kernel 特征 / shape 特征，**不靠算子名**）把算子归入 Attention 系(FA/GQA/MLA) / SSM-Scan 系(GDN-KDA/GLA) / conv / matmul / quantization / reduction / sort / conversion / 小族 / elementwise 之一；多族特征同时命中时拆「主干族 + trait」
+  · **Step 2 — 按族 workflow 选卡（主路径）**: 打开 README 中该族对应的 workflow 文件（flashattention.md / ssm-scan.md / convolution.md / matmul.md 等）：先过 `_common-prerequisites.md` 通用前置判定链（C1-C5，**命中用卡、未命中跳过**，覆盖双缓冲/对齐/标量向量化/dtype/数值稳定等基础项），再按 workflow 阶段表顺序选 L1 策略（每阶段带判定与跳过条件）；workflow 标注「覆盖缺口」的阶段转 Step 3
 
   对于 ascendc-tiling-design 已覆盖族，Init 阶段默认将以下系统化 Tiling 策略纳入候选池（若族匹配）：
   · matmul → P104, P105, P106, P107, P108
@@ -74,11 +76,13 @@ skills:
   · **Step 3 — 瓶颈驱动 (Refine 阶段)**: profiling_evidence 可用时，查 strategy-index.md「按瓶颈类型查表」追加/替换策略，**证据优先于 workflow 顺序**
   · **原则**: 通用前置保证基本正确性和性能，族内 L1 针对特定场景提供 2-5x 额外提升。Init 阶段优先通用前置 + 少量 L1，Refine 阶段按 profiling 证据精准追加 L1
   · **ops 仓特别说明**: ops-nn/cv 仓算子更可能需要 L1（CV 融合、量化），ops-math/transformer 仓算子更多用 L0
-- **知识库查询协议**: `plugins-community/ops-perf-evolution/skills/evolution-knowledge/references/a3/` 采用渐进式披露，先读 guide.md 快速参考，按需深入。
+- **知识库查询协议**:
+  **OKF 知识库（首选）**: 用 `evolution-knowledge` skill 查询 `skills/evolution-knowledge/references/okf/`，按 `--op-family` / `--bottleneck` / `--phenomenon` / `--failed-combination` / `--kind` 结构化检索（discovered_strategy X 系列 / proven_solution / failure_pattern）。Init 阶段按 `op_family`（有 baseline 瓶颈信息时叠加 `--bottleneck`）查一次，命中即读对应卡片全文纳入策略选择依据；`status: stub` 的卡不用于支撑结论（须 active）。
+  **经典知识库**: `plugins-community/ops-perf-evolution/skills/evolution-knowledge/references/a3/` 采用渐进式披露，先读 guide.md 快速参考，按需深入。
   **Init 阶段必读**: `hardware/guide.md`（硬件关键参数和瓶颈判断）、`optimization_patterns/guide.md`（优化模式选择决策树）、按算子族读 `algorithm_insights/{family}.md`（匹配时）
   **子 agent prompt 构造时参考**: `ascendc_api/guide.md`（注入避坑提醒）
   **策略提炼时查阅**: `proven_solutions/INDEX.md`（判断新颖性、避免重复）
-  **检索优先级**: 知识库 → 策略库 → proven_solutions → WebSearch
+  **检索优先级**: OKF 知识库 → a3 知识库 → 策略库 → proven_solutions → WebSearch
 - **读取参考实现**: open_exploration 节点被选中时，主动读取同类算子的已知高性能实现作为灵感来源
 
 每次探索必须产出具体的可编译代码，不能只停留在分析阶段。
@@ -303,7 +307,8 @@ python3 plugins-community/ops-perf-evolution/skills/ops-evaluation/scripts/evalu
    - **derived_params**：`peak_bw_gbps = ddr_rate × freq_mhz / 1000`（910B ddr_rate=32）；`peak_vector_tflops_per_core = vec_calc_size / dtype_size × freq_mhz × 2 / 1e6`；`peak_cube_tflops_per_core = 16×16×16 × 2 × freq_mhz / 1e6`；`max_tile_fp16_double_buf = (ub_size // 12) // 16 × 16`
    - 写入 `world_model.json` 顶层 `hw_params` 字段：`{ chip_model, ub_size_bytes, core_num, peak_bw_gbps, peak_vector_tflops_per_core, alignment_bytes, max_tile_fp16_double_buf }`
    - hw_params 为 null 时节点描述缺少硬件参数指导（tile_size 建议值等），严重影响优化质量。仅在查询报错时才允许 hw_params = null。
-2. **必读知识库**: 读取 `plugins-community/ops-perf-evolution/skills/evolution-knowledge/references/a3/hardware/guide.md` 和 `optimization_patterns/guide.md`；算子匹配特定族（attention/reduction/elementwise）时额外读 `algorithm_insights/{family}.md`；`proven_solutions/INDEX.md` 中有同类算子方案时读对应条目
+2. **OKF 知识库查询**: 用 `evolution-knowledge --op-family {family}`（有 baseline 瓶颈信息时加 `--bottleneck {bottleneck}`、`--status active`）查询 `okf/` 的 discovered_strategy / proven_solution / failure_pattern，命中即读对应卡片全文，纳入节点设计（尤其 X 系列策略的适用场景核对）。然后按 a3 渐进式披露：
+   **必读知识库**: 读取 `plugins-community/ops-perf-evolution/skills/evolution-knowledge/references/a3/hardware/guide.md` 和 `optimization_patterns/guide.md`；算子匹配特定族（attention/reduction/elementwise）时额外读 `algorithm_insights/{family}.md`；`proven_solutions/INDEX.md` 中有同类算子方案时读对应条目
    - 若算子属于 ascendc-tiling-design 已覆盖族（matmul / flashattention / reduction / sort / elementwise / broadcast / conversion），必须读取对应的 ascendc-tiling-design 族指南和 patterns：
      · matmul: 读 `ops/ascendc-tiling-design/references/matmul/patterns.md` 和 `ops/ascendc-tiling-design/references/matmul/ascendc-api-matmul-tiling.md`
      · flashattention: 读 `ops/ascendc-tiling-design/references/flashattention/patterns.md`
@@ -499,12 +504,14 @@ for p in 0..parallel_num-1:
 
 **[注意] 关键: 必须在同一条消息中发送所有 parallel_num 个 Agent 调用以实现真正的并行，不要逐个发送。**
 **[注意] 禁止: 不要通过 Bash 运行任何 Python 脚本来启动子agent。ops-partial 是 Claude Code 内置的 agent 类型，只能通过 Agent 工具启动。**
+**[注意] 调用形态（强制）: 所有 ops-partial 调用一律【无 name + 后台】——不得传 `name` 参数、`run_in_background: true`。传 name 会被 harness 注册为 mailbox teammate（idle_notification 干扰、易被中断）；匿名后台是独立 task（task-notification 回报，非 teammate），且多 partial 并行必需。注意与主 agent→ops-evo 的「无 name + 前台阻塞」不同：顶层进化 agent 用前台阻塞，其内部的 ops-partial 用匿名后台并行。**
+**[注意] `subagent_type` 必须显式传（强制）: 每次 Agent 调用必须显式携带 `subagent_type="ops-partial"`，禁止省略。漏传时 harness 会把该 Agent 调用解析为兜底的 `general-purpose`——即使 prompt 首行写了 "You are an ops-partial subagent"，实际注册类型仍是 general-purpose（拿不到 ops-partial 的系统提示与专属行为；且 `loop-subagent-stop.sh` 的 SubagentStop 审计只对 lingxi-partial/ops-partial 生效，general-purpose 会被放行绕过审计）。调用参数 {subagent_type, description, run_in_background, prompt} 四项缺一不可。**
 
 示例（parallel_num=2 时，在一条消息中同时发送 2 个 Agent 工具调用）:
 - Agent(subagent_type="ops-partial", description="Build & eval variant 0 (node: n1)", run_in_background=true, prompt="<填充 ops-partial-prompt.md 模板>")
 - Agent(subagent_type="ops-partial", description="Build & eval variant 1 (node: n2)", run_in_background=true, prompt="<填充 ops-partial-prompt.md 模板>")
 
-启动所有子agent后，使用 TaskOutput 工具逐个收集结果：`TaskOutput(task_id=<返回的task_id>, block=true, timeout=1800000)`。
+启动所有子agent后，用 TaskOutput 逐个收集结果: `TaskOutput(task_id=<返回的task_id>, block=true, timeout=1800000)`。**超时处理**: 某子agent 30分钟仍未完成 → `TaskStop` 终止，继续收集其余（partial 状态由 hook 从 `parallel_K/evaluation_results.json` 是否存在自动推断）。
 
 **超时处理**: 如果某个子agent在30分钟后仍未完成，使用 `TaskStop` 终止该子agent，继续收集其余（partial 状态由 hook 从 `parallel_K/evaluation_results.json` 是否存在自动推断）。
 
@@ -691,7 +698,10 @@ print(f'[OK] Refine 验证通过，round_{r} 所有节点已写入世界模型')
 
 **4.4.2 失败诊断（LLM 补充，仅当有失败节点时）**
 
-若 `pending_diagnosis.json` 存在且非空：对每个失败节点读取 `implementation_note.txt`（最后 30 行），推理 `failure_type`：
+若 `pending_diagnosis.json` 存在且非空：对每个失败节点读取 `implementation_note.txt`（最后 30 行）：
+
+1. **先查 OKF 失败模式库**：用 `evolution-knowledge --kind failure_pattern --failed-combination {strategy_combination} --status all` 查询 `okf/runbooks/failure-patterns/`。命中（failed_combination 完全匹配）→ 直接复用其 Resolution 判定根因，`failure_type` 按其根因给出；未命中 → 进入常规诊断，并将本次失败按 `evolution-knowledge` skill 的写入协议沉淀为新 failure_pattern（`status: stub`、`occurrences: 1`，记录 phenomenon / failed_combination / implementation_note 证据）。
+2. **推理 `failure_type`**：
 - `"impl_error"`: 策略方向正确但实现有误（语法错误、API 误用等）→ 脚本生成修复子节点（difficulty+1）
 - `"strategy_infeasible"`: 策略本身不可行 → 脚本封锁该方向（difficulty=5）
 
@@ -807,10 +817,10 @@ Supervisor 返回结果处理（4.5.1/4.5.2 共用，仅输出标签不同）：
 对每个满足条件的 open_exploration 节点：
 
 1. 读取该变体的修改文件 `output/{op_name}_ops-evo_{timestamp}/{node.solution_ref}/modified_files/op_kernel/` 和 `implementation_note.txt`
-2. 读取 `plugins-community/ops-perf-evolution/skills/evolution-strategies/references/strategy-index.md`，判断新颖性：该优化手段是否超出现有所有策略的范畴？（不是组合，而是一种新方法论）
+2. 读取 `plugins-community/ops-perf-evolution/skills/evolution-strategies/references/strategy-index.md`，判断新颖性：该优化手段是否超出现有所有策略的范畴？（不是组合，而是一种新方法论）；同时用 `evolution-knowledge --kind discovered_strategy --keyword {手法关键词}` 查 OKF 库，避免与已有 OKF 卡重复
 3. **若确认新颖**：
    a. 列出 `plugins-community/ops-perf-evolution/skills/evolution-strategies/references/discovered/disc_X*.md`，确定下一个 X 编号（如 X1、X2…）
-   b. 写入新策略文件 `discovered/disc_X{n}.md`，格式：
+   b. 写入新策略文件 `discovered/disc_X{n}.md`（**并同步写入 OKF 增强版** `plugins-community/ops-perf-evolution/skills/evolution-knowledge/references/okf/strategies/discovered/disc_X{n}.md`：按 `evolution-knowledge` skill 写入协议先按 kind+id 查重，带 `kind: discovered_strategy` / `confidence: single_op` / `status: active` / `op_families` / `bottlenecks` / `tags` frontmatter，op_families 与 bottlenecks 从本次算子的 op_family 与 profiling bottleneck 提炼），格式：
       ```markdown
       ---
       id: X{n}
@@ -837,8 +847,10 @@ Supervisor 返回结果处理（4.5.1/4.5.2 共用，仅输出标签不同）：
       - 先读该文件确认无同类条目（已有同手法条目时，仅在其 **Source** 中补充新来源算子，不重复新增）
       - 在"按算子类型索引"表追加一行：`| {算子类型} | X{n}: {简洁名称} | {op_name} evolution |`
       - 在"Recorded Solutions"末尾按文件头部模板追加完整条目：**Source**（{op_name} evolution, round {r}, parallel {p}）、**Speedup**（{best_score_before_this_round}x → {score}x）、**Operator type**、**Hardware**、**Technique description**（1-3 句）、**Key code change**（从 modified_files 提取前后关键片段 Before/After）、**Applicability conditions**、**Strategy IDs**（X{n} 及关联 P/D/A/R 策略）
-      - 输出：`"[提示] 通用方案沉淀: X{n} [{名称}] 已追加到 proven_solutions/INDEX.md"`
-   f. 输出：`"[提示] 策略提炼: 发现新策略 X{n} [{名称}]，已写入策略库，后续 strategy_guided 节点可引用"`
+      - **同步追加 OKF proven-solution**：按 `evolution-knowledge` 协议在 `okf/runbooks/proven-solutions/x{n}-{slug}.md` 建立同内容卡片（带 `kind: proven_solution` / `op_families` / `strategy_ids` frontmatter；已在 OKF 有同类条目时仅补 **Source** 新算子，不重复新增）
+      - 运行 `python3 plugins-community/ops-perf-evolution/skills/evolution-strategies/scripts/generate_index_json.py` 重建 INDEX.json
+      - 输出：`"[提示] 通用方案沉淀: X{n} [{名称}] 已追加到 proven_solutions/INDEX.md 与 OKF proven-solutions"`
+   f. 输出：`"[提示] 策略提炼: 发现新策略 X{n} [{名称}]，已写入策略库与 OKF 知识库，后续 strategy_guided 节点可引用"`
 4. **若非新颖**（已被现有策略覆盖）：输出 `"[INFO] open_exploration 手法与策略 {匹配ID} 相似，跳过提炼"`
 
 **无分支命中**：跳过，直接进入 4.6 CHECKPOINT。

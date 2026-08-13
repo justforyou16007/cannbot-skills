@@ -16,7 +16,9 @@
       "icache_miss",
       "bus_contention",
       "l2_cache_thrash",
-      "ub_memory_pressure"
+      "ub_memory_pressure",
+      "cube_bound",
+      "db_not_effective"
     ],
     "op_families": [
       "elementwise",
@@ -34,7 +36,10 @@
       "index_scatter",
       "broadcast_mask",
       "special",
-      "datapath"
+      "datapath",
+      "ssm",
+      "linear_attention",
+      "recurrent"
     ],
     "complexity_levels": [
       "L0",
@@ -43,13 +48,14 @@
     ]
   },
   "stats": {
-    "cards": 146,
-    "active_cards": 133,
+    "cards": 155,
+    "active_cards": 142,
     "deprecated": 13,
-    "preconditions": 131,
-    "playbooks": 131,
+    "preconditions": 140,
+    "playbooks": 140,
     "families": 8,
-    "discovered": 20
+    "discovered": 45,
+    "okf": 0
   },
   "cards": [
     {
@@ -1308,6 +1314,254 @@
       "quantified_gain": []
     },
     {
+      "source_key": "evolution-strategies#card/P132_chunk_scan_three_stage_decomposition",
+      "id": "P132",
+      "title": "P132: 线性递归 chunk-scan 三阶段分解（块内预计算 / 块间状态扫描 / 输出投影）",
+      "doc_path": "cards/P132_chunk_scan_three_stage_decomposition.md",
+      "complexity": "L2",
+      "op_families": [
+        "ssm",
+        "linear_attention",
+        "recurrent",
+        "matmul",
+        "cv_fusion",
+        "reduction"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "compute_bound",
+          "scalar_compute"
+        ]
+      },
+      "conflicts_with": [],
+      "synergizes_with": [
+        "P133",
+        "P134",
+        "P135",
+        "P136"
+      ],
+      "requires": [],
+      "has_preconditions": true,
+      "has_playbook": true,
+      "quantified_gain": []
+    },
+    {
+      "source_key": "evolution-strategies#card/P133_ssm_stage1_cv_pipeline",
+      "id": "P133",
+      "title": "P133: 块内预计算 AIC/AIV CV 流水（cube 算 KKT/求逆、vector 算 cumsum/exp/前代，6-flag 定向握手）",
+      "doc_path": "cards/P133_ssm_stage1_cv_pipeline.md",
+      "complexity": "L2",
+      "op_families": [
+        "ssm",
+        "linear_attention",
+        "recurrent",
+        "cv_fusion",
+        "matmul"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "no_overlap",
+          "partial_overlap",
+          "compute_bound"
+        ]
+      },
+      "conflicts_with": [],
+      "synergizes_with": [
+        "P132",
+        "P134",
+        "P135",
+        "P136"
+      ],
+      "requires": [
+        "P132"
+      ],
+      "has_preconditions": true,
+      "has_playbook": true,
+      "quantified_gain": []
+    },
+    {
+      "source_key": "evolution-strategies#card/P134_ssm_chunk_group_partitioning",
+      "id": "P134",
+      "title": "P134: chunk-group 任务划分（group 间串行 + group 内 (nv, chunk) 多核并行）",
+      "doc_path": "cards/P134_ssm_chunk_group_partitioning.md",
+      "complexity": "L1",
+      "op_families": [
+        "ssm",
+        "linear_attention",
+        "recurrent",
+        "matmul",
+        "cv_fusion"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "tiling_imbalance",
+          "no_overlap",
+          "mte2_stall"
+        ]
+      },
+      "conflicts_with": [],
+      "synergizes_with": [
+        "P132",
+        "P133",
+        "P136"
+      ],
+      "requires": [
+        "P132"
+      ],
+      "has_preconditions": true,
+      "has_playbook": true,
+      "quantified_gain": []
+    },
+    {
+      "source_key": "evolution-strategies#card/P135_delta_rule_inverse_divide_conquer",
+      "id": "P135",
+      "title": "P135: delta-rule 矩阵求逆分治（对角向量前代 + 非对角 cube MM）",
+      "doc_path": "cards/P135_delta_rule_inverse_divide_conquer.md",
+      "complexity": "L2",
+      "op_families": [
+        "ssm",
+        "linear_attention",
+        "recurrent",
+        "matmul",
+        "reduction"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "compute_bound",
+          "scalar_compute"
+        ]
+      },
+      "conflicts_with": [],
+      "synergizes_with": [
+        "P132",
+        "P133"
+      ],
+      "requires": [
+        "P132"
+      ],
+      "has_preconditions": true,
+      "has_playbook": true,
+      "quantified_gain": []
+    },
+    {
+      "source_key": "evolution-strategies#card/P136_ssm_intermediate_bf16_quant",
+      "id": "P136",
+      "title": "P136: SSM 中间量 bf16 量化 + 状态 UB 常驻（head grouping）",
+      "doc_path": "cards/P136_ssm_intermediate_bf16_quant.md",
+      "complexity": "L1",
+      "op_families": [
+        "ssm",
+        "linear_attention",
+        "recurrent",
+        "matmul"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "ub_memory_pressure",
+          "mte2_stall"
+        ]
+      },
+      "conflicts_with": [],
+      "synergizes_with": [
+        "P132",
+        "P133",
+        "P134",
+        "P135"
+      ],
+      "requires": [
+        "P132"
+      ],
+      "has_preconditions": true,
+      "has_playbook": true,
+      "quantified_gain": []
+    },
+    {
+      "source_key": "evolution-strategies#card/P137_sparse_topk_compact_gather_to_cube",
+      "id": "P137",
+      "title": "P137: Token 级稀疏 Attention 的 workspace 紧凑化走 Cube（top-k 不再回退 Vector）",
+      "doc_path": "cards/P137_sparse_topk_compact_gather_to_cube.md",
+      "complexity": "L2",
+      "op_families": [
+        "attention",
+        "flash_attention"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "scalar_loading",
+          "cube_bound"
+        ]
+      },
+      "conflicts_with": [],
+      "synergizes_with": [
+        "P110",
+        "P14",
+        "P129"
+      ],
+      "requires": [],
+      "has_preconditions": true,
+      "has_playbook": true,
+      "quantified_gain": [
+        "shape: \"SparseFlashAttention GQA topK512 Dk128 kvSeq4096（case1, 910B2C→910c）\""
+      ]
+    },
+    {
+      "source_key": "evolution-strategies#card/P138_host_tiling_l0_capacity_guard",
+      "id": "P138",
+      "title": "P138: host tiling 查询 L0A/L0C 容量并按需自适应降维（跨硬件稳定性）",
+      "doc_path": "cards/P138_host_tiling_l0_capacity_guard.md",
+      "complexity": "L1",
+      "op_families": [
+        "attention",
+        "flash_attention",
+        "matmul"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "near_optimal",
+          "db_not_effective"
+        ]
+      },
+      "conflicts_with": [],
+      "synergizes_with": [
+        "P135"
+      ],
+      "requires": [],
+      "has_preconditions": true,
+      "has_playbook": true,
+      "quantified_gain": [
+        "shape: \"SparseFlashAttention 20-case 910c（BenchSite 同 kernel 复测）\""
+      ]
+    },
+    {
+      "source_key": "evolution-strategies#card/P139_multi_slot_workspace_zero_init",
+      "id": "P139",
+      "title": "P139: 多槽流水 workspace 全槽零初始化（防 padded 行 NaN → 偶发崩溃）",
+      "doc_path": "cards/P139_multi_slot_workspace_zero_init.md",
+      "complexity": "L1",
+      "op_families": [
+        "flash_attention",
+        "attention",
+        "elementwise"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "near_optimal"
+        ]
+      },
+      "conflicts_with": [],
+      "synergizes_with": [
+        "P14",
+        "P40",
+        "P137"
+      ],
+      "requires": [],
+      "has_preconditions": true,
+      "has_playbook": true,
+      "quantified_gain": [
+        "shape: \"SparseFlashAttention 20-case 910c（同 kernel 连续复测）\""
+      ]
+    },
+    {
       "source_key": "evolution-strategies#card/P13_special_algorithms",
       "id": "P13",
       "title": "P13: Special Algorithms & High-Level AscendC APIs (特殊算法与高阶API)",
@@ -1329,6 +1583,37 @@
       "quantified_gain": [],
       "deprecated": true,
       "deprecated_reason": "Title is vague 'Special Algorithms'. Content is actually FakeQuant DAG scheduling (very specific, not L0 universal)."
+    },
+    {
+      "source_key": "evolution-strategies#card/P140_mla_large_m_tile",
+      "id": "P140",
+      "title": "P140: MLA（kvHeads=1）的 M-tile 放大到 qHeads（UB/L0 自适应）",
+      "doc_path": "cards/P140_mla_large_m_tile.md",
+      "complexity": "L1",
+      "op_families": [
+        "attention",
+        "flash_attention"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "cube_bound",
+          "scalar_loading"
+        ]
+      },
+      "conflicts_with": [],
+      "synergizes_with": [
+        "P137",
+        "P138",
+        "P110"
+      ],
+      "requires": [
+        "P138"
+      ],
+      "has_preconditions": true,
+      "has_playbook": true,
+      "quantified_gain": [
+        "shape: \"SparseFlashAttention MLA case9/11/13（Dk512 kvHeads=1, 910c）\""
+      ]
     },
     {
       "source_key": "evolution-strategies#card/P14_cv_pipeline_preload",
@@ -3949,9 +4234,54 @@
       "doc_path": "preconditions/P131.yaml"
     },
     {
+      "source_key": "evolution-strategies#preconditions/P132_chunk_scan_three_stage_decomposition",
+      "id": "P132_chunk_scan_three_stage_decomposition",
+      "doc_path": "preconditions/P132_chunk_scan_three_stage_decomposition.yaml"
+    },
+    {
+      "source_key": "evolution-strategies#preconditions/P133_ssm_stage1_cv_pipeline",
+      "id": "P133_ssm_stage1_cv_pipeline",
+      "doc_path": "preconditions/P133_ssm_stage1_cv_pipeline.yaml"
+    },
+    {
+      "source_key": "evolution-strategies#preconditions/P134_ssm_chunk_group_partitioning",
+      "id": "P134_ssm_chunk_group_partitioning",
+      "doc_path": "preconditions/P134_ssm_chunk_group_partitioning.yaml"
+    },
+    {
+      "source_key": "evolution-strategies#preconditions/P135_delta_rule_inverse_divide_conquer",
+      "id": "P135_delta_rule_inverse_divide_conquer",
+      "doc_path": "preconditions/P135_delta_rule_inverse_divide_conquer.yaml"
+    },
+    {
+      "source_key": "evolution-strategies#preconditions/P136_ssm_intermediate_bf16_quant",
+      "id": "P136_ssm_intermediate_bf16_quant",
+      "doc_path": "preconditions/P136_ssm_intermediate_bf16_quant.yaml"
+    },
+    {
+      "source_key": "evolution-strategies#preconditions/P137",
+      "id": "P137",
+      "doc_path": "preconditions/P137.yaml"
+    },
+    {
+      "source_key": "evolution-strategies#preconditions/P138",
+      "id": "P138",
+      "doc_path": "preconditions/P138.yaml"
+    },
+    {
+      "source_key": "evolution-strategies#preconditions/P139",
+      "id": "P139",
+      "doc_path": "preconditions/P139.yaml"
+    },
+    {
       "source_key": "evolution-strategies#preconditions/P14",
       "id": "P14",
       "doc_path": "preconditions/P14.yaml"
+    },
+    {
+      "source_key": "evolution-strategies#preconditions/P140",
+      "id": "P140",
+      "doc_path": "preconditions/P140.yaml"
     },
     {
       "source_key": "evolution-strategies#preconditions/P16",
@@ -4601,6 +4931,51 @@
       "doc_path": "playbooks/P131_weight_repack_lru_cache.md"
     },
     {
+      "source_key": "evolution-strategies#playbook/P132_chunk_scan_three_stage_decomposition",
+      "id": "P132",
+      "doc_path": "playbooks/P132_chunk_scan_three_stage_decomposition.md"
+    },
+    {
+      "source_key": "evolution-strategies#playbook/P133_ssm_stage1_cv_pipeline",
+      "id": "P133",
+      "doc_path": "playbooks/P133_ssm_stage1_cv_pipeline.md"
+    },
+    {
+      "source_key": "evolution-strategies#playbook/P134_ssm_chunk_group_partitioning",
+      "id": "P134",
+      "doc_path": "playbooks/P134_ssm_chunk_group_partitioning.md"
+    },
+    {
+      "source_key": "evolution-strategies#playbook/P135_delta_rule_inverse_divide_conquer",
+      "id": "P135",
+      "doc_path": "playbooks/P135_delta_rule_inverse_divide_conquer.md"
+    },
+    {
+      "source_key": "evolution-strategies#playbook/P136_ssm_intermediate_bf16_quant",
+      "id": "P136",
+      "doc_path": "playbooks/P136_ssm_intermediate_bf16_quant.md"
+    },
+    {
+      "source_key": "evolution-strategies#playbook/P137_sparse_topk_compact_gather_to_cube",
+      "id": "P137",
+      "doc_path": "playbooks/P137_sparse_topk_compact_gather_to_cube.md"
+    },
+    {
+      "source_key": "evolution-strategies#playbook/P138_host_tiling_l0_capacity_guard",
+      "id": "P138",
+      "doc_path": "playbooks/P138_host_tiling_l0_capacity_guard.md"
+    },
+    {
+      "source_key": "evolution-strategies#playbook/P139_multi_slot_workspace_zero_init",
+      "id": "P139",
+      "doc_path": "playbooks/P139_multi_slot_workspace_zero_init.md"
+    },
+    {
+      "source_key": "evolution-strategies#playbook/P140_mla_large_m_tile",
+      "id": "P140",
+      "doc_path": "playbooks/P140_mla_large_m_tile.md"
+    },
+    {
       "source_key": "evolution-strategies#playbook/P14_cv_pipeline_preload",
       "id": "P14",
       "doc_path": "playbooks/P14_cv_pipeline_preload.md"
@@ -5135,14 +5510,139 @@
       "doc_path": "discovered/disc_X20.md"
     },
     {
+      "source_key": "evolution-strategies#discovered/disc_X21",
+      "id": "X21",
+      "doc_path": "discovered/disc_X21.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X22",
+      "id": "X22",
+      "doc_path": "discovered/disc_X22.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X23",
+      "id": "X23",
+      "doc_path": "discovered/disc_X23.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X24",
+      "id": "X24",
+      "doc_path": "discovered/disc_X24.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X25",
+      "id": "X25",
+      "doc_path": "discovered/disc_X25.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X26",
+      "id": "X26",
+      "doc_path": "discovered/disc_X26.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X27",
+      "id": "X27",
+      "doc_path": "discovered/disc_X27.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X28",
+      "id": "X28",
+      "doc_path": "discovered/disc_X28.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X29",
+      "id": "X29",
+      "doc_path": "discovered/disc_X29.md"
+    },
+    {
       "source_key": "evolution-strategies#discovered/disc_X3",
       "id": "X3",
       "doc_path": "discovered/disc_X3.md"
     },
     {
+      "source_key": "evolution-strategies#discovered/disc_X30",
+      "id": "X30",
+      "doc_path": "discovered/disc_X30.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X31",
+      "id": "X31",
+      "doc_path": "discovered/disc_X31.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X32",
+      "id": "X32",
+      "doc_path": "discovered/disc_X32.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X33",
+      "id": "X33",
+      "doc_path": "discovered/disc_X33.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X34",
+      "id": "X34",
+      "doc_path": "discovered/disc_X34.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X35",
+      "id": "X35",
+      "doc_path": "discovered/disc_X35.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X36",
+      "id": "X36",
+      "doc_path": "discovered/disc_X36.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X37",
+      "id": "X37",
+      "doc_path": "discovered/disc_X37.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X38",
+      "id": "X38",
+      "doc_path": "discovered/disc_X38.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X39",
+      "id": "X39",
+      "doc_path": "discovered/disc_X39.md"
+    },
+    {
       "source_key": "evolution-strategies#discovered/disc_X4",
       "id": "X4",
       "doc_path": "discovered/disc_X4.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X40",
+      "id": "X40",
+      "doc_path": "discovered/disc_X40.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X41",
+      "id": "X41",
+      "doc_path": "discovered/disc_X41.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X42",
+      "id": "X42",
+      "doc_path": "discovered/disc_X42.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X43",
+      "id": "X43",
+      "doc_path": "discovered/disc_X43.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X44",
+      "id": "X44",
+      "doc_path": "discovered/disc_X44.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X45",
+      "id": "X45",
+      "doc_path": "discovered/disc_X45.md"
     },
     {
       "source_key": "evolution-strategies#discovered/disc_X5",

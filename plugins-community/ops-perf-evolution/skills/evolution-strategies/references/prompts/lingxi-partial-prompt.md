@@ -55,7 +55,9 @@ Do not stop at "the kernel already uses ReduceSum/Axpy/Muls". These are exactly 
 Steps:
 1. AscendC Translation - Translate TileLang design to AscendC kernel (ascendc-translator skill)
 2. Degeneration check - validate_ascendc_impl.py + evaluate_ascendc.sh. See [Optimization Approach] for strategy application.
-3. Functional verification - evaluate_ascendc.sh (accuracy) + lingxi_perf_driver.py (device-side perf)
+3. Functional verification - evaluate_ascendc.sh (accuracy) + 性能评测用 ops-profiling `msprof_profile_run.sh --quick --output-dir={output_dir} --device={npu}`（产出 performance.json / performance.log / perf_report.md）
+   [禁止] 禁止手写自定义计时脚本（自造 measure_perf.py / event_timing.py / op_only_timing.py 等）替代标准评测——性能数据一律以 ops-profiling quick 模式产出的 performance.json / performance.log 为准
+   [评估基准约束] evaluation_results.json 的 comparison 必须含 `ref_base: "pytorch"`；`base_time_ms` 必须是 `shared/model.py`（PyTorch 参考实现）测得的时间，`gen_time_ms` 是变体内核时间。**禁止**用父内核/基线内核作 base（否则 speedup 变成"变体 vs 父内核"，污染世界模型 score，导致最优判定错误）。缺 `ref_base` 或 base_time_ms 非 PyTorch 时间视为评估不合格。
    On failure: Conductor analysis (A/B/C classification) → targeted fix → retry (max 3 iterations)
 4. Local Refinement (MANDATORY):
    If Max Improve Rounds > 0 AND compilation_success=true AND precision_passed=true → execute inner refinement loop (see [Config])
@@ -89,6 +91,16 @@ If Mode=profiling_driven:
   d. Apply optimization by modifying parent kernel (patch, don't replace from scratch)
   e. In implementation_note: state what profiling bottleneck was targeted and how
 
+If Mode=workflow_guided:
+  本变体是归族 workflow 分支的专门变体。必须严格按下方 [WORKFLOW_REF] 中的 stage_order 阶段顺序优化，不得跳过任一阶段；[WORKFLOW_REF] 中若含 `traits`（正交 trait 列表，如 causal/sparse-blocktable/paged-decode/phase=bwd），按其对应的 workflow trait 追加表叠加对应策略（不改变主链顺序）：
+  a. Read the family workflow file at: {workflow_file_path}（如 skills/evolution-strategies/references/scenario-routing/convolution.md）
+  b. 阶段 0 — 通用前置：过 _common-prerequisites.md C1-C5（命中用卡、未命中跳过）
+  c. 阶段 1 — 分支专用路径：按 {branch} 分支的「判定条件 → 专用路径」实现（如 conv C-2 → P128 hi/lo bf16 3-GEMM、C-6 → im2col+Cube GEMM）
+  d. 阶段 2 — 族内收尾：如 workflow 转 GEMM 主干，按 matmul.md M2/M3/M7 阶段收尾（多核切分、L2 复用、CV 流水）
+  e. 阶段 3 — 门控纪律：遵守 workflow 的「门控纪律」段（如硬件 img2col 展开 k 序须 one-hot 探针实测、W<24 禁 LoadData3D、留环境变量开关）
+  f. In implementation_note: 以 ## Workflow: {workflow_file} {branch} 开头，逐阶段记录做了什么、命中了哪些判定、跳过了哪些（含理由）
+  策略相关资源（card + Playbook SOP）见下方 [STRATEGY RESOURCES] 段；workflow 分支专用路径的策略 Playbook 在其中。
+
 If Mode=strategy_guided (default):
   The [MANDATORY OPTIMIZATION DIRECTION] already contains the strategy direction and key points.
   策略相关资源（card 主体内容 + Playbook SOP）已由主 agent 通过 source_key 程序化加载，见下方 [STRATEGY RESOURCES] 段；不需要再去 plugins-community/ops-perf-evolution/skills/evolution-strategies/references/cards/ 文件系统读取。
@@ -98,6 +110,10 @@ If Mode=strategy_guided (default):
     Read parent kernel at: output/{op_name}_evo_{timestamp}/{parent_solution_ref}/kernel/
     Use as optimization starting point.
   {meta_prompt}
+
+[WORKFLOW_REF]  ← 归族 workflow 分支保底节点专用段（v3.2.1 新增）
+{workflow_ref_block}
+（非 workflow_guided 节点此段为空，跳过）
 
 [STRATEGY RESOURCES]  ← v3.2 新增段，由主 agent 用 query_strategies / load_playbook 程序化注入
 {strategy_resources_block}
@@ -135,7 +151,7 @@ If Mode=strategy_guided (default):
 - 没有 Playbook 的策略不强制 Step 段落
 
 [TILING DESIGN CHECKLIST]
-若算子属于 ascendc-tiling-design 已覆盖族，在实现优化前必须逐项确认对应类别的 Tiling 设计要点：
+若算子属于 ascendc-tiling-design 已覆盖族，在实现优化前必须逐项确认对应类别的 Tiling 设计要点（插件本地副本：`plugins-community/ops-perf-evolution/skills/evolution-strategies/references/tiling-design/{family}/`，可自行修改维护）：
 
 - **MatMul 类** (P104-P108)
   - [ ] Host tiling 使用 `MatmulApiTiling::GetTiling(TCubeTiling&)`，正确覆写 singleCoreM/N/Ka/Kb、baseM/N/K、usedCoreNum

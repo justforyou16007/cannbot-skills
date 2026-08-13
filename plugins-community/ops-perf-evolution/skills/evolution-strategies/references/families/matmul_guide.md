@@ -70,7 +70,7 @@
 
 ## Ascend C Matmul Tiling 系统化设计
 
-> 来源：`ops/ascendc-tiling-design/references/matmul/ascendc-api-matmul-tiling.md`
+> 来源：插件本地 [`tiling-design/matmul/ascendc-api-matmul-tiling.md`](../tiling-design/matmul/ascendc-api-matmul-tiling.md)
 > 适用路径：Ascend C **Matmul 高阶 API**（`MatmulImpl` + Host 侧 `MatmulApiTiling::GetTiling`）
 > 适用平台：Atlas A2 / A3（`DAV_2201`，如 Ascend910B / Ascend910_93）
 > 不适用平台：Ascend 950（`DAV_3510`）→ 应走 Blaze / tensor_api 路径

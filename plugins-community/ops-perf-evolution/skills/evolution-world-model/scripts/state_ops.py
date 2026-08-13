@@ -711,7 +711,52 @@ def _repo_root_from_script() -> str | None:
     return None
 
 
-def _scan_anchor_for_evo_dir(output_dir: str) -> str | None:
+def _session_claude_pid() -> int | None:
+    """Top-level 'claude' session PID owning this process tree, or None.
+
+    Walks the /proc PPID chain and returns the root-most process whose
+    argv[0] basename is 'claude' (i.e. the session's main claude process,
+    not a nested subagent claude). Both the session-anchor writer and the
+    loop-stop hook descend from this same PID, so it is a stable per-session
+    identity for scoping anchors: a hook only guards an anchor whose
+    session_pid equals its own, so concurrent claude sessions in the same
+    repo never inherit each other's loop guard.
+    """
+    def _read_cmdline(pid: int) -> str | None:
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                return f.read().replace(b"\x00", b" ").decode("utf-8", "replace").strip()
+        except (OSError, IOError):
+            return None
+
+    def _read_ppid(pid: int) -> int | None:
+        try:
+            with open(f"/proc/{pid}/status", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("PPid:"):
+                        return int(line.split()[1])
+        except (OSError, ValueError):
+            return None
+        return None
+
+    chain: list[int] = []
+    pid = os.getpid()
+    seen: set[int] = set()
+    for _ in range(128):
+        if pid in seen or pid <= 0:
+            break
+        seen.add(pid)
+        cmd = _read_cmdline(pid)
+        if cmd and os.path.basename(cmd.split()[0]) == "claude":
+            chain.append(pid)
+        ppid = _read_ppid(pid)
+        if ppid is None or ppid <= 0:
+            break
+        pid = ppid
+    return chain[-1] if chain else None
+
+
+def _scan_anchor_for_evo_dir(output_dir: str, session_pid: int | None = None) -> str | None:
     """Scan output_dir for .ops-evo_current_session_*.json anchor files.
 
     `output_dir` must be an absolute path (resolved by the caller, either
@@ -719,13 +764,19 @@ def _scan_anchor_for_evo_dir(output_dir: str) -> str | None:
     _repo_root_from_script) so the scan does not depend on the process cwd.
     Only anchors ≤24h old are considered to avoid stale matches.
 
+    When `session_pid` is given, only anchors whose session_pid equals the
+    caller's own claude session (top-level claude PID) are authoritative;
+    anchors written by other sessions and legacy anchors that predate the
+    session_pid field are ignored, so concurrent sessions in the same repo
+    do not inherit each other's loop guard.
+
     Returns the evo_dir from the most recently modified valid anchor,
     or None if no anchors exist / all are stale.
     """
     import glob
     import time
 
-    pattern = os.path.join(output_dir, ".ops-evo_current_session_*.json")
+    pattern = os.path.join(output_dir, ".ops-evo-current_session_*.json")
     anchor_files = sorted(glob.glob(pattern), key=os.path.getmtime, reverse=True)
     now = time.time()
 
@@ -743,6 +794,14 @@ def _scan_anchor_for_evo_dir(output_dir: str) -> str | None:
                 anchor = json.load(f)
         except (json.JSONDecodeError, OSError):
             continue
+
+        if session_pid is not None:
+            anchor_session = anchor.get("session_pid")
+            # Only anchors owned by THIS claude session are authoritative.
+            # Legacy anchors (no session_pid) and anchors from other sessions
+            # are never returned, so unrelated sessions aren't blocked.
+            if anchor_session is None or anchor_session != session_pid:
+                continue
 
         evo_dir = anchor.get("evo_dir", "")
         if evo_dir and os.path.isdir(evo_dir) and os.path.isfile(os.path.join(evo_dir, "state.json")):
@@ -784,7 +843,14 @@ def find_evo_dir(start: str | None = None) -> str | None:
     repo_root = repo_root_signal or _repo_root_from_script()
     if repo_root is None:
         return None
-    return _scan_anchor_for_evo_dir(os.path.join(repo_root, "output"))
+    # The anchor scan is scoped to this claude session (session_pid) so it can
+    # never pick up another session's loop and block a non-loop session.
+    session_pid = _session_claude_pid()
+    if session_pid is None:
+        # Not running under a claude session (plain python / cron): no anchor
+        # is authoritative for us — the caller must not be a loop session.
+        return None
+    return _scan_anchor_for_evo_dir(os.path.join(repo_root, "output"), session_pid)
 
 
 def check_stage_artifacts(state: dict, evo_dir: str) -> list[str]:

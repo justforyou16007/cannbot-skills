@@ -72,6 +72,7 @@ VALID_BOTTLENECKS = {
     "scalar_compute", "compute_bound", "near_optimal", "no_overlap",
     "partial_overlap", "undersize_transfer", "icache_miss", "bus_contention",
     "l2_cache_thrash", "ub_memory_pressure",
+    "cube_bound", "db_not_effective",
 }
 
 VALID_OP_FAMILIES = {
@@ -79,6 +80,7 @@ VALID_OP_FAMILIES = {
     "flash_attention", "cv_fusion", "matmul", "moe", "quantization",
     "pooling_gather", "optimizer", "index_scatter", "broadcast_mask",
     "special", "datapath",
+    "ssm", "linear_attention", "recurrent",
 }
 
 VALID_COMPLEXITIES = ["L0", "L1", "L2"]

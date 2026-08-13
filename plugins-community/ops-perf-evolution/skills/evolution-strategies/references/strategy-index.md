@@ -278,6 +278,29 @@ P67-P69 为 Vector 计算效率基础策略（Counter 模式、低延迟归约�
 | P130 | 1x1 Conv flipped GEMM | L1 | conv, pointwise | 1×1 卷积：原始布局即 GEMM 操作数，免 wrepack/im2col 两级发射（ex-X19） | playbooks/P130_1x1conv_flipped_gemm.md |
 | P131 | Weight repack LRU cache | L1 | conv, matmul, host-cache | 推理式重复调用：host 侧缓存权重 repack 结果，命中跳过 repack kernel 发射（ex-X20） | playbooks/P131_weight_repack_lru_cache.md |
 
+## 性能优化策略 — SSM/Scan 实战优化 (P132-P136) [Layer: L1-L2]
+
+覆盖无 QK^T、无 softmax 的线性递归/chunk-scan 算子（GDN/KDA delta rule、GLA 门控线性注意力、Mamba2 等）。主链顺序：P132 三阶段分解 → P133 块内 CV 流水 → P134 任务划分 → P135 求逆分治（仅 GDN/KDA）→ P136 数值/UB。参考实现：chunk_gated_delta_rule。
+
+| ID | Strategy | Layer | Tags | When to Apply | Detail File |
+|----|----------|-------|------|---------------|-------------|
+| P132 | 线性递归 chunk-scan 三阶段分解 | L2 | ssm, linear_attention, recurrent, chunk-scan | 逐 token 串行递推：切成 C=64 chunk，块内预计算（全并行）→ 块间状态递推（仅 (Dv,Dk) 串行）→ 输出投影，O(seq) 串行压到 O(seq/C) | playbooks/P132_chunk_scan_three_stage_decomposition.md |
+| P133 | 块内预计算 AIC/AIV CV 流水 | L2 | ssm, cv_fusion, chunk-scan | Stage1 多级 matmul+向量预处理用 SyncAll 同步：cube 算 KKT/求逆/kcumdecay，vector 算 cumsum/exp/前代，6-flag 定向握手替代 | playbooks/P133_ssm_stage1_cv_pipeline.md |
+| P134 | chunk-group 任务划分 | L1 | ssm, chunk-scan, multi-core | 全序列一次分核导致跨核状态依赖退化串行：group 间串行 + group 内 (nv,chunk) 多核并行，maxGroupLength=P_NUM×核×C | playbooks/P134_ssm_chunk_group_partitioning.md |
+| P135 | delta-rule 矩阵求逆分治 | L2 | ssm, delta-rule, matmul | (I-A)^{-1} 整块串行求逆：对角子块向量前代 + 非对角 X10=X11·M10·X00 cube MM，O(C³) 求逆并行化（GLA 用 cumprod 无求逆） | playbooks/P135_delta_rule_inverse_divide_conquer.md |
+| P136 | SSM 中间量 bf16 量化 + 状态常驻 | L1 | ssm, ub-memory, bf16 | 中间量全 fp32/状态每 chunk 搬 GM：块间传递全程 bf16（求逆/衰减核心留 fp32）+ state (Dv,Dk) UB 常驻 + head grouping Nv//Nk | playbooks/P136_ssm_intermediate_bf16_quant.md |
+
+## 性能优化策略 — SparseFlashAttention 实战优化 (P137-P140) [Layer: L1-L2]
+
+覆盖 token 级稀疏（top-k）与 MLA 的 SFA 优化。来源：Z-Search cannbench-evo 实测沉淀。P137 是稀疏主路径（紧凑化走 Cube）；P138/P139 是稳定性加固（L0 容量守卫 / 多槽零初始化）；P140 是 MLA M-tile 放大（依赖 P138）。
+
+| ID | Strategy | Layer | Tags | When to Apply | Detail File |
+|----|----------|-------|------|---------------|-------------|
+| P137 | 稀疏 top-k 紧凑化走 Cube | L2 | flash_attention, sparse, cube | token 级稀疏（topK）被误认"不规则索引无法用 Cube"：AIV 标量 gather 搬成 workspace 紧凑 tile（有效行前置 + 尾部零填充）再喂 AIC mmad，稀疏只加搬运契约不改 Cube 结论（17.28x） | playbooks/P137_sparse_topk_compact_gather_to_cube.md |
+| P138 | host tiling L0 容量守卫 | L1 | flash_attention, matmul, stability | Cube tiling 用写死的 L0 尺寸 → 更小 L0 芯片 InitBuffer 溢出随机 SIGSEGV：`GetCoreMemSize(L0_A/L0_C)` 运行时查询 + groupTile 自适应减半（跨硬件稳定性） | playbooks/P138_host_tiling_l0_capacity_guard.md |
+| P139 | 多槽流水 workspace 全槽零初始化 | L1 | flash_attention, stability | 预发射多槽流水只初始化 slot0 → 后续槽 padded 行残留 NaN/inf 偶发崩溃：零初始化遍历全部槽 + AIC 直读的 score/prob padded 区（防 NaN 稳定性） | playbooks/P139_multi_slot_workspace_zero_init.md |
+| P140 | MLA（kvHeads=1）M-tile 放大 | L1 | flash_attention, mla, tiling | M-tile 上限 = 共享 K/V 的查询行数：GQA 只有 groupSize（小）硬拉无益，MLA（kvHeads=1）可到 qHeads 放大一个数量级，UB/L0 自适应（配合 P138）（1.95x） | playbooks/P140_mla_large_m_tile.md |
+
 ## 精度优化策略 (A1-A8) [Layer: L0]
 
 | ID | Strategy | Layer | Tags | When to Apply | Detail File |
@@ -315,6 +338,24 @@ P67-P69 为 Vector 计算效率基础策略（Counter 模式、低延迟归约�
 | X18 | Fused img2col LoadData3D 随路展开（含 band 窗口化） | L2 | conv, im2col, cube, bandwidth-bound | 卷积 A 侧免 GM 物化：NC1HWC0 常驻 L1 + img2col LoadData3D 随路展开进 L0A；xNz 超 L1 时 band 行带窗口化（padTop'/padBottom' 重算保 Ho 光栅恒等）；硬件 k 序 (ci1,kh,kw,ci0) 须 one-hot 探针确认；W<24 窄图/kExtension>64 门控回退；消 70% im2col 占比，大 case 0.32→0.59 | discovered/disc_X18.md |
 | X19 | 1×1 Conv 翻转 GEMM（原始布局即操作数） | L2 | conv-1x1, pointwise, launch-bound | kH=kW=1/s=1/p=0 且 Ci%16==0、(H*W)%16==0 时：A=原始权重 [Co,Ci]、B=原始 x [Ci,H*W]，免 wrepack+im2col 两级发射，epilogue 通道行直写 NCHW；UB 中转解除对齐门控已证净负；实测 1.0~1.98× | discovered/disc_X19.md |
 | X20 | Host 侧权重预打包结果 LRU 缓存 | L2 | host-cache, weight-repack, inference, conv, matmul | conv/matmul 等带权重 repack 步骤的算子，repack 输出是确定函数，推理式重复调用按 (data_ptr+sizes+dtype+version+布局) 做 LRU 缓存，命中跳过整个 repack 发射；条目持 weight 强引用防地址复用；每次调用省 5-15us | discovered/disc_X20.md |
+| X21 | 910B2C Cube 化平台纪律 + 数据驱动 Kahan 精度路由 | L2 | conv3dbf, fp32, kahan, precision-routing | conv 类 fp32 算子 Cube 化时：平台纪律（GetCoreNum 保底、no_half_ufp16 指令表、fp16 3-GEMM）＋数据驱动精度路由（小数值走 fp16 直算、大数值走 Kahan 补偿），绕过 fp32-Cube 缺失并保精度 | discovered/disc_X21.md |
+| X22 | Depthwise 直接卷积（绕过 im2col+GEMM） | L2 | depthwise, conv2d, vector-conv, im2col-bypass | depthwise(groups==Cin,cig==1) 用单 AIV fp32 向量卷积直接算逐通道 kh*kw dot：无 im2col/GEMM/fp16 分裂/GM workspace/Cube；Tile=(image,co-block8,oh-block) 保 32B 对齐，对齐 interior 向量化+标量 head/tail 独立 corr 缓冲消 S/V hazard；depthwise gen-time 提升 18-84x | discovered/disc_X22.md |
+| X23 | Batched Spatial 全宽向量化 + 编译器驱动标量预取 | L2 | conv, cv_fusion, elementwise, s-pipe-latency-hiding | 滑窗卷积 kw==1/W 维逐点：把 P=floor(64/W) 个连续 oh 打包进 64-lane fp32 向量，每 (co,tap) 1 次权重标量读驱动 P*W 宽 Axpy（向量指令+标量读降 P 倍）；Boundary 零填充 + strided DataCopyPad；`#pragma unroll 4` 驱动编译器软件流水隐藏 ~43cy S-pipe 标量读延迟（⚠️手工多标量预取触发编译器误编译，禁用）；W%8==0 门控；geomean 0.36x→3.5x | discovered/disc_X23.md |
+| X24 | AIC_ONLY 任务类型压设备 launch 地板（固定开销主导算子） | L2 | matmul, elementwise, reduction, aic-only, device-launch-floor | 微小 shape 固定开销主导算子（cube_util 极低、标量占比高）：任务类型从 MIX_AIC_1_2 改 `KERNEL_TYPE_AIC_ONLY` 去掉每 AIC 的 2 个空转 AIV，设备固定地板 ~7-8μs→~4.3-4.5μs；配 compact tiling 头（65→4 int32）；与手动 mmad 叠加 12.09→6.88μs（1.757x vs 基线）；上限：910B kernel launch 地板 ~4.3-5.6μs | discovered/disc_X24.md |
+| X25 | 向量权重广播（Brcb + MulAddDst）替代 S-pipe 标量读 | L2 | conv, cv_fusion, elementwise, matmul, scalar-read-elimination | 标量权重驱动向量 FMA 且权重跨 batch 复用：权重 GM 预展开 [Co,K,8]（每权重 8 副本），每 (g,tap) 一次 V-pipe `Brcb` 广播成 64-lane 权重向量驱动 numBatches 条 `MulAddDst`，彻底消除 S-pipe GetValue 标量读（~43cy）；wvec 2×64-lane ping-pong 破写后读；多 batch 摊销最大（case28 5.9x）；numBatches=1 高 K 无摊销收益被 8x 权重载入抵消 | discovered/disc_X25.md |
+| X26 | Col2im Tap-Batch 事件化（散射类 per-tap 流水重构） | L2 | conv, deconv, scatter, gather, datapath | 散射算子（col2im/deconv）逐输出行 tap 循环每 tap 一次 PIPE_ALL（~16/行）→ tap-batch：一次发出该行所有 tap 的 MTE2 加载 + 1 barrier，随后 V 管道 in-order 背靠背 Gather+Add + 1 barrier；barrier 降到 2/行；对齐 zero slot 在 V 管道初始化（S/V 无保序）、行级 B1/B4 保守保留 PIPE_ALL（MTE3 WAR）、禁忌 strided 多块 DataCopyPad（dav-2201 挂死）；col2im 316→277us | discovered/disc_X26.md |
+| X27 | transpose-on-load 分形加载 + 全 shape 手动 mmad 二维 tile 网格（免 host 预转置） | L2 | matmul, manual-mmad, transpose-on-load, full-shape-grid, aic-only | transB 类 matmul：B 转置由 `LoadToL0B<LOAD2D> isBTranspose=true` 在 L1→L0B 分形加载时完成（免 host workspace 预转置 pass，910B2C 任意 M/N/K 正确，区别于 f3 LoadData3D 陷阱）；输出 C 按 gridM×gridN 16 对齐 tile、每 tile FULL K 单条 Mmad；并行度扩展启发式（per-tile 操作数>96KB 且 grid<24 拆分大维）；全 50 shape 无一 fallback，0.35→0.771x vs PyTorch（2.40x vs 基线），fp32[64,128]=6.3μs vs x24 host-transpose 版 11.2μs | discovered/disc_X27.md |
+| X28 | 小 S prefill FA 自适应 KV chunk 粒度 | L2 | flash_attention, gqa, prefill, tiling | FA/GQA prefill 的 kvPad=align_up(S,256/128) 对小 S 过度 padding（4-85x 白算）时：按 S 自适应 nChunk（小 S 用 64，kvPad=align_up(S,64)）+ kernel 16 对齐尾块 partial chunk，消除 padding 冗余。GQA 上小/中 case attention device 时间 -2-4x，geomean 0.500->0.588（P8 score 0.976）| discovered/disc_X28.md |
+| X29 | Shift-Free Tap-Comb 稠密直算（stride=1 反卷积消 Gather） | L2 | conv, deconv, stride1, gather-elimination, dense-direct | stride=1 反卷积恒等变换：ConvTranspose2d ≡ 零填充输入+180°翻核标准卷积；comb[ci][kf2][row][0:woA]=P 左移 kf2 对齐槽，固定 (ci,kf2,kf) 一次对齐 Axpy 稠密累加，彻底消除 Gather 间接寻址/col2im 散射/G workspace 往返/AIC→AIV 交接；纪律 ph=ho+kh-1、DataCopyPad UB→GM blockLen≥32B(wo<8 用 woA 填充缓冲+host 视图)、向量化 comb 构建 dav-2201 507015 回退标量；case0 0.927x, case7 2.433x (1.83x kernel 级) | discovered/disc_X29.md |
+| X30 | 头维-minor Q 布局免 heads-merge kernel（token-major 折叠 head 合并） | L2 | attention, flash_attention, mqa, gqa, kernel-elimination | 物化式 MHA/MQA/GQA 的 heads-merge kernel（O[BH*S,hdPad]→Om[M,H*hdPad] 转置+cast）是纯搬运；因注意力链对 Q 行序不敏感，Q 布局改 token-major(head-minor)（prep 从逐 head strided gather 变 token 粒度连续块拷贝 blockLen=H*hdPad），PV-GEMM 输出 O.view(M,H*hdPad) 天然即合并 heads 布局——heads-merge 整段删除（少 1 launch + O/Om GM 往返 + cast pass）；MQA 0.965→1.127x（+17%），配合 PV 输出直接 cast T 再省 cast pass | discovered/disc_X30.md |
+| X31 | bounded logits softmax 去 max 减法（平移不变 + 数值有界时跳过 max-trick） | L2 | reduction, elementwise, attention, softmax | softmax(z) 平移不变，max 减法（WholeReduceMax+Brcb+Sub 约 3 pass+8 barrier/tile）仅防 exp 溢出（fp32 溢出点 88）；logits 实测有界 |z|<40 时删除 max 减法直接 Muls(invDiv)+Exp（pass 8->5, barrier ~23->~12），配合行求和 chunk 化 WholeReduceSum 全发出 + log-depth 树合并（barrier O(C)->O(log C)）；softmax 单 kernel -25%；注释记录 logits 上界证据 + 保留恢复开关 | discovered/disc_X31.md |
+| X32 | fp16 hi/lo 投影 GEMM 精度替代 + 投影 GEMM 真实瓶颈识别（MTE2-bound） | L2 | fp32, projection-gemm, cube, precision, gqa | fp32 投影 GEMM 是 GQA prefill dominant 成本（case44 占 55%）但 **MTE2-bound 非 compute-bound**（mac 0.245/mte2 0.709）；P128 bf16 对投影近零输出 MERE 超 2^-13，fp16 hi/lo（~2^-21）是精度安全替代但单维度无净收益（cube 翻倍被内存瓶颈吞没）；正确杠杆是投影 GEMM L1 双缓冲（+3-14%）/大块化/消除 GM 往返 | discovered/disc_X32.md |
+| X33 | attention workspace-ring 握手延迟 bound 的 Q-tile 放大 + 投影 GEMM group A-reuse | L2 | attention, gqa, prefill, workspace-ring, matmul, mte2 | GQA attention 各管道利用率<15% 是跨核 AIC<->AIV workspace-ring 握手延迟 bound：per-task Q tile 32->64->128 每次减半握手次数（case47 +24%、case35 +19%，attention 318->265us）；投影 GEMM MTE2-bound 用 by-group A-reuse（GROUP_BY=6，A over-read 63x->11x，Stage-A 781->450us，mte2_ratio 0.746->0.693）；配 X24 AIC_ONLY/AIV_ONLY + P1 L1 双缓冲（全量 0.598->0.657x，case2 fp32 1.21x）| discovered/disc_X33.md |
+| X34 | Col2im 相位化行归约（stride-s 反卷积散射重构） | L2 | deconv, col2im, scatter, gather, datapath | 反卷积 fallback 真正瓶颈是 col2im 散射（非 im2col 带宽）：GEMM 中间 G 仅 0.03-2MB、~9us 非瓶颈；把 col2im 从'逐输出行 undersize 加载+Gather+parity+PIPE_ALL(~274us)'改为'每相位相位内 K²/s² 条 G 行长全长对齐向量 Add 归约 → 相位平面 → 行粒度批量写回'；列移位经 DataCopyPad src offset+padding 落地（AIV 全 32B 对齐，绕开 odd-shift 对齐封锁）；tap 表预计算、一次向量 Gather 奇偶交织、多块加载门控 wi%8==0&&srcCol==0；case2 548→118us (4.7x)，全量 geomean +18% | discovered/disc_X34.md |
+| X35 | MatmulImpl Host 固定开销消除 + 全覆盖串行多 tile | L2 | matmul, host-overhead, launch-bound, workspace, tiling-cache, multi-core | MatmulImpl 中小 shape launch-bound 时：workspace at::empty（位精确验证免清零）+ per-shape tiling 缓存 + workspace 复用 + kernel 核内串行多 tile 遍历（tile+=blockDim，End 单次，修 totalBlock>blockDim 漏算）；自适应 core re-grid（L0C 约束，目标 totalBlock∈[8,24]，大 shape 保留对齐 tile 避 Cube 掩码浪费）（MatmulTransA 0.272x→0.713x，2.6x） | discovered/disc_X35.md |
+| X36 | Zero-Host-Padding AIV Small-Matmul | L2 | matmul, aiv, host-padding, small-shape | matmul 系算子非 16 对齐小 shape（M*K≤256）时 host constant_pad_nd 的 pad kernel 主导官方 msprof 时长：host 不 pad 直接下发原始 shape + AIV 核内精确 matmul（fp32 累加 + 32B 对齐行展开 + M 行多核切分）；准入超阈值回退 Cube MatmulImpl（BatchMatmul 0.375x→0.61x，小 shape 0.15x→0.98x） | discovered/disc_X36.md |
+| X37 | FP32-via-FP16 Hi/Lo 4-GEMM Cube | L2 | fp32, fp16, cube, hi-lo, precision, flash_attention, matmul | Cube 不吃 fp32 且精度要求 fp32 allclose（atol≈2e-5）时：fp32 拆 fp16 hi/lo 双分量（11 尾数位，捕获 ~23bit）+ 4 次 fp16 Mmad（Ah@Bh+Ah@Bl+Al@Bh+Al@Bl，fp32 L0C 累加，含 lo·lo）达 ~9e-6 误差（bf16 3-GEMM ~1e-4 不够）；独立 AIV split 预 pass 用 8-deep ring UB 规避 MTE3→V WAR（WindowAttention fp32 geomean 0.1x→0.956x，整体 0.47x→0.98x） | discovered/disc_X37.md |
+| X38 | GM-Workspace-Ring KV-tile 宽度缩放 + Host 批量权重打包 | L2 | flash_attention, workspace-ring, kv-tile, host-packing, scalar_loading, cube-efficiency | FA 用 GM workspace ring 握手（AIC↔AIV 经 GM 中转 S/P/O）且每 KV tile 握手开销主导时：kvN 自适应（seq<=64 用 64，seq>64 用 128）减半 GM ring 往返 + 翻倍 MM1/MM2 cube GEMM，workspace/buffer 按 128 max 分配仅 slot/MM/fixpipe/softmax srcK 变运行时 kvN，sPad align_up(seq,kvN) 修越界；融合投影 host 侧 per-head 权重打包 copy-storm（48+ 次 narrow().copy_()，fp32 case 占墙钟 40%）批量化为 cat+pad+reshape+单次 strided copy，输出改 at::empty（FlashAttentionV2 mean 0.579→0.856，geomean 0.530→0.794） | discovered/disc_X38.md |
 
 ---
 
@@ -328,7 +369,7 @@ P67-P69 为 Vector 计算效率基础策略（Counter 模式、低延迟归约�
 
 ### 族判定快速路由（选策略前先归族）
 
-**已下沉为独立场景路由目录**：[`scenario-routing/README.md`](scenario-routing/README.md)。先按结构判据归族（FA / conv / matmul / quantization / reduction / sort / conversion / 小族 / elementwise），再打开对应族的 workflow 文件按阶段顺序选卡——不要在下表平铺选卡。下表仅作补充反查。
+**已下沉为独立场景路由目录**：[`scenario-routing/README.md`](scenario-routing/README.md)。先按结构判据归族（Attention 系 FA/GQA/MLA / SSM-Scan 系 GDN-KDA/GLA / conv / matmul / quantization / reduction / sort / conversion / 小族 / elementwise），再打开对应族的 workflow 文件按阶段顺序选卡——不要在下表平铺选卡。下表仅作补充反查。
 
 ### 按算子类型快速查表 (Quick Reference by Operator Type)
 
@@ -345,16 +386,18 @@ P67-P69 为 Vector 计算效率基础策略（Counter 模式、低延迟归约�
 | Special / Complex ops | D2, D3 | P85, P88, P96, P102 |
 | CV Matmul (Cube+Vector) | D1, D3, P1, P4, P7, A3 | P14, P17, P46, P47, P49, P51, P52, P63, P70, P71, P72, P73, P78, P79, P83, P86, P87, P90, P92, P93, P102, P103, P104, P105, P106, P107, P108, P117, P120 |
 | CV FFN (MoE) | D1, D3, P1, P4, A1 | P46, P48, P49, P50, P73, P75, P88 |
-| Flash Attention | D1, P1, P5, A4, A5 | P14, P16, P17, P18, P29, P38, P53, P57, P58, P60, P61, P76, P77, P80, P90, P91, P115-P126（**按 scenario-routing/flashattention.md 的 SOP 阶段顺序选用，勿平铺**） |
+| Flash Attention | D1, P1, P5, A4, A5 | P14, P16, P17, P18, P29, P38, P53, P57, P58, P60, P61, P76, P77, P80, P90, P91, P115-P126（**按 scenario-routing/flashattention.md 的分支路由 + 基础链 + trait 追加选用，勿平铺**） |
+| SSM/Scan（GDN-KDA/GLA） | D1, P1, A2, A5 | P132-P136（**按 scenario-routing/ssm-scan.md 分支选用**）；近邻 P109/P110、X15/X16 |
 | Reduction (mean/sum/max/min) | D1, P1, P2, A1, A2 | P68, P69, P109, P110 |
 | Sort / TopK | D1, P1, P2, A7 | P96, P111 |
 | Transpose / Layout Conversion | D1, P1, P7, P10 | P127（模式特化路由）, P26, P114 |
 | Convolution (conv1d/2d/3d, depthwise, ConvTranspose) | D1, P1, P7, A1 | P130（1×1）, P128（fp32）, P129（fused im2col）, P131（repack 缓存）——按 scenario-routing/convolution.md 模式分发 |
 | Data Path (通用数据通路) | D1, D5, P1, P8, P10, P20, P25, P40, P54, P65, P66, P74 | — |
 
-### FA 算子族优化 SOP
+### Attention 系优化 SOP
 
-**已迁入场景路由**：[`scenario-routing/flashattention.md`](scenario-routing/flashattention.md)（S0 形态判定 → S1 结构改写 → S2 CV 流水 → S3 内存搬运 → S4 mask/稀疏特化 → S5 调度均衡 → S6 通用收尾）。
+**已迁入场景路由**：[`scenario-routing/flashattention.md`](scenario-routing/flashattention.md)（Step 2 分支路由 standard/gqa/mla → Step 3 基础链 S1 结构改写 → S2 CV 流水 → S3 内存搬运 → S4 mask/稀疏特化 → S5 调度均衡 → S6 通用收尾 → Step 4 正交 trait 追加）。
+**SSM/Scan 系**（GDN-KDA/GLA）走 [`scenario-routing/ssm-scan.md`](scenario-routing/ssm-scan.md)（P132 三阶段分解 → P133 CV 流水 → P134 任务划分 → P135 求逆分治[仅 GDN-KDA] → P136 bf16 量化）。
 
 ### 按瓶颈类型查表 (Bottleneck-Driven Strategy Selection)
 

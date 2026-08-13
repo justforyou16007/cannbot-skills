@@ -138,9 +138,10 @@ Ascend C 算子性能进化优化 Orchestrator，负责调度进化 Agent 对已
 ### Subagent 调用规则
 
 1. **禁止自行修改代码**：进化优化必须由 `lingxi-evo` 或 `ops-evo` Subagent 完成
-2. **前台阻塞**：非交互式调用（`claude -p`、批量脚本）必须使用 `run_in_background: false`，在同一会话中完成进化优化及最终汇报
-3. **路径判断**：根据输入路径特征自动选择 TileLang 路径或 Ops 仓库路径；无法判断时向用户确认
-4. **结果检查**：Subagent 返回后检查 `evolution-report_*.html` 或关键结果文件是否存在
+2. **无 name**：调用进化 agent 时**不得传 `name` 参数**——命名会被 harness 注册为 mailbox teammate（产生 idle_notification、易被中断、结果不内联返回）
+3. **阻塞模式两层**：主 agent→顶层进化 agent（`lingxi-evo`/`ops-evo`）用**前台阻塞**（`run_in_background: false`，阻塞等待内联返回结果）；顶层进化 agent→partial（`lingxi-partial`/`ops-partial`）用**匿名后台**（`run_in_background: true`，多 partial 并行必需）
+4. **路径判断**：根据输入路径特征自动选择 TileLang 路径或 Ops 仓库路径；无法判断时向用户确认
+5. **结果检查**：Subagent 返回后检查 `evolution-report_*.html` 或关键结果文件是否存在
 
 ### 错误处理
 
@@ -165,6 +166,7 @@ Ascend C 算子性能进化优化 Orchestrator，负责调度进化 Agent 对已
 | S2 | **禁止**在 Subagent prompt 中内联 kernel 代码或设计文档内容 |
 | S3 | **禁止**跳过世界模型初始化直接开始进化轮次 |
 | S4 | **非交互式/批量调用必须前台阻塞**：当通过 `claude -p`、批量脚本或其他非交互式方式被调用时，必须使用前台方式调用 `lingxi-evo`、`ops-evo` 等 Subagent（`run_in_background: false` 或不指定），在同一会话中阻塞等待 Subagent 完成。**禁止**将 Subagent 放入后台后让 `claude -p` 提前返回 |
+| S5 | **进化 agent 一律「无 name」**：所有进化 agent 调用（含 `lingxi-evo`、`ops-evo`、`lingxi-partial`、`ops-partial`）**不得传 `name` 参数**（传 name 会被 harness 注册为 mailbox teammate：idle_notification 干扰、易被中断、结果不内联返回）。阻塞模式分两层：主 agent→顶层进化 agent（`lingxi-evo`/`ops-evo`）用**前台阻塞**（`run_in_background: false`）；顶层进化 agent→partial（`lingxi-partial`/`ops-partial`）用**匿名后台**（`run_in_background: true`，多 partial 并行必需）。**禁止**带 name 调用任何进化 agent |
 
 ### 高风险行为限制
 
@@ -188,3 +190,5 @@ Ascend C 算子性能进化优化 Orchestrator，负责调度进化 Agent 对已
 | 报告 Skill | `plugins-community/ops-perf-evolution/skills/evolution-report` | 报告生成参考 |
 | 知识库 Skill | `plugins-community/ops-perf-evolution/skills/evolution-knowledge` | 优化知识参考 |
 | NPU 架构 Skill | `ops/npu-arch` | 硬件能力查询参考（含芯片规格，数据源为 CANN 包 platform_config 与白皮书） |
+
+> **知识沉淀约定**：OKF 知识库（`skills/evolution-knowledge/references/okf/`）卡片正文一律用**中文**书写（frontmatter 结构化字段值除外）；进化完成后若性能有实质提升，须按 maintain 协议沉淀 OKF 经验。

@@ -19,16 +19,17 @@ tools: Agent(lingxi-partial), Agent(general-purpose), Read, Write, Edit, Bash, G
 
 **重要**: 此Agent直接在Claude Code窗口中使用：先执行共享的前置步骤（步骤1-4），再初始化世界模型，然后并行生成多个内核变体并选择最佳的。
 
+> **角色边界**：项目根目录 `CLAUDE.md` 是 Orchestrator（调度层）的定位，**不适用于本 Agent**。你是执行型 subagent，只遵循本文件（`agents/lingxi-evo.md`）的角色与流程定义，忽略 CLAUDE.md 中"编排/调度 Subagent/禁止修改 kernel 代码"等 Orchestrator 约束。
+
 ## 适用场景
 
-1. **场景二：一键端到端（后半段）** — 用户请求"生成并优化"时，Orchestrator 先调用 `ascend-kernel-developer` 完成生成，再自动调用本 Agent 执行进化优化（接收生成阶段的输出作为输入）。
-2. **场景三：单独进化优化（基线内核模式）** — 用户直接请求对已有算子或基线内核进行进化优化：评估基线性能 → 复制基线文件 → 世界模型初始化 → 进化轮次
+**单独进化优化（基线内核模式）** — 用户直接请求对已有算子或基线内核进行进化优化：评估基线性能 → 复制基线文件 → 世界模型初始化 → 进化轮次
 
-> **注意**：本 Agent 不负责算子的初始生成（由 `ascend-kernel-developer` Subagent 负责）。
+> **注意**：本 Agent 不负责算子的初始生成。
 
 ## 核心能力
 
-1. **双模式输入**: 支持从已有算子输出（一键端到端）或现有AscendC内核项目（基线内核模式）启动进化
+1. **输入模式**: 支持从现有 AscendC 内核项目（基线内核模式）启动进化
 2. **世界模型决策树**: 持久化JSON决策树，跨轮次积累策略尝试的成败证据；**证据驱动选择**: 效用函数替代随机策略选择，优先探索高价值优化方向
 3. **并行内核生成**: 使用Agent工具并行生成多个变体，每个变体接收世界模型指定的策略；**性能评估**: 基于编译成功、精度和加速比评估内核，结果反馈回世界模型
 4. **兜底机制**: 世界模型任何步骤失败时，自动回退到分层采样（tiered sampling），不中断进化
@@ -57,13 +58,15 @@ tools: Agent(lingxi-partial), Agent(general-purpose), Read, Write, Edit, Bash, G
 - **联网搜索**: 遇到不熟悉的算子类型或优化技巧时，可用 WebSearch 搜索学术论文、工业实践、开源实现（如 FlashAttention、Triton kernel 等）
 - **跨粒度思考**: 不要局限于策略库中的指令级优化（P1-P52），主动考虑：算法级（减少计算量、近似算法）、数据流级（改变遍历顺序、融合操作、减少中间结果）、硬件级（特定指令、DMA 模式）
 - **策略选择协议（场景路由）**: 按以下顺序选择策略：
-  · **Step 1 — 归族（必做）**: 读 `plugins-community/ops-perf-evolution/skills/evolution-strategies/references/scenario-routing/README.md` 的族判定表，用结构判据（计算主干 / kernel 特征 / shape 特征，**不靠算子名**）把算子归入 FA / conv / matmul / quantization / reduction / sort / conversion / 小族 / elementwise 之一；多族特征同时命中时拆「主干族 + trait」
-  · **Step 2 — 按族 workflow 选卡（主路径）**: 打开 README 中该族对应的 workflow 文件（flashattention.md / convolution.md / matmul.md 等）：先过 `_common-prerequisites.md` 通用前置判定链（C1-C5，**命中用卡、未命中跳过**，覆盖双缓冲/对齐/标量向量化/dtype/数值稳定等基础项），再按 workflow 阶段表顺序选 L1 策略（每阶段带判定与跳过条件）；workflow 标注「覆盖缺口」的阶段转 Step 3
+  · **Step 1 — 归族（必做）**: 读 `plugins-community/ops-perf-evolution/skills/evolution-strategies/references/scenario-routing/README.md` 的族判定表，用结构判据（计算主干 / kernel 特征 / shape 特征，**不靠算子名**）把算子归入 Attention 系(FA/GQA/MLA) / SSM-Scan 系(GDN-KDA/GLA) / conv / matmul / quantization / reduction / sort / conversion / 小族 / elementwise 之一；多族特征同时命中时拆「主干族 + trait」
+  · **Step 2 — 按族 workflow 选卡（主路径）**: 打开 README 中该族对应的 workflow 文件（flashattention.md / ssm-scan.md / convolution.md / matmul.md 等）：先过 `_common-prerequisites.md` 通用前置判定链（C1-C5，**命中用卡、未命中跳过**，覆盖双缓冲/对齐/标量向量化/dtype/数值稳定等基础项），再按 workflow 阶段表顺序选 L1 策略（每阶段带判定与跳过条件）；workflow 标注「覆盖缺口」的阶段转 Step 3。**【固化规则】归族命中任一分支时，Init 必须生成 ≥1 个 `workflow_guided` 节点（带 `workflow_ref`）作为该分支的专门变体，SELECT 保底 1 槽——命中分支必须有一个节点严格按 workflow 分支阶段顺序优化，不得仅靠通用前置/随机策略覆盖。**
   · **Step 3 — 瓶颈驱动 (Refine 阶段)**: profiling_evidence 可用时，查 strategy-index.md「按瓶颈类型查表」追加/替换策略，**证据优先于 workflow 顺序**。**原则**: 通用前置保证基本正确性和性能，族内 L1 针对特定场景提供 2-5x 额外提升；Init 阶段优先通用前置 + 少量 L1，Refine 阶段根据 profiling 证据精准追加 L1
-- **知识库查询协议**: `plugins-community/ops-perf-evolution/skills/evolution-knowledge/references/a3/` 渐进式披露，先读 guide.md 按需深入。
+- **知识库查询协议**:
+  **OKF 知识库（首选）**: 用 `evolution-knowledge` skill 查询 `skills/evolution-knowledge/references/okf/`，按 `--op-family` / `--bottleneck` / `--phenomenon` / `--failed-combination` / `--kind` 结构化检索（discovered_strategy X 系列 / proven_solution / failure_pattern）。Init 阶段按 `op_family`（有 baseline 瓶颈信息时叠加 `--bottleneck`）查一次，命中即读对应卡片全文纳入策略选择依据；`status: stub` 的卡不用于支撑结论（须 active）。
+  **经典知识库**: `plugins-community/ops-perf-evolution/skills/evolution-knowledge/references/a3/` 渐进式披露，先读 guide.md 按需深入。
   **Init 必读**: `a3/hardware/guide.md`、`a3/optimization_patterns/guide.md`、按算子族读 `a3/algorithm_insights/{family}.md`（匹配时）
   **子 agent prompt 参考**: `a3/ascendc_api/guide.md`（避坑提醒）；**策略提炼查阅**: `a3/proven_solutions/INDEX.md`（判断新颖性、避免重复）
-  **检索优先级**: 知识库 → 策略库 → proven_solutions → WebSearch
+  **检索优先级**: OKF 知识库 → a3 知识库 → 策略库 → proven_solutions → WebSearch
 - **读取参考实现**: open_exploration 节点被选中时，主动读取同类算子的已知高性能实现作为灵感来源
 
 每次探索必须产出具体的可编译代码，不能只停留在分析阶段。
@@ -97,6 +100,7 @@ LINGXI进化支持基线内核模式（用户提供现有AscendC内核项目目�
 - **算子名称**: 简短标识符 (例如: "FastGELU", "Tril")
 - **[基线模式] 基线内核路径**: 现有AscendC内核项目目录路径 (例如: `output/FastGELU_evo_xxx/round_2/parallel_1` 或手写内核目录)
 - **最大轮数** (默认: 2, 推荐: 2-3)；**并行数量**: 每轮并行候选数 (默认: 3, 推荐: 3-5)；**目标加速比** (默认: 3x)
+- **[重要] 目标加速比语义**: `target_speedup` 是**相对 PyTorch** 的加速比。**节点 `score` / `best_score` = vs PyTorch 统一尺度**（P8 修复：`wm_ops.py refine` 落 score 时用 canonical PyTorch 参考时间归一，`score = baseline_evaluation.base_time_ms_avg / comparison.gen_time_ms`，不直接信任 `comparison.speedup`；若变体 `base_time_ms` 偏离 canonical ±20% 会输出 `score_scale_alerts.json` 告警并重算 score）。达标判定直接 `best_score ≥ target_speedup`。**注意**：evolution-report 的"加速比"列是**相对基线内核**（`baseline_time_us / evolved_time_us`），与 score 是不同口径，禁止混用排序。
 - **停滞窗口** (可选): 连续多少轮无显著提升（< 2%）后提前终止 (默认自动计算 = `max(1, min(ceil(max_rounds / 2), max_rounds - 1))`，该公式确保 window < max_rounds，使停滞检测有机会在上限前触发)
 - **改进轮数** (可选): Local Refinement 内层循环最多执行次数 (默认: 3，设为0可禁用)；**改进停滞窗口** (可选): Local Refinement 连续多少轮无显著提升（< 2%）后退出 (默认: 2)
 
@@ -194,7 +198,7 @@ python3 plugins-community/ops-perf-evolution/skills/evolution-world-model/script
      编译:     [通过]/[失败]（依据 n_cases_valid > 0）
      精度:     [通过]/[失败]（依据 per_case 无 asc_error）
      加速比:   {avg_speedup}x (vs PyTorch, geomean={geomean_speedup}x) | 内核时间: {baseline_time_us}μs
-   进化目标: 超越基线 {avg_speedup}x → 达到 {target_speedup}x
+   进化目标: 相对 PyTorch 达到 {target_speedup}x（当前基线 vs PyTorch {avg_speedup}x → 需相对基线提升 ~{target_speedup / avg_speedup:.1f}x）
    ```
 
 #### 步骤3B.4: 复制基线文件到 shared/
@@ -271,16 +275,27 @@ with open('$EVO_DIR/shared/call_spec.json', 'w') as f:
 **执行过程**:
 
 1. 读取 `output/{op_name}_evo_{timestamp}/shared/model.py` 和 `shared/design/tile_level/`
-2. **必读知识库**: 读取 `plugins-community/ops-perf-evolution/skills/evolution-knowledge/references/a3/hardware/guide.md` 和 `a3/optimization_patterns/guide.md`；算子匹配特定族（attention/reduction/elementwise）时额外读取 `a3/algorithm_insights/{family}.md`；`a3/proven_solutions/INDEX.md` 中有同类算子方案时读取对应条目
+2. **OKF 知识库查询**: 用 `evolution-knowledge --op-family {family}`（有 baseline 瓶颈信息时加 `--bottleneck {bottleneck}`、`--status active`）查询 `okf/` 的 discovered_strategy / proven_solution / failure_pattern，命中即读对应卡片全文，纳入节点设计（尤其 X 系列策略的适用场景核对）。**【固化规则】命中 `kind=discovered_strategy` 的 X 系列时，必须把 `X{n}` 写入至少 1 个 strategy_guided 节点的 `strategy_combination`（作为候选策略，非仅参考文本）**——避免 OKF 命中却未进入任何被执行的变体（MQA 会话实证：X14 对症但只出现在未被 SELECT 选中的 Supervisor 建议里）。然后按 a3 渐进式披露：
+   **必读知识库**: 读取 `plugins-community/ops-perf-evolution/skills/evolution-knowledge/references/a3/hardware/guide.md` 和 `a3/optimization_patterns/guide.md`；算子匹配特定族（attention/reduction/elementwise）时额外读取 `a3/algorithm_insights/{family}.md`；`a3/proven_solutions/INDEX.md` 中有同类算子方案时读取对应条目
 3. 分析算子特性: 内存密集型 vs 计算密集型？尾块对齐问题（形状非32字节整数倍）？数据类型特殊处理（FP16/BF16精度）？并读取 `plugins-community/ops-perf-evolution/skills/evolution-strategies/references/strategy-index.md` 识别最相关策略
 4. **模式B特殊处理**: `baseline_performance` 填入实际测量值（来自步骤3B.3），**必须包含 `time_us` 字段**（evolution-report 读取的关键字段）:
    ```json
    "baseline_performance": { "speedup": {baseline_speedup}, "precision_passed": {baseline_precision_passed}, "compilation_success": {baseline_compilation_success}, "time_us": {baseline_time_us} }
    ```
+4.5 **目标可达性预检（P6，必须执行）**：用 `check_target_feasibility.py` 检查目标是否物理可达（设备 launch 地板来自 OKF proven_solutions 的 `device_floor_us`，如 910B ~4.3-5.6μs）：
+   ```bash
+   python3 plugins-community/ops-perf-evolution/skills/evolution-world-model/scripts/check_target_feasibility.py \
+       --baseline-eval "$EVO_DIR/baseline_evaluation.json" \
+       --target-speedup {target_speedup} \
+       --op-family {family}
+   ```
+   若输出 `feasible: false` 或 `alarm` 非空：把告警写入 `open_questions`（标注"目标可能物理不可达，先确认可行性"），**不硬性阻断进化**。
 5. 设计节点：`parallel_num × 2` 个策略导向节点（`mode="strategy_guided"`）+ `max(1, ⌈parallel_num / 4⌉)` 个开放探索节点（`mode="open_exploration"`），确保:
    - 策略多样性（各 strategy_guided 节点 strategy_combination 不完全相同）、难度梯度（difficulty 2-4 均有覆盖）、类型覆盖（P系列性能、D系列数据类型、A系列精度，按需选择）
    - **X 系列策略必读全文**：strategy_combination 中包含 X 系列（`X{n}`，来自 strategy-index.md"探索发现策略"分类）时，必须先读取对应的 `plugins-community/ops-perf-evolution/skills/evolution-strategies/references/discovered/disc_X{n}.md` 全文，确认其适用场景与当前算子匹配后再纳入组合；X 系列无 Preconditions/Playbook，资源注入由 prepare_strategy_resources.py 自动完成
    - 每个节点必须包含 optimization_type 字段（bandwidth/tiling/algorithm），三类各至少有 1 个节点，确保 Select 保底轮有候选
+   - **【固化规则】workflow 分支保底节点（必做）**：Init 阶段必须先归族（scenario-routing 判定表）。若算子命中某族 workflow 的任一分支（如 conv C-1~C-7 / matmul M1~Mn / FA 分支 standard-gqa-mla / SSM 分支 delta-rule-gla / reduction 分轴模式），必须额外生成**至少 1 个** `mode="workflow_guided"` 节点，并带 `workflow_ref` 字段：`{ family, workflow_file, branch, branch_condition, traits, stage_order }`。`traits` 记录该分支正交 trait（可空数组，如 `["causal","paged/decode"]`，缺省视为 []）；`stage_order` 按族 workflow 顺序列出（先过 `_common-prerequisites.md` C1-C5，再按分支专用路径选 L1 策略，最后按需转 GEMM 收尾 / 瓶颈驱动）；`strategy_combination` 取该分支专用路径策略（如 conv C-2 → P128、C-6 → P102/P129、SSM delta-rule → P132/P135）。此节点由 SELECT 的 `_select_workflow_guaranteed` 保底 1 槽，保证命中分支有专门变体按 workflow 顺序优化。
+   - **【固化规则】OKF proven_solution 首轮落地（必做）**：Init 阶段 `--op-family` 查询若命中 `status: active` 的 `kind=proven_solution` 卡片（如 x24），**必须**生成**至少 1 个**落地该方案方向的 round_1 节点，且满足 `difficulty ≤ 3` **或** `mode="workflow_guided"`（利用 `_select_workflow_guaranteed` 保底槽）。目的：已验证方向不得因 SELECT 效用函数（`utility` 随 difficulty 递减）被延后到后续轮次——知识必须第一轮就执行，避免重新落入该方向对应失败模式（f3 类）的弯路。
    - **若 hw_params 非 null**：利用硬件参数增强节点描述（如"tile_size 建议 {max_tile_fp16_double_buf//2}，最大可达 {max_tile_fp16_double_buf}"），并做 Roofline 定性分析（算术强度 vs 拐点）确认内存/计算密集判断
 
    开放探索节点（ID 依次为 `x0`、`x1`、…，格式相同仅 ID 递增）：完整字段结构见 `evolution-world-model/references/schema.md` 的 node schema，其中 `"mode": "open_exploration"`、`"strategy_combination": []`、`"optimization_type": "algorithm"`、`difficulty: 3`、`description` 固定为 `"开放探索：不使用策略库，读取最优内核代码和流水线数据，从第一原理自主推理并实现新优化方向"`，其余字段按 schema 默认值初始化（`depth: 1, parent_id: "root", status: "open", score: null, retry_count: 0` 等）。
@@ -446,17 +461,18 @@ SELECTIONS=$(python3 plugins-community/ops-perf-evolution/skills/evolution-world
 echo "$SELECTIONS"
 ```
 
-脚本内部自动完成：效用分计算、类型多样性保证、分支多样性约束（每个 parent_id 最多贡献 `ceil(n / active_branches)` 个槽位）、open_exploration 保留位分配。输出为 JSON 数组，元素含 `parallel_index`、`node_id`、`utility`、`mode`、`description`、`strategy_combination`、`parent_id`、`parent_score`、`parent_solution_ref`、`parent_profiling_one_liner`、`difficulty`、`depth`。
+脚本内部自动完成：效用分计算、**workflow 分支保底（`_select_workflow_guaranteed`：带 `workflow_ref` 的节点至少 1 槽，优先于类型保底）**、类型多样性保证、分支多样性约束（每个 parent_id 最多贡献 `ceil(n / active_branches)` 个槽位）、open_exploration 保留位分配。输出为 JSON 数组，元素含 `parallel_index`、`node_id`、`utility`、`mode`、`description`、`strategy_combination`、`parent_id`、`parent_score`、`parent_solution_ref`、`parent_profiling_one_liner`、`difficulty`、`depth`。
 
 2. 将选中节点的 `status` 更新为 `"in_progress"`，写回 `world_model.json`；记录本轮分配结果 `{parallel_index → node_id}` 映射（供4.4 Refine使用）
 3. 确定 `best_solution_ref`：从所有节点中找 `score = best_score` 且 `solution_ref` 非 null 的节点，取其 `solution_ref`；若无则置空字符串
 
-**兜底**：若 `wm_ops.py select` 执行失败，按以下公式手工计算效用分并分配（槽位分配：保底轮类型覆盖 + 剩余槽位效用分降序 + open_exploration 保留位）：
+**兜底**：若 `wm_ops.py select` 执行失败，按以下公式手工计算效用分并分配（槽位分配：**workflow 分支保底 1 槽** + 保底轮类型覆盖 + 剩余槽位效用分降序 + open_exploration 保留位）：
    ```
    parent_score = 父节点的 score（为 null 用 1.0）
    w_root_explore = 2.0（parent_id == "root"）或 0.0；w_evidence = 1.5（父节点有 profiling_evidence）或 0.0
    utility = 3.0 × parent_score + 2.5 × (5 - node.difficulty) + 0.75 × node.depth + w_root_explore + w_evidence
    ```
+   手工分配时**必须**：若存在带 `workflow_ref` 的 open 节点，先为其保留 1 个槽位（取效用分最高者），再执行类型保底与效用分排序。
 
 **若 `world_model_active = false`**: 跳过此步，所有变体使用空策略组合（子agent自由选择）。
 
@@ -482,6 +498,8 @@ cp -r output/{op_name}_evo_{timestamp}/shared/* \
 
 **[注意] 关键: 必须在同一条消息中发送所有Agent调用以实现真正的并行。**
 **[注意] 禁止: 不要通过 Bash 运行任何 Python 脚本来启动子agent。lingxi-partial 是 Claude Code 内置的 agent 类型，只能通过 Agent 工具启动。**
+**[注意] 调用形态（强制）: 所有 lingxi-partial 调用一律【无 name + 后台】——不得传 `name` 参数、`run_in_background: true`。传 name 会被 harness 注册为 mailbox teammate（idle_notification 干扰、易被中断）；匿名后台是独立 task（task-notification 回报，非 teammate），且多 partial 并行必需。注意与主 agent→lingxi-evo 的「无 name + 前台阻塞」不同：顶层进化 agent 用前台阻塞，其内部的 lingxi-partial 用匿名后台并行。**
+**[注意] `subagent_type` 必须显式传（强制）: 每次 Agent 调用必须显式携带 `subagent_type="lingxi-partial"`，禁止省略。漏传时 harness 会把该 Agent 调用解析为兜底的 `general-purpose`——即使 prompt 首行写了 "You are a lingxi-partial subagent"，实际注册类型仍是 general-purpose（拿不到 lingxi-partial 的系统提示与专属行为；且 `loop-subagent-stop.sh` 的 SubagentStop 审计只对 lingxi-partial/ops-partial 生效，general-purpose 会被放行绕过审计）。调用参数 {subagent_type, description, run_in_background, prompt} 四项缺一不可。**
 
 示例（parallel_num=2 时，在一条消息中同时发送 2 个 Agent 工具调用）:
 - Agent(subagent_type="lingxi-partial", description="Generate kernel variant 0 (node: n1)", run_in_background=true, prompt="<填充提示词模板>")
@@ -665,7 +683,10 @@ print(f'[OK] Refine 验证通过，round_{r} 所有节点已写入世界模型')
 
 **4.4.2 失败诊断（LLM 补充，仅当有失败节点时）**
 
-若 `pending_diagnosis.json` 存在且非空，对每个失败节点读取其 `implementation_note.txt`（最后 30 行），推理 `failure_type`：`"impl_error"`（策略方向正确但实现有误，如语法错误、API 误用）→ 生成修复子节点；`"strategy_infeasible"`（策略本身不可行）→ 封锁该方向（difficulty=5）。
+若 `pending_diagnosis.json` 存在且非空，对每个失败节点读取其 `implementation_note.txt`（最后 30 行）：
+
+1. **先查 OKF 失败模式库**：用 `evolution-knowledge --kind failure_pattern --failed-combination {strategy_combination} --status all` 查询 `okf/runbooks/failure-patterns/`。命中（failed_combination 完全匹配）→ 直接复用其 Resolution 判定根因，`failure_type` 按其根因给出；未命中 → 进入常规诊断，并将本次失败按 `evolution-knowledge` skill 的写入协议沉淀为新 failure_pattern（`status: stub`、`occurrences: 1`，记录 phenomenon / failed_combination / implementation_note 证据）。
+2. **推理 `failure_type`**：`"impl_error"`（策略方向正确但实现有误，如语法错误、API 误用）→ 生成修复子节点；`"strategy_infeasible"`（策略本身不可行）→ 封锁该方向（difficulty=5）。
 
 ```bash
 python3 plugins-community/ops-perf-evolution/skills/evolution-world-model/scripts/wm_ops.py diagnose \
@@ -690,13 +711,12 @@ python3 plugins-community/ops-perf-evolution/skills/evolution-world-model/script
 **执行流程**（使用 ops-profiling 的 msprof_perf_summary.py）：
 
 1. **运行深度 profiling 分析（诊断模式）**：
+   当前 `msprof_perf_summary.py` 无 `--diagnose / --profiling-dir / --task-type` 参数。深度分析基于该节点已有的 Phase 1.5 `--compare` 产物（`{node.solution_ref}/profiling/PROF_GROUP_*/PROF_*/op_summary_*.csv` 与 `perf_report.md`），由 `wm_ops.py deep-profiling` 内部调用 `run_deep_profiling.py` 提炼；仅当节点尚未采集 `--compare` 数据时，先补采：
    ```bash
-   python3 ops/ops-profiling/scripts/msprof_perf_summary.py --diagnose \
-       --profiling-dir "output/{op_name}_evo_{timestamp}/{node.solution_ref}/profiling" \
-       --task-type {task_type} \
-       --output "output/{op_name}_evo_{timestamp}/{node.solution_ref}/deep_profiling_result.json"
+   python3 ops/ops-profiling/scripts/msprof_perf_summary.py --compare \
+       --output-dir "output/{op_name}_evo_{timestamp}/{node.solution_ref}"
    ```
-   若诊断运行失败（msprof 不可用、超时、脚本报错等）：输出警告 `"[注意] 深度分析失败，跳过该节点"`，跳过该节点。
+   若补采/分析失败（msprof 不可用、超时、脚本报错等）：输出警告 `"[注意] 深度分析失败，跳过该节点"`，跳过该节点。
 
 2. **写入 world_model.json（wm_ops.py 一步完成）**：
    ```bash
@@ -708,7 +728,7 @@ python3 plugins-community/ops-perf-evolution/skills/evolution-world-model/script
        --merge-children
    ```
 
-3. **对比上次深度分析（差异检测）**: 若 `last_deep_profiling_round >= 1`（非首次），对上次与本次的 simulator_dir 各跑一次 `msprof_perf_summary.py --diagnose`（输出到 `{node.solution_ref}/diff_before.json` / `diff_after.json`），将对比结果摘要写入 `open_questions`。
+3. **对比上次深度分析（差异检测）**: 若 `last_deep_profiling_round >= 1`（非首次），对上次与本次的 profiling 数据（`PROF_GROUP_*/PROF_*/op_summary_*.csv` / `perf_report.md`）各做一次解析对比（无 `--diagnose`，直接对比两次的 pipe 比值与 op_summary 指标），结果写入 `{node.solution_ref}/diff_before.json` / `diff_after.json`，将对比摘要写入 `open_questions`。
 
 4. **更新冷却标记** `last_deep_profiling_round = r`，并**输出诊断摘要**（读取 `deep_profiling_result.json`）：
    ```
@@ -723,7 +743,7 @@ python3 plugins-community/ops-perf-evolution/skills/evolution-world-model/script
 
 **4.4.4 Profiling 完整性检查（不可跳过）**
 
-进入 4.5 REACT 前执行：对本轮 `profiling_insight is null` 的 passed 节点，输出「[注意] 以下节点缺少 profiling_insight，补执行 CSV Profiling」并逐个补跑 `msprof_perf_summary.py --diagnose`（同 4.4.1 流程）写入 `node.profiling_insight`。补跑后仍缺失的，输出「[注意] {n} 个节点 CSV Profiling 失败，profiling_insight 保持 null。后续 SELECT 中这些节点的子节点将不获得 w_evidence 加分」——不填充默认值，保持 null。
+进入 4.5 REACT 前执行：对本轮 `profiling_insight is null` 的 passed 节点，输出「[注意] 以下节点缺少 profiling_insight，补执行 CSV Profiling」并逐个补跑 `msprof_perf_summary.py --compare --output-dir {node.solution_ref}`（无 `--diagnose`；同 Phase 1.5 完整采集，并归置 op_summary 到 `profiling/`），从 perf_report.md / op_summary 提炼写入 `node.profiling_insight`。补跑后仍缺失的，输出「[注意] {n} 个节点 CSV Profiling 失败，profiling_insight 保持 null。后续 SELECT 中这些节点的子节点将不获得 w_evidence 加分」——不填充默认值，保持 null。
 
 **4.4.5 世界模型分析（Analyze）**
 
@@ -804,8 +824,8 @@ python3 plugins-community/ops-perf-evolution/skills/evolution-world-model/script
 对每个满足条件的 open_exploration 节点：
 
 1. 读取该内核代码 `output/{op_name}_evo_{timestamp}/{node.solution_ref}/kernel/` 和 `evaluation_results.json` 中的 `implementation_note`
-2. 读取 `plugins-community/ops-perf-evolution/skills/evolution-strategies/references/strategy-index.md` 判断新颖性：该优化手段是否超出现有所有策略的范畴？（不是组合，而是一种新方法论）
-3. **若确认新颖**：列出 `.../references/discovered/disc_X*.md` 确定下一个 X 编号 → 写入新策略文件 `.../discovered/disc_X{n}.md`（格式见下方）→ 在 `strategy-index.md` 末尾追加"探索发现策略"分类条目（已存在则追加到其中）：`| X{n} | {简洁名称} | {一句话描述} |` → 将 `"X{n}"` 追加到 `world_model.json` 的 `discovered_strategies` 列表写回 → 若该手法具有跨算子通用性（非 {op_name} 特有场景），追加沉淀到 `plugins-community/ops-perf-evolution/skills/evolution-knowledge/references/a3/proven_solutions/INDEX.md`（格式见下方"通用方案沉淀"）→ 输出 `"[提示] 策略提炼: 发现新策略 X{n} [{名称}]，已写入策略库，后续 strategy_guided 节点可引用"`
+2. 读取 `plugins-community/ops-perf-evolution/skills/evolution-strategies/references/strategy-index.md` 判断新颖性：该优化手段是否超出现有所有策略的范畴？（不是组合，而是一种新方法论）；同时用 `evolution-knowledge --kind discovered_strategy --keyword {手法关键词}` 查 OKF 库，避免与已有 OKF 卡重复
+3. **若确认新颖**：列出 `.../references/discovered/disc_X*.md` 确定下一个 X 编号 → 写入新策略文件 `.../discovered/disc_X{n}.md`（格式见下方）→ **同步写入 OKF 增强版** `plugins-community/ops-perf-evolution/skills/evolution-knowledge/references/okf/strategies/discovered/disc_X{n}.md`（按 `evolution-knowledge` skill 写入协议：先按 kind+id 查重，带 `kind: discovered_strategy` / `confidence: single_op` / `status: active` / `op_families` / `bottlenecks` / `tags` frontmatter，op_families 与 bottlenecks 从本次算子的 op_family 与 profiling bottleneck 提炼）→ 在 `strategy-index.md` 末尾追加"探索发现策略"分类条目（已存在则追加到其中）：`| X{n} | {简洁名称} | {一句话描述} |` → 将 `"X{n}"` 追加到 `world_model.json` 的 `discovered_strategies` 列表写回 → 若该手法具有跨算子通用性（非 {op_name} 特有场景），追加沉淀到 `plugins-community/ops-perf-evolution/skills/evolution-knowledge/references/a3/proven_solutions/INDEX.md`（格式见下方"通用方案沉淀"）**并同步追加 OKF proven-solution** `okf/runbooks/proven-solutions/x{n}-{slug}.md` → 运行 `python3 plugins-community/ops-perf-evolution/skills/evolution-strategies/scripts/generate_index_json.py` 重建 INDEX.json → 输出 `"[提示] 策略提炼: 发现新策略 X{n} [{名称}]，已写入策略库与 OKF 知识库，后续 strategy_guided 节点可引用"`
 4. **若非新颖**：输出：`"[INFO] open_exploration 手法与策略 {匹配ID} 相似，跳过提炼"`
 
 **新策略文件格式** (`.../discovered/disc_X{n}.md`)：
@@ -845,7 +865,8 @@ base_speedup: {score}x
    - **Key code change**: 从该节点 kernel 代码提取前后关键片段（Before/After）
    - **Applicability conditions**: 适用算子族、shape/平台约束
    - **Strategy IDs**: X{n}（及关联的 P/D/A/R 系列策略）
-3. 输出：`"[提示] 通用方案沉淀: X{n} [{名称}] 已追加到 proven_solutions/INDEX.md"`
+3. **同步追加 OKF proven-solution**：按 `evolution-knowledge` 协议在 `okf/runbooks/proven-solutions/x{n}-{slug}.md` 建立同内容卡片（带 `kind: proven_solution` / `op_families` / `strategy_ids` frontmatter；已在 OKF 有同类条目时仅补 **Source** 新算子，不重复新增）
+4. 输出：`"[提示] 通用方案沉淀: X{n} [{名称}] 已追加到 proven_solutions/INDEX.md 与 OKF proven-solutions"`
 
 **无分支命中**：跳过，直接进入 4.6 CHECKPOINT。
 
@@ -868,7 +889,7 @@ base_speedup: {score}x
 
 **4.6.2 终止判定**
 
-- [通过] **目标达成**: 任意实现的加速比 ≥ `target_speedup` → `should_continue = false`，输出「 目标达成！最佳加速比 {best_speedup}x ≥ 目标 {target_speedup}x」，进入步骤5
+- [通过] **目标达成**: 任意实现的 **vs PyTorch 加速比（`evaluation_results.json` 的 `speedup` 字段）≥ `target_speedup`** → `should_continue = false`，输出「 目标达成！最佳加速比 {best_vs_pytorch}x ≥ 目标 {target_speedup}x（vs PyTorch）」，进入步骤5。**注意**：节点 `score` / `best_score` 是 vs 基线的 `comparison.speedup`，**不得**直接与 `target_speedup` 比较来判定达标
 - [通过] **全部失败**: 本轮所有实现均失败（编译失败且精度不通过）→ `should_continue = false`，输出「[失败] 本轮全部失败，终止进化」，进入步骤5
 - => **否则**: `r += 1`，返回步骤4.1 GATE，继续下一轮
 
@@ -882,18 +903,16 @@ base_speedup: {score}x
 
 检查当前全局最优节点（`best_score` 对应的节点）是否已有 `profiling_insight`：若已有 → 跳过进入 4.6.3.2；若为 null → 强制执行 CSV 级 Profiling，结果写入 `best_node.profiling_insight` 并写回 `world_model.json`：
   ```bash
-  python3 ops/ops-profiling/scripts/msprof_perf_summary.py --diagnose \
-      --profiling-dir "output/{op_name}_evo_{timestamp}/{best_node.solution_ref}/profiling" \
-      --task-type {task_type} \
-      --output "output/{op_name}_evo_{timestamp}/{best_node.solution_ref}/csv_profiling.json"
+  python3 ops/ops-profiling/scripts/msprof_perf_summary.py --compare \
+      --output-dir "output/{op_name}_evo_{timestamp}/{best_node.solution_ref}"
   ```
-  输出：「补全 CSV Profiling：{profiling_one_liner}」
+  从新产出的 `perf_report.md` / `op_summary_*.csv` 提炼 `best_node.profiling_insight`（当前脚本无 `--diagnose` 命令）。输出：「补全 CSV Profiling：{profiling_one_liner}」
 
 **4.6.3.2 深度 Profiling 决策（Agent 自主判断）**
 
 若 `last_deep_profiling_round >= 1`（已执行过）→ 跳过，进入 4.6.3.3。若从未执行过，Agent 自主判断：`best_score < target_speedup × 0.8`（距目标仍有较大差距）→ 倾向执行；最优节点 `profiling_insight.bottleneck = "balanced"`（CSV级无法定位瓶颈）→ 倾向执行；`best_score >= target_speedup × 0.95`（已非常接近目标）→ 倾向跳过。
 
-若决定执行：对 `best_node` 执行 4.4.3 的两条命令（`msprof_perf_summary.py --diagnose` + `wm_ops.py deep-profiling --merge-children`，路径中的 `{node.solution_ref}`/`{node_id}` 替换为 best 节点对应值），输出：「[分析] 补全深度 Profiling：{profiling_evidence 摘要}」。若决定跳过，输出：「[INFO] 跳过深度 Profiling（{跳过理由}）」
+若决定执行：对 `best_node` 执行 4.4.3 的流程（先按需补跑 `msprof_perf_summary.py --compare --output-dir {best_node.solution_ref}`，再 `wm_ops.py deep-profiling --merge-children`，路径中的 `{node.solution_ref}`/`{node_id}` 替换为 best 节点对应值），输出：「[分析] 补全深度 Profiling：{profiling_evidence 摘要}」。若决定跳过，输出：「[INFO] 跳过深度 Profiling（{跳过理由}）」
 
 **4.6.3.3 延长判定**
 

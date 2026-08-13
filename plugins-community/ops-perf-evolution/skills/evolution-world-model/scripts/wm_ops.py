@@ -874,6 +874,29 @@ class _BranchQuota:
         self.branch_count[pid] = self.branch_count.get(pid, 0) + 1
 
 
+def _select_workflow_guaranteed(strategy_guided: list, sg_slots: int,
+                                quota: _BranchQuota, selected_sg: list, used_ids: set):
+    """workflow 分支保底：归族命中后，workflow_guided 节点至少占 1 槽。
+
+    规则（lingxi-evo Init/Select 固化）：Init 阶段归族命中某 workflow 分支后，
+    必须生成至少 1 个 workflow_guided 节点（node.workflow_ref 指向族 workflow
+    文件 + 分支 ID + 阶段顺序）。SELECT 必须为此类节点保留至少 1 个槽位，
+    防止被低难度 / 高 parent_score 的通用节点挤掉（utility 公式对新节点
+    score=null + difficulty=4 系统性低估：约 6.9 vs 低难度 11.9 vs 派生子节点 13.5）。
+
+    匹配判定：`mode == "workflow_guided"` **或** `workflow_ref` 非空均可——
+    workflow_ref 是规范字段，但为避免 Init 漏填 workflow_ref 导致失去保护，
+    mode 本身也作为保护判据（双保险）。
+    """
+    for nid, nd in strategy_guided:
+        is_workflow = (nd.get("mode") == "workflow_guided") or bool(nd.get("workflow_ref"))
+        if is_workflow and quota.ok(nd) and not _collides_with_selected(nd, selected_sg):
+            selected_sg.append((nid, nd))
+            used_ids.add(nid)
+            quota.add(nd)
+            return
+
+
 def _select_sg_guaranteed(strategy_guided: list, sg_slots: int, quota: _BranchQuota,
                           selected_sg: list, used_ids: set):
     """保底轮：每种 optimization_type 的开放节点先各占 1 槽。
@@ -901,9 +924,12 @@ def _select_sg_guaranteed(strategy_guided: list, sg_slots: int, quota: _BranchQu
 
 
 def _select_sg_slots(strategy_guided: list, sg_slots: int, quota: _BranchQuota) -> list:
-    """strategy_guided 槽位选择：保底轮 + utility 排序 + 两级放宽兜底。"""
+    """strategy_guided 槽位选择：workflow 保底 + 类型保底 + utility 排序 + 两级放宽兜底。"""
     selected_sg: list[tuple[str, dict]] = []
     used_ids: set[str] = set()
+
+    # workflow 分支保底优先于类型保底：归族命中的 workflow 节点必得 1 槽
+    _select_workflow_guaranteed(strategy_guided, sg_slots, quota, selected_sg, used_ids)
 
     _select_sg_guaranteed(strategy_guided, sg_slots, quota, selected_sg, used_ids)
 
@@ -1478,6 +1504,10 @@ class _RefineContext:
     round_best_speedup: float = 0.0
     worst_quality: str = "good"
     expected_cases: int | None = None
+    # P8: canonical PyTorch 参考时间（baseline_evaluation.base_time_ms_avg），
+    # 用于统一 score 基准；score_scale_alerts 记录 base 异常需归一的变体。
+    pytorch_time_ms: float = 0.0
+    score_scale_alerts: list = None
 
 
 def _expected_case_count(results_dir: str) -> int | None:
@@ -1751,6 +1781,17 @@ def _gen_children_for_passed(node: dict, node_id: str, nodes: dict,
         _gen_oe_child(node, node_id, nodes, speedup, substantial)
     elif mode == "profiling_driven":
         _gen_pd_continue_child(node, node_id, nodes, speedup, substantial)
+    elif mode == "workflow_guided":
+        # P1: workflow_guided 分支延续——passed 后复用 strategy_guided 派生逻辑生成
+        # 子节点，并让子节点继承 workflow_ref，使 FA workflow 分支可持续推进
+        # （此前无此分支，workflow_guided 通过后无子节点、workflow 链一轮即断）。
+        _gen_sg_children(node, node_id, nodes, speedup, substantial)
+        wf_ref = node.get("workflow_ref")
+        if wf_ref:
+            for cid in node.get("children", []):
+                child = nodes.get(cid)
+                if child and child.get("parent_id") == node_id:
+                    child["workflow_ref"] = wf_ref
 
     _gen_profiling_driven_child(node, node_id, nodes, bottleneck, one_liner)
 
@@ -1840,6 +1881,25 @@ class _VariantEvalInput:
     speedup: float
 
 
+def _note_infeasible_hits(note_text: str) -> list:
+    """P5: 从 implementation_note 提取"验证不可行"判断的标记。
+
+    强标记直接命中；"不可行"需排除否定语境（如"无不可行判断"、"未发现不可行"），
+    避免 passed 节点的普通叙述被误判为不可行结论。
+    """
+    strong_marks = ("必然失精度", "平台约束", "无法实现", "崩溃回退", "不兼容")
+    hits = [m for m in strong_marks if m in note_text]
+    neg_prefixes = ("无", "没有", "未", "不是")
+    idx = note_text.find("不可行")
+    while idx != -1:
+        prefix = note_text[max(0, idx - 2):idx]
+        if not any(neg in prefix for neg in neg_prefixes):
+            hits.append("不可行")
+            break
+        idx = note_text.find("不可行", idx + 1)
+    return hits
+
+
 def _process_passed_variant(vei: _VariantEvalInput, ctx: _RefineContext):
     """处理 PASSED 变体：填字段、profiling_insight、evidence、子节点。"""
     node, node_id, p_idx, eval_result, speedup = (
@@ -1879,6 +1939,28 @@ def _process_passed_variant(vei: _VariantEvalInput, ctx: _RefineContext):
                              _PassedEvalInfo(speedup, mq, one_liner, bottleneck))
     _merge_evidence_into_children(node, node_id, ctx.nodes)
     _inject_shape_spec_into_children(node, ctx.nodes)
+
+    # P5: passed 节点若 implementation_note 记录"验证不可行"判断，也进 pending_diagnosis
+    # （供 4.4.2 按 failure_pattern 沉淀，避免可复用失败教训因节点 passed 而丢失）。
+    note_path = os.path.join(ctx.results_dir, f"parallel_{p_idx}", "implementation_note.txt")
+    note_hits = []
+    if os.path.isfile(note_path):
+        try:
+            with open(note_path, "r", encoding="utf-8", errors="ignore") as _f:
+                note_text = _f.read()
+            note_hits = _note_infeasible_hits(note_text)
+        except OSError:
+            note_hits = []
+    if note_hits:
+        ctx.pending_diagnosis.append({
+            "node_id": node_id,
+            "parallel_index": p_idx,
+            "compilation_success": True,
+            "precision_passed": True,
+            "phenomenon": "impl_verdict_infeasible",
+            "error": f"implementation_note 记录不可行判断: {'/'.join(note_hits)}",
+            "implementation_note_path": note_path,
+        })
 
     ctx.summary_lines.append(
         f"  p{p_idx} [{node_id}]: PASS {speedup:.2f}x "
@@ -1993,6 +2075,64 @@ def _process_one_variant(node_id: str, p_idx_str: str, ctx: _RefineContext):
         if isinstance(ms_min, (int, float)) and ms_min > 0:
             speedup = ms_min
 
+    # ── P8 (修正): score = 同 run canonical（同一次 msprof 测量的 ref geomean ÷ asc geomean）──
+    # 历史缺陷: 旧 P8 用 baseline_evaluation.base_time_ms_avg（基线 run 的 mean_ref，
+    # 属跨 run 值）作为 "canonical PyTorch 参考"；当变体 base_time_ms 与之偏差 >±20% 时
+    # 用 baseline_mean_ref / gen_time_ms 重算 score —— 这是跨 run 混算（基线 run 的 ref
+    # 与变体 run 的 asc 混合）。QuantMatmul 会话实证: 0.68x 同 run canonical 被误记为 1.49x。
+    # 用户指令: 权威指标 = 同一次 msprof 测量中的 ref geomean ÷ asc geomean，
+    # 禁止任何跨 run 归一、禁止用不同 run 的 ref 和 asc 混合计算。
+    # 修正 (P8-20260813): 优先取变体自身 performance.json 的 geomean_ref_us /
+    # geomean_asc_us（同一 run 内 ref 与 asc 的 geomean，权威同 run canonical），
+    # 退化为 comparison.base_time_ms / gen_time_ms（ref_base == "pytorch" 时）。
+    # 绝不用 baseline run 的参考时间重算变体 score。base 疑似污染时记录 alert 供审计。
+    if not ms_active:
+        gen_ms = comp.get("gen_time_ms")
+        base_ms = comp.get("base_time_ms")
+        ref_base = comp.get("ref_base", "missing")
+        canonical = 0.0
+        canonical_src = None
+        # 1) 变体自身 performance.json 的同 run geomean（最权威）
+        perf_json = os.path.join(ctx.results_dir, f"parallel_{p_idx}", "performance.json")
+        if os.path.isfile(perf_json):
+            try:
+                with open(perf_json, "r", encoding="utf-8") as _pf:
+                    pd = json.load(_pf)
+                _gr = pd.get("geomean_ref_us")
+                _ga = pd.get("geomean_asc_us")
+                if (isinstance(_gr, (int, float)) and _gr > 0
+                        and isinstance(_ga, (int, float)) and _ga > 0):
+                    canonical = float(_gr) / float(_ga)
+                    canonical_src = "performance.json"
+            except (OSError, json.JSONDecodeError, ValueError):
+                canonical_src = None
+        # 2) 退化为 comparison base/gen（ref_base == "pytorch" 时）
+        if not canonical and (ref_base == "pytorch"
+                              and isinstance(base_ms, (int, float)) and base_ms > 0
+                              and isinstance(gen_ms, (int, float)) and gen_ms > 0):
+            canonical = float(base_ms) / float(gen_ms)
+            canonical_src = "comparison"
+        if canonical > 0:
+            if abs(canonical - speedup) > 0.05 * max(speedup, 1e-9):
+                ctx.score_scale_alerts.append({
+                    "node_id": node_id, "parallel_index": p_idx,
+                    "base_time_ms": base_ms, "gen_time_ms": gen_ms,
+                    "ref_base": ref_base,
+                    "raw_speedup": round(speedup, 4),
+                    "normalized_speedup": round(canonical, 4),
+                    "note": f"comparison.speedup 与同 run canonical 不一致，score 按 {canonical_src} 同 run canonical 重算",
+                })
+            speedup = canonical
+        elif ref_base != "pytorch" and isinstance(gen_ms, (int, float)) and gen_ms > 0:
+            ctx.score_scale_alerts.append({
+                "node_id": node_id, "parallel_index": p_idx,
+                "base_time_ms": base_ms, "gen_time_ms": gen_ms,
+                "ref_base": ref_base,
+                "raw_speedup": round(speedup, 4),
+                "normalized_speedup": None,
+                "note": "ref_base 非 pytorch，base 可能被污染为父/基线内核时间；score 保持原值，不做跨 run 重算",
+            })
+
     if compilation_ok and precision_ok and speedup > 0:
         _process_passed_variant(
             _VariantEvalInput(node, node_id, p_idx, eval_result, speedup), ctx)
@@ -2077,6 +2217,18 @@ def refine(
         pending_diagnosis=[],
         expected_cases=_expected_case_count(results_dir),
     )
+    # P8: 读取 baseline_evaluation.json 的 canonical PyTorch 参考时间
+    # (base_time_ms_avg = ref 平均耗时, 单位 ms)，用于统一 score 基准。
+    baseline_eval_path = os.path.join(
+        os.path.dirname(results_dir.rstrip(os.sep)), "baseline_evaluation.json")
+    if os.path.isfile(baseline_eval_path):
+        try:
+            with open(baseline_eval_path, "r", encoding="utf-8") as _f:
+                _be = json.load(_f)
+            ctx.pytorch_time_ms = float(_be.get("base_time_ms_avg", 0) or 0)
+        except (OSError, json.JSONDecodeError, ValueError):
+            ctx.pytorch_time_ms = 0.0
+    ctx.score_scale_alerts = []
     round_total = len(parallel_map)
 
     for p_idx_str, node_id in parallel_map.items():
@@ -2113,6 +2265,7 @@ def refine(
         "best_score_before": best_score_before,
         "best_score_after": best_score_after,
         "worst_quality": ctx.worst_quality,
+        "score_scale_alerts": ctx.score_scale_alerts,
     }
 
 
@@ -2416,6 +2569,18 @@ def cmd_refine(args: argparse.Namespace) -> None:
             json.dump(result["pending_diagnosis"], f, ensure_ascii=False, indent=2)
         LOGGER.info("Pending diagnosis written to: %s", diag_path)
 
+    # P8: 写 score_scale_alerts.json + 告警（base_time_ms 偏离 canonical PyTorch 的变体）
+    if result.get("score_scale_alerts"):
+        alert_path = os.path.join(args.results_dir, "score_scale_alerts.json")
+        with open(alert_path, "w", encoding="utf-8") as f:
+            json.dump(result["score_scale_alerts"], f, ensure_ascii=False, indent=2)
+        for a in result["score_scale_alerts"]:
+            LOGGER.warning(
+                "[P8] score scale alert: node %s (p%s) base_time_ms=%s 偏离 canonical PyTorch %s → score 重算 %s (ref_base=%s)",
+                a.get("node_id"), a.get("parallel_index"), a.get("base_time_ms"),
+                a.get("canonical_pytorch_ms"), a.get("normalized_speedup"),
+                a.get("ref_base"))
+
     # Print round summary
     DATA_LOGGER.info("%s", result["round_summary"])
     # Re-infer state from filesystem after refine writes wm.session.actual_rounds_completed
@@ -2448,6 +2613,7 @@ def cmd_session(args: argparse.Namespace) -> None:
 
     now = dt.datetime.now(dt.timezone(dt.timedelta(hours=8)))
     evo_dir = os.path.abspath(args.evo_dir)
+    op_name = args.op_name if getattr(args, "op_name", None) else args.session_id
 
     wm["session"] = {
         "session_id": args.session_id,
@@ -2455,7 +2621,7 @@ def cmd_session(args: argparse.Namespace) -> None:
         "requested_rounds": args.requested_rounds,
         "actual_rounds_completed": 0,
         "evo_dir": evo_dir,
-        "op_name": args.op_name,
+        "op_name": op_name,
     }
 
     os.makedirs(os.path.dirname(args.wm_path), exist_ok=True)
@@ -2726,6 +2892,7 @@ def _register_filter_session_commands(subparsers):
     p_sess.add_argument("--session-id", required=True)
     p_sess.add_argument("--evo-dir", required=True)
     p_sess.add_argument("--requested-rounds", type=int, default=5)
+    p_sess.add_argument("--op-name", default=None, help="Operator name (optional, defaults to session_id prefix)")
     p_sess.set_defaults(func=cmd_session)
 
     p_sv = subparsers.add_parser(

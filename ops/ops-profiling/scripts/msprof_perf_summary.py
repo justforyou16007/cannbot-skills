@@ -1471,6 +1471,7 @@ def _report_compare_to_markdown(report: Dict[str, Any]) -> str:
     lines = []
     _add_compare_header(lines, report)
     _add_per_case_table(lines, report)
+    _add_mfu_section(lines, report)
     _add_summary_section(lines, report)
     _add_analysis_sections(lines, report)
     return "\n".join(lines)
@@ -1523,6 +1524,12 @@ def _report_compare_to_text(report: Dict[str, Any]) -> str:
             f"{report['total_asc_us']:.2f}"
         )
         lines.append(f"  Total speedup (Σref/Σasc) : {report['total_speedup']:.2f}x")
+    mfu = report.get("mfu")
+    if mfu:
+        lines.append("--- MFU（官方 operator_mfu 等价口径，AscendC 实现）---")
+        lines.append(f"  峰值: {mfu['peak_tflops']:.2f} TFLOPS（{mfu['peak_source']}）")
+        lines.append(f"  平均 MFU: {mfu['mean_mfu_pct']:.2f}%  最大 MFU: {mfu['max_mfu_pct']:.2f}%  "
+                     f"({mfu['n_cases']} cases)")
     lines.append("=" * 100)
 
     return "\n".join(lines)
@@ -1921,6 +1928,223 @@ def _run_quick_loop(out_dir, cases, n_cases, args, device_id):
     return rows, speedups, ref_times, asc_times
 
 
+# ============================================================================
+# MFU（官方 operator_mfu 口径）: 理论 FLOPs / kernel 时长 / 芯片峰值
+#
+# 口径来源: msprof-analyze operator_mfu
+#   actual_tflops = FLOPs / (kernelDuration(ns) * 1e-9) / 1e12
+#   mfu           = FLOPs / (kernelDuration(ns) * 1e-9) / chipPeakFLOPS
+# 其中 FLOPs 为模型理论计算量（与官方"注册公式"等价，本地由可选的
+# {out_dir}/flops.py 提供: `def flops(case: dict) -> float`，case 为
+# jsonl 中的一行）。与 PMU 口径(aic_mac_fp16_ratio)相比，官方口径不受
+# 活跃核归一与运行时频率影响，是跨算子可对比的有效算力指标。
+# ============================================================================
+
+def _load_flops_hook(out_dir: Path):
+    """加载可选的 {out_dir}/flops.py，约定暴露 flops(case: dict) -> float。
+
+    case 即 jsonl 中的一行（含 inputs 列表，tensor 项有 shape/dtype，
+    标量项有 value/range_values）。返回 None 表示无 hook 或接口不符。
+    """
+    path = out_dir / "flops.py"
+    if not path.is_file():
+        return None
+    try:
+        spec = importlib.util.spec_from_file_location("op_flops_hook", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+    except Exception as e:  # noqa: BLE001
+        LOGGER.warning("[MFU] 加载 %s 失败: %s", path, e)
+        return None
+    fn = getattr(mod, "flops", None)
+    if not callable(fn):
+        LOGGER.warning("[MFU] %s 未暴露可调用的 flops(case) 函数，跳过 MFU", path)
+        return None
+    return fn
+
+
+def _parse_platform_config_peak(ini_path: Path):
+    """从 platform_config ini 解析 cube 峰值 TFLOPS。
+
+    peak = 2 * m*k*n (MAC/cycle) * ai_core_cnt * cube_freq(MHz) / 1e6
+    例如 910B2C: 2*16^3*24*1800/1e6 = 353.89 TFLOPS
+    """
+    vals = {}
+    for line in ini_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        m = re.match(r"\s*([A-Za-z_]+)\s*=\s*([0-9.]+)", line)
+        if m:
+            vals[m.group(1)] = m.group(2)
+    try:
+        cnt = int(float(vals["ai_core_cnt"]))
+        freq = float(vals["cube_freq"])  # MHz
+        mm = int(float(vals.get("cube_m_size", 16)))
+        kk = int(float(vals.get("cube_k_size", 16)))
+        nn = int(float(vals.get("cube_n_size", 16)))
+    except (KeyError, ValueError):
+        return None
+    if cnt <= 0 or freq <= 0:
+        return None
+    return 2.0 * mm * kk * nn * cnt * freq / 1e6
+
+
+def _query_npu_aicore_info(device_id: int):
+    """通过 npu-smi 查询 (Aicore Count, Aicore Freq MHz)。失败返回 None。"""
+    try:
+        p = subprocess.run(
+            ["npu-smi", "info", "-t", "common", "-i", str(device_id)],
+            capture_output=True, text=True, timeout=15)
+    except Exception:  # noqa: BLE001
+        return None
+    if p.returncode != 0:
+        return None
+    cnt = freq = None
+    for line in p.stdout.splitlines():
+        m = re.match(r"\s*Aicore Count\s*:\s*(\d+)", line)
+        if m:
+            cnt = int(m.group(1))
+        m = re.match(r"\s*Aicore Freq\(MHZ\)\s*:\s*(\d+)", line)
+        if m:
+            freq = int(m.group(1))
+    if cnt and freq:
+        return cnt, freq
+    return None
+
+
+def _resolve_peak_tflops(args, device_id: int):
+    """解析芯片 cube 峰值 TFLOPS，返回 (peak, source_desc) 或 (None, reason)。
+
+    优先级:
+      1. --mfu-peak 显式指定
+      2. SOC_VERSION 环境变量 → platform_config/<SOC>.ini
+      3. npu-smi Aicore Count × Freq × 16^3 MAC（910B 系列 cube 规格）,
+         若与某 platform_config ini 的 ai_core_cnt 唯一匹配则以 ini 为准
+    """
+    explicit = getattr(args, "mfu_peak", 0) or 0
+    if explicit > 0:
+        return float(explicit), f"--mfu-peak 显式指定 ({explicit} TFLOPS)"
+
+    ascend_home = os.environ.get("ASCEND_HOME_PATH", "/usr/local/Ascend/cann-8.5.1")
+    cfg_dirs = sorted(Path(ascend_home).glob("*/data/platform_config"))
+
+    soc = os.environ.get("SOC_VERSION", "")
+    if soc and cfg_dirs:
+        for ini in cfg_dirs[0].glob(f"{soc}*.ini"):
+            peak = _parse_platform_config_peak(ini)
+            if peak:
+                return peak, f"platform_config/{ini.name} (SOC_VERSION={soc})"
+
+    info = _query_npu_aicore_info(device_id)
+    if info:
+        cnt, freq = info
+        # 用 (ai_core_cnt, cube_freq) 匹配 ini；若候选的峰值一致则采用 ini 精确值
+        if cfg_dirs:
+            peaks = {}
+            for ini in cfg_dirs[0].glob("Ascend*.ini"):
+                try:
+                    txt = ini.read_text(encoding="utf-8", errors="ignore")
+                except OSError:
+                    continue
+                m = re.search(r"ai_core_cnt\s*=\s*(\d+)", txt)
+                f = re.search(r"cube_freq\s*=\s*(\d+)", txt)
+                if m and f and int(m.group(1)) == cnt and int(f.group(1)) == freq:
+                    p = _parse_platform_config_peak(ini)
+                    if p:
+                        peaks[ini.name] = p
+            if peaks and len(set(peaks.values())) == 1:
+                names = "/".join(sorted(peaks))
+                return next(iter(peaks.values())), \
+                    f"platform_config {names} (按 AIC 数={cnt}, freq={freq}MHz 匹配)"
+        # 回退: 假定 cube 16x16x16 MAC/cycle（910B 系列规格）, cube_freq=Aicore Freq
+        peak = 2.0 * 16 * 16 * 16 * cnt * freq / 1e6
+        return peak, (f"npu-smi Aicore Count={cnt} × Freq={freq}MHz × 16³×2 MAC "
+                      f"(假定 910B 系列 cube 规格)")
+    return None, "无法自动推导峰值（npu-smi 查询失败且无 SOC_VERSION），请用 --mfu-peak 显式指定"
+
+
+def _select_mfu_top_cases(cases, flops_fn, top_k: int):
+    """按理论 FLOPs 降序选取 top-K case 下标（MFU 随规模饱和，大 shape 代表峰值水平）。"""
+    scored = []
+    for idx, case in enumerate(cases):
+        if _case_has_empty_tensor(case):
+            continue
+        try:
+            f = float(flops_fn(case))
+        except Exception as e:  # noqa: BLE001
+            LOGGER.warning("[MFU] flops(case %d) 计算失败: %s", idx, e)
+            continue
+        if f > 0:
+            scored.append((f, idx))
+    scored.sort(reverse=True)
+    return sorted(idx for _, idx in scored[:max(1, top_k)])
+
+
+def _annotate_rows_mfu(rows, cases, flops_fn, peak_tflops: float):
+    """为含 asc_us 的行追加理论 FLOPs / actual TFLOPS / 官方口径 MFU。返回有效行数。"""
+    n_valid = 0
+    for row in rows:
+        asc_us = row.get("asc_us")
+        idx = row.get("case")
+        if asc_us is None or asc_us <= 0 or not cases or idx is None or idx >= len(cases):
+            continue
+        try:
+            flops = float(flops_fn(cases[idx]))
+        except Exception:  # noqa: BLE001
+            continue
+        if flops <= 0:
+            continue
+        actual_tflops = flops / (asc_us * 1e-6) / 1e12
+        row["theory_gflop"] = flops / 1e9
+        row["actual_tflops"] = actual_tflops
+        row["mfu_pct"] = actual_tflops / peak_tflops * 100.0
+        n_valid += 1
+    return n_valid
+
+
+def _build_mfu_summary(rows, peak_tflops: float, peak_src: str):
+    """汇总 MFU 结果（对 AscendC 实现）。无有效行时返回 None。"""
+    mfus = [r["mfu_pct"] for r in rows if r.get("mfu_pct") is not None]
+    if not mfus:
+        return None
+    return {
+        "口径": "operator_mfu 官方等价口径: 理论FLOPs / kernel时长 / 芯片cube峰值",
+        "peak_tflops": peak_tflops,
+        "peak_source": peak_src,
+        "mean_mfu_pct": statistics.mean(mfus),
+        "max_mfu_pct": max(mfus),
+        "n_cases": len(mfus),
+    }
+
+
+def _add_mfu_section(lines, report):
+    """Add the official-口径 MFU section to the compare markdown report."""
+    mfu = report.get("mfu")
+    if not mfu:
+        return
+    lines.append("## MFU（官方 operator_mfu 等价口径）")
+    lines.append("")
+    lines.append(f"- **口径**: {mfu['口径']}（softmax/mask 等后处理不计 FLOPs）")
+    lines.append(f"- **芯片 cube 峰值**: {mfu['peak_tflops']:.2f} TFLOPS（来源: {mfu['peak_source']}）")
+    lines.append(f"- **理论 FLOPs 来源**: 算子目录 flops.py hook")
+    lines.append("")
+    lines.append("| Case | Shape | 理论FLOPs(GFLOP) | AscendC(us) | actual TFLOPS | MFU |")
+    lines.append("| ---- | ----- | ---------------- | ----------- | ------------- | --- |")
+    for case in report.get("per_case", []):
+        if case.get("mfu_pct") is None:
+            continue
+        lines.append(
+            f"| {case['case']} | {case.get('shape', '?')} | "
+            f"{case['theory_gflop']:.3f} | {case['asc_us']:.2f} | "
+            f"{case['actual_tflops']:.2f} | {case['mfu_pct']:.2f}% |")
+    lines.append("")
+    lines.append(f"**平均 MFU: {mfu['mean_mfu_pct']:.2f}%　最大 MFU: {mfu['max_mfu_pct']:.2f}%**"
+                 f"（{mfu['n_cases']} 个 case）")
+    lines.append("")
+    lines.append("> 注: PMU 口径(aic_mac_fp16_ratio)按活跃核归一且使用运行时频率峰值，"
+                 "小 shape 会严重虚高；官方口径不受此影响。若需 cube 阵列占空比等"
+                 "瓶颈指标，请用 --compare 模式采集 ArithmeticUtilization。")
+    lines.append("")
+
+
 def run_compare_mode(args):
     """执行对比模式：model.py vs model_new_ascendc.py"""
     out_dir = Path(args.output_dir).resolve()
@@ -1956,6 +2180,30 @@ def run_quick_mode(args):
     if case_source:
         LOGGER.info(f"[INFO] Loaded {n_cases} cases from {case_source}")
 
+    # MFU（官方 operator_mfu 等价口径）: 需要 flops.py hook + 芯片峰值
+    flops_fn = None
+    peak_tflops, peak_src = None, None
+    if getattr(args, "mfu", False):
+        flops_fn = _load_flops_hook(out_dir)
+        if flops_fn is None:
+            LOGGER.warning(f"[MFU] 未找到可用的 {out_dir}/flops.py（约定: def flops(case)->float），"
+                           "本次跳过 MFU 统计（正常采集耗时）")
+        else:
+            peak_tflops, peak_src = _resolve_peak_tflops(args, device_id)
+            if peak_tflops is None:
+                LOGGER.warning(f"[MFU] {peak_src}，本次跳过 MFU 统计")
+                flops_fn = None
+            else:
+                LOGGER.info(f"[MFU] 芯片 cube 峰值: {peak_tflops:.2f} TFLOPS（{peak_src}）")
+                # 未显式指定 case 时，按理论 FLOPs 取 top-K 大 shape（MFU 随规模饱和）
+                if not getattr(args, "cases", None) and not getattr(args, "max_cases", 0):
+                    top_k = max(1, getattr(args, "mfu_top_k", 3))
+                    idxs = _select_mfu_top_cases(cases, flops_fn, top_k)
+                    if idxs and len(idxs) < n_cases:
+                        args.cases = ",".join(map(str, idxs))
+                        LOGGER.info(f"[MFU] 按理论 FLOPs 选取 top-{len(idxs)} case（峰值 MFU 代表 shape）: "
+                                    f"{idxs}（如需全量请显式 --cases 或 --max-cases）")
+
     max_cases = getattr(args, "max_cases", 0)
     if max_cases and max_cases < n_cases:
         n_cases = max_cases
@@ -1967,11 +2215,25 @@ def run_quick_mode(args):
     rows, speedups, ref_times, asc_times = _run_quick_loop(
         out_dir, cases, n_cases, args, device_id)
 
+    if flops_fn is not None and peak_tflops:
+        n_mfu = _annotate_rows_mfu(rows, cases, flops_fn, peak_tflops)
+        if n_mfu:
+            LOGGER.info("-" * 100)
+            LOGGER.info("--- MFU（官方 operator_mfu 等价口径，AscendC 实现）---")
+            for row in rows:
+                if row.get("mfu_pct") is not None:
+                    LOGGER.info(f"  case {row['case']:<3} theory={row['theory_gflop']:>8.3f} GFLOP  "
+                                f"actual={row['actual_tflops']:>7.2f} TFLOPS  MFU={row['mfu_pct']:.2f}%")
+
     csi = _CompareSummaryInput(
         out_dir, rows, speedups, ref_times, asc_times, n_cases, args, device_id, device_src)
     summary = _compute_compare_summary(csi)
     summary["timing_method"] = "msprof.quick.Task_Duration"
     summary["profiling_mode"] = "quick"
+    if flops_fn is not None and peak_tflops:
+        mfu_summary = _build_mfu_summary(rows, peak_tflops, peak_src)
+        if mfu_summary:
+            summary["mfu"] = mfu_summary
     _log_and_save_compare_reports(summary, out_dir, speedups, n_cases)
 
 
@@ -2230,6 +2492,12 @@ def main():
                         help="quick 模式只跑前 N 个 case（0=全部，用于冒烟测试）")
     parser.add_argument("--cases", default=None,
                         help="quick 模式只跑指定 case 下标，逗号分隔，如 0,4,9,18（优先于 --max-cases）")
+    parser.add_argument("--mfu", action="store_true",
+                        help="quick 模式追加官方 operator_mfu 等价口径 MFU 统计（需要算子目录提供 flops.py hook）")
+    parser.add_argument("--mfu-top-k", dest="mfu_top_k", type=int, default=3,
+                        help="--mfu 且未显式指定 case 时，按理论 FLOPs 选取 top-K 大 shape（默认 3，峰值 MFU 代表 shape）")
+    parser.add_argument("--mfu-peak", dest="mfu_peak", type=float, default=0,
+                        help="芯片 cube 峰值 TFLOPS 显式指定（0=自动从 platform_config/npu-smi 推导）")
     parser.add_argument("--prof-tag", dest="prof_tag", default=None,
                         help="PROF 临时目录后缀，用于同一 case 多次独立采集互不覆盖")
     parser.add_argument("--seed", type=int, default=0, help="随机种子")

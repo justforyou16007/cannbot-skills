@@ -122,6 +122,10 @@ Usage: bash msprof_profile_run.sh [OPTIONS] -- <executable> [args...]
   --device=N             指定 NPU 设备 ID；未指定时自动选择空闲卡
   --repeats=N            重复采集次数（默认 1）
   --retry=N              单 case 解析失败重试次数（默认 2）
+  --mfu                  追加官方 operator_mfu 等价口径 MFU 统计（需算子目录提供 flops.py）
+  --mfu-top-k=N          按理论 FLOPs 选取 top-K 大 shape 测 MFU（默认 3）
+  --mfu-peak=N           显式指定芯片 cube 峰值 TFLOPS（默认自动推导）
+  --impl=asc|ref|both    只采集指定实现（MFU 场景建议 asc，省参考实现采集时间）
 
 批量模式 (--batch):
   --batch                启用批量模式：扫描 base-dir 下所有子目录并行测试
@@ -148,6 +152,10 @@ while [[ $# -gt 0 ]]; do
         --repeats=*) REPEATS="${1#*=}"; shift ;;
         --retry=*)   RETRY="${1#*=}"; shift ;;
         --keep-prof) KEEP_PROF=1; shift ;;
+        --mfu)       MFU=1; shift ;;
+        --mfu-top-k=*) MFU_TOP_K="${1#*=}"; shift ;;
+        --mfu-peak=*) MFU_PEAK="${1#*=}"; shift ;;
+        --impl=*)    IMPL="${1#*=}"; shift ;;
         --compare)   MODE="compare"; shift ;;
         --quick)     MODE="quick"; shift ;;
         --batch)     MODE="batch"; shift ;;
@@ -281,6 +289,10 @@ run_quick() {
     [[ -n "$DEVICE_ID" ]] && extra_args+=("--device" "$DEVICE_ID")
     [[ -n "${REPEATS:-}" ]] && extra_args+=("--repeats" "$REPEATS")
     [[ -n "${RETRY:-}" ]] && extra_args+=("--retry" "$RETRY")
+    [[ "${MFU:-0}" == "1" ]] && extra_args+=("--mfu")
+    [[ -n "${MFU_TOP_K:-}" ]] && extra_args+=("--mfu-top-k" "$MFU_TOP_K")
+    [[ -n "${MFU_PEAK:-}" ]] && extra_args+=("--mfu-peak" "$MFU_PEAK")
+    [[ -n "${IMPL:-}" ]] && extra_args+=("--impl" "$IMPL")
 
     python3 "${SCRIPT_DIR}/msprof_perf_summary.py" --quick \
         --output-dir "$OUT_DIR" \

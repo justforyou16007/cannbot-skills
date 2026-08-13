@@ -53,6 +53,25 @@ bash scripts/msprof_profile_run.sh --quick --output-dir=./output/GELU --warm-up=
 
 输出：`performance.json` + `performance.log` + `perf_report.md`
 
+### 3.1 MFU 统计（官方 operator_mfu 等价口径，quick 模式扩展）
+
+在 quick 模式基础上追加 **MFU（理论 FLOPs / kernel 时长 / 芯片 cube 峰值）** 统计：
+
+```bash
+bash scripts/msprof_profile_run.sh --quick --mfu --impl=asc --output-dir=./output/GELU --device=0
+```
+
+- **前置条件**：算子目录下存在 `flops.py`（约定 `def flops(case: dict) -> float`，返回该 case 的
+  理论 FLOPs）；不存在时只采集耗时并在日志提示跳过 MFU。
+- **shape 自动选择**：默认按理论 FLOPs 降序只取 **top-3 大 shape**（MFU 随规模饱和，大 shape 即
+  代表峰值水平，同时省去小 case 采集时间）；`--mfu-top-k=N` 调整，显式 `--cases/--max-cases` 可覆盖。
+- **芯片峰值自动推导**：platform_config ini / npu-smi；推导失败用 `--mfu-peak=<TFLOPS>` 显式指定。
+- **输出**：`perf_report.md` 增加 MFU 小节，`performance.json` 增加 `mfu` 字段。
+- 口径细节、flops.py 编写指南见 [`references/mfu-guide.md`](references/mfu-guide.md)。
+
+> MFU（官方口径）回答"离硬件极限多远"；PMU 口径（`--compare` 的 ArithmeticUtilization）回答
+> "瓶颈在哪条流水线"。小 shape 下 PMU 比值按活跃核归一会严重虚高，横向对比以官方口径为准。
+
 ### 4. 批量并行模式（多 NPU）
 
 扫描目录下所有算子子目录，多 NPU 并行执行对比测试：
@@ -133,6 +152,7 @@ Markdown 报告包含：
 | [`references/msprof-guide.md`](references/msprof-guide.md) | `msprof`：构建 / 采集 / 归档 / **主 Bound 判定** / 瓶颈 | 选用 `msprof` 时 |
 | [`references/csv_fields_reference.md`](references/csv_fields_reference.md) | CSV 字段定义与阈值 | 理解指标含义时 |
 | [`references/optimization_quickref.md`](references/optimization_quickref.md) | 瓶颈类型与优化方法 | 定位瓶颈后 |
+| [`references/mfu-guide.md`](references/mfu-guide.md) | MFU 口径、flops.py 编写指南、经验水位 | 采集/解读 MFU 时 |
 
 ---
 
@@ -147,4 +167,5 @@ Markdown 报告包含：
 | Agent team 测试阶段 | `--quick` / `--compare` + 标准采集 | 先快速对比，不达标再深度分析 |
 | 端到端自动开发 Phase 5 | `msprof_profile_run.sh --quick` | 集成到 tilelang2ascendc-ops-generator 流程（只获取加速比） |
 | 进化优化前基线测试 | `msprof_profile_run.sh --quick` | 快速获取基线加速比 |
+| 峰值算力利用率验收（MFU） | `msprof_profile_run.sh --quick --mfu --impl=asc` | 官方口径 MFU，自动只测 top-3 大 shape |
 | 批量性能测试 | `msprof_profile_run.sh --batch` | 多 NPU 并行批量测试 |

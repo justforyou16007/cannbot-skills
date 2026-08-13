@@ -11,3 +11,6 @@
 {"inputs": [{"type": "tensor", "shape": [4, 4, 17, 32], "dtype": "float32"}, {"type": "tensor", "shape": [4, 4, 17, 32], "dtype": "float32"}, {"type": "tensor", "shape": [4, 4, 17, 32], "dtype": "float32"}]}
 {"inputs": [{"type": "tensor", "shape": [4, 8, 79, 64], "dtype": "float32"}, {"type": "tensor", "shape": [4, 8, 79, 64], "dtype": "float32"}, {"type": "tensor", "shape": [4, 8, 79, 64], "dtype": "float32"}]}
 {"inputs": [{"type": "tensor", "shape": [2, 16, 509, 64], "dtype": "float32"}, {"type": "tensor", "shape": [2, 16, 509, 64], "dtype": "float32"}, {"type": "tensor", "shape": [2, 16, 509, 64], "dtype": "float32"}]}
+{"inputs": [{"type": "tensor", "shape": [1, 16, 2048, 128], "dtype": "float16"}, {"type": "tensor", "shape": [1, 16, 2048, 128], "dtype": "float16"}, {"type": "tensor", "shape": [1, 16, 2048, 128], "dtype": "float16"}]}
+{"inputs": [{"type": "tensor", "shape": [2, 16, 1024, 128], "dtype": "bfloat16"}, {"type": "tensor", "shape": [2, 16, 2048, 128], "dtype": "bfloat16"}, {"type": "tensor", "shape": [2, 16, 2048, 128], "dtype": "bfloat16"}]}
+{"inputs": [{"type": "tensor", "shape": [4, 16, 1024, 128], "dtype": "float16"}, {"type": "tensor", "shape": [4, 16, 1024, 128], "dtype": "float16"}, {"type": "tensor", "shape": [4, 16, 1024, 128], "dtype": "float16"}]}

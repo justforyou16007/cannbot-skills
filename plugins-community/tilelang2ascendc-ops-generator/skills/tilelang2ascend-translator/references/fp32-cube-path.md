@@ -36,5 +36,3 @@ A2/A3 上 fp16 能跑通的 cube 代码换 fp32 挂掉，几乎都源于分形�
 
 8. **Buffer 容量翻倍**：fp32 下 L0A/L0B 双 buffer 可能恰好顶满 64KB 硬件上限
    （如 2×[64,128]×4B），放不下就先降 queue 深度。
-
-参考实现：`workflows/templates/archive_tasks/flash_attention/`（kernel + FP32_FIX_REPORT.md）。

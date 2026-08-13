@@ -56,5 +56,5 @@ workspace（~32KB/task 一次 flag）在 SetFlag 之前无法全局可见（L2 �
 
 - X17 / P128（fp32-via-bf16 hi/lo 3-GEMM 算法本体）
 - X44（SetHF32(false) 全精度 fp32 Cube，无需 hi/lo 拆分——更优方案，见 proven-solutions）
-- x38（WindowAttention FP32-on-Cube host 预拆分落地）
+- X37（WindowAttention FP32-via-FP16 Hi/Lo 4-GEMM，含 host 预拆分绕法 + Mmad barrier）
 - f4（bf16 hi/lo 对近零输出精度不足，转 fp16 hi/lo）

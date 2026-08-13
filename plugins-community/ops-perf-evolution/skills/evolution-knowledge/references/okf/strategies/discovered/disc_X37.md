@@ -36,6 +36,12 @@ fp16 有 11 位尾数（vs bf16 的 7 位），hi+lo 捕获 ~23 bit，逼近 fp3
 2. K1/K3 GEMM 与 K2 注意力均可套用（bulk-sync 或跨核 ping-pong）
 3. 每 k-chunk 的 `cmatrixInitVal` 必须为 true（每个 chunk 是独立输出 tile，AIV 分别累加 O）
 4. 4x cube FLOPs 是固有代价；小 shape 建议按 M*C 阈值路由回向量 FMA
+5. host 预拆分（替代 split 方式）：把 fp32→hi/lo 拆分放到 host（torch cast + 双分量打包），kernel launch 边界全同步，规避「kernel 内 AIV→AIC 大 workspace 的 L2 可见性缺陷」（见 f6）；代价是 host 侧额外 GM 流量
+6. 多次 Mmad 累加间必须 `PipeBarrier<PIPE_ALL>`：否则 L0C WAR 依赖导致输出垃圾（hdp=16 case 实测 MERE ~1e-3）
+
+## Related
+- f6（跨核 workspace L2 可见性缺陷 + host 预拆分绕法）
+- f4（bf16 hi/lo 精度不足，转 fp16 hi/lo）
 
 ## 与 X17/P128 的关系
 | 维度 | X17/P128 (bf16 3-GEMM) | X24 (fp16 4-GEMM) |

@@ -30,6 +30,8 @@ fp16 有 11 位尾数（vs bf16 的 7 位），hi+lo 捕获 ~23 bit，逼近 fp3
 3. **每 k-chunk 的 `cmatrixInitVal` 必须为 true**：每个 KV-chunk 是独立输出 tile（AIV 分别累加 O），用 `(kt==0)` 会 double-count 产生错误结果
 4. **4x cube FLOPs 是固有代价**：fp32 需要 4 次 fp16 Mmad（vs fp16/bf16 的 1 次），但对 cube 远快于标量 FMA 的场景可接受
 5. **小 shape 会回归**：split 预 pass + 额外 kernel launch 的固定开销主导 tiny GEMM，小 shape 建议保留原向量 FMA 路径（按 M*C 阈值路由）
+6. **host 预拆分（绕跨核 workspace bug 的替代 split 方式）**：除独立 AIV split 预 pass 外，也可把 fp32→hi/lo 拆分放到 host（torch `.to(fp16)` + `x − fp32(hi)` 双分量打包），在 kernel launch 边界完成。kernel launch = 全同步，AIC 读预拆分 fp16 面板与读原生数据等价，彻底规避「kernel 内 AIV MTE3 写 → AIC MTE2 读大 workspace 的 L2 可见性非确定」缺陷（证据链见 OKF f6）。代价：host 侧额外 GM 流量 + 丢失 device 侧折叠 scale 的机会；适合 host 侧已做 cast/打包的场景
+7. **多次 Mmad 累加间必须 `PipeBarrier<PIPE_ALL>`**：同一 L0C 累加器的 hi·hi / hi·lo / lo·hi / lo·lo 多次 Mmad 之间必须插 `PipeBarrier<PIPE_ALL>`，否则 L0C WAR 依赖导致输出垃圾（hdp=16 case 实测 MERE ~1e-3，加 barrier 后全过）。这是 3-GEMM/4-GEMM 累加链的通病，与 X17/P128 的 L0C 累加同源
 
 ## 与 X17/P128 的关系
 | 维度 | X17/P128 (bf16 3-GEMM) | X24 (fp16 4-GEMM) |

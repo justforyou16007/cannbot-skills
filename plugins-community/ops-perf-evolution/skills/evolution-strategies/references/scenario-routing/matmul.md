@@ -11,11 +11,15 @@
 
 打开 [_common-prerequisites.md](_common-prerequisites.md) 过 C1-C5。Matmul 族常见命中：**C1**（向量模拟 matmul → P102/P103，数量级收益，务必最先做）。
 
+**固定开销审计（先于基础链，中小 shape 必做）**：若 asc 与 shape 几乎无关（launch-bound），先消除每次调用的固定开销——workspace `at::zeros`→`at::empty`（MatmulImpl 自 init，需全量精度验证）、任务类型 MIX_AIC_1_2→纯核（AIC_ONLY/AIV_ONLY）、tiling H2D 按 shape 缓存 → **X35**（MatmulImpl host 固定开销消除）+ **X24**（AIC_ONLY 压 launch 地板）+ **P54**（紧凑 tiling/H2D 缓存）。实证：MatmulBothTrans v2 1.89x、MatmulTransA n2、BatchMatmul。
+
+**小 shape VEC 直算分流（基础链 M1 前判定）**：MAC 阈值内（fp32 ~50K / fp16·bf16 ~120K）走 AIV 向量化外积直算（Axpy/`MulAddDst`），免 MatmulImpl 全部固定开销；**非 16 对齐小 shape 必须走此路径**（MatmulImpl 病态慢路径 ~500us）→ **X36**（Zero-Host-Padding AIV Small-Matmul，小 shape 1.36x）；bf16 用 D5 raw-bit 宽化 + CAST_ROUND/RINT。
+
 ## Step 2 — 基础链（按序推进）
 
 | 阶段 | 判定条件（满足才做） | 命中用卡 | 跳过条件 |
 |---|---|---|---|
-| M1 计算路径判定 | kernel 未用 MatmulImpl 高层 API（手写搬运/mmad 时序） | P46（MatmulImpl 高阶 API）；手动 mmad 时序优化 → P87；数据通路效率 → P86 | 已是 MatmulImpl 路径 |
+| M1 计算路径判定 | kernel 未用 MatmulImpl 高层 API（手写搬运/mmad 时序）；或中小 shape 固定开销主导 / 小 shape 需 VEC 分流 | **先做固定开销审计**（Step 1 命中）：**X35**（workspace at::empty + tiling 缓存 + 核内多 tile）+ **X24**（AIC_ONLY 纯核压 launch 地板）+ **P54**（紧凑 tiling）；**小 shape VEC 直算**（MAC 阈值内，非 16 对齐必走，防 MatmulImpl 病态 ~500us）→ **X36**；仍走 MatmulImpl 再压 → P46/P87/P86 | 大 shape（计算/MTE2 主导）已走 MatmulImpl 且固定开销占比低 |
 | M2 多核扩展 | `GetTiling` 返回 totalBlock < aicCoreNum（核没吃满） | P104（多核切分扩展，重算 singleCoreM/N） | totalBlock ≥ 核数 |
 | M3 L2 切分 | 大算子（M×N×K 超 L2 容量） | P105（L2 tile sizing）→ 配 P107（serpentine 遍历）；K≫M·N 时 P72（Split-K，注意与 P9 确定性互斥） | 算子小，L2 无压力 |
 | M5 平台路由 | 需跨平台（DAV_2201 / DAV_3510） | P108（平台路由：MatmulImpl+MatmulApiTiling vs Blaze/tensor_api） | 单平台目标 |
@@ -24,6 +28,10 @@
 | M8 缓存与复用 | L1/L0 复用率低、GM 地址冲突 | P71（IBShare L1 共享）、P83（L1 常驻分区，扩展 P53）、P78（片上缓存）、P52（L2 hint，与 P74 互斥）、P93（K 轴错峰访存）、P92（base block 算存比） | 复用已达标 |
 
 > 基础链顺序不可颠倒（计算路径 → 多核 → L2 是硬依赖链）；traits 叠加不影响链序。
+
+> **Matmul 族实测结论（2026-08）**：中小 shape 的瓶颈是**每次调用固定开销**（workspace memset ~6.5us + MIX 调度 + MatmulImpl init + tiling H2D），非 Cube 算力——先消除（X35/X24/P54）再谈 tiling。**小 shape 只有 VEC 直算能反超参考**（X36，非 16 对齐必走，MatmulImpl 病态 ~500us）。**大 shape 受 vendor 天花板限制**（MTE2/L2 bound，只求追平）。**launch 地板 ~4us** 是硬墙（绕过 MatmulImpl 也消不掉），多核 M 行切分（X23 式）可摊薄。**已证伪勿重复**：P86 MDL、fp16/bf16 block_N 继续加宽、misaligned 单核切碎、裸写 mmad 绕过（矩形正确性 + CANN 版本堆损坏）。
+>
+> ⚠️ **测量纪律**：同负载 A/B（同机同批 3 次取平均）、各变体自编译 .so 直载（防共享 whl 多变体竞态测到别的内核）、低争用窗口或多测取中位数；用 msprof task_time 逐 kernel 拆解固定开销（区分 memset/launch/init），勿只看整体时间。
 
 ## Step 3 — 正交 trait 追加表（可叠加，不重排链序）
 

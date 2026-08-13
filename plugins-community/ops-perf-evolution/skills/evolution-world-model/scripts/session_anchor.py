@@ -52,6 +52,8 @@ import os
 import sys
 from datetime import datetime, timezone, timedelta
 
+from state_ops import _session_claude_pid
+
 LOGGER = logging.getLogger(__name__)
 
 # 数据输出专用 logger：CLI 结果（JSON/表格/报告）走 stdout（agent 调用协议通道），
@@ -85,6 +87,11 @@ def cmd_write(args: argparse.Namespace) -> int:
         "requested_rounds": args.requested_rounds,
         "actual_rounds_completed": 0,
         "pid": os.getpid(),
+        # Top-level claude session PID owning this write. The loop-stop hook
+        # only guards anchors whose session_pid equals its own claude session,
+        # so concurrent sessions in the same repo don't inherit this loop's
+        # guard. Falls back to None for non-claude writers (never guarded).
+        "session_pid": _session_claude_pid(),
     }
 
     path = _anchor_path(args.op_name, args.output_dir)

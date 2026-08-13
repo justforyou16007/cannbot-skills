@@ -1,9 +1,34 @@
 # Attention Family Optimization Insights
 
-## Operator Variants
+## Operator Classification（线性 / 稀疏 / 压缩 大类别）
+
+Attention 按**计算特性**分三大类：线性、稀疏、压缩。标准 Softmax Attention（MHA / cross / self）是基础形态，三大类是它的变体方向；**通道注意力（SE/SK 等）不是 attention 计算**，不归本类。
+
+- **基础 Softmax Attention**（默认）：MHA / cross / self / SDPA / FlashAttention —— `QK^T → scale → mask → softmax → PV`，online-softmax 状态机
+- **稀疏 Attention**：SparseFlashAttention / BlockSparse / Strided / Window / Local / BigBird / Longformer —— softmax 保留 + 稀疏 mask，大部分 score 无效
+- **压缩 Attention**：MLA（latent c 压缩）/ GQA / MQA（head 共享）/ Paged（kv-cache）—— KV 经压缩表示
+- **线性 Attention**：GLA / Mamba2（SSD）/ GDN-KDA / LinearAttention / Nyström / Linformer —— 无 QK^T、无 softmax，状态递推 + chunk-scan
+- **通道注意力**（排除）：SE / SK / Triplet / CBAM / CoordAtt —— `global pool → FC → sigmoid/softmax → 通道 scale`，无 QK^T、无 head 结构 → 归 reduction / elementwise
+
+### 标准 Softmax Attention（head 结构）
 - **MHA** (Multi-Head Attention): num_q_heads == num_kv_heads
-- **MQA** (Multi-Query Attention): num_kv_heads == 1
 - **GQA** (Grouped Query Attention): num_q_heads = G × num_kv_heads
+- **MQA** (Multi-Query Attention): num_kv_heads == 1（GQA 特例）
+
+### 稀疏 Attention（softmax + 稀疏 mask）
+- BlockSparse / Strided / Window / BigBird / Longformer / SparseFlashAttention / GqaSparse
+- 判据：softmax 注意力 + 稀疏 pattern（block_table / band / strided / top-k）
+- 优化：flashattention.md **sparse trait** —— P123（skip + 边界 mask）、**P137**（紧凑化走 Cube，top-k 不再回退 Vector）、P138/P139（L0 守卫 / 多槽零填充稳定性）、P76/P77（sparse KV）
+
+### 压缩 Attention（KV 压缩表示）
+- MLA（latent c 压缩：`c → W^U → [nope|rope] → K/V`）/ GQA / MQA（head 共享）/ Paged（block table）
+- 判据：KV 经压缩表示（latent 向量 / `num_kv_heads < num_q_heads` / kv-cache）
+- 优化：flashattention.md **mla 分支**（P124 nope/rope 拼 K + P125 跨任务预取 + P126 任务表 + **P140** M-tile 放大）、**gqa 分支**（P116 G→M 合并 + X5 decode GEMV→GEMM + X4）
+
+### 线性 Attention（无 QK^T、无 softmax）
+- GLA（门控衰减 `S = α⊙S + k⊗v`）/ Mamba2（SSD）/ GDN-KDA（delta rule `S ← β⊙(k⊗v − corr) + S`，含 corr 修正）/ LinearAttention / Nyström / Linformer
+- 判据：沿序列维状态递推 + chunk-scan；有 `cumprod` 衰减 / `solve_triangular` 求逆
+- 优化：ssm-scan.md —— P132 三阶段分解（GLA 用 cumprod 替代求逆）+ P133 块内 CV 流水 + P134 任务划分 + P135 求逆分治（仅 GDN-KDA）+ P136 bf16 量化
 
 ## Key Algorithmic Optimizations
 
@@ -101,21 +126,3 @@ Additional skip vs. standard causal: blocks far behind the window
 
 4. **Pre/next token parameters**: Ascend attention APIs use `preTokens` and `nextTokens` to define the attention window, equivalent to a band mask.
 
-### MLA (Multi-head Latent Attention)
-- KV 由 latent c 压缩重建：`c → W^U → [nope | rope] → K/V`，KV 不经 head 维直接存 latent。
-- 判据：存在 latent 压缩 matmul（`c→K/V` 升维），decode 阶段侧重。
-- 优化：nope/rope 拼成单 GEMM K 维（P124），跨任务预取（P125），GM 任务表变长调度（P126）。
-
-### GDN-KDA（Gated Delta Rule，无 QK^T）
-- delta rule：`S ← β⊙(k⊗v − corr) + S`（含 corr 修正项），状态沿序列 chunk-scan。
-- 判据：无 QK^T、无 softmax；有 `solve_triangular`/求逆/`corr` 修正项。
-- 优化：三阶段 chunk 分解（P132）、块内 CV 流水（P133）、求逆分治（P135）。
-
-### GLA（Gated Linear Attention，无 QK^T）
-- 门控衰减：`S = α⊙S + k⊗v`（含衰减门 α，无修正项），Mamba2 的 SSD 是其一种。
-- 判据：无 QK^T、无 softmax；有 `cumprod` 衰减/门控 α，无 corr 修正项。
-- 优化：三阶段 chunk 分解（P132，cumprod 替代求逆）、CV 流水（P133）、任务划分（P134）、bf16 量化（P136）。
-
-### 通道注意力（SE/SK/Triplet/CBAM 等）—— 不是 attention 计算
-- 形态：`global pool → FC → sigmoid/softmax → 通道 scale`，**无 QK^T、无 head 结构**。
-- 判定：不归 attention 族，落 reduction / elementwise。

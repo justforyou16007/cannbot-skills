@@ -8,7 +8,7 @@
 
 | 算子族 | 文件 | 关键洞见 |
 |--------|------|---------|
-| Attention (MHA/GQA/MQA) | `attention_family.md` | 块稀疏跳过、在线 softmax、KV-cache |
+| Attention | `attention_family.md`（线性/稀疏/压缩分类 + 优化手法） | 三大类判据、块稀疏跳过、在线 softmax、KV-cache |
 | Reduction (Norm/Softmax) | `reduction_ops.md` | 双遍 vs 单遍、Welford、树归约 |
 | Elementwise 融合 | `elementwise_fusion.md` | 算子融合、原地计算 |
 

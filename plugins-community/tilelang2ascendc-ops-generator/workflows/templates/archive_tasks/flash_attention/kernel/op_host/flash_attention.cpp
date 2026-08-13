@@ -19,6 +19,7 @@
 
 #include "kernels/aclrtlaunch_flash_attention_bf16.h"
 #include "kernels/aclrtlaunch_flash_attention_fp16.h"
+#include "kernels/aclrtlaunch_flash_attention_fp32.h"
 
 #include "utils/flash_attention_tiling.h"
 #include "utils/flash_attention_common.h"
@@ -82,7 +83,7 @@ static at::Tensor AllocateFlashAttentionWorkspace(const at::Tensor &q, int32_t u
 {
     uint32_t dim         = q.sizes()[3];
     uint32_t dimAlign    = AlignUpHost(dim, 16);
-    uint64_t qElemSize   = sizeof(uint16_t);
+    uint64_t qElemSize   = q.element_size();
     uint64_t wsSSize     = (uint64_t)RING_SLOTS * BLOCK_M * BLOCK_N * sizeof(float);
     uint64_t wsPSize     = (uint64_t)RING_SLOTS * BLOCK_M * BLOCK_N * qElemSize;
     uint64_t wsOSize     = (uint64_t)RING_SLOTS * BLOCK_M * dimAlign * sizeof(float);
@@ -126,6 +127,27 @@ at::Tensor flash_attention_bf16(const at::Tensor &q, const at::Tensor &k, const 
 
     auto aclStream = c10_npu::getCurrentNPUStream().stream(false);
     aclrtlaunch_flash_attention_bf16(
+        static_cast<uint32_t>(usedCoreNum), aclStream,
+        const_cast<void*>(q.storage().data()),
+        const_cast<void*>(k.storage().data()),
+        const_cast<void*>(v.storage().data()),
+        const_cast<void*>(output.storage().data()),
+        const_cast<void*>(workspace.storage().data()),
+        const_cast<void*>(tilingNpu.storage().data()));
+    return output;
+}
+
+at::Tensor flash_attention_fp32(const at::Tensor &q, const at::Tensor &k, const at::Tensor &v)
+{
+    int32_t usedCoreNum;
+    at::Tensor tilingNpu;
+    at::Tensor output;
+    PrepareFlashAttention(q, k, v, output, usedCoreNum, tilingNpu);
+
+    at::Tensor workspace = AllocateFlashAttentionWorkspace(q, usedCoreNum);
+
+    auto aclStream = c10_npu::getCurrentNPUStream().stream(false);
+    aclrtlaunch_flash_attention_fp32(
         static_cast<uint32_t>(usedCoreNum), aclStream,
         const_cast<void*>(q.storage().data()),
         const_cast<void*>(k.storage().data()),

@@ -11,7 +11,16 @@
 #ifndef KERNEL_COMMON_H
 #define KERNEL_COMMON_H
 
-#include "../../../common/tiling_copy.h"
+// Copy packed tiling data from GM into a local tiling struct
+template <typename T>
+__aicore__ inline void CopyTiling(T *tiling, GM_ADDR tilingGM)
+{
+    uint32_t *ptr = reinterpret_cast<uint32_t *>(tiling);
+    auto tiling32 = reinterpret_cast<__gm__ uint32_t *>(tilingGM);
+    for (size_t i = 0; i < sizeof(T) / sizeof(uint32_t); ++i, ++ptr) {
+        *ptr = *(tiling32 + i);
+    }
+}
 
 __aicore__ inline uint32_t CeilDiv(uint32_t a, uint32_t b)
 {

@@ -19,8 +19,11 @@ import torch_npu
 
 os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
 
+import sysconfig
+
 _KERNEL_BUILD = Path(__file__).resolve().parent / "kernel" / "build"
-_so_path = _KERNEL_BUILD / "flash_attention_ext.cpython-311-x86_64-linux-gnu.so"
+_ext_suffix = sysconfig.get_config_var("EXT_SUFFIX") or ".so"
+_so_path = _KERNEL_BUILD / f"flash_attention_ext{_ext_suffix}"
 if _so_path.is_file():
     ctypes.CDLL(str(_so_path), mode=ctypes.RTLD_GLOBAL)
 
@@ -34,6 +37,8 @@ class ModelNew(nn.Module):
             return torch.ops.npu.flash_attention_fp16(q, k, v)
         elif q.dtype == torch.bfloat16:
             return torch.ops.npu.flash_attention_bf16(q, k, v)
+        elif q.dtype == torch.float32:
+            return torch.ops.npu.flash_attention_fp32(q, k, v)
         else:
             raise ValueError(f"Unsupported dtype: {q.dtype}")
 

@@ -22,6 +22,13 @@ using namespace AscendC;
 template <typename QType>
 class FlashAttentionCube {
     static constexpr uint32_t C0 = 32 / sizeof(QType);  // 16
+    static constexpr bool IS_FP32 = std::is_same_v<QType, float>;
+    static constexpr uint32_t MMAD_ALIGN = IS_FP32 ? 16U : C0;
+
+    __aicore__ inline uint32_t AlignForMmad(uint32_t v) const
+    {
+        return AlignUp(v, MMAD_ALIGN);
+    }
 
 public:
     __aicore__ inline FlashAttentionCube() {}
@@ -80,7 +87,7 @@ public:
 
         uint32_t rowStart  = t * BLOCK_N;
         uint32_t kvRows      = (tailValid != 0 && rowStart + BLOCK_N > kvSeqLen) ? tailValid : BLOCK_N;
-        uint32_t kvRowsAlign = AlignUp(kvRows, C0);
+        uint32_t kvRowsAlign = AlignForMmad(kvRows);
 
         LocalTensor<QType> kvL1 = kvBufL1_.Get<QType>();
         uint64_t kOffset = ((uint64_t)bz * tiling_.heads * kvSeqLen
@@ -93,23 +100,23 @@ public:
         LocalTensor<QType>  qL1  = qBufL1_.Get<QType>();
 
         uint32_t kTiles      = dim / BASE_K;
-        uint32_t mActAlign   = AlignUp(BLOCK_M, C0);
+        uint32_t mActAlign   = AlignForMmad(BLOCK_M);
 
         for (uint32_t ki = 0; ki < kTiles; ki++) {
             DoMM1Tile(cL0, qL1, kvL1,
                       (uint64_t)ki * BLOCK_M * BASE_K,
                       (uint64_t)ki * kvRowsAlign * BASE_K,
-                      BASE_K, (BASE_K / C0) * (kvRowsAlign / C0),
+                      BASE_K, (BASE_K / C0) * (kvRowsAlign / 16U),  // fractal rows are always 16
                       mActAlign, kvRowsAlign, ki == 0);
         }
 
         uint32_t kRemain = dim % BASE_K;
         if (kRemain > 0) {
-            uint32_t kAligned = AlignUp(kRemain, C0);
+            uint32_t kAligned = AlignForMmad(kRemain);
             DoMM1Tile(cL0, qL1, kvL1,
                       (uint64_t)kTiles * BLOCK_M * BASE_K,
                       (uint64_t)kTiles * kvRowsAlign * BASE_K,
-                      kAligned, (kAligned / C0) * (kvRowsAlign / C0),
+                      kAligned, (kAligned / C0) * (kvRowsAlign / 16U),  // fractal rows are always 16
                       mActAlign, kvRowsAlign, kTiles == 0);
         }
 
@@ -162,13 +169,13 @@ public:
         auto oSlot = oQueue_.ProducerAcquire();
         uint32_t rowStart   = t * BLOCK_N;
         uint32_t kvRows     = (tailValid != 0 && rowStart + BLOCK_N > kvSeqLen) ? tailValid : BLOCK_N;
-        uint32_t kvRowsAlign = AlignUp(kvRows, C0);
+        uint32_t kvRowsAlign = AlignForMmad(kvRows);
         uint64_t vOffset = ((uint64_t)bz * tiling_.heads * kvSeqLen
                           + (uint64_t)by * kvSeqLen
                           + (uint64_t)rowStart) * dim;
         LocalTensor<QType> kvL1 = kvBufL1_.Get<QType>();
         uint32_t nTiles    = dim / BASE_K;
-        uint32_t mActAlign = AlignUp(BLOCK_M, C0);
+        uint32_t mActAlign = AlignForMmad(BLOCK_M);
 
         for (uint32_t ni = 0; ni < nTiles; ni++) {
             uint64_t vSliceOffset = vOffset + (uint64_t)ni * BASE_K;
@@ -180,7 +187,7 @@ public:
 
         uint32_t nRemain = dim % BASE_K;
         if (nRemain > 0) {
-            uint32_t nAligned = AlignUp(nRemain, C0);
+            uint32_t nAligned = AlignForMmad(nRemain);
             uint64_t vSliceOffset = vOffset + (uint64_t)nTiles * BASE_K;
             ComputeMM2Tile(pL1, kvL1, kvRows, kvRowsAlign, nAligned, vSliceOffset);
             LocalTensor<float> cL0 = queL0C_.DeQue<float>();
@@ -203,7 +210,14 @@ private:
     {
         SetWaitFlag<HardEvent::M_MTE1>();
         LocalTensor<QType> aL0 = queL0A_.AllocTensor<QType>();
-        {
+        if constexpr (IS_FP32) {
+            // fp32 NZ->ZZ: SetFmatrix(LEFT) + LoadData3D (sticky state, set right before use).
+            // The LoadData2D loop below only works for C0=16 (fp16/bf16); fp32 fractals are
+            // [16, C0=8] and need the fMatrix-assisted path.
+            constexpr uint8_t PAD_LIST[4] = {0, 0, 0, 0};
+            SetFmatrix(1, static_cast<uint16_t>(mActAlign), PAD_LIST, FmatrixMode::FMATRIX_LEFT);
+            LoadNzL1ToZzL0A(aL0, qL1[qL1Off], mActAlign, kSize, mActAlign);
+        } else {
             for (uint32_t i = 0; i < mActAlign / C0; i++) {
                 LoadData2DParams p;
                 p.startIndex  = i;
@@ -230,6 +244,7 @@ private:
         mp.k = kSize;
         mp.cmatrixInitVal = isFirst;
         mp.cmatrixSource  = false;
+        if constexpr (IS_FP32) { mp.kDirectionAlign = true; }
         SetWaitFlag<HardEvent::MTE1_M>();
         PipeBarrier<PIPE_M>();
         Mmad(cL0, aL0, bL0, cL0, mp);
@@ -244,14 +259,29 @@ private:
     {
         SetWaitFlag<HardEvent::M_MTE1>();
         LocalTensor<QType> aL0 = queL0A_.AllocTensor<QType>();
+        if constexpr (IS_FP32) {
+            // fp32 NZ->ZZ needs the sticky fMatrix set to LEFT right before LoadData3D.
+            constexpr uint8_t PAD_LIST[4] = {0, 0, 0, 0};
+            SetFmatrix(1, static_cast<uint16_t>(BLOCK_M), PAD_LIST, FmatrixMode::FMATRIX_LEFT);
+        }
         LoadNzL1ToZzL0A(aL0, pL1, BLOCK_M, kvRowsAlign, BLOCK_M);
         queL0A_.EnQue(aL0);
 
-        LoadNdGmToNzL1(kvL1, vGm_[vSliceOffset], kvRows, nSize, tiling_.dim, kvRowsAlign);
+        if constexpr (IS_FP32) {
+            // fp32: V goes to L1 in ZZ layout (plain LoadData3D/LoadData2D cannot do the
+            // [16,C0=8] -> [C0=8,16] inner-fractal transpose NZ->nZ requires).
+            GmToL1Nd2ZzFp32(kvL1, vGm_[vSliceOffset], kvRows, nSize, tiling_.dim);
+        } else {
+            LoadNdGmToNzL1(kvL1, vGm_[vSliceOffset], kvRows, nSize, tiling_.dim, kvRowsAlign);
+        }
         SetWaitFlag<HardEvent::MTE2_MTE1>();
         SetWaitFlag<HardEvent::M_MTE1>();
         LocalTensor<QType> bL0 = queL0B_.AllocTensor<QType>();
-        LoadNzL1ToZnL0B(bL0, kvL1, kvRowsAlign, nSize, kvRowsAlign);
+        if constexpr (IS_FP32) {
+            L1ZzToL0BZnFp32(bL0, kvL1, kvRowsAlign, nSize);
+        } else {
+            LoadNzL1ToZnL0B(bL0, kvL1, kvRowsAlign, nSize, kvRowsAlign);
+        }
         queL0B_.EnQue(bL0);
 
         aL0 = queL0A_.DeQue<QType>();
@@ -264,6 +294,7 @@ private:
         mp.k = kvRowsAlign;
         mp.cmatrixInitVal = true;
         mp.cmatrixSource  = false;
+        if constexpr (IS_FP32) { mp.kDirectionAlign = true; }
         SetWaitFlag<HardEvent::MTE1_M>();
         PipeBarrier<PIPE_M>();
         Mmad(cL0, aL0, bL0, mp);
@@ -273,7 +304,7 @@ private:
     }
 
     // Helper: Fixpipe for main MM2 tiles
-    __aicore__ inline void FixpipeMM2Main(LocalTensor<float> &oSlot, LocalTensor<float> &cL0,
+    __aicore__ inline void FixpipeMM2Main(GlobalTensor<float> &oSlot, LocalTensor<float> &cL0,
                                            uint32_t ni, uint32_t mActAlign)
     {
         SetWaitFlag<HardEvent::M_FIX>();
@@ -291,13 +322,75 @@ private:
     }
 
     // Helper: Fixpipe for remainder MM2 tile
-    __aicore__ inline void FixpipeMM2Remainder(LocalTensor<float> &oSlot, LocalTensor<float> &cL0,
+    __aicore__ inline void FixpipeMM2Remainder(GlobalTensor<float> &oSlot, LocalTensor<float> &cL0,
                                                 uint32_t nTiles, uint32_t nAligned)
     {
         SetWaitFlag<HardEvent::M_FIX>();
         uint64_t wsBase = (uint64_t)nTiles * BASE_K;
-        FixpipeNzL0cToNdGm(oSlot[wsBase], cL0, nAligned, BLOCK_M);
+        // L0C is [BLOCK_M rows, nAligned cols]; write ND rows with the workspace row stride.
+        // (Previously passed m=nAligned / n=BLOCK_M, which transposed the tile whenever
+        //  nAligned != BLOCK_M — the d_k=80 case.)
+        FixpipeParamsV220 fixParams;
+        fixParams.mSize       = BLOCK_M;
+        fixParams.nSize       = nAligned;
+        fixParams.srcStride   = AlignForMmad(BLOCK_M);
+        fixParams.dstStride   = dimAlign_;
+        fixParams.ndNum       = 1;
+        fixParams.srcNdStride = 0;
+        fixParams.dstNdStride = 0;
+        Fixpipe(oSlot[wsBase], cL0, fixParams);
         SetWaitFlag<HardEvent::FIX_MTE2>();
+    }
+
+    // ---- fp32-only ZZ-layout helpers (kept here so matmul_tile.h stays untouched) ----
+
+    // GM(ND) -> L1(ZZ), fp32 only. ZZ layout: 16-row groups; group g sits at
+    // g*AlignUp(w,16)*16 elements, each group holds NZ fractals [16 rows, C0=8].
+    __aicore__ inline void GmToL1Nd2ZzFp32(LocalTensor<QType> &dst, GlobalTensor<QType> src,
+                                           uint32_t h, uint32_t w, uint32_t W)
+    {
+        if (h / 16 > 0) {
+            Nd2NzParams param;
+            param.ndNum = h / 16;
+            param.nValue = 16;
+            param.dValue = w;
+            param.srcNdMatrixStride = W * 16;
+            param.srcDValue = W;
+            param.dstNzC0Stride = 16;
+            param.dstNzNStride = 1;
+            param.dstNzMatrixStride = AlignUp(w, 16U) * 16;
+            DataCopy(dst, src, param);
+        }
+        if (h % 16 != 0) {
+            Nd2NzParams param;
+            param.ndNum = 1;
+            param.nValue = h % 16;
+            param.dValue = w;
+            param.srcNdMatrixStride = 0;
+            param.srcDValue = W;
+            param.dstNzC0Stride = 16;
+            param.dstNzNStride = 1;
+            param.dstNzMatrixStride = 0;
+            uint32_t tailStart = h / 16 * 16;
+            DataCopy(dst[tailStart * AlignUp(w, 16U)], src[(uint64_t)tailStart * W], param);
+        }
+    }
+
+    // L1(ZZ) -> L0B(nZ) with inner-fractal transpose, fp32 only.
+    // k (reduction) and n must be 16-aligned (guaranteed by AlignForMmad / BASE_K).
+    __aicore__ inline void L1ZzToL0BZnFp32(LocalTensor<QType> &dst, const LocalTensor<QType> &src,
+                                           uint32_t k, uint32_t n)
+    {
+        uint32_t nAlign = AlignUp(n, 16U);
+        LoadData2dTransposeParams p;
+        p.startIndex  = 0;
+        p.repeatTimes = n / 16;
+        p.srcStride   = 1;
+        p.dstGap      = 0;
+        p.dstFracGap  = n / 16 - 1;
+        for (uint32_t i = 0; i < k / 16; ++i) {
+            LoadDataWithTranspose(dst[i * 16 * nAlign], src[i * 16 * nAlign], p);
+        }
     }
 
     FlashAttentionTiling tiling_;

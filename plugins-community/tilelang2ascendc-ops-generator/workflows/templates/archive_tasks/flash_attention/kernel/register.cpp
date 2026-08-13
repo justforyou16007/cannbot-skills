@@ -19,12 +19,14 @@ TORCH_LIBRARY_FRAGMENT(npu, m)
 {
     m.def("flash_attention_fp16(Tensor q, Tensor k, Tensor v) -> Tensor");
     m.def("flash_attention_bf16(Tensor q, Tensor k, Tensor v) -> Tensor");
+    m.def("flash_attention_fp32(Tensor q, Tensor k, Tensor v) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(npu, PrivateUse1, m)
 {
     m.impl("flash_attention_fp16", TORCH_FN(ascend_kernel::flash_attention_fp16));
     m.impl("flash_attention_bf16", TORCH_FN(ascend_kernel::flash_attention_bf16));
+    m.impl("flash_attention_fp32", TORCH_FN(ascend_kernel::flash_attention_fp32));
 }
 
 } // namespace

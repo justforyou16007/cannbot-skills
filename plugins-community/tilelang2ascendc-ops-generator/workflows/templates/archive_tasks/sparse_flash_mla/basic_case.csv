@@ -1,0 +1,2 @@
+case_name,scenario,layout_q,layout_kv,batch_size,seq_len_q,seq_len_kv,n_heads_q,n_heads_kv,head_dim,topk,cmp_ratio,ori_mask_mode,cmp_mask_mode,ori_win_left,ori_win_right,dtype
+swa_decode,SWA,BSND,BSND,1,1,2048,128,1,512,,,4,3,127,0,bfloat16

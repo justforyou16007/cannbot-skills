@@ -27,7 +27,7 @@ WORKDIR = SCRIPT_DIR.parent
 # Import shared utility functions from the canonical AscendC verification module.
 # Canonical source: tilelang2ascend-translator/scripts/verification_ascendc.py
 _ASCENDC_SCRIPTS = (
-    Path(__file__).resolve().parents[1] / "tilelang2ascend-translator" / "scripts"
+    Path(__file__).resolve().parents[2] / "tilelang2ascend-translator" / "scripts"
 )
 if str(_ASCENDC_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_ASCENDC_SCRIPTS))
@@ -99,9 +99,18 @@ def _get_input_groups(module):
     if not hasattr(module, "get_input_groups"):
         raise AttributeError(f"get_input_groups() not found in {module.__file__}")
 
-    input_groups = module.get_input_groups()
+    # If the task exposes a TileLang-specific input selector, use it so we only
+    # run cases the TileLang kernel's tiling can express (e.g. scenarios not
+    # covered by the TileLang design). This keeps the CSV-driven
+    # get_input_groups() intact for the AscendC verification path.
+    selector = getattr(module, "get_input_groups_tilelang", None)
+    if callable(selector):
+        input_groups = selector()
+    else:
+        input_groups = module.get_input_groups()
     if not isinstance(input_groups, list) or not input_groups:
-        raise ValueError("get_input_groups() must return a non-empty list")
+        raise ValueError(f"get_input_groups{'_tilelang' if callable(selector) else ''}() "
+                         "must return a non-empty list")
     return input_groups
 
 

@@ -443,7 +443,17 @@ AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(notifyId);
      双 MMA 通路隔离实验（第二次 Mmad 改用 P_hi，ratio=2.0）是正确的，极易误判方向。
   3. fp32 路径无此问题（无 Cast 截断），保持单 MMA。
   来源：ScaledDotProductAttention case[7] bf16 [2,8,577,128→136] 及全量 case[17]/[44] fp16。
-- 💡 **fp32 Vector matmul 无性能出路时的降精度方向**：fp32 无 MMA 硬件支持，Vector fp32 matmul
-  吞吐约为 Cube 的 1/20~1/50（实测 897×921×136 case：2484us vs ref 118us，speedup 0.042x）。
-  若精度容差允许，可将 P hi/lo 同思路扩展到 QK/PV 两侧（Q/K/V 各拆 hi/lo bf16 走 Cube MMA），
-  是把 fp32 大 case 拉回 1.0x 附近的唯一已知路径；TileLang 层无法收敛。
+- 💡 **fp32 matmul 的正确前提与已验证路径**：注意区分两层限制——**TileLang 框架**的
+  mma_macro_generator 仅支持 16/8bit 输入（probe 实证），故 TileLang 阶段 fp32 只能表达为
+  Vector；但 **910B2C（Atlas A2）Cube 硬件支持 float×float→float Mmad**（Mmad.md 表7），
+  吞吐为 fp16 的 1/4（cube_k=4，见 cube_instruction_theoretical_perf_summary.md 表1），
+  开 HF32 模式为 1/2（尾数截断、精度有损）。⚠️ 不要写成"平台不支持 fp32 MMA"（SDPA 任务
+  kernel 注释曾误写）。
+  **路径 ① fp32 直接 Cube Mmad 已实证**（SDPA 2026-08-12，`SdpaKernel<float>` 复用 fp16/bf16
+  CV 融合结构，fp32 全程无 Cast 无 hi/lo）：case [2,15,239,192]×Skv=275 从 2307us→185us
+  （12.5x，0.042x→0.522x），MERE 2.6e-7，fp32 谱 geomean 0.32→0.78。实现要点：
+  BASE_K_T=64（双缓冲 L0A/L0B 适配 64KB）、C0=8 K 对齐（恒满足 kDirectionAlign=false 的
+  ceil(K/8)×8）；**小 shape 按 qkElems≥2048 分流保留 Vector**——Cube 的 host 固定开销
+  （workspace at::zeros、tiling H2D、MIX launch）在小 shape 使端到端反转（device kernel time
+  持平 ≠ 端到端持平，阈值须 A/B 实测）。备选：② Q/K/V hi/lo bf16 3-MMA（~1/3 fp16，
+  P hi/lo 同思路已验证）；③ HF32（1/2 fp16，需实测能否过 fp32 atol=1e-3）。

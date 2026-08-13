@@ -291,3 +291,10 @@ AscendC::Fixpipe(dst, src, params);
 - ❌ **`MmadParams.m` 传 1**（如 MQA G=1、singleM=1）：硬件 Mmad.m 最小为 2，m=1 触发 VEC illegal config / 输出错。正确：`mp.m = (mRows==1)?2:mRows`，Fixpipe.mSize 仍取真实 mRows。
 - ❌ **`Nd2NzParams.srcDValue`（行距 ld）传 G\*D**：BSND `[B,S,N1=G,D]` 每行 D 元素，行距应 = **D**（不是 N1\*D）。传 G\*D 会读到下一 s1 的同 head（G=1 时 G\*D==D 巧合正确，G>1 全错；G\*D 过大致 Nd2Nz 寻址越界 crash）。`LoadQToL1/LoadDyToL1/ComputeMm5 dO` 等 GM→L1 加载都要核 ld=D。
 - ❌ **K 维多 tile 累加 cmatrixInitVal 时序错**：跨 D 分 tile 累加时，首 tile（isFirstK）cmatrixInitVal 置初值、续 tile 累加；跨 inner-step（如 dq 跨 selected-chunk）累加用 AtomicAdd 时，每步 cmatrixInitVal 须为增量（非清零），且目标 workspace 预清零。
+- ❌ **ClearL1（MTE1 写 L1）后 ND2NZ/LoadData（MTE2 读 L1）缺 `SetWaitFlag<MTE1_MTE2>` 守卫**：
+  清零未完成的 L1 被 ND2NZ 搬走 → pad 区读到脏数据。典型潜伏竞态：fp16/bf16 小 K 下时序
+  巧合长期通过，fp32 dqk=192（行字节数翻倍拉长 MTE1 清零窗口）才首次暴露。**正确做法**：
+  ClearL1 与下游首个 ND2NZ 之间插 `SetWaitFlag<HardEvent::MTE1_MTE2>`（MTE2 等 MTE1）。
+  注意与 §2.3/§8 尾部两条的区别：那些是"MTE2 写 L1 → MTE1 读"方向的守卫，本条是反向。
+  来源：SDPA fp32 Cube 路径（2026-08-12），同轮修复 fp16/bf16 同型潜伏 bug
+  （正确性代价 bf16/fp16 大 case -4~-7%，应接受）。

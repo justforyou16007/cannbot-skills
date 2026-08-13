@@ -33,9 +33,17 @@ geomean 上限 ~0.95。再往上需要 Expert 模式修复或 AscendC 手写流�
 
 - **小 case（Sq≤59）**：1.7~3.2x。reference 在小 shape 上 launch/调度开销占比高，单 kernel 融合优势明显。
 - **大 case Cube 路径（fp16/bf16）**：0.46~0.54x，ns=1 串行是主因。
-- **大 case fp32 Vector 路径**：0.048~0.21x。fp32 无 MMA，Vector fp32 matmul 吞吐约为 Cube 的
-  1/20~1/50（实测 [2,8,897,128]×Skv=921：2484us vs ref 118us），TileLang 层无法收敛，
-  唯一已知方向是 AscendC 阶段 Q/K/V hi/lo bf16 拆分走 Cube MMA。
+- **大 case fp32 路径**：⚠️ 前提澄清——**TileLang 框架**的 MMA macro 不支持 fp32 输入
+  （probe 实证：mma_macro_generator 仅 16/8bit），故 TileLang 阶段 fp32 只能 Vector（0.048~0.21x）；
+  但 **910B2C Cube 硬件支持 float×float→float Mmad**（Mmad.md 表7，cube_k=4，吞吐 1/4 fp16）。
+  **AscendC 转译阶段 fp32 应直接走 Cube Mmad（已实证，2026-08-12）**：`SdpaKernel<float>`
+  复用 fp16/bf16 CV 融合结构、无 Cast 无 hi/lo，case [2,15,239,192]×Skv=275 达 0.522x
+  （185us vs 标杆 97us），fp32 谱 geomean 0.32→0.78，全任务 geomean 0.583→0.750。
+  实现要点：BASE_K_T=64（双缓冲 L0A/L0B）、C0=8 K 对齐；**小 shape 按 qkElems≥2048 分流
+  保留 Vector**（Cube host 固定开销——workspace at::zeros + tiling H2D + MIX launch——在小
+  shape 使端到端反转；device kernel time 持平 ≠ 端到端持平，阈值须 A/B 实测）。
+  备选：hi/lo bf16 3-MMA（~1/3 fp16）、HF32（1/2 fp16，精度有损需实测）。
+  注意 ClearL1→ND2NZ 必须 `SetWaitFlag<MTE1_MTE2>` 守卫（详 cube-impl-patterns.md §8.1）。
 - **geomean 基线**：TileLang 层 ~0.80；AscendC 转译后 ~0.58（统一 P hi/lo 后 fp16 略降）。
 
 ## 4. 转译阶段精度预案（与 vector-impl-patterns.md 联动）

@@ -10,6 +10,7 @@
 # ----------------------------------------------------------------------------------------------------------
 
 import csv
+import os
 from pathlib import Path
 
 import torch
@@ -28,7 +29,10 @@ class Model(nn.Module):
 
 
 def get_input_groups():
-    case_path = Path(__file__).resolve().parent / "general_case.csv"
+    # FA_CASE_FILE selects the case list; TileLang verification passes
+    # general_tilelang_case.csv (TileLang does not support float32).
+    case_name = os.environ.get("FA_CASE_FILE", "general_case.csv")
+    case_path = Path(__file__).resolve().parent / case_name
     input_groups = []
     with case_path.open(newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):

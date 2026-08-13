@@ -2075,32 +2075,63 @@ def _process_one_variant(node_id: str, p_idx_str: str, ctx: _RefineContext):
         if isinstance(ms_min, (int, float)) and ms_min > 0:
             speedup = ms_min
 
-    # ── P8: 统一 score 基准为 vs PyTorch ──
-    # comparison.speedup 的 base_time_ms 可能被污染为父/基线内核时间（ref_base 缺失、
-    # base 与 canonical PyTorch 参考偏差 >±20%）。此时用 canonical pytorch_time_ms /
-    # gen_time_ms 重算 score，并记录 alert 供审计，避免 vs 基线 / vs PyTorch 混存导致
-    # 最优判定错误（MQA 会话实证：n8 的 vs 基线 0.9451 被误判为 vs PyTorch 最优）。
-    if not ms_active and ctx.pytorch_time_ms > 0:
+    # ── P8 (修正): score = 同 run canonical（同一次 msprof 测量的 ref geomean ÷ asc geomean）──
+    # 历史缺陷: 旧 P8 用 baseline_evaluation.base_time_ms_avg（基线 run 的 mean_ref，
+    # 属跨 run 值）作为 "canonical PyTorch 参考"；当变体 base_time_ms 与之偏差 >±20% 时
+    # 用 baseline_mean_ref / gen_time_ms 重算 score —— 这是跨 run 混算（基线 run 的 ref
+    # 与变体 run 的 asc 混合）。QuantMatmul 会话实证: 0.68x 同 run canonical 被误记为 1.49x。
+    # 用户指令: 权威指标 = 同一次 msprof 测量中的 ref geomean ÷ asc geomean，
+    # 禁止任何跨 run 归一、禁止用不同 run 的 ref 和 asc 混合计算。
+    # 修正 (P8-20260813): 优先取变体自身 performance.json 的 geomean_ref_us /
+    # geomean_asc_us（同一 run 内 ref 与 asc 的 geomean，权威同 run canonical），
+    # 退化为 comparison.base_time_ms / gen_time_ms（ref_base == "pytorch" 时）。
+    # 绝不用 baseline run 的参考时间重算变体 score。base 疑似污染时记录 alert 供审计。
+    if not ms_active:
         gen_ms = comp.get("gen_time_ms")
         base_ms = comp.get("base_time_ms")
         ref_base = comp.get("ref_base", "missing")
-        base_ok = (
-            ref_base == "pytorch"
-            and isinstance(base_ms, (int, float)) and base_ms > 0
-            and abs(float(base_ms) - ctx.pytorch_time_ms) <= 0.2 * ctx.pytorch_time_ms
-        )
-        if not base_ok and isinstance(gen_ms, (int, float)) and gen_ms > 0:
-            norm_speedup = ctx.pytorch_time_ms / gen_ms
+        canonical = 0.0
+        canonical_src = None
+        # 1) 变体自身 performance.json 的同 run geomean（最权威）
+        perf_json = os.path.join(ctx.results_dir, f"parallel_{p_idx}", "performance.json")
+        if os.path.isfile(perf_json):
+            try:
+                with open(perf_json, "r", encoding="utf-8") as _pf:
+                    pd = json.load(_pf)
+                _gr = pd.get("geomean_ref_us")
+                _ga = pd.get("geomean_asc_us")
+                if (isinstance(_gr, (int, float)) and _gr > 0
+                        and isinstance(_ga, (int, float)) and _ga > 0):
+                    canonical = float(_gr) / float(_ga)
+                    canonical_src = "performance.json"
+            except (OSError, json.JSONDecodeError, ValueError):
+                canonical_src = None
+        # 2) 退化为 comparison base/gen（ref_base == "pytorch" 时）
+        if not canonical and (ref_base == "pytorch"
+                              and isinstance(base_ms, (int, float)) and base_ms > 0
+                              and isinstance(gen_ms, (int, float)) and gen_ms > 0):
+            canonical = float(base_ms) / float(gen_ms)
+            canonical_src = "comparison"
+        if canonical > 0:
+            if abs(canonical - speedup) > 0.05 * max(speedup, 1e-9):
+                ctx.score_scale_alerts.append({
+                    "node_id": node_id, "parallel_index": p_idx,
+                    "base_time_ms": base_ms, "gen_time_ms": gen_ms,
+                    "ref_base": ref_base,
+                    "raw_speedup": round(speedup, 4),
+                    "normalized_speedup": round(canonical, 4),
+                    "note": f"comparison.speedup 与同 run canonical 不一致，score 按 {canonical_src} 同 run canonical 重算",
+                })
+            speedup = canonical
+        elif ref_base != "pytorch" and isinstance(gen_ms, (int, float)) and gen_ms > 0:
             ctx.score_scale_alerts.append({
                 "node_id": node_id, "parallel_index": p_idx,
                 "base_time_ms": base_ms, "gen_time_ms": gen_ms,
                 "ref_base": ref_base,
-                "canonical_pytorch_ms": round(ctx.pytorch_time_ms, 4),
                 "raw_speedup": round(speedup, 4),
-                "normalized_speedup": round(norm_speedup, 4),
-                "note": "base_time_ms 偏离 canonical PyTorch 参考（可能用父/基线内核作 base），score 已按 canonical PyTorch 重算",
+                "normalized_speedup": None,
+                "note": "ref_base 非 pytorch，base 可能被污染为父/基线内核时间；score 保持原值，不做跨 run 重算",
             })
-            speedup = norm_speedup
 
     if compilation_ok and precision_ok and speedup > 0:
         _process_passed_variant(
@@ -2582,6 +2613,7 @@ def cmd_session(args: argparse.Namespace) -> None:
 
     now = dt.datetime.now(dt.timezone(dt.timedelta(hours=8)))
     evo_dir = os.path.abspath(args.evo_dir)
+    op_name = args.op_name if getattr(args, "op_name", None) else args.session_id
 
     wm["session"] = {
         "session_id": args.session_id,
@@ -2589,7 +2621,7 @@ def cmd_session(args: argparse.Namespace) -> None:
         "requested_rounds": args.requested_rounds,
         "actual_rounds_completed": 0,
         "evo_dir": evo_dir,
-        "op_name": args.op_name,
+        "op_name": op_name,
     }
 
     os.makedirs(os.path.dirname(args.wm_path), exist_ok=True)
@@ -2860,6 +2892,7 @@ def _register_filter_session_commands(subparsers):
     p_sess.add_argument("--session-id", required=True)
     p_sess.add_argument("--evo-dir", required=True)
     p_sess.add_argument("--requested-rounds", type=int, default=5)
+    p_sess.add_argument("--op-name", default=None, help="Operator name (optional, defaults to session_id prefix)")
     p_sess.set_defaults(func=cmd_session)
 
     p_sv = subparsers.add_parser(

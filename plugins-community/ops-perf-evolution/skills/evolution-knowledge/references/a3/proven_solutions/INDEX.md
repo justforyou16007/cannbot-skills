@@ -51,7 +51,12 @@ Each entry should follow this template:
 | conv-transpose / deconv (col2im 散射) | X26: Col2im Tap-Batch 事件化 | 10_ConvTranspose2d evolution |
 | conv-transpose / deconv (stride=1, 固定开销主导) | X29: Shift-Free Tap-Comb 稠密直算 | 10_ConvTranspose2d evolution |
 | attention (物化式 MHA/MQA/GQA) | X30: 头维-minor Q 布局免 heads-merge kernel | 22_MultiQueryAttention evolution |
+| attention (GQA prefill) | X33: workspace-ring 握手延迟 bound 的 Q-tile 放大 + 投影 GEMM group A-reuse | 21_GroupedQueryAttention evolution |
+| attention (block-sparse GQA prefill) | 单遍 flash-attention 融合（MIX_AIC_1_2 + P137 紧凑 gather + P hi/lo 双平面） | 80_GqaSparseFwd evolution |
 | softmax (logits 有界) | X31: bounded logits softmax 去 max 减法 | 22_MultiQueryAttention evolution |
+| ssm / GLA / linear-attention (chunked 输出阶段) | X34: GLA 输出阶段 Cube CV 融合重写（MIX_AIC_1_1 + hilo 精度分裂） | ChunkGlaFwdKernelO evolution |
+| deconv, conv (col2im 散射) | X34: Col2im 相位化行归约 | 10_ConvTranspose2d evolution |
+| host-bound 算子（大 workspace 全写） | X39: host 侧全写 workspace 免零初始化（at::empty + 动态 blockDim） | 80_GqaSparseFwd evolution |
 
 _新方案沉淀时按此格式追加行_
 
@@ -408,6 +413,32 @@ G workspace 往返 / AIC→AIV 交接 / torch x2 预处理。
 
 ---
 
+### X32: fp16 hi/lo 投影 GEMM 精度替代 + 投影 GEMM 真实瓶颈识别（MTE2-bound）
+
+**Source**: GroupedQueryAttention evolution, round 2-4
+**Speedup**: 早期大 fp32 case 2-3x 为采样伪影；round-4 全量：fp16 投影净收益在噪声带内；L1 双缓冲 +3-14%
+**Operator type**: matmul / attention (GQA prefill fp32 投影)
+**Hardware**: Ascend 910B2C (DAV_2201)
+
+**Technique description**:
+fp32 投影 GEMM 是 GQA prefill dominant 成本（case44 占 kernel 55%），profiling 证明它是
+**MTE2-bound（mac_ratio 0.245 / mte2_ratio 0.709）非 compute-bound**。P128 bf16 hi/lo
+对 attention 精度通过、对投影近零输出 MERE 超 2^-13；fp16 hi/lo（~2^-21）是精度安全替代
+但 cube 吞吐翻倍被内存瓶颈吞没（单维度无净收益）。正确杠杆：投影 GEMM L1 双缓冲
+（GM→L1 与 mmad 重叠，+3-14%）、大块化减少 undersize transfer、消除 GM 往返。
+
+**Key code change**:
+```cpp
+// L1 双缓冲: aBufL1_[0/1], bBufL1_[0/1] 2-slot ping-pong，k-step ks+1 载入与 ks mmad 重叠
+// fp16 hi/lo 精度替代（如需）: hi=fl16(x), lo=fl16(x-fl32(hi)), 3-GEMM 舍 lo@lo
+```
+
+**Applicability conditions**:
+- fp32 投影 GEMM 已 MTE2-bound → 先优化内存访问（L1 双缓冲/大块化），再考虑精度替代
+- 精度需保真时 fp16 hi/lo 替代 3xTF32（K≤1472 MERE≈9e-6）
+
+**Strategy IDs**: X32, P128
+
 _Add new entries below as they are discovered._
 
 ### X30: 头维-minor Q 布局免 heads-merge kernel（22_MultiQueryAttention）
@@ -462,3 +493,199 @@ exp 溢出（fp32 溢出点 ~88）。logits 实测有界 |z|<40 时删除 max �
 - 是 A5 max-trick 的条件反向优化；与 X30 正交
 
 **Strategy IDs**: X31
+
+---
+
+### X33: attention workspace-ring 握手延迟 bound 的 Q-tile 放大 + 投影 GEMM group A-reuse（21_GroupedQueryAttention）
+
+**Source**: 21_GroupedQueryAttention evolution, round 3, parallel 2 (x0_x1_x1) + parallel 0 (m2) + parallel 1 (n1_cont)
+**Speedup**: 全量 50-case 0.598x → 0.640-0.657x（round-3 vs round-4 prior-art +7-10%；vs 原始基线 0.4997 +28-31%）；attention Q-tile 32→64 单步 case47 +24%、case35 +19%（attention 318→265us）；case2 fp32 小 shape 达 1.21x（快于 PyTorch）
+**Operator type**: GQA/FA prefill（attention workspace-ring 流水 + 投影 GEMM）
+**Hardware**: Ascend910B2C (DAV_2201)
+
+**Technique description**:
+GQA attention 各 aic/aiv 管道利用率 <15% → 是跨核 AIC↔AIV workspace-ring 握手延迟 bound（非带宽/计算）。per-task Q tile 放大（GQA_BLOCK_Q 32→64→128）把每次输出的握手次数减半，直接压延迟。fp32 投影 GEMM 是 MTE2(GM→L1) 管道饱和（aic_mte2_ratio=0.693-0.746），用 by-group A-reuse（GQA_GEMM_GROUP_BY=6，每 task [64,6] slab，A tile 复用 6 列 B）把 A GM over-read 从 ~63x 降到 ~11x。配 X24（AIC_ONLY 纯 cube + AIV_ONLY 纯搬移压 launch 地板）+ P1（L1 双缓冲）是最优组合。
+
+**Key code change**:
+```cpp
+// attention Q tile: gqa_tiling.h
+// Before: constexpr uint32_t GQA_BLOCK_Q = 32;
+// After:  constexpr uint32_t GQA_BLOCK_Q = 128;  // 每放大一次握手减半
+//        constexpr uint32_t GQA_PV_CHUNK = 64;  // PV 分块控 L0C 宽度
+
+// 投影 GEMM group A-reuse: gqa_matmul.h
+// Before: 每 task 1 个 [64,64] 输出块，A 被 nNum 个 N 块重复读
+// After:  每 task 覆盖 GROUP_BY=6 个连续 N-tile，A 每 k-step 载一次复用 6 次
+```
+
+**Applicability conditions**:
+- attention 各管道利用率低（<15-30%）但耗时长 → Q-tile 放大减握手次数；Q-tile 放大需同步 AIV softmax 行组数 + 小 seq 的 padding-row skip
+- 投影/GEMM A 侧 over-read 严重 → by-group A-reuse；GROUP_BY 上限由 L0C 容量定（GROUP_BY*BLK*BLK*4B ≤ L0C，fault 时降级）
+- 与 X24（AIC_ONLY/AIV_ONLY）+ P1（L1 双缓冲）叠加收益最大
+- 残余瓶颈：投影 GEMM B 侧权重搬运（case44 B:A≈12.7:1）
+
+**Strategy IDs**: X33, X24, P1
+
+### X34: GLA 输出阶段 Cube CV 融合重写（MIX_AIC_1_1 + hilo 精度分裂）
+
+**Source**: ChunkGlaFwdKernelO evolution, round 1-3（round1 p0 → round2 p2 NVM → round3 p2 v_ws）
+**Speedup**: 0.293x → 10.34x vs PyTorch（geomean，相对基线 ~35x；round1 2.918x → round2 7.594x → round3 10.34x；50/50 精度，min 3.42x）
+**Operator type**: ssm / GLA / linear-attention（chunked 输出阶段）
+**Hardware**: 910B2C
+
+**Technique description**:
+GLA/SSM 系 chunked 输出阶段（`o[t] = tril(A)@v + scale*(q*exp(g))@h`）的纯 AIV count-8 Mul 外积模拟矩阵乘
+重写为 `KERNEL_TYPE_MIX_AIC_1_1` Cube CV 融合（三次 Mmad 融合 + Fixpipe F322F16 + hilo 精度分裂 + 任务间流水）。
+**关键演进：host 零布局预处理（NVM）**——父 MIX 的 8 个 host 设备 op（pad/permute/OnesLike/Tril）约 120µs/call 占大 case 60%+，
+改 q/g/A 原生布局直传 + kernel 内 strided 读取，host op 8→1；**v_ws 混合**再消除最后 host pad（tail chunk AIV 在 workspace 零填充 v，
+full chunk AIC 直读 GM），host op→0，小 case 近翻倍。AIC_ONLY 变体（X24）另证小 shape launch 地板可压。
+
+**Key code change**:
+```cpp
+// op_kernel/chunk_gla_fwd_o.cpp: KERNEL_TYPE_MIX_AIC_1_1
+// AIC: 三次 Mmad 融合到单 L0C, 末次 Fixpipe(F322F16) 直写 o (mSize=L 只写实际块长)
+//   Mmad(l0c, l0a_qg_hi, l0b_h, mp_init1);   // qg_hi@h 覆盖
+//   Mmad(l0c, l0a_qg_lo, l0b_h, mp_init0);   // qg_lo@h 累加
+//   Mmad(l0c, l0a_Am, l0b_v, mp_init0);      // A_m@v 累加
+//   Fixpipe(l0c, ws_o, fp322f16);            // L0C(fp32)→GM(fp16) 直写
+// AIV: qg = q*scale*exp(g) 分块(EXP_CHUNK=512) + hilo 分裂; A_m = A * tril_mask
+// 任务间: AIC gemm(task_i) ∥ AIV prep(task_{i+1}), SyncAll<false>() 每迭代 1 次
+```
+
+**Applicability conditions**:
+- GLA/GDN/SSM 系 chunked 输出阶段（任务 = batch×chunk×head 独立，h 为每 chunk 独立状态）
+- gemm 维度 K/V ∈ {32,64,128}，chunk_size 32/64；fp16 输入 + fp32 中间精度要求
+- 下一杠杆 = AIV MTE2 优化（P1 任务间双缓冲 + P66 大块 DMA 合并 + 精简 workspace 写入），非加大 Cube
+- 纯 AIV 向量路径（任务流水 0.51x / 全宽 count-32 批处理 0.55x）天花板 ~2x 相对基线，不敌 Cube 化
+
+**Strategy IDs**: P102, P133, P134, P25, P66（OKF 卡 x34；同轮对照组 BFR1A 见 x34 卡内）
+
+### X34: Col2im 相位化行归约 (10_ConvTranspose2d)
+
+**Source**: 10_ConvTranspose2d evolution, round 2, parallel 0
+**Speedup**: 全量 50-case geomean 0.405x → 0.478x (+18%)；case2 [2,32,16,16] 548.4us → 118us (4.66x)
+**Operator type**: deconv / conv (col2im 散射 fallback)
+**Hardware**: Ascend910B2C
+
+**Technique description**:
+反卷积 fallback（cube GEMM + col2im）的真正瓶颈是 col2im 散射（逐输出行 undersize 加载 + Gather + parity 过滤 + PIPE_ALL，~274us/大 case），不是 im2col 带宽（GEMM 中间 G 仅 0.03-2MB、~9us）。把 col2im 重构为相位化行归约：按输出奇偶拆 s² 相位，每相位对相位内 K²/s² 条 G 行做全长对齐向量 Add 归约 → 相位平面 → 行粒度批量写回；列移位经 DataCopyPad src offset + padding 落地（AIV 全 32B 对齐，绕开 odd-shift 对齐封锁）；tap 表预计算 + 一次向量 Gather 奇偶交织。
+
+**Key code change**:
+```cpp
+// Before (ct2d_col2im): 逐输出行 (n,co,oh) 循环 tap，每 tap 一次 MTE2 加载 + Gather + PIPE_ALL (~16/行)
+// After (ct2d_col2im_phase):
+//   每相位内 K²/4 条 G 行全长对齐向量 Add 归约 (P94)
+//   acc_phase = Σ_{taps in phase} G_row[0:ng]   // 一次向量 Add 替代逐 tap Gather+Add
+//   列移位 c0=d_w0-b 经 DataCopyPad src offset + left/rightPadding (P26)
+//   相位平面 [co, n·hi·wi] 行粒度批量写回 (P56); wo==woA 多块 DataCopyPad
+//   一次向量 Gather 奇偶交织写回 (idx 一次性预计算)
+```
+
+**Applicability conditions**:
+- 反卷积/分数步长卷积的 col2im fallback（GEMM + col2im 两 kernel）；散射类 col2im/deconv
+- GEMM 中间矩阵 G 可复用（常驻 L2）；G 行 [0,ng) 连续（全长对齐行归约前提）
+- 多块加载仅用于 wi%8==0 && srcCol==0（非对齐 src 行多块 dav-2201 病态）
+- 残余瓶颈：G 读带宽 (~35us floor) + 双 kernel launch + co 小 case 并行度不足
+
+**Strategy IDs**: P94, P56, P26, X34（OKF 卡 disc_X34）
+
+| 路由/多分支选择 | X35: 路由选中分支消除 | AdaptiveAttention evolution |
+
+### X35: 路由选中分支消除（selected-option elimination）
+
+**Source**: AdaptiveAttention evolution, round 1, parallel 2
+**Speedup**: 0.187x → 0.449x geomean (2.40x improvement)，大 shape 5-7.6x
+**Operator type**: attention / 路由选择式多分支算子（MoE、条件计算通用）
+**Hardware**: Ascend910B2C (DAV_2201)
+
+**Technique description**:
+路由器在计算前产生 one-hot 选择向量 sel，输出 = sum_i sel_i·branch_i(x)（one-hot 下仅
+取被选中分支）。按 batch 分发把主计算 task 表只映射到被选中分支的权重/数据，跳过其余
+n_branch-1 个分支的完整计算链（投影 GEMM、attention、输出投影）。AIC CUBE_ONLY 核无法
+可靠读 GM 标量，host D2H 读回 sel（B×n_branch float）算 option 索引作启动参数。
+
+**Key code change**:
+```cpp
+// Before: 对全部 n_opt 候选层各计算 QKV 投影→attention→out 投影，再 sum_i sel_i·out_i
+// After:  只算被 router 选中的 option 的完整链
+int64_t opt[B];  // host D2H 读 sel 后 argmax 每 batch 的 option
+// 投影 GEMM C[task=(b,i,h)] = x[b] @ W[(i, sel[b], h)]^T（按分支裁剪 + 行块权重）
+// attention 任务 B×3H → B×H，Sbuf/Pbuf O(S²) 物化减 n_branch 倍
+```
+
+**Applicability conditions**:
+- 输出 = one-hot 选择 × 各分支结果（AdaptiveAttention 多候选层 / MoE expert 路由）
+- router 代价 << 被跳过分支代价；分支权重可切块寻址
+- 小 shape 下 host D2H 同步开销可能吃收益（评估 threshold）
+
+**Strategy IDs**: X35（OKF 卡 disc_X35，与 X30/X33 正交）
+
+| 向量模拟→Cube 全量重写 | X37: fp32 Cube mmad 替代向量模拟 matmul | LongformerAttention evolution |
+
+### X37: fp32 Cube mmad 全量重写替代向量模拟 matmul（SetHF32(false) 全精度）
+
+**Source**: LongformerAttention evolution, round 1, parallel 2 (x0, open_exploration)
+**Speedup**: geomean 0.0013x → 4.149x vs PyTorch（基线 368ms → 最优 81μs）；小 shape 2-3x、大 shape 7-9x；50/50 PASS（MERE ~1e-6）
+**Operator type**: attention（QK^T → softmax → PV → W_o 多 matmul 流水）
+**Hardware**: Ascend910B2C (DAV_2201)
+
+**Technique description**:
+基线把所有 matmul 用 AIV 向量标量模拟（16×16 tile 逐点 GetValue 累加）完全绕过 Cube，
+且 host 侧 ~1000+ 次串行 launch。重写为 7 次单次发射 kernel（lf_prep→lf_gemm_nt_fp32
+QK^T→lf_softmax→lf_gemm_nn_fp32 PV→lf_merge→lf_gemm_nt_fp32 W_o→lf_bias），三个 matmul
+全部走 Matmul 高阶 API（ASCENDC_CUBE_ONLY + REGIST_MATMUL_OBJ + IterateAll）fp32 Cube；
+`SetHF32(false)` 关闭 HF32 10-bit 尾数截断获得全精度 fp32（MERE ~1e-6）。Cube 重写是
+跨越关键：同轮 w1（workflow 策略）0.843x、n2（仅发射消除）0.050x。
+
+**Key code change**:
+```cpp
+// Before: AIV 向量标量模拟 matmul —— 16×16 tile 逐点 Mul + GetValue 累加，绕过 Cube
+// After:  Matmul 高阶 API + SetHF32(false) 全精度 fp32 Cube
+Mmz pmat;
+pmat.SetHF32(false);                          // 全精度 fp32（默认 HF32 仅 10-bit 尾数）
+REGIST_MATMUL_OBJ(&pmat, 1, Tiling, CUBE_ONLY);
+pmat.SetTensorA(A, aL0, N1, M0, ...);
+pmat.SetTensorB(B, bL0, N1, M0, ...);
+pmat.IterateAll();                            // AIC 执行，coreIdx 步进覆盖全部任务
+```
+
+**Applicability conditions**:
+- 基线 matmul 为向量标量模拟（AIV GetValue 逐点累加）的算子 —— 改 Cube 是跨越式收益
+- attention 族多 matmul 流水，fp32 精度路径可放弃 fp16 hi/lo 拆分（HF32 拆分 3 次 gemm
+  被全精度单次 gemm 取代）
+- 小/中 shape 为主、gemm 非瓶颈上限的算子（全精度 fp32 比 HF32 慢但 shape 小可接受）
+- 配套工程约束：uint8 位图 mask 向量操作须 256-bit block 对齐；小 seqLen 统一 sR16≥64；
+  fp32 向量 op count ≥8 且为 8 的倍数；exp 保留行 max 减法防下溢
+
+**Strategy IDs**: X37（OKF 卡 disc_X37；与 P54 发射消除、X24 手动 mmad 同族但覆盖「向量
+模拟→Cube 全量重写」数量级跨越场景）
+
+### 单遍 flash-attention 融合消除 5-kernel workspace 往返（80_GqaSparseFwd）
+
+**Source**: 80_GqaSparseFwd evolution, round 1, parallel_0 (n1, workflow_guided P115/P121/P123/P137)
+**Speedup**: 25 例 geomean 0.405x → 10.75x vs PyTorch（min 4.2x / max 19.5x，约 26.5x vs 基线）；50/50 全量精度过；大 case（totalQ≥4）普遍 14-19x
+**Operator type**: GQA block-sparse attention（MiniMax-M3 prefill，paged KV，block_size=128）
+**Hardware**: Ascend910B2C (DAV_2201)
+
+**Technique description**:
+基线 5 个顺序 kernel（k0 gather → k1 向量 QK^T → k2 online softmax → k3 向量 PV → k4 epilogue），S/P/O 全部经 GM workspace 全量往返、固定 24 核、k1/k3 为 AIV 向量模拟 GEMM。重写为 2-kernel：
+1. **k0 紧凑化 gather（P137）**：paged KV 按 topk_idx+block_table 批量 strided DataCopy（每 (task,chunk) 从 256 条 MTE2 命令降到 2 条）→ wsK/wsV。
+2. **单遍融合 flash-attention（P115/P121/P123）**：MIX_AIC_1_2 单 kernel，AIC Cube mmad 跑 QK^T → ws1(S 环) → AIV two-pass max-trick softmax（causal lv 掩码）→ ws2(P fp16/bf16 hi/lo 双平面) → Cube PV → ws3(O 环) → AIV 写回。S/P/O 只在每核小环槽（cores×RING_DEPTH×tile），消除跨 kernel 全量 workspace（数百 MB → 每核 10MB 环槽）；6 个 CrossCore mode2 flag 定向握手；动态核数 min(totalTasks,24)。
+3. **P hi/lo 双平面**：bf16 大 seq case44 MERE 越界，拆 P_hi@V + P_lo@V 修复（fp16 单平面不够精度）。
+
+**Key code change**:
+```cpp
+// 基线：5 顺序 kernel + workspace 全量 GM 往返（wsS/wsP/wsO 数百 MB）
+// After：k0 紧凑 gather + MIX_AIC_1_2 单遍融合，S/P/O 每核环槽
+//   AIC: cube QK^T -> ws1 ring -> (AIV softmax) -> ws2 P hi/lo -> cube PV -> ws3 ring
+//   CrossCoreSetFlag/WaitFlag mode2 定向握手（6 flag），RING_DEPTH=2
+//   k0: DataCopyParams 批量 strided copy（blockLen/srcStride 32B 单位），256 条 MTE2 -> 2 条
+```
+
+**Applicability conditions**:
+- 5+ 顺序 kernel + 全量 workspace 中转的 attention（S/P/O 物化到 GM 再读回）—— 融合消除跨 kernel 往返是数量级收益
+- block-sparse/paged KV 的 top-k gather 独立成 k0（P137）优于折入融合 kernel（避免每 task K/V 握手，X33 教训）
+- bf16 精度路径须 P hi/lo 双平面（fp16 单平面 MERE 越界）
+- 保留 k0 独立 kernel：分页 gather 需标量索引，折入 AIV 会引入每 task 一次 K/V 握手
+
+**Strategy IDs**: P115, P121, P123, P137, P119, P120, A5, A4；OKF 卡 X39（host workspace 免 memset，x0 侧沉淀）

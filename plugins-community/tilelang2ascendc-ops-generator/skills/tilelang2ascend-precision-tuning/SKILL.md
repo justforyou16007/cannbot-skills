@@ -46,6 +46,8 @@ description: |
 | 类型 A - 简单 Vector | 单核、无 Cube、无跨核同步、线性数据流 | Add、Mul、Softmax、LayerNorm |
 | 类型 B - 复杂 Cube+Vector | 双核分离、Mmad/Matmul、跨核同步、Workspace 中间数据 | FlashAttention、Matmul fusion |
 
+> **量化/反量化类算子**（quant_matmul / dynamic_quant / dequant+act+quant / weight-group-quant 等）：类型 B 场景，先用 DumpTensor 分段定位 Cube 输出 / Vector 中间 / Vector 输出 哪一段异常，再按 `tilelang2ascend-translator/references/quant-patterns/quant-precision-rules.md` 的 6 步清单排查根因（① 乘法顺序 `(acc×scale)×pertoken` ② int32 bias 前 / float bias 后 ③ cast RoundMode ④ fp32 scale 19-bit 截断 ⑤ 标量 V_S/S_V 同步 ⑥ V→MTE2 WAR 用 PIPE_ALL）。
+
 ## 通用执行顺序
 
 每次调试遵循这个顺序，禁止跳步：
@@ -89,3 +91,4 @@ description: |
 - `references/error-patterns.md` - 常见错误模式与根因对照表
 - `references/debug-workflow-simple.md` - 类型 A 详细调试步骤 (适用于Vector简单算子)
 - `references/debug-workflow-complex.md` - 类型 B 详细调试步骤（适用于CV融合算子）
+- `tilelang2ascend-translator/references/quant-patterns/quant-precision-rules.md` - 量化算子精度铁律（类型 B 量化场景优先排查清单）

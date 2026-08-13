@@ -106,6 +106,7 @@ mkdir -p build/input build/output
 | **BF16 通过但 FP16/FP32 失败** | (1) 部分 API 不支持 BF16，BF16 走了更简单的 fallback 路径反而正确；(2) BF16 与 FP16/FP32 精度特性不同（BF16 mantissa 7bit vs FP16 10bit），精度阈值或溢出行为差异 | 先排查 API fallback 分支差异，再检查精度阈值（rtol/atol）是否适配各 dtype |
 | **FP32 通过但 FP16/BF16 失败** | 半精度中间计算精度不足 | 升精度：Cast → FP32 计算 → Cast 回半精度 |
 | **修改代码后输出完全不变** | 二进制未更新 / 编译器缓存 | 清理 build/ 和 $HOME/atc_data/kernel_cache/ 后重试 |
+| **量化/反量化算子精度失败**（输出全偏 / 1-ULP / int8 差 1 LSB） | 反量化乘法顺序 / bias 位置 / cast RoundMode / scale 截断 | 🛑 先读 `tilelang2ascend-translator/references/quant-patterns/quant-precision-rules.md`：`(acc×scale)×pertoken` 顺序、int32 bias 前 / float bias 后、bf16 必须 CAST_RINT、int8 clamp+两步 cast、fp32 scale 19-bit 截断 ⭐⭐⭐ |
 
 ### 诊断模式："FP32 通过但 FP16/BF16 失败"
 
@@ -164,6 +165,38 @@ mkdir -p build/input build/output
         ├─ 使用 `/ascendc-docs-search` skill 查阅文档确认相关 API 是否支持 BF16
         ├─ 如果 API 不支持 BF16 → 优先按原因1排查
         └─ 如果 API 支持 BF16（BF16/FP16 走相同路径）→ 优先按原因2排查
+```
+
+---
+
+### 诊断模式：量化/反量化算子精度失败
+
+量化类算子的 D 类失败有专属根因，按以下顺序排查（详细清单见 `tilelang2ascend-translator/references/quant-patterns/quant-precision-rules.md`）：
+
+```
+确认: 量化/反量化算子精度失败（MERE/MARE 超标 或 int8 差 1 LSB）
+    │
+    ├─ ① 反量化乘法顺序
+    │   ├─ 必须是 (acc×scale)×pertoken（scale 先、pertoken 后）
+    │   └─ 反序 → 1-ULP 偏差（对拍 torch_npu 实证）
+    │
+    ├─ ② bias 位置
+    │   ├─ int32 bias 在 scale 前（int32 域 Add→Cast）
+    │   └─ float bias 在 scale 后（fp32 域）；post-add 会引入 MERE 4~10 误差
+    │
+    ├─ ③ 输出 cast RoundMode
+    │   ├─ fp16 → CAST_NONE；bf16/int32 → 必须 CAST_RINT
+    │   └─ int8 → clamp[-128,127] 后 f32→f16→s8 两步 RINT
+    │
+    ├─ ④ scale 预处理（匹配 NPU 硬件）
+    │   └─ fp32 scale 需按 0xFFFFE000 截断到 19 位（npu_trans_quant_param）
+    │
+    ├─ ⑤ 标量读/写同步（dynamic quant）
+    │   ├─ ReduceMax 后必须 V_S 同步再 GetValue
+    │   └─ 写回标量后 S_V 同步；标量写 GM 走 UB+DataCopyPad
+    │
+    └─ ⑥ V→MTE2 WAR（N>2048 列分块时）
+        └─ scale/bias staging 前用 PipeBarrier<PIPE_ALL>（PIPE_V 不足）
 ```
 
 ---

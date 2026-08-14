@@ -149,6 +149,8 @@ Markdown 报告包含：
    - 两者皆可用 → 须向用户确认或按项目约定选用其一
    - 两者皆不可用 → 报错，提示检查 CANN / `ASCEND_HOME` 安装
 
+> **需要指令级流水线时序图？** 上板采集（msprof / msopprof）只有 PMU 聚合计数器，无逐指令时序。若目标是查看 MTE2/Cube/Vec 流水线时序图、CV overlap、DoubleBuffer 效果或代码行映射，需走仿真模式 — 见 **ops-simulator** skill（`references/msopprof-simulator-guide.md` / `msopprof-simulator-ops-transformer-guide.md`）。
+
 ### 参考资源
 
 | 文件 | 内容 | 何时查阅 |

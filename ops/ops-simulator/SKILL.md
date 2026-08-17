@@ -1,11 +1,25 @@
 ---
 name: ops-simulator
-description: NPU 仿真器技能。提供 CANN Simulator 的使用指导，包括精度仿真、性能仿真、流水线分析。当需要在无 NPU 硬件环境下验证算子功能、分析性能瓶颈、定位精度问题时使用。也用于分析已有的 cannsim 性能报告（summary.json）并给出优化建议。
+description: NPU 仿真器技能。提供 CANN Simulator（cannsim，Ascend 950）与 msopprof simulator（910B 等存量芯片）两条仿真路径的使用指导，包括精度仿真、性能仿真、指令级流水线时序采集与分析。当需要在无 NPU 硬件环境下验证算子功能、查看流水线时序图（CV overlap / DoubleBuffer / 空泡）、分析性能瓶颈、定位精度问题时使用。也用于分析已有的 cannsim 性能报告（summary.json）并给出优化建议。
 ---
 
 # NPU 仿真器使用指南
 
 ## 概述
+
+本 skill 覆盖两条仿真采集路径，按目标芯片与算子形态选择：
+
+| 工具 | 适用芯片 | 输出 | 指南 |
+|------|----------|------|------|
+| `cannsim`（CANN Simulator） | 仅 Ascend 950 | summary.json + trace_core*.json（Chrome Trace） | 本文档下方章节 |
+| `msopprof simulator`（Agent 生成算子） | 910B 等存量芯片 | visualize_data.bin（MindStudio Insight 流水线时序图）+ 指令级 CSV | [`references/msopprof-simulator-guide.md`](references/msopprof-simulator-guide.md) |
+| `msopprof simulator`（CANN 仓算子，如 ops-transformer） | 910B 等存量芯片 | 同上（含 `--op_debug_level=1` 注入、aclnn 测试程序构建） | [`references/msopprof-simulator-ops-transformer-guide.md`](references/msopprof-simulator-ops-transformer-guide.md) |
+
+**选择原则**：目标是 Ascend 950 → cannsim；目标是 910B 系列、或需要在 MindStudio Insight 中查看逐指令流水线时序图 / 代码行映射 → msopprof simulator。上板采集（msprof/msopprof 非仿真模式）只有 PMU 聚合计数器，无指令级时序，见 ops-profiling skill。
+
+---
+
+## cannsim（Ascend 950）
 
 CANN Simulator 是一款面向算子开发场景的 SoC 级芯片仿真工具，通过 `cannsim` 命令行工具提供以下能力：
 
@@ -153,6 +167,8 @@ cannsim report -e ./cannsim_Ascend950_* -n all -o ./report_output
 
 | 文件 | 内容 | 何时查阅 |
 |------|------|---------|
+| `references/msopprof-simulator-guide.md` | msopprof simulator 仿真采集（Agent 生成的 torch extension 算子） | 目标为 910B 系列、需 MindStudio Insight 流水线时序图时 |
+| `references/msopprof-simulator-ops-transformer-guide.md` | msopprof simulator 仿真采集（CANN 仓 / ops-transformer 算子，含 `--op_debug_level=1` 注入与 aclnn 测试程序） | 对 CANN 仓算子做仿真流水线采集时 |
 | `references/simulator-advanced.md` | 仿真进阶命令参考 | 需要高级参数或批量仿真时 |
 | `references/troubleshooting.md` | 问题排查指南 | 仿真失败或报告未生成时 |
 | `references/pipeline-bubble-analysis.md` | 指令流水空泡分类、因果归因、周期性模式检测 | 生成 trace 后，定位性能瓶颈根因时 |

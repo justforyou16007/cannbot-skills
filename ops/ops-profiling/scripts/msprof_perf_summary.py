@@ -18,8 +18,16 @@
 #   2. 对比模式 (--compare): 对算子目录做 model.py vs model_new_ascendc.py 对比测试
 #      python3 msprof_perf_summary.py --compare --output-dir <op_dir> [--warm-up=N] [--device=N]
 #
-#   3. 批量模式 (--batch): 扫描多个算子目录，汇总批量报告
-#      python3 msprof_perf_summary.py --batch <base_dir> [--output-md <path>] [--output-json <path>]
+#   3. 快速模式 (--quick): 对算子目录做单轮对比测试（只取 kernel 时间，不采集 aic-metrics）
+#      python3 msprof_perf_summary.py --quick --output-dir <op_dir> [--warmup=N] [--repeats=N] [--device=N]
+#
+# Ref/Asc 测量方式:
+#   - Ref (reference)  = 算子目录下的 model.py (PyTorch 参考实现)
+#   - Asc (ascendc)    = 算子目录下的 model_new_ascendc.py (AscendC 实现)
+#   - 单卡单进程批量: asc 用 _measure_asc_batch_quick（每 case 一个 torch.npu.Stream），
+#     一次 msprof 采集全部 case，按 stream_id 归组；失败回退逐 case。设备锁协调同卡 lane。
+#   - 关键纪律: --ai-core=on 必须保留；解析 task_time.csv 必须包含 MIX_AIC 等计算
+#     kernel 类型，否则 aicore 时长欠采集约 2.6-3x，加速比虚高。
 #
 # 归档位置 (与 perf_summary.py 保持一致):
 #     <ops_dir>/docs/perf/round_NNN/
@@ -31,6 +39,8 @@
 
 import argparse
 import csv
+import fcntl
+import hashlib
 import importlib.util
 import inspect
 import json
@@ -47,6 +57,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -627,33 +638,27 @@ def _load_cases_json(out_dir: Path):
     找到第一个非备份、非排除的 JSON 文件，优先按标准 JSON 文档解析（单对象或数组），
     失败时回退到 JSONL 逐行解析。
     """
-    json_files = sorted(out_dir.glob("*.json"))
-    json_path = None
-    for f in json_files:
-        if not f.name.endswith(".bak") and f.name not in ("performance.json", "perf_report.json"):
-            json_path = f
-            break
-    if not json_path:
-        return [], None
-
-    with open(json_path, "r", encoding="utf-8") as f:
-        raw = f.read()
-    # 优先按标准 JSON 文档解析（单对象或数组），失败时回退到 JSONL 逐行解析
-    try:
-        parsed = json.loads(raw)
-        if isinstance(parsed, list):
-            cases = parsed
-        elif isinstance(parsed, dict):
-            cases = [parsed]
-        else:
-            raise ValueError("Unexpected JSON root type")
-    except ValueError:
-        cases = []
-        for line in raw.splitlines():
-            line = line.strip()
-            if line:
-                cases.append(json.loads(line))
-    return cases, f"json:{json_path.name}"
+    generated = {"performance.json", "perf_report.json", "evaluation_results.json",
+                 "accuracy_results.json", "worker.json", "session_state.json",
+                 "call_spec.json"}
+    for json_path in sorted(out_dir.glob("*.json")):
+        if json_path.name.endswith(".bak") or json_path.name in generated:
+            continue
+        raw = json_path.read_text(encoding="utf-8")
+        try:
+            parsed = json.loads(raw)
+            cases = parsed if isinstance(parsed, list) else [parsed]
+        except (ValueError, json.JSONDecodeError):
+            try:
+                cases = [json.loads(line) for line in raw.splitlines() if line.strip()]
+            except json.JSONDecodeError:
+                continue
+        # Control-plane JSON is common in candidate directories. Only an
+        # inputs-bearing document is a valid benchmark case file.
+        if cases and all(isinstance(case, dict) and isinstance(case.get("inputs"), list)
+                         for case in cases):
+            return cases, f"json:{json_path.name}"
+    return [], None
 
 
 def _extract_shape_dtype_from_jsonl(case):
@@ -667,18 +672,12 @@ def _extract_shape_dtype_from_jsonl(case):
 
 
 def _case_has_empty_tensor(case):
-    """判断 case 中是否包含 0 元素张量（空 tensor）。
-
-    shape=None 表示形状未指定（如可选 bias），不应视作空 tensor。
-    只有形状明确包含 0 维度或为空列表的才是真正的空 tensor。
-    """
+    """判断 case 中是否包含 0 元素张量（空 tensor）。"""
     if not case:
         return False
     for inp in case.get("inputs", []):
         if inp.get("type") == "tensor":
             shape = inp.get("shape", [])
-            if shape is None:
-                continue
             if not shape or any(s == 0 for s in shape):
                 return True
     return False
@@ -707,10 +706,10 @@ def _jsonl_scalar_value(inp):
             val = 1.0
 
     dtype_str = inp.get("dtype", "")
-    if dtype_str == "str" or isinstance(val, str):
-        return str(val)
-    if dtype_str == "list" or isinstance(val, list):
-        return list(val)
+    # Attributes such as stride/padding/data_format are structured Python
+    # values, not numeric scalars. Preserve them verbatim.
+    if not dtype_str and isinstance(val, (list, tuple, dict, str)):
+        return val
     if dtype_str == "bool":
         return bool(val)
     if dtype_str.startswith("complex"):
@@ -747,101 +746,32 @@ def _jsonl_tensor_code(shape, dtype_str: str) -> str:
     return f"inputs.append(torch.randn({shape_expr}, dtype={dtype}))"
 
 
-def _jsonl_tensor_expr(shape, dtype_str: str) -> str:
-    """返回构造 tensor 的表达式字符串（不带 ``inputs.append()`` 包装）。"""
-    code = _jsonl_tensor_code(shape, dtype_str)
-    # _jsonl_tensor_code returns "inputs.append(TORCH_EXPR)"
-    prefix = "inputs.append("
-    assert code.startswith(prefix) and code.endswith(")"), f"unexpected tensor code: {code}"
-    return code[len(prefix):-1]  # strip "inputs.append(" and trailing ")"
-
-
-def _jsonl_tensor_dtype_repr(dtype_str: str) -> str:
-    """将 JSONL dtype 字符串映射为 torch dtype 表达式（用于 torch.tensor(..., dtype=...)）。"""
-    dtype_map = {
-        "fp16": "torch.float16", "float16": "torch.float16", "half": "torch.float16",
-        "fp32": "torch.float32", "float32": "torch.float32", "float": "torch.float32",
-        "fp64": "torch.float64", "float64": "torch.float64",
-        "bf16": "torch.bfloat16", "bfloat16": "torch.bfloat16",
-        "int8": "torch.int8", "int16": "torch.int16", "int32": "torch.int32",
-        "int": "torch.int32", "int64": "torch.int64", "long": "torch.int64",
-        "uint8": "torch.uint8", "uint16": "torch.uint16", "uint32": "torch.uint32", "uint64": "torch.uint64",
-        "bool": "torch.bool",
-        "complex64": "torch.complex64", "complex128": "torch.complex128",
-    }
-    return dtype_map.get(dtype_str, "torch.float32")
-
-
-# attr dtype=str 且值为 torch dtype 名称时，映射到 torch.xxx 表达式（而非字符串字面量）
-_TORCH_DTYPE_EXPR_MAP = {
-    "float16": "torch.float16", "bfloat16": "torch.bfloat16",
-    "float32": "torch.float32", "float64": "torch.float64",
-    "int8": "torch.int8", "int16": "torch.int16",
-    "int32": "torch.int32", "int64": "torch.int64",
-    "uint8": "torch.uint8", "bool": "torch.bool",
-}
-
-
-# 名称提示为 offsets/cumsum 类结构性整型参数的集合（随机合成时保证单调不减）
-_OFFSETS_LIKE_NAMES = frozenset({
-    "offs", "offsets", "group_list", "group_offsets", "cumsum",
-    "cu_seqlens", "cu_seqlens_q", "cu_seqlens_k", "seqlens", "seq_lens",
-})
-
-
 def _serialize_jsonl_inputs(case):
-    """Generate kwargs dict code from JSONL inputs, using 'name' fields as keys.
-
-    Uses named keyword arguments (``model(**kwargs)``) so that parameter binding
-    is independent of the order of inputs in the JSONL file.
-    """
-    lines = ["_inputs_dict = {}"]
+    import torch
+    lines = ["inputs = []"]
     for inp in case.get("inputs", []):
-        name = inp.get("name", "")
         typ = inp.get("type", "tensor")
         if typ == "tensor":
+            shape = inp.get("shape", [])
             dtype_str = inp.get("dtype", "float16")
-            # 优先使用显式 value（如 group_list / cumsum 等结构参数）
-            explicit_val = inp.get("value")
-            if explicit_val is not None:
-                dtype_repr = _jsonl_tensor_dtype_repr(dtype_str)
-                lines.append(f"_inputs_dict[{repr(name)}] = torch.tensor({repr(explicit_val)}, dtype={dtype_repr})")
-            else:
-                shape = inp.get("shape", [])
-                # offsets/cumsum 类结构性整型参数：完全随机的值几乎必然违反
-                # 单调性约束导致被测实现直接抛异常，退化为单调不减序列更稳妥
-                if name.lower() in _OFFSETS_LIKE_NAMES and dtype_str.startswith(("int", "uint")):
-                    dtype_repr = _jsonl_tensor_dtype_repr(dtype_str)
-                    lines.append(f"_inputs_dict[{repr(name)}] = "
-                                 f"torch.randint(0, 100, {shape}, dtype=torch.int64).cumsum(0).to({dtype_repr})")
-                    continue
-                tensor_expr = _jsonl_tensor_expr(shape, dtype_str)
-                lines.append(f"_inputs_dict[{repr(name)}] = {tensor_expr}")
+            lines.append(_jsonl_tensor_code(shape, dtype_str))
         elif typ in ("attr", "scalar"):
-            # 显式 "value": null 表示可选参数未启用（如 offsets=None），
-            # 必须生成 None 而不是默认标量，否则会把 None 语义错传成 1.0/1
-            if "value" in inp and inp.get("value") is None:
-                lines.append(f"_inputs_dict[{repr(name)}] = None")
-                continue
             val = _jsonl_scalar_value(inp)
-            # attr 的 dtype 为 str 且值是 torch dtype 名时，生成 torch.xxx 表达式而非字符串字面量
-            if inp.get("dtype") == "str" and isinstance(val, str):
-                dtype_expr = _TORCH_DTYPE_EXPR_MAP.get(val)
-                if dtype_expr is not None:
-                    lines.append(f"_inputs_dict[{repr(name)}] = {dtype_expr}")
-                    continue
-            lines.append(f"_inputs_dict[{repr(name)}] = {repr(val)}")
+            if isinstance(val, str):
+                lines.append(f"inputs.append({repr(val)})")
+            else:
+                lines.append(f"inputs.append({repr(val)})")
         elif typ == "tensor_list":
             lines.append("_tensors = []")
             for tinfo in inp.get("value", []):
                 shape = tinfo.get("shape", [])
                 dtype_str = tinfo.get("dtype", "float16")
-                tensor_expr = _jsonl_tensor_expr(shape, dtype_str)
-                lines.append(f"_tensors.append({tensor_expr})")
-            lines.append(f"_inputs_dict[{repr(name)}] = _tensors")
+                code = _jsonl_tensor_code(shape, dtype_str).split('inputs.append(')[1].rstrip(')')
+                lines.append(f"_tensors.append({code})")
+            lines.append("inputs.append(_tensors)")
         else:
             val = _jsonl_scalar_value(inp)
-            lines.append(f"_inputs_dict[{repr(name)}] = {repr(val)}")
+            lines.append(f"inputs.append({repr(val)})")
     return "\n".join(lines)
 
 
@@ -855,7 +785,6 @@ class _WrapperConfig:
     device_id: int
     warmup: int
     jsonl_case: Optional[Dict[str, Any]] = None
-    repeats: int = 1
 
 
 _WRAPPER_SCRIPT_TEMPLATE = """\
@@ -863,19 +792,13 @@ _WRAPPER_SCRIPT_TEMPLATE = """\
 import importlib.util
 import os
 import sys
-import torch
 from pathlib import Path
 
 out_dir = Path("{out_dir}")
 os.environ["ASCEND_RT_VISIBLE_DEVICES"] = "{device_id}"
+import torch
 sys.path.insert(0, str(out_dir / "kernel" / "build"))
 sys.path.insert(0, str(out_dir))
-
-torch.manual_seed({seed})
-try:
-    torch.npu.manual_seed_all({seed})
-except Exception:
-    pass
 
 def _load(path, name):
     spec = importlib.util.spec_from_file_location(name, path)
@@ -896,18 +819,7 @@ def _move(v):
     if isinstance(v, (list, tuple)):
         return type(v)(_move(x) for x in v)
     return v
-
-_use_kwargs = inputs is None
-if _use_kwargs:
-    for _k, _v in _inputs_dict.items():
-        if isinstance(_v, torch.Tensor):
-            _inputs_dict[_k] = _v.to(device)
-        elif isinstance(_v, list):
-            _inputs_dict[_k] = [_move(x) for x in _v]
-    # build positional list from dict values (preserving JSONL order) for fallback
-    _inputs_list = list(_inputs_dict.values())
-else:
-    inputs = _move(inputs)
+inputs = _move(inputs)
 
 # ---- model construction (honour get_init_inputs if present) ----
 _init_args = []
@@ -933,40 +845,14 @@ elif _init_args:
 else:
     model = cls().to(device).eval()
 
-_use_positional_fallback = 0  # 0=kargs, 1=spread, 2=tuple
-
-
-def _one_iter():
-    global _use_positional_fallback
+for _ in range({warmup}):
     with torch.no_grad():
-        if _use_kwargs:
-            if _use_positional_fallback == 0:
-                try:
-                    _ = model(**_inputs_dict)
-                except TypeError:
-                    _use_positional_fallback = 1
-                    try:
-                        _ = model(*_inputs_list)
-                    except TypeError:
-                        _use_positional_fallback = 2
-                        _ = model(tuple(_inputs_list))
-            elif _use_positional_fallback == 1:
-                _ = model(*_inputs_list)
-            else:
-                _ = model(tuple(_inputs_list))
-        else:
-            _ = model(*inputs)
+        _ = model(*inputs)
     torch.npu.synchronize()
 
-
-# ---- in-process warmup: 与 torch_npu profiler 的 warmup 语义一致 ----
-# 这些迭代同样落在 msprof 采集窗口内，解析时按 run 拆分后丢弃前 {warmup} 次。
-for _ in range({warmup}):
-    _one_iter()
-
-# ---- timed repeats ----
-for _ in range({repeats}):
-    _one_iter()
+with torch.no_grad():
+    _ = model(*inputs)
+torch.npu.synchronize()
 """
 
 
@@ -977,32 +863,10 @@ def _build_wrapper_script_content(cfg, model_file, cls_name, inputs_code):
         device_id=cfg.device_id,
         case_idx=cfg.case_idx,
         warmup=cfg.warmup,
-        repeats=cfg.repeats,
-        seed=cfg.seed,
         model_file=model_file,
         cls_name=cls_name,
         inputs_code=inputs_code,
     )
-
-
-# 优先从 model.py 自带的输入生成器取真实输入（保证 offsets/cumsum 等结构性
-# 参数合法，且与 evaluate 输入同源）；取不到时 inputs 保持 None，回退到
-# JSONL 随机合成的 _inputs_dict kwargs 路径。
-_REAL_INPUTS_CODE = """\
-# Prefer real inputs from model.py's own generator (valid structural params,
-# same source as evaluate); fall back to serialized kwargs when unavailable.
-inputs = None
-try:
-    _ref_mod = _load(out_dir / "model.py", "ref_for_inputs")
-    _gen = getattr(_ref_mod, "get_input_groups", getattr(_ref_mod, "get_inputs", None))
-    if _gen is not None:
-        _all_input_groups = _gen()
-        if 0 <= {case_idx} < len(_all_input_groups):
-            _entry = _all_input_groups[{case_idx}]
-            inputs = list(_entry) if isinstance(_entry, (list, tuple)) else [_entry]
-except Exception:
-    inputs = None
-"""
 
 
 def _generate_wrapper_script(cfg: _WrapperConfig):
@@ -1014,15 +878,14 @@ def _generate_wrapper_script(cfg: _WrapperConfig):
         cls_name = "ModelNew"
 
     if cfg.jsonl_case is not None:
-        # 先准备 JSONL 随机合成的 kwargs 作为兜底，再尝试真实输入覆盖
-        inputs_code = (_serialize_jsonl_inputs(cfg.jsonl_case) + "\n\n"
-                       + _REAL_INPUTS_CODE.format(case_idx=cfg.case_idx))
+        inputs_code = _serialize_jsonl_inputs(cfg.jsonl_case)
     else:
-        # 无 JSONL case 时只能依赖 model.py 的输入生成器
-        inputs_code = (_REAL_INPUTS_CODE.format(case_idx=cfg.case_idx) + """
-if inputs is None:
-    raise RuntimeError("failed to obtain inputs from model.py get_input_groups()/get_inputs()")
-""")
+        inputs_code = f"""
+    ref_mod = _load(out_dir / "model.py", "ref_for_inputs")
+    input_groups = getattr(ref_mod, "get_input_groups",
+                           getattr(ref_mod, "get_inputs", lambda: [[]]))()
+    inputs = input_groups[{cfg.case_idx}]
+"""
     return _build_wrapper_script_content(cfg, model_file, cls_name, inputs_code)
 
 
@@ -1032,32 +895,6 @@ def _find_msprof_script():
     if candidate.exists():
         return str(candidate)
     return "msprof_profile_run.sh"
-
-
-def _save_app_output(output_dir: str, stdout: str, stderr: str) -> str:
-    """把被测 app 的输出落盘，便于采集失败时回溯真实原因。返回日志路径。"""
-    log_path = os.path.join(output_dir, "app_output.log")
-    try:
-        with open(log_path, "w", encoding="utf-8", errors="replace") as f:
-            f.write("=== stdout ===\n" + (stdout or "") + "\n=== stderr ===\n" + (stderr or ""))
-    except OSError:
-        pass
-    return log_path
-
-
-def _extract_app_crash(stdout: str, stderr: str):
-    """从 msprof 输出中检测被测 app 的 Python 异常。
-
-    msprof 在 app 崩溃时仍返回退出码 0（只打 WARNING），若不主动检测，
-    上层只能看到 "no csv found" 这类误导性错误。返回最后一行异常信息或 None。
-    """
-    text = (stdout or "") + "\n" + (stderr or "")
-    if "Traceback" not in text and "An exception has occurred in process App" not in text:
-        return None
-    exc_lines = re.findall(r"^(\w[\w.]*(?:Error|Exception|Interrupt)\b[^\n]*)", text, re.M)
-    if exc_lines:
-        return exc_lines[-1].strip()[:200]
-    return "app raised an exception during profiling"
 
 
 def _run_msprof_standard(wrapper_script: str, output_dir: str, device_id: int, warmup: int = 3):
@@ -1079,6 +916,8 @@ def _run_msprof_standard(wrapper_script: str, output_dir: str, device_id: int, w
         sys.executable, wrapper_path
     ]
     env = os.environ.copy()
+    # Set visibility before the wrapper process imports torch/torch_npu.
+    env["ASCEND_RT_VISIBLE_DEVICES"] = str(device_id)
     result = subprocess.run(cmd, capture_output=True, text=True, env=env)
 
     try:
@@ -1086,18 +925,12 @@ def _run_msprof_standard(wrapper_script: str, output_dir: str, device_id: int, w
     except OSError:
         pass
 
-    app_log = _save_app_output(output_dir, result.stdout, result.stderr)
-
     if result.returncode != 0:
-        return None, f"msprof failed: {result.stderr[-500:]}\n(app log: {app_log})"
-
-    app_crash = _extract_app_crash(result.stdout, result.stderr)
-    if app_crash:
-        return None, f"profiled app crashed: {app_crash} (app log: {app_log})"
+        return None, f"msprof failed: {result.stderr[-500:]}"
 
     prof_dirs = sorted(Path(output_dir).glob("PROF_GROUP_*"))
     if not prof_dirs:
-        return None, f"no PROF_GROUP directory found (app log: {app_log})"
+        return None, "no PROF_GROUP directory found"
     return str(prof_dirs[-1]), None
 
 
@@ -1116,16 +949,17 @@ def _run_msprof_quick(wrapper_script: str, output_dir: str, device_id: int, warm
         f.write(wrapper_script)
 
     env = os.environ.copy()
+    # Set visibility before the wrapper process imports torch/torch_npu.
+    env["ASCEND_RT_VISIBLE_DEVICES"] = str(device_id)
 
     # Warmup: 在 msprof 外部执行，不采集
-    warmup_crash = None
     for _ in range(warmup):
-        w = subprocess.run([sys.executable, wrapper_path],
-                           capture_output=True, text=True, env=env)
-        if w.returncode != 0 and warmup_crash is None:
-            warmup_crash = _extract_app_crash(w.stdout, w.stderr) or (w.stderr or "")[-200:]
+        subprocess.run([sys.executable, wrapper_path],
+                       capture_output=True, text=True, env=env)
 
     # Measurement: msprof 只采集正式 timed run
+    # NOTE: --ai-core=on 必须保留——缺失时 msprof 对 aicore kernel 时长欠采集约
+    # 2.6-3x，导致 asc 耗时被低估、加速比虚高（2026-08-13 实测确认）。
     cmd = [
         "msprof",
         f"--output={output_dir}",
@@ -1141,20 +975,12 @@ def _run_msprof_quick(wrapper_script: str, output_dir: str, device_id: int, warm
     except OSError:
         pass
 
-    app_log = _save_app_output(output_dir, result.stdout, result.stderr)
-
     if result.returncode != 0:
-        return None, f"msprof failed: {result.stderr[-500:]}\n(app log: {app_log})"
-
-    # msprof 在 app 崩溃时仍返回 0，必须主动检测，否则只能看到误导性的
-    # "no task_time csv found"
-    app_crash = _extract_app_crash(result.stdout, result.stderr) or warmup_crash
-    if app_crash:
-        return None, f"profiled app crashed: {app_crash} (app log: {app_log})"
+        return None, f"msprof failed: {result.stderr[-500:]}"
 
     prof_dirs = sorted(Path(output_dir).glob("PROF_*"))
     if not prof_dirs:
-        return None, f"no PROF directory found (app log: {app_log})"
+        return None, "no PROF directory found"
     return str(prof_dirs[-1]), None
 
 
@@ -1203,128 +1029,69 @@ def _parse_msprof_duration(prof_group_dir: str):
     return None, None, "no compute rows found"
 
 
-_META_KERNEL_TYPES = ("PROFILING_ENABLE", "PROFILING_DISABLE", "TASK_TIMEOUT_SET", "")
-
-
-def _split_task_time_runs(rows: List[Dict[str, str]], n_runs: int):
-    """把 task_time.csv 的 kernel 行按「重复的 kernel 序列」拆成 n_runs 次 run。
-
-    采集窗口内包含 warmup + repeats 次迭代，每次迭代发射完全相同的 kernel 序列。
-    按 task_start 排序后，总行数应能被 n_runs 整除，且每个分块的 kernel_name
-    序列必须逐位相同 —— 否则说明迭代次数与预期不符，返回 None 由调用方回退。
-
-    Returns: list[list[float]] 每个 run 的 kernel 耗时列表，或 None。
-    """
-    kernels = []
-    for r in rows:
-        if r.get("kernel_type", "") in _META_KERNEL_TYPES:
-            continue
-        try:
-            dur = float(r.get("task_time(us)", "") or 0)
-            start = float((r.get("task_start(us)", "") or "0").strip())
-        except ValueError:
-            continue
-        if dur <= 0:
-            continue
-        kernels.append((start, r.get("kernel_name", "unknown"), dur))
-
-    if not kernels or n_runs < 1 or len(kernels) % n_runs:
-        return None
-    kernels.sort(key=lambda x: x[0])
-
-    n = len(kernels) // n_runs
-    runs, seq = [], [k[1] for k in kernels[:n]]
-    for i in range(n_runs):
-        chunk = kernels[i * n:(i + 1) * n]
-        if [k[1] for k in chunk] != seq:
-            return None
-        runs.append([k[2] for k in chunk])
-    return runs
-
-
-def _parse_msprof_duration_quick(prof_group_dir: str, warmup: int = 0, repeats: int = 1):
+def _parse_msprof_duration_quick(prof_group_dir: str):
     """快速模式解析：从 PROF 目录中查找 task_time.csv 或 api_statistic.csv 并提取时间。
 
-    快速模式只跑 1 轮（不采集 7 个 aic-metrics），因此没有 op_summary_*.csv。
-
-    采集窗口内包含 warmup + repeats 次 in-process 迭代（与 torch_npu profiler 的
-    warmup/active 语义一致）。这里按 kernel 序列把它们拆开，**只对后 repeats 次
-    （active）求平均**，丢弃 warmup 次 —— 避免首次迭代的冷启动污染测量值。
-
-    若拆分失败（行数不匹配等），回退为「全部 kernel 求和 / (warmup+repeats)」。
-
-    兼容两种目录结构：
-      - 无 --aic-metrics: PROF_*/mindstudio_profiler_output/task_time_*.csv
-      - 有 --aic-metrics: PROF_*/PROF_PipeUtilization/mindstudio_profiler_output/task_time_*.csv
+    快速模式只跑 1 轮，不设置 --aic-metrics，因此没有 op_summary_*.csv。
+    warmup 已在 msprof 外部执行，task_time.csv 只包含正式 timed run 的 kernel 时间，
+    对单次采集中所有计算 kernel 的耗时直接累加即可。
     """
-    # 1. 尝试从 task_time.csv 提取（两种可能路径）
-    task_time_patterns = [
-        os.path.join(prof_group_dir, "mindstudio_profiler_output", "task_time_*.csv"),
-        os.path.join(prof_group_dir, "PROF_*", "mindstudio_profiler_output", "task_time_*.csv"),
-    ]
-    for pattern in task_time_patterns:
-        task_time_files = sorted(glob.glob(pattern))
-        if not task_time_files:
-            continue
+    # 1. 尝试从 task_time.csv 提取
+    task_time_pattern = os.path.join(prof_group_dir, "mindstudio_profiler_output/task_time_*.csv")
+    task_time_files = sorted(glob.glob(task_time_pattern))
+    if task_time_files:
         try:
             with open(task_time_files[0], "r", encoding="utf-8", errors="replace") as f:
                 reader = csv.DictReader(f)
                 rows = list(reader)
-
-            # 优先：按 run 拆分，只取 active（后 repeats 次）的均值
-            runs = _split_task_time_runs(rows, warmup + repeats)
-            if runs is not None:
-                active = runs[warmup:] if warmup < len(runs) else runs
-                per_run = [sum(x) for x in active]
-                return (sum(per_run) / len(per_run)), "multiple_kernels", None
-
-            # 回退路径：run 拆分失败（kernel 名称序列不一致等），不再按名分组，
-            # 改为按时间排序后做位置分片，显式丢弃前 warmup 份再取均值。
-            kernels = []
+            # 汇总所有真实计算 kernel 的耗时
+            # 参考实现可能包含大量 PyTorch native kernel；AscendC 实现也可能拆分为多个 kernel。
+            # 只累加 kernel_type 为实际计算类型的行，排除 PROFILING_ENABLE / TASK_TIMEOUT_SET 等。
+            # NOTE: MIX_AIC 必须包含——自定义 AscendC op 的 AIC GEMM kernel 是 MIX_AIC 类型，
+            # 缺失会导致 aicore 耗时欠采集约 2.6-3x（2026-08-14 实测确认）。
+            COMPUTE_KERNEL_TYPES = {"AI_VECTOR_CORE", "AI_CORE", "MIX_AIV", "MIX", "MIX_AIC"}
+            compute_rows = []
             for r in rows:
                 kernel_type = r.get("kernel_type", "")
                 task_time = r.get("task_time(us)", "")
-                if kernel_type in _META_KERNEL_TYPES or not task_time:
-                    continue
-                try:
-                    dur = float(task_time)
-                    start = float((r.get("task_start(us)", "") or "0").strip())
-                except ValueError:
-                    continue
-                if dur <= 0:
-                    continue
-                kernels.append((start, r.get("kernel_name", "unknown"), dur))
-
-            if kernels:
-                kernels.sort(key=lambda x: x[0])
-                total = sum(d for _, _, d in kernels)
-                n_total = warmup + repeats
-                if n_total <= 0:
-                    n_total = 1
-                n_kernels = len(kernels)
-
-                if n_kernels % n_total == 0:
-                    # 行数可整除：按位置精确分片，丢弃前 warmup 份
-                    k_per = n_kernels // n_total
-                    active_kernels = kernels[warmup * k_per:]
-                    active_total = sum(d for _, _, d in active_kernels)
-                    result = active_total / max(1, repeats)
-                else:
-                    # 行数不可整除：按比例估算，丢弃时间轴上前 warmup/n_total 的部分
-                    split_idx = max(1, int(n_kernels * warmup / n_total))
-                    active_kernels = kernels[split_idx:]
-                    active_total = sum(d for _, _, d in active_kernels)
-                    # 按 active kernel 数占总 kernel 数的比例折算单次迭代耗时
-                    if len(active_kernels) > 0:
-                        result = active_total / (len(active_kernels) / (n_kernels / n_total))
-                    else:
-                        result = total / n_total
-
-                kernel_names = list({k[1] for k in kernels})
-                kernel_name = kernel_names[0] if len(kernel_names) == 1 else "multiple_kernels"
-                return result, kernel_name, None
+                if kernel_type in COMPUTE_KERNEL_TYPES and task_time:
+                    try:
+                        duration = float(task_time)
+                        if duration > 0:
+                            compute_rows.append((duration, r.get("kernel_name", "unknown")))
+                    except ValueError:
+                        continue
+            if compute_rows:
+                total_duration = sum(d for d, _ in compute_rows)
+                if total_duration > 0:
+                    kernel_name = compute_rows[0][1] if len(compute_rows) == 1 else "multiple_kernels"
+                    return total_duration, kernel_name, None
         except Exception:
             pass
+
+    # 2. 尝试从 api_statistic.csv 提取（launch 行）
+    api_pattern = os.path.join(prof_group_dir, "mindstudio_profiler_output/api_statistic_*.csv")
+    api_files = sorted(glob.glob(api_pattern))
+    if api_files:
+        try:
+            with open(api_files[0], "r", encoding="utf-8", errors="replace") as f:
+                reader = csv.DictReader(f)
+                rows = list(reader)
+            # 查找 Level=node, API Name=launch 的行
+            for r in rows:
+                level = r.get("Level", "")
+                api_name = r.get("API Name", "")
+                if level == "node" and api_name == "launch":
+                    time_us = r.get("Time(us)", "")
+                    if time_us:
+                        try:
+                            duration = float(time_us)
+                            if duration > 0:
+                                return duration, "launch", None
+                        except ValueError:
+                            continue
+        except Exception:
+            return None, None, "no task_time or api_statistic csv found"
 
     return None, None, "no task_time or api_statistic csv found"
 
@@ -1471,7 +1238,6 @@ def _report_compare_to_markdown(report: Dict[str, Any]) -> str:
     lines = []
     _add_compare_header(lines, report)
     _add_per_case_table(lines, report)
-    _add_mfu_section(lines, report)
     _add_summary_section(lines, report)
     _add_analysis_sections(lines, report)
     return "\n".join(lines)
@@ -1524,12 +1290,6 @@ def _report_compare_to_text(report: Dict[str, Any]) -> str:
             f"{report['total_asc_us']:.2f}"
         )
         lines.append(f"  Total speedup (Σref/Σasc) : {report['total_speedup']:.2f}x")
-    mfu = report.get("mfu")
-    if mfu:
-        lines.append("--- MFU（官方 operator_mfu 等价口径，AscendC 实现）---")
-        lines.append(f"  峰值: {mfu['peak_tflops']:.2f} TFLOPS（{mfu['peak_source']}）")
-        lines.append(f"  平均 MFU: {mfu['mean_mfu_pct']:.2f}%  最大 MFU: {mfu['max_mfu_pct']:.2f}%  "
-                     f"({mfu['n_cases']} cases)")
     lines.append("=" * 100)
 
     return "\n".join(lines)
@@ -1575,13 +1335,14 @@ def _measure_one_impl(mi: _MeasureInput):
         wrapper = _generate_wrapper_script(_WrapperConfig(
             mi.out_dir, mi.case_idx, mi.impl, mi.args.seed, mi.device_id,
             mi.args.warmup, mi.jsonl_case))
-        tmpdir = f"/tmp/msprof_{impl_abbr}_{mi.out_dir.name}_c{mi.case_idx}"
+        candidate_key = hashlib.sha256(str(mi.out_dir.resolve()).encode()).hexdigest()[:12]
+        tmpdir = f"/tmp/msprof_{impl_abbr}_{candidate_key}_c{mi.case_idx}"
         prof_dir, err = _run_msprof_standard(wrapper, tmpdir, mi.device_id, mi.args.warmup)
         if prof_dir:
             duration, _op_name, parse_err = _parse_msprof_duration(prof_dir)
             if duration is not None:
                 return duration, None, prof_dir
-            err = f"{parse_err} (app log: {tmpdir}/app_output.log)"
+            err = parse_err
         time.sleep(0.5)
     return None, err, prof_dir
 
@@ -1589,42 +1350,40 @@ def _measure_one_impl(mi: _MeasureInput):
 def _measure_one_impl_quick(mi: _MeasureInput):
     """快速模式：Measure one implementation with retries and repeats.
 
-    --retry 用于解析失败重试。
-
-    与 torch_npu profiler 对齐的口径：wrapper 在**同一个被采集的进程内**先跑
-    --warmup 次预热迭代、再跑 --repeats 次计时迭代，msprof 一把全采；解析时按
-    kernel 序列拆分成 (warmup + repeats) 次 run，只对后 repeats 次求平均。
-
-    旧实现把 warmup 放在 msprof 外部的独立进程里执行，对被采集的那个进程毫无
-    预热作用，导致采到的必然是冷 run（首个 kernel 被放大 ~47%）。--ext-warmup
-    保留了旧行为，默认关闭。
+    --retry 用于解析失败重试；--repeats 控制 wrapper 内 timed iteration 次数。
+    wrapper 做 repeats 次 timed run，msprof 一把采集，total / repeats = 单次耗时。
+    warmup 由 _run_msprof_quick 在 msprof 外部执行。
 
     Returns (duration_us, error, prof_dir).
     """
     prof_dir = None
     impl_abbr = "ref" if mi.impl == "reference" else "asc"
     repeats = max(1, getattr(mi.args, "repeats", 1))
-    warmup = max(0, getattr(mi.args, "warmup", 0))
-    ext_warmup = max(0, getattr(mi.args, "ext_warmup", 0))
 
     for _ in range(1 + mi.args.retry):
+        # 让 wrapper 内跑 repeats 次 timed run，msprof 一把采集后除以 repeats 得到单次
         wrapper = _generate_wrapper_script(_WrapperConfig(
             mi.out_dir, mi.case_idx, mi.impl, mi.args.seed, mi.device_id,
-            warmup, mi.jsonl_case, repeats))
-        tag = getattr(mi.args, "prof_tag", None)
-        tmpdir = (f"/tmp/msprof_quick_{impl_abbr}_{mi.out_dir.name}_c{mi.case_idx}"
-                  + (f"_{tag}" if tag else ""))
+            repeats - 1, mi.jsonl_case))
+        # parallel_0 is reused by every evolution session. Include the full
+        # candidate path so concurrent sessions cannot delete each other's
+        # profiler output.
+        candidate_key = hashlib.sha256(str(mi.out_dir.resolve()).encode()).hexdigest()[:12]
+        # 并行 asc 时同一 case_idx 会在不同 device 上并发测量，tmpdir 必须含 device_id，
+        # 否则 _cleanup_prof_dirs(tmpdir) 会误删并发兄弟的输出、msprof 也会互相覆盖。
+        tmpdir = f"/tmp/msprof_quick_{impl_abbr}_{candidate_key}_c{mi.case_idx}_d{mi.device_id}"
         _cleanup_prof_dirs(tmpdir)
-        prof_dir, err = _run_msprof_quick(wrapper, tmpdir, mi.device_id, ext_warmup)
+        prof_dir, err = _run_msprof_quick(wrapper, tmpdir, mi.device_id, mi.args.warmup)
         if not prof_dir:
             continue
 
-        duration, _op_name, parse_err = _parse_msprof_duration_quick(
-            prof_dir, warmup, repeats)
+        duration, _op_name, parse_err = _parse_msprof_duration_quick(prof_dir)
         if duration is None:
-            err = f"{parse_err} (app log: {tmpdir}/app_output.log)"
+            err = parse_err
             continue
 
+        # msprof 采集了 repeats 次 timed run，除以 repeats 得到单次耗时
+        duration = duration / repeats
         return duration, None, prof_dir
 
     return None, err, prof_dir
@@ -1654,6 +1413,8 @@ class _CompareSummaryInput:
     args: argparse.Namespace
     device_id: int
     device_src: str
+    device_pool: Optional[List[int]] = None
+    device_pool_source: str = "none"
 
 
 def _compute_compare_summary(csi: _CompareSummaryInput):
@@ -1673,6 +1434,8 @@ def _compute_compare_summary(csi: _CompareSummaryInput):
         "device_select_source": csi.device_src,
         "timing_method": "msprof.op_summary.Task_Duration",
         "per_case": csi.rows,
+        "device_pool": csi.device_pool,
+        "device_pool_source": csi.device_pool_source,
     }
 
 
@@ -1806,6 +1569,40 @@ def _cleanup_prof_dirs(*dirs):
             shutil.rmtree(d, ignore_errors=True)
 
 
+# ----------------------------------------------------------------------------
+# 设备锁（flock）：跨进化 lane/进程协调同一张卡上的串行测量
+# ----------------------------------------------------------------------------
+_ASCEND_EVO_LOCK_DIR = "/tmp/ascend_evo_locks"
+
+
+def _device_lock_path(device_id: int) -> str:
+    """返回某 NPU 设备对应的共享 flock 锁文件路径。
+
+    锁目录固定为 /tmp/ascend_evo_locks（可用 env ASCEND_EVO_LOCK_DIR 覆盖），
+    跨进化 lane/进程共享——多个并发候选在同一张卡上串行测量靠它协调。
+    """
+    lock_dir = os.environ.get("ASCEND_EVO_LOCK_DIR", _ASCEND_EVO_LOCK_DIR)
+    return os.path.join(lock_dir, f"device_{device_id}.lock")
+
+
+@contextmanager
+def _device_flock(device_id: int):
+    """持锁执行一个 case 的测量（阻塞排它）。
+
+    复用文件内 reference-cache 的 fcntl 用法；subprocess.run 默认 close_fds=True，
+    锁不会传给 msprof 子进程，父线程在子进程退出后释放即可。
+    """
+    path = _device_lock_path(device_id)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd = open(path, "a+")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        fd.close()
+
+
 def _run_compare_loop(out_dir, cases, n_cases, args, device_id):
     """Run the measurement loop over all cases. Returns rows and stats."""
     rows, speedups, ref_times, asc_times = [], [], [], []
@@ -1860,23 +1657,64 @@ def _run_compare_loop(out_dir, cases, n_cases, args, device_id):
 
 
 def _run_quick_loop(out_dir, cases, n_cases, args, device_id):
-    """快速模式：Run the measurement loop over all cases (只跑 1 轮 msprof).
+    """快速模式：单设备上 asc 批量测量（每 case 一个 torch.npu.Stream，一次 msprof 采集全部）。
 
-    Returns rows and stats.
+    - asc: 优先 _measure_asc_batch_quick 批量采集；解析失败/结构校验不过时逐 case 回退。
+    - ref: _measure_batch_reference_quick_cached 批量（含 reference-cache）；失败时逐 case。
+    - 两段测量均持 _device_flock 与本卡其他进化 lane 串行协调。
+
+    Returns (rows, speedups, ref_times, asc_times, pool, pool_source, asc_mode).
     """
     rows, speedups, ref_times, asc_times = [], [], [], []
+    skip = {idx for idx in range(n_cases) if _case_has_empty_tensor(cases[idx])}
+    meas_indices = [idx for idx in range(n_cases) if idx not in skip]
+    meas_cases = [cases[i] for i in meas_indices]
 
-    sel = getattr(args, "cases", None)
-    if sel:
-        idx_list = [int(x) for x in str(sel).split(",") if x.strip() != ""]
-    else:
-        idx_list = list(range(n_cases))
+    asc_batch = None
+    asc_prof_batch = None
+    asc_results = {}
+    asc_mode = "per_case"
+    ref_batch = None
+    ref_prof_batch = None
+    ref_results = {}
 
-    for idx in idx_list:
+    if meas_indices:
+        # ---- asc: 单进程批量（每 case 一个 torch.npu.stream）；失败回退逐 case ----
+        with _device_flock(device_id):
+            asc_batch, asc_prof_batch, asc_batch_err = _measure_asc_batch_quick(
+                out_dir, meas_cases, meas_indices, args, device_id)
+        if asc_batch is None:
+            LOGGER.warning("[WARN] batch asc failed (%s); falling back to per-case", asc_batch_err)
+            with _device_flock(device_id):
+                for idx in meas_indices:
+                    mi = _MeasureInput(out_dir, idx, "ascendc", args, device_id, cases[idx])
+                    asc_results[idx] = _measure_one_impl_quick(mi)
+                    us = asc_results[idx][0]
+                    LOGGER.info("[asc] case %s -> %s",
+                                idx, ("%.2fus" % us) if us is not None else "ERR")
+        else:
+            asc_mode = "batch"
+            LOGGER.info("[INFO] batch asc: %d cases in one msprof run (single process)",
+                        len(meas_indices))
+
+        # ---- ref: 批量（含 cache）；失败回退逐 case ----
+        with _device_flock(device_id):
+            ref_batch, ref_prof_batch, ref_batch_err = _measure_batch_reference_quick_cached(
+                out_dir, meas_cases, meas_indices, args, device_id)
+        if ref_batch is None:
+            LOGGER.warning("[WARN] batch reference profiling failed (%s); falling back to per-case",
+                           ref_batch_err)
+            with _device_flock(device_id):
+                for idx in meas_indices:
+                    mi = _MeasureInput(out_dir, idx, "reference", args, device_id, cases[idx])
+                    ref_results[idx] = _measure_reference_quick_cached(mi)
+
+    # ref + 行组装循环（顺序遍历；asc/ref 从批量结果取，批量失败则从逐 case 收集结果取）
+    for idx in range(n_cases):
         shape, dtype = _extract_shape_dtype_from_jsonl(cases[idx]) if cases else ("?", "?")
         jsonl_case = cases[idx] if cases else None
 
-        if _case_has_empty_tensor(jsonl_case):
+        if idx in skip:
             LOGGER.info(f"{idx:<5} {shape:<35} {dtype:<10} "
                   f"{'--':>12} {'--':>12} "
                   f"{'skip':>10}  (empty tensor)")
@@ -1888,17 +1726,27 @@ def _run_quick_loop(out_dir, cases, n_cases, args, device_id):
             })
             continue
 
-        which = getattr(args, "impl", "both")
-        if which in ("both", "ref"):
-            ref_mi = _MeasureInput(out_dir, idx, "reference", args, device_id, jsonl_case)
-            ref_us, ref_err, ref_prof_dir = _measure_one_impl_quick(ref_mi)
+        pos = meas_indices.index(idx)
+        if asc_batch is not None:
+            asc_us = asc_batch[pos]
+            asc_err = None
+            asc_prof_dir = asc_prof_batch
         else:
-            ref_us, ref_err, ref_prof_dir = None, "skipped (--impl)", None
-        if which in ("both", "asc"):
-            asc_mi = _MeasureInput(out_dir, idx, "ascendc", args, device_id, jsonl_case)
-            asc_us, asc_err, asc_prof_dir = _measure_one_impl_quick(asc_mi)
+            asc_res = asc_results.get(idx)
+            if asc_res is None:
+                asc_us, asc_err, asc_prof_dir = None, "asc measurement missing", None
+            else:
+                asc_us, asc_err, asc_prof_dir = asc_res
+
+        if ref_batch is not None:
+            ref_us, ref_err, _ = ref_batch[pos]
+            ref_prof_dir = ref_prof_batch
         else:
-            asc_us, asc_err, asc_prof_dir = None, "skipped (--impl)", None
+            ref_res = ref_results.get(idx)
+            if ref_res is None:
+                ref_us, ref_err, ref_prof_dir = None, "ref measurement missing", None
+            else:
+                ref_us, ref_err, ref_prof_dir = ref_res
 
         if ref_us is not None and asc_us is not None and asc_us > 0:
             sp = ref_us / asc_us
@@ -1920,229 +1768,436 @@ def _run_quick_loop(out_dir, cases, n_cases, args, device_id):
             "asc_error": asc_err,
             "ref_prof_dir": ref_prof_dir,
             "asc_prof_dir": asc_prof_dir,
+            "asc_device": device_id,
+            "ref_device": device_id,
         })
 
         if not args.keep_prof:
             _cleanup_prof_dirs(ref_prof_dir, asc_prof_dir)
 
-    return rows, speedups, ref_times, asc_times
+    return rows, speedups, ref_times, asc_times, [], "none", asc_mode
 
 
-# ============================================================================
-# MFU（官方 operator_mfu 口径）: 理论 FLOPs / kernel 时长 / 芯片峰值
-#
-# 口径来源: msprof-analyze operator_mfu
-#   actual_tflops = FLOPs / (kernelDuration(ns) * 1e-9) / 1e12
-#   mfu           = FLOPs / (kernelDuration(ns) * 1e-9) / chipPeakFLOPS
-# 其中 FLOPs 为模型理论计算量（与官方"注册公式"等价，本地由可选的
-# {out_dir}/flops.py 提供: `def flops(case: dict) -> float`，case 为
-# jsonl 中的一行）。与 PMU 口径(aic_mac_fp16_ratio)相比，官方口径不受
-# 活跃核归一与运行时频率影响，是跨算子可对比的有效算力指标。
-# ============================================================================
+def _reference_cache_path(args) -> Optional[Path]:
+    """Return the session-shared reference cache configured by CLI or env."""
+    value = getattr(args, "reference_cache", None)
+    if not value:
+        value = os.environ.get("LINGXI_REFERENCE_CACHE")
+    return Path(value).expanduser().resolve() if value else None
 
-def _load_flops_hook(out_dir: Path):
-    """加载可选的 {out_dir}/flops.py，约定暴露 flops(case: dict) -> float。
 
-    case 即 jsonl 中的一行（含 inputs 列表，tensor 项有 shape/dtype，
-    标量项有 value/range_values）。返回 None 表示无 hook 或接口不符。
+def _reference_cache_key(mi: _MeasureInput, method: str = "per_case") -> tuple[str, dict]:
+    """Build a stable key for an unchanged reference model and one input case.
+
+    The physical device id is intentionally excluded: lingxi-evo allocates one
+    homogeneous NPU per lane, while a session must share the immutable PyTorch
+    reference timing across those lanes.
+
+    ``method`` distinguishes measurement semantics: 逐 case（每个 case 新进程，含
+    进程级首 kernel 启动开销）与 batch（单进程稳态测量）。两种语义的耗时不可直接
+    混用，用独立的 cache key 避免 batch 结果误用旧的 per-case 缓存值。
     """
-    path = out_dir / "flops.py"
-    if not path.is_file():
-        return None
-    try:
-        spec = importlib.util.spec_from_file_location("op_flops_hook", path)
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-    except Exception as e:  # noqa: BLE001
-        LOGGER.warning("[MFU] 加载 %s 失败: %s", path, e)
-        return None
-    fn = getattr(mod, "flops", None)
-    if not callable(fn):
-        LOGGER.warning("[MFU] %s 未暴露可调用的 flops(case) 函数，跳过 MFU", path)
-        return None
-    return fn
-
-
-def _parse_platform_config_peak(ini_path: Path):
-    """从 platform_config ini 解析 cube 峰值 TFLOPS。
-
-    peak = 2 * m*k*n (MAC/cycle) * ai_core_cnt * cube_freq(MHz) / 1e6
-    例如 910B2C: 2*16^3*24*1800/1e6 = 353.89 TFLOPS
-    """
-    vals = {}
-    for line in ini_path.read_text(encoding="utf-8", errors="ignore").splitlines():
-        m = re.match(r"\s*([A-Za-z_]+)\s*=\s*([0-9.]+)", line)
-        if m:
-            vals[m.group(1)] = m.group(2)
-    try:
-        cnt = int(float(vals["ai_core_cnt"]))
-        freq = float(vals["cube_freq"])  # MHz
-        mm = int(float(vals.get("cube_m_size", 16)))
-        kk = int(float(vals.get("cube_k_size", 16)))
-        nn = int(float(vals.get("cube_n_size", 16)))
-    except (KeyError, ValueError):
-        return None
-    if cnt <= 0 or freq <= 0:
-        return None
-    return 2.0 * mm * kk * nn * cnt * freq / 1e6
-
-
-def _query_npu_aicore_info(device_id: int):
-    """通过 npu-smi 查询 (Aicore Count, Aicore Freq MHz)。失败返回 None。"""
-    try:
-        p = subprocess.run(
-            ["npu-smi", "info", "-t", "common", "-i", str(device_id)],
-            capture_output=True, text=True, timeout=15)
-    except Exception:  # noqa: BLE001
-        return None
-    if p.returncode != 0:
-        return None
-    cnt = freq = None
-    for line in p.stdout.splitlines():
-        m = re.match(r"\s*Aicore Count\s*:\s*(\d+)", line)
-        if m:
-            cnt = int(m.group(1))
-        m = re.match(r"\s*Aicore Freq\(MHZ\)\s*:\s*(\d+)", line)
-        if m:
-            freq = int(m.group(1))
-    if cnt and freq:
-        return cnt, freq
-    return None
-
-
-def _resolve_peak_tflops(args, device_id: int):
-    """解析芯片 cube 峰值 TFLOPS，返回 (peak, source_desc) 或 (None, reason)。
-
-    优先级:
-      1. --mfu-peak 显式指定
-      2. SOC_VERSION 环境变量 → platform_config/<SOC>.ini
-      3. npu-smi Aicore Count × Freq × 16^3 MAC（910B 系列 cube 规格）,
-         若与某 platform_config ini 的 ai_core_cnt 唯一匹配则以 ini 为准
-    """
-    explicit = getattr(args, "mfu_peak", 0) or 0
-    if explicit > 0:
-        return float(explicit), f"--mfu-peak 显式指定 ({explicit} TFLOPS)"
-
-    ascend_home = os.environ.get("ASCEND_HOME_PATH", "/usr/local/Ascend/cann-8.5.1")
-    cfg_dirs = sorted(Path(ascend_home).glob("*/data/platform_config"))
-
-    soc = os.environ.get("SOC_VERSION", "")
-    if soc and cfg_dirs:
-        for ini in cfg_dirs[0].glob(f"{soc}*.ini"):
-            peak = _parse_platform_config_peak(ini)
-            if peak:
-                return peak, f"platform_config/{ini.name} (SOC_VERSION={soc})"
-
-    info = _query_npu_aicore_info(device_id)
-    if info:
-        cnt, freq = info
-        # 用 (ai_core_cnt, cube_freq) 匹配 ini；若候选的峰值一致则采用 ini 精确值
-        if cfg_dirs:
-            peaks = {}
-            for ini in cfg_dirs[0].glob("Ascend*.ini"):
-                try:
-                    txt = ini.read_text(encoding="utf-8", errors="ignore")
-                except OSError:
-                    continue
-                m = re.search(r"ai_core_cnt\s*=\s*(\d+)", txt)
-                f = re.search(r"cube_freq\s*=\s*(\d+)", txt)
-                if m and f and int(m.group(1)) == cnt and int(f.group(1)) == freq:
-                    p = _parse_platform_config_peak(ini)
-                    if p:
-                        peaks[ini.name] = p
-            if peaks and len(set(peaks.values())) == 1:
-                names = "/".join(sorted(peaks))
-                return next(iter(peaks.values())), \
-                    f"platform_config {names} (按 AIC 数={cnt}, freq={freq}MHz 匹配)"
-        # 回退: 假定 cube 16x16x16 MAC/cycle（910B 系列规格）, cube_freq=Aicore Freq
-        peak = 2.0 * 16 * 16 * 16 * cnt * freq / 1e6
-        return peak, (f"npu-smi Aicore Count={cnt} × Freq={freq}MHz × 16³×2 MAC "
-                      f"(假定 910B 系列 cube 规格)")
-    return None, "无法自动推导峰值（npu-smi 查询失败且无 SOC_VERSION），请用 --mfu-peak 显式指定"
-
-
-def _select_mfu_top_cases(cases, flops_fn, top_k: int):
-    """按理论 FLOPs 降序选取 top-K case 下标（MFU 随规模饱和，大 shape 代表峰值水平）。"""
-    scored = []
-    for idx, case in enumerate(cases):
-        if _case_has_empty_tensor(case):
-            continue
-        try:
-            f = float(flops_fn(case))
-        except Exception as e:  # noqa: BLE001
-            LOGGER.warning("[MFU] flops(case %d) 计算失败: %s", idx, e)
-            continue
-        if f > 0:
-            scored.append((f, idx))
-    scored.sort(reverse=True)
-    return sorted(idx for _, idx in scored[:max(1, top_k)])
-
-
-def _annotate_rows_mfu(rows, cases, flops_fn, peak_tflops: float):
-    """为含 asc_us 的行追加理论 FLOPs / actual TFLOPS / 官方口径 MFU。返回有效行数。"""
-    n_valid = 0
-    for row in rows:
-        asc_us = row.get("asc_us")
-        idx = row.get("case")
-        if asc_us is None or asc_us <= 0 or not cases or idx is None or idx >= len(cases):
-            continue
-        try:
-            flops = float(flops_fn(cases[idx]))
-        except Exception:  # noqa: BLE001
-            continue
-        if flops <= 0:
-            continue
-        actual_tflops = flops / (asc_us * 1e-6) / 1e12
-        row["theory_gflop"] = flops / 1e9
-        row["actual_tflops"] = actual_tflops
-        row["mfu_pct"] = actual_tflops / peak_tflops * 100.0
-        n_valid += 1
-    return n_valid
-
-
-def _build_mfu_summary(rows, peak_tflops: float, peak_src: str):
-    """汇总 MFU 结果（对 AscendC 实现）。无有效行时返回 None。"""
-    mfus = [r["mfu_pct"] for r in rows if r.get("mfu_pct") is not None]
-    if not mfus:
-        return None
-    return {
-        "口径": "operator_mfu 官方等价口径: 理论FLOPs / kernel时长 / 芯片cube峰值",
-        "peak_tflops": peak_tflops,
-        "peak_source": peak_src,
-        "mean_mfu_pct": statistics.mean(mfus),
-        "max_mfu_pct": max(mfus),
-        "n_cases": len(mfus),
+    model_path = mi.out_dir / "model.py"
+    model_hash = hashlib.sha256(model_path.read_bytes()).hexdigest()
+    payload = {
+        "model_sha256": model_hash,
+        "case_index": mi.case_idx,
+        "case": mi.jsonl_case,
+        "seed": int(mi.args.seed),
+        "warmup": int(mi.args.warmup),
+        "repeats": int(mi.args.repeats),
+        "timing_method": "msprof.quick.Task_Duration",
+        "method": method,
     }
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest(), payload
 
 
-def _add_mfu_section(lines, report):
-    """Add the official-口径 MFU section to the compare markdown report."""
-    mfu = report.get("mfu")
-    if not mfu:
-        return
-    lines.append("## MFU（官方 operator_mfu 等价口径）")
-    lines.append("")
-    lines.append(f"- **口径**: {mfu['口径']}（softmax/mask 等后处理不计 FLOPs）")
-    lines.append(f"- **芯片 cube 峰值**: {mfu['peak_tflops']:.2f} TFLOPS（来源: {mfu['peak_source']}）")
-    lines.append(f"- **理论 FLOPs 来源**: 算子目录 flops.py hook")
-    lines.append("")
-    lines.append("| Case | Shape | 理论FLOPs(GFLOP) | AscendC(us) | actual TFLOPS | MFU |")
-    lines.append("| ---- | ----- | ---------------- | ----------- | ------------- | --- |")
-    for case in report.get("per_case", []):
-        if case.get("mfu_pct") is None:
+def _read_reference_cache(path: Path) -> dict:
+    if not path.is_file():
+        return {"schema_version": 1, "entries": {}}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        LOGGER.warning("[WARN] Ignoring invalid reference cache: %s", path)
+        return {"schema_version": 1, "entries": {}}
+    if value.get("schema_version") != 1 or not isinstance(value.get("entries"), dict):
+        LOGGER.warning("[WARN] Ignoring unsupported reference cache: %s", path)
+        return {"schema_version": 1, "entries": {}}
+    return value
+
+
+def _write_reference_cache(path: Path, cache: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    with tmp.open("w", encoding="utf-8") as stream:
+        json.dump(cache, stream, ensure_ascii=False, indent=2)
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(tmp, path)
+
+
+def _measure_reference_quick_cached(mi: _MeasureInput):
+    """Measure the reference at most once per session/cache key.
+
+    The cache lock remains held on a miss while profiling the reference. This
+    prevents simultaneously launched candidates from all paying the same
+    reference cost before the first result is committed.
+    """
+    cache_path = _reference_cache_path(mi.args)
+    if cache_path is None:
+        return _measure_one_impl_quick(mi)
+
+    key, identity = _reference_cache_key(mi)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = cache_path.with_name(cache_path.name + ".lock")
+    with lock_path.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        try:
+            cache = _read_reference_cache(cache_path)
+            cached = cache["entries"].get(key)
+            if cached is not None and cached.get("ref_us") is not None:
+                LOGGER.info(
+                    "[CACHE HIT] reference case %s from %s", mi.case_idx, cache_path
+                )
+                return cached["ref_us"], cached.get("ref_error"), None
+
+            LOGGER.info(
+                "[CACHE MISS] profiling reference case %s once for session", mi.case_idx
+            )
+            ref_us, ref_err, ref_prof_dir = _measure_one_impl_quick(mi)
+            if ref_us is not None:
+                cache["entries"][key] = {
+                    **identity,
+                    "ref_us": ref_us,
+                    "ref_error": ref_err,
+                    "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                }
+                _write_reference_cache(cache_path, cache)
+            return ref_us, ref_err, ref_prof_dir
+        finally:
+            fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+
+
+# ============================================================================
+# 批量快速采集（stream-per-case，单次 msprof 采集全部 case）
+#
+# 逐 case 调 msprof 时，每次都要付出 ~20s 的 msprof 工具启动开销（50 case ≈ 40min）。
+# 批量模式把每个 case 放在独立 torch.npu.Stream 上，一个 wrapper 进程内顺序跑完所有
+# case，只启动一次 msprof；解析时按 stream_id 归组即可精确还原每个 case 的耗时。
+#
+# asc 同样走该批量路径（impl="ascendc"）：自定义 AscendC op 经 TORCH_LIBRARY 注册，
+# host 侧 EXEC_KERNEL_CMD 宏用 c10_npu::getCurrentNPUStream() 绑定启动流，因此
+# `with torch.npu.stream(_s):` 内调用 op 其 kernel 会落到该 case 的 stream，
+# 可按 stream_id 归组。早期批量 asc 欠采样 ~3x 是解析缺 MIX_AIC 所致（已修复）。
+# ============================================================================
+
+_BATCH_WRAPPER_SCRIPT_TEMPLATE = """\
+#!/usr/bin/env python3
+import importlib.util
+import os
+import sys
+import torch
+from pathlib import Path
+
+out_dir = Path({out_dir!r})
+os.environ["ASCEND_RT_VISIBLE_DEVICES"] = "{device_id}"
+sys.path.insert(0, str(out_dir / "kernel" / "build"))
+sys.path.insert(0, str(out_dir))
+
+def _load(path, name):
+    spec = importlib.util.spec_from_file_location(name, path)
+    m = importlib.util.module_from_spec(spec)
+    sys.modules[name] = m
+    spec.loader.exec_module(m)
+    return m
+
+mod = _load(out_dir / "{model_file}", "prof_mod")
+cls = getattr(mod, "{cls_name}")
+
+device = torch.device("npu")
+
+def _move(v):
+    if isinstance(v, torch.Tensor):
+        return v.to(device)
+    if isinstance(v, (list, tuple)):
+        return type(v)(_move(x) for x in v)
+    return v
+
+_ref_for_init = None
+try:
+    _ref_for_init = _load(out_dir / "{model_file}", "ref_for_init")
+except Exception:
+    _ref_for_init = None
+
+# 所有 case 的 stream 必须一次性预建并保持存活：
+# 若在循环里逐个创建 stream，上一把 stream 被 GC 释放后 torch 会复用其 ID，
+# 导致多个 case 共享同一 stream_id，task_time.csv 无法按 stream 归组到每个 case。
+_batch_streams = [torch.npu.Stream() for _ in range({n_cases})]
+
+# ---- 每个 case 一个独立 stream（隔离 kernel），按 case 顺序展开 ----
+{case_blocks}
+"""
+
+
+def _generate_batch_wrapper_script(out_dir, impl, cases, indices, args, device_id):
+    """生成批量 wrapper：每个 case 独占一个 stream，单进程内顺序跑完所有 case。
+
+    cases 与 indices 一一对应；indices 为原始 case 编号（get_init_inputs 按它索引）。
+    """
+    model_file = "model.py" if impl == "reference" else "model_new_ascendc.py"
+    cls_name = "Model" if impl == "reference" else "ModelNew"
+    repeats = max(1, int(getattr(args, "repeats", 1)))
+    blocks = []
+    for pos, (idx, case) in enumerate(zip(indices, cases)):
+        inp = _serialize_jsonl_inputs(case)
+        # 输入构造与 forward 必须都在 case 的 stream 上下文内：
+        # 逐 case 语义会把输入 randn 的 cast 与算子 kernel 一起计入 task 时长，
+        # 若 randn 落在默认 stream，则这些 cast 不会被计入各 case 的 stream 归组，
+        # 导致批量值与逐 case 值不一致。
+        inp_indented = "\n".join("    " + line for line in inp.split("\n"))
+        blocks.append(
+            f"# ---- case {idx} ----\n"
+            f"_s = _batch_streams[{pos}]\n"
+            f"with torch.npu.stream(_s):\n"
+            f"{inp_indented}\n"
+            f"    inputs = _move(inputs)\n"
+            f"    _init_args = []\n"
+            f"    _init_kwargs = {{}}\n"
+            f"    if _ref_for_init is not None:\n"
+            f"        try:\n"
+            f"            _all_init = _ref_for_init.get_init_inputs()\n"
+            f"            if isinstance(_all_init, list) and {idx} < len(_all_init):\n"
+            f"                _entry = _all_init[{idx}]\n"
+            f"                if isinstance(_entry, dict):\n"
+            f"                    _init_kwargs = _entry\n"
+            f"                elif isinstance(_entry, (list, tuple)):\n"
+            f"                    _init_args = list(_entry)\n"
+            f"        except Exception:\n"
+            f"            pass\n"
+            f"    model = cls(*_init_args, **_init_kwargs).to(device).eval()\n"
+            f"    for _ in range({repeats}):\n"
+            f"        with torch.no_grad():\n"
+            f"            _ = model(*inputs)\n"
+            f"        torch.npu.synchronize()\n"
+        )
+    return _BATCH_WRAPPER_SCRIPT_TEMPLATE.format(
+        out_dir=str(out_dir), device_id=device_id, model_file=model_file,
+        cls_name=cls_name, n_cases=len(cases), case_blocks="\n".join(blocks),
+    )
+
+
+def _run_msprof_quick_batch(wrapper_script, output_dir, device_id, warmup):
+    """批量模式：外部 warmup + 单次 msprof 采集（不设置 --aic-metrics）。
+
+    NOTE: 必须带 --ai-core=on，否则 aicore kernel 时长欠采集约 2.6-3x。
+    """
+    wrapper_path = os.path.join(output_dir, "_wrapper_batch.py")
+    os.makedirs(output_dir, exist_ok=True)
+    with open(wrapper_path, "w", encoding="utf-8") as f:
+        f.write(wrapper_script)
+    env = os.environ.copy()
+    for _ in range(max(1, warmup)):
+        subprocess.run([sys.executable, wrapper_path],
+                       capture_output=True, text=True, env=env)
+    cmd = ["msprof", f"--output={output_dir}", "--ai-core=on", "--task-time=on",
+           "--ascendcl=on", sys.executable, wrapper_path]
+    result = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    try:
+        os.remove(wrapper_path)
+    except OSError:
+        pass
+    if result.returncode != 0:
+        return None, f"msprof failed: {result.stderr[-500:]}"
+    prof_dirs = sorted(Path(output_dir).glob("PROF_*"))
+    if not prof_dirs:
+        return None, "no PROF directory found"
+    return str(prof_dirs[-1]), None
+
+
+def _parse_msprof_duration_quick_batch(prof_group_dir):
+    """批量解析：按 stream_id 归组计算 kernel，返回每个 case 的耗时列表（stream 首现顺序）。
+
+    批量 wrapper 中每个 case 独占一个 stream，因此 stream 首现顺序即 case 顺序。
+    只累加真实计算 kernel（与逐 case 解析的 COMPUTE_KERNEL_TYPES 一致），
+    排除 PROFILING_ENABLE/DISABLE、TASK_TIMEOUT_SET、MEMCPY_ASYNC、DSA_SQE 等非计算行。
+    """
+    task_time_pattern = os.path.join(prof_group_dir, "mindstudio_profiler_output/task_time_*.csv")
+    task_time_files = sorted(glob.glob(task_time_pattern))
+    if not task_time_files:
+        return None, "no task_time csv found"
+    try:
+        with open(task_time_files[0], "r", encoding="utf-8", errors="replace") as f:
+            rows = list(csv.DictReader(f))
+    except Exception as e:
+        return None, f"read csv error: {e}"
+    # NOTE: MIX_AIC 必须包含——自定义 AscendC op 的 AIC GEMM kernel 是 MIX_AIC 类型，
+    # 缺失会导致 aicore 耗时欠采集约 2.6-3x（2026-08-14 实测确认）。
+    COMPUTE_KERNEL_TYPES = {"AI_VECTOR_CORE", "AI_CORE", "MIX_AIV", "MIX", "MIX_AIC"}
+    stream_order = []
+    stream_sums = {}
+    for r in rows:
+        kt = r.get("kernel_type", "")
+        if kt not in COMPUTE_KERNEL_TYPES:
             continue
-        lines.append(
-            f"| {case['case']} | {case.get('shape', '?')} | "
-            f"{case['theory_gflop']:.3f} | {case['asc_us']:.2f} | "
-            f"{case['actual_tflops']:.2f} | {case['mfu_pct']:.2f}% |")
-    lines.append("")
-    lines.append(f"**平均 MFU: {mfu['mean_mfu_pct']:.2f}%　最大 MFU: {mfu['max_mfu_pct']:.2f}%**"
-                 f"（{mfu['n_cases']} 个 case）")
-    lines.append("")
-    lines.append("> 注: PMU 口径(aic_mac_fp16_ratio)按活跃核归一且使用运行时频率峰值，"
-                 "小 shape 会严重虚高；官方口径不受此影响。若需 cube 阵列占空比等"
-                 "瓶颈指标，请用 --compare 模式采集 ArithmeticUtilization。")
-    lines.append("")
+        try:
+            d = float(r.get("task_time(us)", ""))
+        except ValueError:
+            continue
+        if d <= 0:
+            continue
+        sid = r.get("stream_id", "")
+        if sid not in stream_sums:
+            stream_order.append(sid)
+            stream_sums[sid] = 0.0
+        stream_sums[sid] += d
+    if not stream_order:
+        return None, "no compute rows found"
+    return [stream_sums[sid] for sid in stream_order], None
+
+
+# 单批最大 case 数。torch.npu 的设备 stream 池上限约 32，
+# 超过后 stream ID 会被复用，task_time.csv 无法按 stream 区分 case，
+# 因此按 _BATCH_CHUNK_SIZE 分批采集，每批 stream 数都在池上限内。
+_BATCH_CHUNK_SIZE = 28
+
+
+def _measure_batch_quick(out_dir, cases, indices, args, device_id, impl):
+    """分批单次 msprof 采集指定 cases（cases/indices 一一对应）。
+
+    Returns (durations, prof_dir, err)；durations 对齐 cases，已除以 repeats。
+    """
+    repeats = max(1, int(getattr(args, "repeats", 1)))
+    # 共享机上 msprof 的设备 profiling 通道会被并发会话瞬时争抢（"Collect data failed" /
+    # "no task_time"），对每个 chunk 重试 --retry 次（与逐 case 的 _measure_one_impl_quick 一致），
+    # 避免瞬时通道失败直接回退到慢速逐 case。
+    retry = max(0, int(getattr(args, "retry", 2)))
+    impl_abbr = "ref" if impl == "reference" else "asc"
+    all_durations = []
+    prof_dirs = []
+    for start in range(0, len(cases), _BATCH_CHUNK_SIZE):
+        chunk_cases = cases[start:start + _BATCH_CHUNK_SIZE]
+        chunk_indices = indices[start:start + _BATCH_CHUNK_SIZE]
+        try:
+            wrapper = _generate_batch_wrapper_script(
+                out_dir, impl, chunk_cases, chunk_indices, args, device_id)
+        except Exception as e:
+            return None, None, f"batch wrapper generation failed: {e}"
+        tmpdir = f"/tmp/msprof_quick_{impl_abbr}_{out_dir.name}_batch_{start}"
+        durations = None
+        prof_dir = None
+        last_err = None
+        for attempt in range(1 + retry):
+            _cleanup_prof_dirs(tmpdir)
+            prof_dir, err = _run_msprof_quick_batch(wrapper, tmpdir, device_id, args.warmup)
+            if not prof_dir:
+                last_err = err or "no prof dir"
+            else:
+                durations, perr = _parse_msprof_duration_quick_batch(prof_dir)
+                if durations is None:
+                    last_err = perr
+                # 结构校验：stream 归组的 case 数必须与输入的 case 数一致，且每个 case 都必须有
+                # 非零耗时。任何 case 为零都意味着该 case 的 kernel 未被正确归属到其 stream
+                # （例如 AscendC 内部 kernel 逃逸到其他流），此时整批结果不可信，交由上层回退
+                # 逐 case 测量，绝不静默产出偏小的 asc 值。
+                elif len(durations) != len(chunk_cases):
+                    last_err = (
+                        f"chunk[{start}]: batch stream count {len(durations)} != cases {len(chunk_cases)}")
+                elif any(d <= 0 for d in durations):
+                    last_err = (
+                        f"chunk[{start}]: {sum(1 for d in durations if d <= 0)}/{len(durations)} "
+                        f"cases have zero/negative duration; stream grouping invalid")
+            if durations is not None:
+                break
+            LOGGER.warning("[WARN] batch chunk %s attempt %d/%d failed: %s",
+                           start, attempt + 1, 1 + retry, last_err)
+            time.sleep(0.5)
+        if durations is None:
+            return None, prof_dir, last_err
+        all_durations.extend(d / repeats for d in durations)
+        prof_dirs.append(prof_dir)
+    return all_durations, (prof_dirs[-1] if prof_dirs else None), None
+
+
+def _measure_asc_batch_quick(out_dir, cases, indices, args, device_id):
+    """单进程批量测量 asc：每个 case 独占一个 torch.npu.Stream()，一次 msprof 采集全部 case。
+
+    原理：自定义 AscendC op 通过 TORCH_LIBRARY 注册，host 侧 EXEC_KERNEL_CMD 宏
+    （kernel/utils/torch_kernel_helper.h）用 c10_npu::getCurrentNPUStream() 绑定启动流，
+    因此在 `with torch.npu.stream(_s):` 内调用 op，其 kernel 会落到该 case 的 stream，
+    task_time.csv 可按 stream_id 精确归组。早期批量 asc 只测到逐 case 的 ~1/3，根因是
+    解析缺 MIX_AIC（欠采样 2.6-3x），现已在 _parse_msprof_duration_quick_batch 补齐
+    MIX_AIC/MIX_AIV/AI_CORE 等类型；结构校验不过时上层会回退逐 case。
+
+    Returns (durations, prof_dir, err)；durations 对齐 cases，已除以 repeats。
+    """
+    return _measure_batch_quick(out_dir, cases, indices, args, device_id, "ascendc")
+
+
+def _measure_batch_reference_quick_cached(out_dir, cases, indices, args, device_id):
+    """批量测量 reference，尊重共享 cache；只在 cache miss 时单次 msprof 采集缺失 case。
+
+    与逐 case 的 _measure_reference_quick_cached 不同：测量时不持有 cache 锁，
+    避免并发 lane 在锁内串行重复测量同一 reference。
+
+    Returns (per_case, prof_dir, err)；per_case[pos] 对齐 cases[pos] =
+    (ref_us, ref_err, ref_prof_dir)。
+    """
+    n = len(cases)
+    results = [None] * n
+    cache_path = _reference_cache_path(args)
+    miss_pos = []
+    if cache_path is None:
+        miss_pos = list(range(n))
+    else:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = cache_path.with_name(cache_path.name + ".lock")
+        with lock_path.open("a+", encoding="utf-8") as lock_stream:
+            fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+            try:
+                cache = _read_reference_cache(cache_path)
+                for pos, idx in enumerate(indices):
+                    mi = _MeasureInput(out_dir, idx, "reference", args, device_id, cases[pos])
+                    key, _ = _reference_cache_key(mi, method="batch")
+                    cached = cache["entries"].get(key)
+                    if cached is not None and cached.get("ref_us") is not None:
+                        results[pos] = (cached["ref_us"], cached.get("ref_error"), None)
+                    else:
+                        miss_pos.append(pos)
+            finally:
+                fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+    if miss_pos:
+        miss_cases = [cases[p] for p in miss_pos]
+        miss_indices = [indices[p] for p in miss_pos]
+        durations, prof_dir, err = _measure_batch_quick(
+            out_dir, miss_cases, miss_indices, args, device_id, "reference")
+        if durations is None:
+            return None, prof_dir, err
+        for offset, pos in enumerate(miss_pos):
+            results[pos] = (durations[offset], None, prof_dir)
+        if cache_path is not None:
+            lock_path = cache_path.with_name(cache_path.name + ".lock")
+            with lock_path.open("a+", encoding="utf-8") as lock_stream:
+                fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+                try:
+                    cache = _read_reference_cache(cache_path)
+                    for offset, pos in enumerate(miss_pos):
+                        idx = indices[pos]
+                        mi = _MeasureInput(out_dir, idx, "reference", args, device_id, cases[pos])
+                        key, identity = _reference_cache_key(mi, method="batch")
+                        cache["entries"][key] = {
+                            **identity,
+                            "ref_us": durations[offset],
+                            "ref_error": None,
+                            "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                        }
+                    _write_reference_cache(cache_path, cache)
+                finally:
+                    fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+    return results, None, None
 
 
 def run_compare_mode(args):
@@ -2180,290 +2235,25 @@ def run_quick_mode(args):
     if case_source:
         LOGGER.info(f"[INFO] Loaded {n_cases} cases from {case_source}")
 
-    # MFU（官方 operator_mfu 等价口径）: 需要 flops.py hook + 芯片峰值
-    flops_fn = None
-    peak_tflops, peak_src = None, None
-    if getattr(args, "mfu", False):
-        flops_fn = _load_flops_hook(out_dir)
-        if flops_fn is None:
-            LOGGER.warning(f"[MFU] 未找到可用的 {out_dir}/flops.py（约定: def flops(case)->float），"
-                           "本次跳过 MFU 统计（正常采集耗时）")
-        else:
-            peak_tflops, peak_src = _resolve_peak_tflops(args, device_id)
-            if peak_tflops is None:
-                LOGGER.warning(f"[MFU] {peak_src}，本次跳过 MFU 统计")
-                flops_fn = None
-            else:
-                LOGGER.info(f"[MFU] 芯片 cube 峰值: {peak_tflops:.2f} TFLOPS（{peak_src}）")
-                # 未显式指定 case 时，按理论 FLOPs 取 top-K 大 shape（MFU 随规模饱和）
-                if not getattr(args, "cases", None) and not getattr(args, "max_cases", 0):
-                    top_k = max(1, getattr(args, "mfu_top_k", 3))
-                    idxs = _select_mfu_top_cases(cases, flops_fn, top_k)
-                    if idxs and len(idxs) < n_cases:
-                        args.cases = ",".join(map(str, idxs))
-                        LOGGER.info(f"[MFU] 按理论 FLOPs 选取 top-{len(idxs)} case（峰值 MFU 代表 shape）: "
-                                    f"{idxs}（如需全量请显式 --cases 或 --max-cases）")
-
-    max_cases = getattr(args, "max_cases", 0)
-    if max_cases and max_cases < n_cases:
-        n_cases = max_cases
-        LOGGER.info(f"[INFO] --max-cases: limiting to first {n_cases} cases")
-
-    LOGGER.info(f"[INFO] in-process warmup={args.warmup}, timed repeats={args.repeats}, "
-                f"ext-warmup={getattr(args, 'ext_warmup', 0)}, impl={getattr(args, 'impl', 'both')}")
     _log_compare_header(out_dir, args)
-    rows, speedups, ref_times, asc_times = _run_quick_loop(
+    rows, speedups, ref_times, asc_times, _pool, _pool_source, asc_mode = _run_quick_loop(
         out_dir, cases, n_cases, args, device_id)
 
-    if flops_fn is not None and peak_tflops:
-        n_mfu = _annotate_rows_mfu(rows, cases, flops_fn, peak_tflops)
-        if n_mfu:
-            LOGGER.info("-" * 100)
-            LOGGER.info("--- MFU（官方 operator_mfu 等价口径，AscendC 实现）---")
-            for row in rows:
-                if row.get("mfu_pct") is not None:
-                    LOGGER.info(f"  case {row['case']:<3} theory={row['theory_gflop']:>8.3f} GFLOP  "
-                                f"actual={row['actual_tflops']:>7.2f} TFLOPS  MFU={row['mfu_pct']:.2f}%")
-
     csi = _CompareSummaryInput(
-        out_dir, rows, speedups, ref_times, asc_times, n_cases, args, device_id, device_src)
+        out_dir, rows, speedups, ref_times, asc_times, n_cases, args, device_id, device_src,
+        device_pool=None, device_pool_source="none")
     summary = _compute_compare_summary(csi)
+    # asc 验证已收敛为单卡批量（每 case 一个 torch.npu.stream，一次 msprof 采集全部 case）。
+    # asc_mode ∈ {"batch", "per_case"}：batch 成功用批量值；失败回退逐 case。
+    summary["asc_mode"] = asc_mode
+    summary["asc_parallel"] = False  # 兼容旧字段：已无多 NPU 扇出
+    summary["n_pool_devices"] = 0
     summary["timing_method"] = "msprof.quick.Task_Duration"
     summary["profiling_mode"] = "quick"
-    if flops_fn is not None and peak_tflops:
-        mfu_summary = _build_mfu_summary(rows, peak_tflops, peak_src)
-        if mfu_summary:
-            summary["mfu"] = mfu_summary
     _log_and_save_compare_reports(summary, out_dir, speedups, n_cases)
 
 
 # ============================================================================
-# 批量模式：扫描多个算子目录，汇总报告
-# ============================================================================
-
-def _is_valid_table_row(line: str) -> bool:
-    return line.startswith('|') and 'Level' not in line and '---' not in line and len(line) > 5
-
-
-def _extract_trace_table_rows(trace_file_path: str) -> List[str]:
-    if not os.path.exists(trace_file_path):
-        return []
-    try:
-        with open(trace_file_path, 'r', encoding='utf-8') as f:
-            content = f.read()
-    except Exception:
-        return []
-    start_idx = content.find('## 汇总表报告')
-    if start_idx == -1:
-        return []
-    section_content = content[start_idx:]
-    lines = section_content.split('\n')
-    valid_rows = []
-    for line in lines:
-        line = line.strip()
-        if _is_valid_table_row(line):
-            valid_rows.append(line)
-    return valid_rows
-
-
-def _load_performance_json(op_dir: Path) -> Optional[Dict[str, Any]]:
-    perf_json = op_dir / "performance.json"
-    if perf_json.exists():
-        try:
-            with open(perf_json, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception as e:
-            LOGGER.warning("Failed to load performance.json from %s: %s", op_dir, e)
-    return None
-
-
-def _build_batch_md_summary_table(op_results):
-    """Build the batch summary table markdown lines."""
-    md_lines = []
-    if op_results:
-        md_lines.append("## 性能汇总")
-        md_lines.append("")
-        md_lines.append(
-            "| 算子名称 | 用例数 | 有效用例 | 几何平均加速比 | 平均加速比 | 状态 |"
-        )
-        md_lines.append("| -------- | ------ | -------- | -------------- | ---------- | ---- |")
-        for op in op_results:
-            data = op["data"]
-            name = op["name"]
-            n_total = data.get("n_cases_total", 0)
-            n_valid = data.get("n_cases_valid", 0)
-            geo = data.get("geomean_speedup")
-            mean = data.get("mean_speedup")
-            geo_str = f"{geo:.3f}" if geo is not None else "N/A"
-            mean_str = f"{mean:.3f}" if mean is not None else "N/A"
-            status = "✅" if geo is not None and geo > 1 else "⚠️" if geo is not None else "❌"
-            md_lines.append(f"| {name} | {n_total} | {n_valid} | {geo_str} | {mean_str} | {status} |")
-        md_lines.append("")
-    return md_lines
-
-
-def _build_batch_md_per_op_details(op_results):
-    """Build per-operator detail tables in markdown."""
-    md_lines = []
-    for op in op_results:
-        data = op["data"]
-        name = op["name"]
-        md_lines.append(f"## {name}")
-        md_lines.append("")
-        if data.get("per_case"):
-            md_lines.append("| Case | Shape | DType | 自定义算子(us) | 标杆(us) | 加速比 |")
-            md_lines.append("| ---- | ----- | ----- | ------------- | -------- | -------------- |")
-            for case in data["per_case"]:
-                shape = case.get("shape", "?")
-                dtype = case.get("dtype", "?")
-                ref = case.get("ref_us")
-                asc = case.get("asc_us")
-                sp = case.get("speedup")
-                ref_str = f"{ref:.2f}" if ref is not None else "N/A"
-                asc_str = f"{asc:.2f}" if asc is not None else "N/A"
-                sp_str = f"{sp:.3f}" if sp is not None else "N/A"
-                md_lines.append(f"| {case['case']} | {shape} | {dtype} | {asc_str} | {ref_str} | {sp_str} |")
-            md_lines.append("")
-    return md_lines
-
-
-def _build_batch_md_trace_section(trace_rows):
-    """Build trace table section in markdown if rows exist."""
-    if not trace_rows:
-        return []
-    md_lines = [
-        "## Trace 汇总表",
-        "",
-        ("| Level | Problem ID | 算子名称 | 算子类型 | 编译通过 | 精度正确 | "
-         "PyTorch 参考延迟 | 生成AscendC代码延迟 | 加速比 | 最终状态 | "
-         "精度正确 | 性能0.6x pytorch | 性能0.8x pytorch |"),
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
-    ]
-    md_lines.extend(trace_rows)
-    md_lines.append("")
-    return md_lines
-
-
-def _generate_batch_md_report(args, op_results, trace_rows, base_dir):
-    """Generate and save the batch Markdown report."""
-    md_lines = []
-    md_lines.append("# 📊 算子批量性能汇总报告")
-    md_lines.append("")
-    md_lines.append(f"- **扫描目录**: {base_dir}")
-    md_lines.append(f"- **算子总数**: {len(op_results)}")
-    md_lines.append(f"- **生成时间**: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-    md_lines.append("")
-
-    md_lines.extend(_build_batch_md_summary_table(op_results))
-    md_lines.extend(_build_batch_md_per_op_details(op_results))
-    md_lines.extend(_build_batch_md_trace_section(trace_rows))
-
-    md_path = Path(args.output_md)
-    md_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(md_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(md_lines))
-    LOGGER.info("Batch markdown report saved to: %s", md_path)
-
-
-def _generate_batch_json_report(args, op_results, base_dir):
-    """Generate and save the batch JSON summary."""
-    batch_summary = {
-        "base_dir": str(base_dir),
-        "n_operators": len(op_results),
-        "operators": [
-            {
-                "name": op["name"],
-                "n_cases_total": op["data"].get("n_cases_total", 0),
-                "n_cases_valid": op["data"].get("n_cases_valid", 0),
-                "geomean_speedup": op["data"].get("geomean_speedup"),
-                "mean_speedup": op["data"].get("mean_speedup"),
-                "mean_ref_us": op["data"].get("mean_ref_us"),
-                "mean_asc_us": op["data"].get("mean_asc_us"),
-            }
-            for op in op_results
-        ],
-        "generated_at": time.strftime('%Y-%m-%d %H:%M:%S'),
-    }
-    json_path = Path(args.output_json)
-    json_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(batch_summary, f, indent=2, ensure_ascii=False)
-    LOGGER.info("Batch JSON summary saved to: %s", json_path)
-
-
-def run_batch_mode(args):
-    """执行批量模式：扫描 base_dir 下所有子目录，汇总性能报告。"""
-    base_dir = Path(args.batch).resolve()
-
-    if not base_dir.is_dir():
-        raise ValueError("'%s' is not a directory." % base_dir)
-
-    # 收集所有子目录的 performance.json
-    op_results = []
-    for subdir in sorted(base_dir.iterdir()):
-        if not subdir.is_dir():
-            continue
-        perf_data = _load_performance_json(subdir)
-        if perf_data:
-            op_results.append({
-                "name": subdir.name,
-                "data": perf_data,
-                "dir": subdir,
-            })
-
-    # 同时收集 trace.md 中的表格行（兼容旧 batch_report.py 功能）
-    trace_rows = []
-    for subdir in sorted(base_dir.iterdir()):
-        if not subdir.is_dir():
-            continue
-        trace_file = subdir / "trace.md"
-        if trace_file.exists():
-            rows = _extract_trace_table_rows(str(trace_file))
-            trace_rows.extend(rows)
-
-    LOGGER.info("Found %d operators with performance.json in %s", len(op_results), base_dir)
-
-    if args.output_md:
-        _generate_batch_md_report(args, op_results, trace_rows, base_dir)
-
-    if args.output_json:
-        _generate_batch_json_report(args, op_results, base_dir)
-
-
-# ============================================================================
-# 主入口
-# ============================================================================
-
-def _run_standard_mode(args):
-    """Execute standard mode: parse PROF_GROUP and generate summary."""
-    group_dir = os.path.abspath(args.prof_group_dir)
-    ops_dir = os.path.abspath(args.ops_dir)
-
-    if not os.path.isdir(group_dir):
-        raise ValueError("'%s' is not a directory." % group_dir)
-    if not os.path.isdir(ops_dir):
-        raise ValueError("'%s' is not a directory." % ops_dir)
-
-    merged = merge_metric_rows(group_dir, args.op_name)
-    if not merged.get("Op Name"):
-        raise ValueError("no op_summary_*.csv rows discovered under %s" % group_dir)
-
-    perf_dir = os.path.join(ops_dir, "docs", "perf")
-    round_dir = os.path.join(perf_dir, args.round_name) if args.round_name else find_next_round(perf_dir)
-
-    copied = archive_csvs(group_dir, round_dir)
-    pc_csv = archive_per_core_csv(group_dir, round_dir)
-    if pc_csv:
-        copied.append(os.path.basename(pc_csv))
-    LOGGER.info("Archived %d CSV files to: %s", len(copied), round_dir)
-
-    summary = generate_summary(merged, round_dir, group_dir)
-    summary_path = os.path.join(round_dir, "summary.txt")
-    with open(summary_path, "w", encoding="utf-8") as f:
-        f.write(summary)
-
-    LOGGER.info("Summary written to: %s", summary_path)
-    LOGGER.info("\n%s", summary)
 
 
 def main():
@@ -2480,35 +2270,22 @@ def main():
     parser.add_argument("--compare", action="store_true", help="启用对比模式（8 轮采集：7 metrics + sample）")
     parser.add_argument("--quick", action="store_true", help="启用快速模式（1 轮采集：只获取 kernel 时间，不采集 7 个 aic-metrics）")
     parser.add_argument("--output-dir", dest="output_dir", help="算子输出目录（对比模式/快速模式）")
-    parser.add_argument("--warmup", type=int, default=3,
-                        help="quick 模式：被采集进程内的预热迭代次数（解析时丢弃）")
-    parser.add_argument("--repeats", type=int, default=1,
-                        help="quick 模式：被采集进程内的计时迭代次数（解析时取均值）")
-    parser.add_argument("--ext-warmup", dest="ext_warmup", type=int, default=0,
-                        help="旧行为：在 msprof 外部另起进程预热的次数（对被采集进程无预热效果，默认 0）")
-    parser.add_argument("--impl", choices=["both", "ref", "asc"], default="both",
-                        help="quick 模式只采集指定实现（ref=参考实现，asc=AscendC 实现）")
-    parser.add_argument("--max-cases", dest="max_cases", type=int, default=0,
-                        help="quick 模式只跑前 N 个 case（0=全部，用于冒烟测试）")
-    parser.add_argument("--cases", default=None,
-                        help="quick 模式只跑指定 case 下标，逗号分隔，如 0,4,9,18（优先于 --max-cases）")
-    parser.add_argument("--mfu", action="store_true",
-                        help="quick 模式追加官方 operator_mfu 等价口径 MFU 统计（需要算子目录提供 flops.py hook）")
-    parser.add_argument("--mfu-top-k", dest="mfu_top_k", type=int, default=3,
-                        help="--mfu 且未显式指定 case 时，按理论 FLOPs 选取 top-K 大 shape（默认 3，峰值 MFU 代表 shape）")
-    parser.add_argument("--mfu-peak", dest="mfu_peak", type=float, default=0,
-                        help="芯片 cube 峰值 TFLOPS 显式指定（0=自动从 platform_config/npu-smi 推导）")
-    parser.add_argument("--prof-tag", dest="prof_tag", default=None,
-                        help="PROF 临时目录后缀，用于同一 case 多次独立采集互不覆盖")
+    parser.add_argument("--warmup", type=int, default=1, help="msprof warmup 次数")
+    parser.add_argument("--repeats", type=int, default=1, help="重复采集次数")
     parser.add_argument("--seed", type=int, default=0, help="随机种子")
     parser.add_argument("--retry", type=int, default=2, help="单 case 解析失败重试次数")
     parser.add_argument("--device", type=int, default=None, help="NPU 设备 id")
     parser.add_argument("--keep-prof", action="store_true", help="保留 msprof 原始 PROF 目录")
+    parser.add_argument(
+        "--reference-cache",
+        default=None,
+        help=(
+            "会话级 model.py reference 计时缓存；也可设置 "
+            "LINGXI_REFERENCE_CACHE。quick 模式下相同 model/case 只评测一次"
+        ),
+    )
 
     # 批量模式参数
-    parser.add_argument("--batch", metavar="BASE_DIR", help="启用批量模式，指定根目录")
-    parser.add_argument("--output-md", help="批量模式 Markdown 输出路径")
-    parser.add_argument("--output-json", help="批量模式 JSON 输出路径")
 
     args = parser.parse_args()
 
@@ -2521,12 +2298,6 @@ def main():
         if not args.output_dir:
             parser.error("--quick 模式必须指定 --output-dir")
         run_quick_mode(args)
-    elif args.batch:
-        try:
-            run_batch_mode(args)
-        except ValueError as e:
-            LOGGER.error("%s", e)
-            sys.exit(1)
     else:
         if not args.prof_group_dir or not args.ops_dir:
             parser.error("标准模式需要 prof_group_dir 和 ops_dir 参数")

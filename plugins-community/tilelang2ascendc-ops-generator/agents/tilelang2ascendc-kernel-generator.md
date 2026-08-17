@@ -76,7 +76,6 @@ Phase 7: Trace 记录            (tilelang2ascend-trace-recorder)
 | 验证脚本 | `.claude/skills/tilelang2ascend-translator/scripts/verification_ascendc.py` | AscendC 正确性验证 |
 | 验证脚本 | `.claude/skills/tilelang2ascend-tilelang-designer/scripts/verification_tilelang.py` | TileLang 正确性验证 |
 | 性能测试 | `msprof_profile_run.sh --quick` | 性能对比测试（--quick 模式） |
-| 批处理 | `msprof_profile_run.sh --batch` | 批量性能测试 |
 
 ### Hook 行为
 

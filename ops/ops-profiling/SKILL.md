@@ -26,7 +26,7 @@ description: NPU 性能采集与分析，融合 msprof 算子级瓶颈定位与 
 对单个可执行文件采集 7 组 aic-metrics + sample-based：
 
 ```bash
-bash scripts/msprof_profile_run.sh --warm-up=3 --output=./msprof_output -- \
+bash scripts/msprof_profile_run.sh --warm-up=1 --output=./msprof_output -- \
     ./matmul_tutorial_mxfp4_pingpong 8448 4096 4096
 
 # 解析结果
@@ -38,7 +38,7 @@ python3 scripts/msprof_perf_summary.py ./msprof_output/PROF_GROUP_* <ops_dir>
 对算子目录下的 `model.py` vs `model_new_ascendc.py` 做对比测试：
 
 ```bash
-bash scripts/msprof_profile_run.sh --compare --output-dir=./output/GELU --warm-up=3 --device=0
+bash scripts/msprof_profile_run.sh --compare --output-dir=./output/GELU --warm-up=1 --device=0
 ```
 
 输出：`performance.json` + `performance.log` + `perf_report.md`
@@ -55,7 +55,7 @@ bash scripts/msprof_profile_run.sh --compare --output-dir=./output/GELU --warm-u
 - 解析必须包含 `MIX_AIC/MIX_AIV/AI_CORE` 等计算 kernel 类型，否则 aicore 时长欠采集约 2.6-3x。
 
 ```bash
-bash scripts/msprof_profile_run.sh --quick --output-dir=./output/GELU --warm-up=3 --device=0
+bash scripts/msprof_profile_run.sh --quick --output-dir=./output/GELU --warm-up=1 --device=0
 ```
 
 输出：`performance.json`（含 `asc_mode: batch|per_case`）+ `performance.log` + `perf_report.md`

@@ -11,10 +11,11 @@
 # ----------------------------------------------------------------------------------------------------------
 # msprof runner - 统一性能采集入口
 #
-# 支持三种模式：
+# 支持四种模式：
 #   1. 标准模式 (默认): 对单个可执行文件采集 7 组 aic-metrics + sample-based
 #   2. --compare 模式:  对算子目录下的 model.py vs model_new_ascendc.py 做对比测试
 #   3. --quick 模式:    单卡单进程批量对比（每 case 一个 torch.npu.Stream，一次 msprof 采全部）
+#   4. --batch 模式:    批量扫描目录下的多个算子子目录，并行执行对比测试
 #
 # Usage (标准模式):
 #   bash msprof_profile_run.sh [--warm-up=N] [--output=<dir>] -- <executable> [args...]
@@ -25,22 +26,29 @@
 # Usage (--quick 模式):
 #   bash msprof_profile_run.sh --quick --output-dir=/path/to/op_dir [--warm-up=N] [--device=N]
 #
+# Usage (--batch 模式):
+#   bash msprof_profile_run.sh --batch --base-dir=/path/to/output_dir [--max-jobs=N] [--device-start=N]
+#
 
 # Example (标准):
-#   bash msprof_profile_run.sh --warm-up=3 --output=./msprof_output -- \
+#   bash msprof_profile_run.sh --warm-up=1 --output=./msprof_output -- \
 #        ./matmul_tutorial_mxfp4_pingpong 8448 4096 4096
 #
 # Example (对比):
-#   bash msprof_profile_run.sh --compare --output-dir=./output/GELU --warm-up=3 --device=0
+#   bash msprof_profile_run.sh --compare --output-dir=./output/GELU --warm-up=1 --device=0
 #
 # Example (快速):
-#   bash msprof_profile_run.sh --quick --output-dir=./output/GELU --warm-up=3 --device=0
+#   bash msprof_profile_run.sh --quick --output-dir=./output/GELU --warm-up=1 --device=0
+#
+# Example (批量):
+#   bash msprof_profile_run.sh --batch --base-dir=./output_performance --max-jobs=7 --device-start=1
 #
 
 # 产出:
 #   标准模式: <output_dir>/PROF_GROUP_<timestamp>/PROF_<Metric>/ (7 个子目录 + 1 个 Sample)
 #   对比模式: <output_dir>/performance.json + performance.log + perf_report.md
 #   快速模式: <output_dir>/performance.json + performance.log + perf_report.md
+#   批量模式: <base_dir>/batch_performance.log + 各子目录 performance.json
 # ----------------------------------------------------------------------------------------------------------
 
 set -euo pipefail
@@ -84,6 +92,9 @@ APP_CMD=()
 MODE="standard"   # standard | compare | quick
 OUTPUT_DIR_ARG=""  # --compare/--quick 模式用的算子目录
 DEVICE_ID=""
+BASE_DIR=""
+MAX_JOBS=7
+DEVICE_START=1
 REFERENCE_CACHE="${LINGXI_REFERENCE_CACHE:-}"
 
 usage() {
@@ -91,9 +102,10 @@ usage() {
 Usage: bash msprof_profile_run.sh [OPTIONS] -- <executable> [args...]
        bash msprof_profile_run.sh --compare --output-dir=<dir> [OPTIONS]
        bash msprof_profile_run.sh --quick --output-dir=<dir> [OPTIONS]
+       bash msprof_profile_run.sh --batch --base-dir=<dir> [OPTIONS]
 
 通用选项:
-  --warm-up=N     在正式采集之前，先跑 N 次可执行文件（不采集）预热 DVFS。默认 3。
+  --warm-up=N     在正式采集之前，先跑 N 次可执行文件（不采集）预热 DVFS。默认 1。
   --output=<dir>  msprof 结果根目录。默认 ./msprof_output。
   -h, --help      Show this help.
 
@@ -115,6 +127,12 @@ Usage: bash msprof_profile_run.sh [OPTIONS] -- <executable> [args...]
   --device=N             指定 NPU 设备 ID；未指定时自动选择空闲卡
   --repeats=N            重复采集次数（默认 1）
   --retry=N              单 case 解析失败重试次数（默认 2）
+批量模式 (--batch):
+  --batch                启用批量模式：扫描 base-dir 下所有子目录并行测试
+  --base-dir=<dir>       包含多个算子输出子目录的根目录
+  --max-jobs=N           最大并发数（默认 7）
+  --device-start=N       起始 NPU 设备 ID（默认 1）
+
 
 脚本会按顺序用 msprof 采集 7 个 aic-metrics:
   PipeUtilization, ArithmeticUtilization, Memory, MemoryL0, MemoryUB,
@@ -138,6 +156,10 @@ while [[ $# -gt 0 ]]; do
         --keep-prof) KEEP_PROF=1; shift ;;
         --compare)   MODE="compare"; shift ;;
         --quick)     MODE="quick"; shift ;;
+        --batch)     MODE="batch"; shift ;;
+        --base-dir=*) BASE_DIR="${1#*=}"; shift ;;
+        --max-jobs=*) MAX_JOBS="${1#*=}"; shift ;;
+        --device-start=*) DEVICE_START="${1#*=}"; shift ;;
         -h|--help)   usage; exit 0 ;;
         --)          shift; APP_CMD=("$@"); break ;;
         -*)          echo "ERROR: unknown option $1" >&2; usage; exit 1 ;;
@@ -278,6 +300,83 @@ run_quick() {
 
 # ============================================================================
 # ============================================================================
+# 批量模式：多 NPU 并行执行多个算子
+# ============================================================================
+run_batch() {
+    if [[ -z "$BASE_DIR" ]]; then
+        echo "ERROR: --batch 模式必须指定 --base-dir=<dir>" >&2
+        usage
+        exit 1
+    fi
+
+    BASE_DIR="$(cd "$BASE_DIR" && pwd)"
+    LOG_FILE="${BASE_DIR}/batch_performance.log"
+    > "$LOG_FILE"
+
+    LOCK_DIR="/tmp/ascend_locks_$$"
+    mkdir -p "$LOCK_DIR"
+
+    device_id=$DEVICE_START
+
+    for dir in "$BASE_DIR"/*; do
+        if [[ -d "$dir" ]]; then
+            folder_name=$(basename "$dir")
+
+            # 控制总并发数
+            while [[ $(jobs -r | wc -l) -ge $MAX_JOBS ]]; do
+                sleep 0.5
+            done
+
+            # 寻找空闲设备
+            while true; do
+                lock_file="$LOCK_DIR/device_${device_id}.lock"
+                if ! ( set -o noclobber; flock -n 200 ) 200>"$lock_file" 2>/dev/null; then
+                    device_id=$(( (device_id % 7) + 1 ))
+                    sleep 0.2
+                else
+                    break
+                fi
+            done
+
+            echo ">>> 锁定设备 $device_id 并启动算子: $folder_name" | tee -a "$LOG_FILE"
+
+            # 启动后台任务
+            (
+                lock_file="$LOCK_DIR/device_${device_id}.lock"
+                exec 200>"$lock_file"
+                flock 200
+
+                export ASCEND_RT_VISIBLE_DEVICES=$device_id
+
+                # 调用对比模式
+                bash "$0" --compare --output-dir="$dir" --warm-up="$WARM_UP" --device="$device_id" 2>&1 | \
+                    grep -v "tiling struct \[MC2MatmulV3TilingData\] is conflict" | \
+                    grep -v "tiling struct \[TileInfo\] is conflict" \
+                    >> "$LOG_FILE"
+
+                echo ">>> 算子 $folder_name 在设备 $device_id 上执行完毕" >> "$LOG_FILE"
+            ) &
+
+            device_id=$(( (device_id % 7) + 1 ))
+        fi
+    done
+
+    wait
+    rm -rf "$LOCK_DIR"
+
+    echo "所有并行任务已执行完毕，日志已保存至 $LOG_FILE"
+
+    # 生成批量汇总报告
+    python3 "${SCRIPT_DIR}/msprof_perf_summary.py" --batch "$BASE_DIR" \
+        --output-md "${BASE_DIR}/batch_report.md" \
+        --output-json "${BASE_DIR}/batch_summary.json"
+
+    print_elapsed "$BASE_DIR"
+}
+
+# ============================================================================
+
+# ============================================================================
 # 主入口
 # ============================================================================
 case "$MODE" in
@@ -289,6 +388,9 @@ case "$MODE" in
         ;;
     quick)
         run_quick
+        ;;
+    batch)
+        run_batch
         ;;
     *)
         echo "ERROR: 未知模式: $MODE" >&2

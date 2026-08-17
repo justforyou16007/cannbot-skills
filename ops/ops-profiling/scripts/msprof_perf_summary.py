@@ -18,8 +18,8 @@
 #   2. 对比模式 (--compare): 对算子目录做 model.py vs model_new_ascendc.py 对比测试
 #      python3 msprof_perf_summary.py --compare --output-dir <op_dir> [--warm-up=N] [--device=N]
 #
-#   3. 快速模式 (--quick): 对算子目录做单轮对比测试（只取 kernel 时间，不采集 aic-metrics）
-#      python3 msprof_perf_summary.py --quick --output-dir <op_dir> [--warmup=N] [--repeats=N] [--device=N]
+#   3. 批量模式 (--batch): 扫描多个算子目录，汇总批量报告
+#      python3 msprof_perf_summary.py --batch <base_dir> [--output-md <path>] [--output-json <path>]
 #
 # Ref/Asc 测量方式:
 #   - Ref (reference)  = 算子目录下的 model.py (PyTorch 参考实现)
@@ -2256,6 +2256,234 @@ def run_quick_mode(args):
 # ============================================================================
 
 
+# 批量模式：扫描多个算子目录，汇总报告
+# ============================================================================
+
+def _is_valid_table_row(line: str) -> bool:
+    return line.startswith('|') and 'Level' not in line and '---' not in line and len(line) > 5
+
+
+def _extract_trace_table_rows(trace_file_path: str) -> List[str]:
+    if not os.path.exists(trace_file_path):
+        return []
+    try:
+        with open(trace_file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+    except Exception:
+        return []
+    start_idx = content.find('## 汇总表报告')
+    if start_idx == -1:
+        return []
+    section_content = content[start_idx:]
+    lines = section_content.split('\n')
+    valid_rows = []
+    for line in lines:
+        line = line.strip()
+        if _is_valid_table_row(line):
+            valid_rows.append(line)
+    return valid_rows
+
+
+def _load_performance_json(op_dir: Path) -> Optional[Dict[str, Any]]:
+    perf_json = op_dir / "performance.json"
+    if perf_json.exists():
+        try:
+            with open(perf_json, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            LOGGER.warning("Failed to load performance.json from %s: %s", op_dir, e)
+    return None
+
+
+def _build_batch_md_summary_table(op_results):
+    """Build the batch summary table markdown lines."""
+    md_lines = []
+    if op_results:
+        md_lines.append("## 性能汇总")
+        md_lines.append("")
+        md_lines.append(
+            "| 算子名称 | 用例数 | 有效用例 | 几何平均加速比 | 平均加速比 | 状态 |"
+        )
+        md_lines.append("| -------- | ------ | -------- | -------------- | ---------- | ---- |")
+        for op in op_results:
+            data = op["data"]
+            name = op["name"]
+            n_total = data.get("n_cases_total", 0)
+            n_valid = data.get("n_cases_valid", 0)
+            geo = data.get("geomean_speedup")
+            mean = data.get("mean_speedup")
+            geo_str = f"{geo:.3f}" if geo is not None else "N/A"
+            mean_str = f"{mean:.3f}" if mean is not None else "N/A"
+            status = "✅" if geo is not None and geo > 1 else "⚠️" if geo is not None else "❌"
+            md_lines.append(f"| {name} | {n_total} | {n_valid} | {geo_str} | {mean_str} | {status} |")
+        md_lines.append("")
+    return md_lines
+
+
+def _build_batch_md_per_op_details(op_results):
+    """Build per-operator detail tables in markdown."""
+    md_lines = []
+    for op in op_results:
+        data = op["data"]
+        name = op["name"]
+        md_lines.append(f"## {name}")
+        md_lines.append("")
+        if data.get("per_case"):
+            md_lines.append("| Case | Shape | DType | 自定义算子(us) | 标杆(us) | 加速比 |")
+            md_lines.append("| ---- | ----- | ----- | ------------- | -------- | -------------- |")
+            for case in data["per_case"]:
+                shape = case.get("shape", "?")
+                dtype = case.get("dtype", "?")
+                ref = case.get("ref_us")
+                asc = case.get("asc_us")
+                sp = case.get("speedup")
+                ref_str = f"{ref:.2f}" if ref is not None else "N/A"
+                asc_str = f"{asc:.2f}" if asc is not None else "N/A"
+                sp_str = f"{sp:.3f}" if sp is not None else "N/A"
+                md_lines.append(f"| {case['case']} | {shape} | {dtype} | {asc_str} | {ref_str} | {sp_str} |")
+            md_lines.append("")
+    return md_lines
+
+
+def _build_batch_md_trace_section(trace_rows):
+    """Build trace table section in markdown if rows exist."""
+    if not trace_rows:
+        return []
+    md_lines = [
+        "## Trace 汇总表",
+        "",
+        ("| Level | Problem ID | 算子名称 | 算子类型 | 编译通过 | 精度正确 | "
+         "PyTorch 参考延迟 | 生成AscendC代码延迟 | 加速比 | 最终状态 | "
+         "精度正确 | 性能0.6x pytorch | 性能0.8x pytorch |"),
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    md_lines.extend(trace_rows)
+    md_lines.append("")
+    return md_lines
+
+
+def _generate_batch_md_report(args, op_results, trace_rows, base_dir):
+    """Generate and save the batch Markdown report."""
+    md_lines = []
+    md_lines.append("# 📊 算子批量性能汇总报告")
+    md_lines.append("")
+    md_lines.append(f"- **扫描目录**: {base_dir}")
+    md_lines.append(f"- **算子总数**: {len(op_results)}")
+    md_lines.append(f"- **生成时间**: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    md_lines.append("")
+
+    md_lines.extend(_build_batch_md_summary_table(op_results))
+    md_lines.extend(_build_batch_md_per_op_details(op_results))
+    md_lines.extend(_build_batch_md_trace_section(trace_rows))
+
+    md_path = Path(args.output_md)
+    md_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(md_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(md_lines))
+    LOGGER.info("Batch markdown report saved to: %s", md_path)
+
+
+def _generate_batch_json_report(args, op_results, base_dir):
+    """Generate and save the batch JSON summary."""
+    batch_summary = {
+        "base_dir": str(base_dir),
+        "n_operators": len(op_results),
+        "operators": [
+            {
+                "name": op["name"],
+                "n_cases_total": op["data"].get("n_cases_total", 0),
+                "n_cases_valid": op["data"].get("n_cases_valid", 0),
+                "geomean_speedup": op["data"].get("geomean_speedup"),
+                "mean_speedup": op["data"].get("mean_speedup"),
+                "mean_ref_us": op["data"].get("mean_ref_us"),
+                "mean_asc_us": op["data"].get("mean_asc_us"),
+            }
+            for op in op_results
+        ],
+        "generated_at": time.strftime('%Y-%m-%d %H:%M:%S'),
+    }
+    json_path = Path(args.output_json)
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(batch_summary, f, indent=2, ensure_ascii=False)
+    LOGGER.info("Batch JSON summary saved to: %s", json_path)
+
+
+def run_batch_mode(args):
+    """执行批量模式：扫描 base_dir 下所有子目录，汇总性能报告。"""
+    base_dir = Path(args.batch).resolve()
+
+    if not base_dir.is_dir():
+        raise ValueError("'%s' is not a directory." % base_dir)
+
+    # 收集所有子目录的 performance.json
+    op_results = []
+    for subdir in sorted(base_dir.iterdir()):
+        if not subdir.is_dir():
+            continue
+        perf_data = _load_performance_json(subdir)
+        if perf_data:
+            op_results.append({
+                "name": subdir.name,
+                "data": perf_data,
+                "dir": subdir,
+            })
+
+    # 同时收集 trace.md 中的表格行（兼容旧 batch_report.py 功能）
+    trace_rows = []
+    for subdir in sorted(base_dir.iterdir()):
+        if not subdir.is_dir():
+            continue
+        trace_file = subdir / "trace.md"
+        if trace_file.exists():
+            rows = _extract_trace_table_rows(str(trace_file))
+            trace_rows.extend(rows)
+
+    LOGGER.info("Found %d operators with performance.json in %s", len(op_results), base_dir)
+
+    if args.output_md:
+        _generate_batch_md_report(args, op_results, trace_rows, base_dir)
+
+    if args.output_json:
+        _generate_batch_json_report(args, op_results, base_dir)
+
+
+# ============================================================================
+# 主入口
+# ============================================================================
+
+def _run_standard_mode(args):
+    """Execute standard mode: parse PROF_GROUP and generate summary."""
+    group_dir = os.path.abspath(args.prof_group_dir)
+    ops_dir = os.path.abspath(args.ops_dir)
+
+    if not os.path.isdir(group_dir):
+        raise ValueError("'%s' is not a directory." % group_dir)
+    if not os.path.isdir(ops_dir):
+        raise ValueError("'%s' is not a directory." % ops_dir)
+
+    merged = merge_metric_rows(group_dir, args.op_name)
+    if not merged.get("Op Name"):
+        raise ValueError("no op_summary_*.csv rows discovered under %s" % group_dir)
+
+    perf_dir = os.path.join(ops_dir, "docs", "perf")
+    round_dir = os.path.join(perf_dir, args.round_name) if args.round_name else find_next_round(perf_dir)
+
+    copied = archive_csvs(group_dir, round_dir)
+    pc_csv = archive_per_core_csv(group_dir, round_dir)
+    if pc_csv:
+        copied.append(os.path.basename(pc_csv))
+    LOGGER.info("Archived %d CSV files to: %s", len(copied), round_dir)
+
+    summary = generate_summary(merged, round_dir, group_dir)
+    summary_path = os.path.join(round_dir, "summary.txt")
+    with open(summary_path, "w", encoding="utf-8") as f:
+        f.write(summary)
+
+    LOGGER.info("Summary written to: %s", summary_path)
+    LOGGER.info("\n%s", summary)
+
+
 def main():
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     parser = argparse.ArgumentParser(description="msprof 解析 & 归档 & 对比测试脚本（统一入口）")
@@ -2276,6 +2504,11 @@ def main():
     parser.add_argument("--retry", type=int, default=2, help="单 case 解析失败重试次数")
     parser.add_argument("--device", type=int, default=None, help="NPU 设备 id")
     parser.add_argument("--keep-prof", action="store_true", help="保留 msprof 原始 PROF 目录")
+    # 批量模式参数
+    parser.add_argument("--batch", metavar="BASE_DIR", help="启用批量模式，指定根目录")
+    parser.add_argument("--output-md", help="批量模式 Markdown 输出路径")
+    parser.add_argument("--output-json", help="批量模式 JSON 输出路径")
+
     parser.add_argument(
         "--reference-cache",
         default=None,
@@ -2298,6 +2531,13 @@ def main():
         if not args.output_dir:
             parser.error("--quick 模式必须指定 --output-dir")
         run_quick_mode(args)
+
+    elif args.batch:
+        try:
+            run_batch_mode(args)
+        except ValueError as e:
+            LOGGER.error("%s", e)
+            sys.exit(1)
     else:
         if not args.prof_group_dir or not args.ops_dir:
             parser.error("标准模式需要 prof_group_dir 和 ops_dir 参数")

@@ -121,25 +121,24 @@ CANNBot 会自动调度 ascend-kernel-developer 按 7 Phase 流程执行：
 
 #### 场景二：批量性能测试
 
-适用于对多个已生成算子进行批量性能对比测试。ops-profiling 已精简批量外围能力，改为对每个算子目录逐目录执行快速对比：
+适用于对多个已生成算子进行批量性能对比测试，支持单 NPU 串行或多 NPU 并行执行。
 
 **操作步骤**：
 
 1. 确保每个算子目录下已有 `model.py`、`model_new_ascendc.py` 和测试用例文件
-2. 对每个算子目录执行快速对比测试：
+2. 执行批量测试脚本：
 
 ```bash
-for op_dir in /path/to/output_performance/*/; do
-    bash .claude/skills/ops-profiling/scripts/msprof_profile_run.sh --quick \
-        --output-dir="$op_dir" \
-        --warm-up=3 \
-        --device=0
-done
+bash .claude/skills/ops-profiling/scripts/msprof_profile_run.sh --batch \
+    --base-dir /path/to/output_performance \
+    --max-jobs 7 \
+    --device-start 1
 ```
 
 **参数说明**：
-- `--output-dir`: 单个算子输出目录（含 `model.py`、`model_new_ascendc.py` 与用例）
-- `--device`: NPU 设备 ID（可对不同算子指定不同设备并行）
+- `--base-dir`: 包含多个算子输出子目录的根目录（必填）
+- `--max-jobs`: 最大并发数（默认 7）
+- `--device-start`: 起始 NPU 设备 ID（默认 1）
 - `--warm-up`: 预热次数（默认 3）
 
 ### 产出物示例

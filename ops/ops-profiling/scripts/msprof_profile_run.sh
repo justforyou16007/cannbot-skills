@@ -96,6 +96,8 @@ BASE_DIR=""
 MAX_JOBS=7
 DEVICE_START=1
 REFERENCE_CACHE="${LINGXI_REFERENCE_CACHE:-}"
+QUICK_BATCH=0
+PER_CASE=0
 
 usage() {
     cat <<'EOF'
@@ -127,6 +129,8 @@ Usage: bash msprof_profile_run.sh [OPTIONS] -- <executable> [args...]
   --device=N             指定 NPU 设备 ID；未指定时自动选择空闲卡
   --repeats=N            重复采集次数（默认 1）
   --retry=N              单 case 解析失败重试次数（默认 2）
+  --quick-batch          quick 模式内部使用一次 msprof 批量采集全部 case
+  --per-case             quick 模式强制逐 case 测量（默认行为，用于覆盖 --quick-batch）
   --mfu                  追加官方 operator_mfu 等价口径 MFU 统计（需算子目录提供 flops.py）
   --mfu-top-k=N          按理论 FLOPs 选取 top-K 大 shape 测 MFU（默认 3，保留参数兼容）
   --mfu-peak=N           显式指定芯片 cube 峰值 TFLOPS（默认自动推导）
@@ -157,6 +161,8 @@ while [[ $# -gt 0 ]]; do
         --repeats=*) REPEATS="${1#*=}"; shift ;;
         --retry=*)   RETRY="${1#*=}"; shift ;;
         --reference-cache=*) REFERENCE_CACHE="${1#*=}"; shift ;;
+        --quick-batch) QUICK_BATCH=1; shift ;;
+        --per-case)    PER_CASE=1; shift ;;
         --keep-prof) KEEP_PROF=1; shift ;;
         --mfu)       MFU=1; shift ;;
         --mfu-top-k=*) MFU_TOP_K="${1#*=}"; shift ;;
@@ -296,6 +302,8 @@ run_quick() {
     [[ -n "${REPEATS:-}" ]] && extra_args+=("--repeats" "$REPEATS")
     [[ -n "${RETRY:-}" ]] && extra_args+=("--retry" "$RETRY")
     [[ -n "$REFERENCE_CACHE" ]] && extra_args+=("--reference-cache" "$REFERENCE_CACHE")
+    [[ "${QUICK_BATCH:-0}" == "1" ]] && extra_args+=("--quick-batch")
+    [[ "${PER_CASE:-0}" == "1" ]] && extra_args+=("--per-case")
     [[ "${MFU:-0}" == "1" ]] && extra_args+=("--mfu")
     [[ -n "${MFU_TOP_K:-}" ]] && extra_args+=("--mfu-top-k" "$MFU_TOP_K")
     [[ -n "${MFU_PEAK:-}" ]] && extra_args+=("--mfu-peak" "$MFU_PEAK")

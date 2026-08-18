@@ -298,3 +298,69 @@ AscendC::Fixpipe(dst, src, params);
   注意与 §2.3/§8 尾部两条的区别：那些是"MTE2 写 L1 → MTE1 读"方向的守卫，本条是反向。
   来源：SDPA fp32 Cube 路径（2026-08-12），同轮修复 fp16/bf16 同型潜伏 bug
   （正确性代价 bf16/fp16 大 case -4~-7%，应接受）。
+- ❌ **ring 流水只在单 task 内连续，任务边界整体排空**：每个 q-block 任务支付 LoadQ + 2-tile
+  ramp + 2-tile drain，实测边界成本 13~21us/task（≈3~5 个 tile），kvLoops 小（≤5）的任务边界
+  占比 30~45%。**正确做法（任务级平坦流水，archive flash_attention_gqa 已验证）**：
+  Process 改为 (task × kvTile) 全局单一 cycle 循环，TaskInfo ring[3] 传递
+  (bz,by,bx,kvIdx,isFirstKV,isLastKV,qBufParity)，AIC 每迭代 MM1(c)+MM2(c-lag)、AIV 每迭代
+  V1(c)+V2(c-lag)，flag 序列与 CV1:2 计数与原结构保持不变。实现前必须逐条做竞态分析
+  （UB online-softmax 状态核私有程序序、GM meta ring slot 数 > lag、S/P/O ring 计数器跨任务
+  连续、Q L1 双缓冲 parity 防 MTE1读/MTE2写同地址 hazard）。收益实测：fp32 大 case -12%
+  （Cube bound 场景）；fp16/bf16 大 case 仅 ~2%（那些是 AIV bound，杠杆在 V 侧）。
+- ❌ **depth-1 TQue 管理 L0 → 逐 slice `SetWaitFlag<M_MTE1>`+`PipeBarrier<PIPE_M>` 全 M 管排空，
+  load 与 Mmad 严格交替**。**正确做法（事件门控双缓冲）**：L0A/L0B 各 2 buffer + 持久事件 ID
+  （Mmad 完成释放 M_MTE1），L0C 2 buffer + FIX_M 事件（Fixpipe 完成释放）；load(i+1) 仅等
+  Mmad(i-1)、Fixpipe(i) 与 Mmad(i+1) 重叠。Begin 预 Set 全部 free 事件、End Wait+Release
+  保持配对平衡；cL0 累加链（k-slice、hi/lo 第二 MMA）仍保留 `PipeBarrier<PIPE_M>`。
+- 💡 **L1 clear 可从每 tile 降为 Init 一次**：安全性论证——NaN 仅可能来自 L1 上电垃圾；
+  此后 pad 区只会是 0（从未被写）或有限真实数据（前序 tile 残留），而加性 mask 对有限值
+  稳健（finite + (-inf) = -inf），**只有 NaN 能穿透**（NaN + (-inf) = NaN）。前提：K pad 列
+  永为 0（load 只写实列）、V pad 行配对 P 的精确 0 列（tail 已 mask）、Finalize 只写有效行。
+- 💡 **host 侧 workspace 与输出的固定开销**：全量 `at::zeros`（10~37MB/call 的 memset kernel）
+  每次调用重复支付。正确做法：workspace 改 **region-major 布局**（所有核的 S ring 连续位于
+  起始处，kernel SetupWorkspace 镜像同公式），每次调用 `at::empty` + 仅对连续 S 区一次小
+  fill（~1.2MB，1-2us）；输出 `at::zeros→at::empty`（前提：V2 finalize 全量覆盖写出且有行
+  守卫，需论证记录）。⚠️ **测量污染陷阱**：不要用"静态缓存 + 仅创建时 zero"——ops-profiling
+  quick 模式的 run 拆分器要求采集窗内 warmup/timed 各 run 的 kernel 序列逐位相同，首 run
+  多出的一次性 zero kernel 会使拆分器回退为"全部求和/run 数"口径，把慢 fill 摊入每次测量
+  （实测 idx=47 假劣化 796→1318us）。每次调用保持一致的 kernel 序列即可避免。
+- ❌ **持久事件 ID 的 Set/Wait 必须严格 1:1，End 期禁止对已消费事件二次 Wait**：事件门控
+  双缓冲（见上条 💡）调试中实测——End 期对已被 Mmad/Fixpipe 消费过的持久事件再做一次
+  WaitFlag → 死锁（表现为偶发 1/N hang）。**安全设计**：Begin 预 Set 全部 free 事件、周期内
+  严格生产/消费交替、**End 期仅 `ReleaseEventID` 回收、不做 Wait**（按此设计 >1000 次启动
+  零挂死）。来源：SDPA R3 调试（2026-08-13）死锁定位 + R4（2026-08-14）按此纪律实现。
+- ✅ **L1 双缓冲按 dtype 编译期分派（R4 已验证模式）**：同一流水优化对不同 dtype 效果相反
+  ——K/V L1 跨 tile 双缓冲对 AIV-bound 的 fp16/bf16 **+2~7%**（fp16 idx=35 -6.4%），但对
+  fp32 Cube 路径 **-7%**（无收益可抵）且曾伴随 hang 风险。正确做法：
+  `constexpr bool KV_L1_DB = (sizeof(QType)==2)` 编译期开关，fp32 路径保持原流水逐字不变，
+  两路径各自全量回归。**教训：流水/预取类优化落地前先按 dtype 定性 bound 侧，禁止一刀切
+  全 dtype 启用**。来源：SDPA R3 方向 A 回退（2026-08-13）→ R4 条件化重交付（2026-08-14，
+  geomean 0.8526→0.8616）。
+- 💡 **"无 pipe 吞吐饱和 + scalar 前端高占用" = 延迟链 bound，别用消融实验定性吞吐侧**：
+  SDPA R5 分解轮（2026-08-17，msprof 设备计数器，40 迭代中位数）实测三个代表 case：
+  最高 pipe 占用仅 47%（AIC mte2），而 **AIC/AIV scalar 前端占用 72~98%**（官方口径 >30%
+  即 SCALAR Bound）——核被依赖停顿占满而非吞吐打满。**kernel 时长 ≈ tiles/core × 恒定
+  per-tile 周期（4.2~5.4us）**，周期由每 tile 的 CV 握手/事件等待串行延迟链决定，与 tile
+  内 Cube 含量无关（两 case Cube 含量差 1.7 倍、周期相同；与 R2 实测 t_tile≈4.5~4.7us
+  独立吻合）。**教训**：此前曾凭"K 维消融零收益"定性某 case "Cube-compute-bound"——消融
+  零收益与"延迟链 bound"同样自洽（瓶颈不在 K 搬运也不在 K 计算），**定性 bound 侧必须
+  实测 pipe 占用分解，不能只靠消融**。杠杆含义：此类 kernel 的首要杠杆是减少 tile 数
+  （加大 tile）或缩短 per-tile 握手链（overlap），而非提升任何 pipe 的吞吐利用率；MIX
+  核配比调整被数据否决（1:2 已是 910B2C 硬件最大 AIV 配比，1:1 反向恶化 ~2x）。
+- ✅ **per-shape 分桶 tile 多实例化（R5-A1 已验证模式）**：kernel 类模板化 `<QType,BM,BN>`
+  多实例 + host 按谓词 `tilesBig*4 < tilesSmall*3` 选 tile（大 tile 使 tile 数降 ≥1/4 才
+  划算；由 50-case 同会话 A/B 校准：全部回退落在 ratio≥3/4、全部胜利落在 ≤2/3）。
+  **方向不对称 ★关键★**：BM 方向 V2/Cube 工作量随 BM 翻倍，抵消 per-tile 固定成本减半
+  （fp32 中 shape 净收益≈0）；BN 方向 V2 工作量不随 BN 缩放，净收益巨大（fp16 大 case
+  -23%~-53%，bf16 -8%）——**选 tile 放大方向前先算"V 侧工作量随哪个维度缩放"**。
+  **统一大 tile 必伤小 case**：tile 数不降时整 tile padding 纯亏（fp32 小 case 回退
+  +13~22%）、S fill 与 V1 填充列工作量翻倍（2B 小 case +2~8%）→ 分桶是必选不是可选。
+  配套坑：BN=128 时 fp32 广播 maskNum≤64 上限（256B/迭代）需拆两个半调用；L0A/L0B
+  贴顶 64KB 经容量复核可接受。收益（SDPA R5，2026-08-17）：geomean 0.8616→**0.9436**，
+  fp16 两锚点反超标杆（1.04x/1.12x），bf16 锚点 0.60→0.92x。
+- 💡 **高负载共享环境的性能仲裁纪律**：服务器共享负载极高（load avg 550~850）时，
+  跨会话绝对耗时不可比（同代码同 case 摆动 ±25%）。正确做法：**同会话 A/B 配对** +
+  用同构建中代码未改动的 case 组标定噪声带（如 SDPA 的 {1,4,7,10,13,22,34} 对照组标定
+  0.96~1.15 噪声带），落带内的差异一律判噪声；环境离群点用同构建即时复测证伪后替换。
+  分解/定性类结论只信设备 cycle 计数器（msprof pipe utilization），不信 wall-clock。
+  来源：SDPA R4/R5（2026-08-14/17）噪声仲裁方法论。

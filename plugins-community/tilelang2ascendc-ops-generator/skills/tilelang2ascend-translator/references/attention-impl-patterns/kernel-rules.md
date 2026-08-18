@@ -147,6 +147,31 @@ P1：可能导致边界问题或实现意图不可追溯
 - **检查方法**：对照 host 与 kernel 的共享定义，确认每个字段、notifyId 和 buffer 数在双方一致；对每个 SetFlag/WaitFlag 核对唯一 ID 与配对。
 - **等级**：P0
 
+### RK-A06 持久事件 ID 的 Set/Wait 必须严格 1:1，End 期禁止二次 Wait
+
+- **解决问题**：2（事件门控双缓冲 / 手工事件管理）
+- **锚点**：`AllocEventID` / `SetFlag<HardEvent>(evtId)` / `WaitFlag<HardEvent>(evtId)` /
+  `ReleaseEventID` 使用位置（典型：L0/L1 事件门控双缓冲的 free/ready 事件池）
+- **禁止**：
+  - 对同一持久事件 ID 做两次连续 Wait 而无中间 Set —— 二次 Wait 永不返回 → 死锁
+    （表现为偶发 1/N hang，非确定性）
+  - End/drain 期对"已被消费者消费过"的持久事件再做兜底 Wait
+  - 事件 ID 在一处分配多处复用且无配对账本
+- **要求**：
+  - 每个持久事件 ID 维护明确的 Set→Wait 严格交替账本；Begin 期预 Set 全部 free 事件、
+    周期内生产/消费严格交替
+  - **End 期仅 `ReleaseEventID` 回收，不做 Wait**（已按此纪律实现 >1000 次启动零挂死）
+  - 新增事件用独立持久 ID，不与既有事件复用
+- **来源**：SDPA R3（2026-08-13）事件门控双缓冲调试中实测双重 Wait 死锁；R4（2026-08-14）
+  按"仅 Release 不 Wait"设计验证零挂死。详 `cube-impl-patterns.md` §8.1 事件门控条目
+- **检查方法**：
+  ```
+  grep -nE 'AllocEventID|ReleaseEventID|SetFlag|WaitFlag' op_kernel/
+  ```
+  对每个持久事件 ID：列出全部 Set/Wait 调用点，确认严格 1:1 交替；重点检查循环退出/
+  drain 路径是否存在兜底 Wait → 有则记 P0
+- **等级**：P0
+
 ---
 
 ## 类别 B：容量与 buffer

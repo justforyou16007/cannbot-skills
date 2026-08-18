@@ -457,3 +457,30 @@ AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(notifyId);
   （workspace at::zeros、tiling H2D、MIX launch）在小 shape 使端到端反转（device kernel time
   持平 ≠ 端到端持平，阈值须 A/B 实测）。备选：② Q/K/V hi/lo bf16 3-MMA（~1/3 fp16，
   P hi/lo 同思路已验证）；③ HF32（1/2 fp16，需实测能否过 fp32 atol=1e-3）。
+- ✅ **逐行 GetValue+标量 op 循环的广播化（V1 已验证模式）**：online softmax 的
+  `P = S - runMax` 逐行 `GetValue+Adds(-m)` → `Brcb(runMax) + BinaryRepeat Sub`
+  （x-m ≡ x+(-m) 位级一致）；tail mask 逐行 Add → 单条广播 Add（BinaryRepeatParams
+  src1RepStride=0，mask 向量自动每行复用）。实测消除每 tile 最大一处标量循环（32 次
+  GetValue + 32 条 Adds），fp16 大 case 单 case -73us。Brcb 官方语义注意：源操作数恒连续读
+  （repeat i 读 [8i,8i+8)）、参数为 {dstBlkStride, dstRepStride}、不支持 src/dst 同地址、
+  位于 PIPE_V（详 Brcb.md 与 test_operator_vbrcb.cpp）。
+- ❌ **GM→UB meta 拷贝（MTE2）的守卫类型必须匹配消费者 pipe 而非数据本身**：online softmax
+  的 alpha/sum meta 由 DataCopy（MTE2）载入后，若消费者是标量管 `GetValue`，守卫用
+  `SetWaitFlag<MTE2_S>`；一旦把下游改为 V 管的 Brcb/Mul/Div（广播化改造），守卫必须同步改
+  `MTE2_V`——否则 V 管读到未完成搬运的 meta → 错误 alpha rescale。阴险点：fp32 路径时序
+  余量大可巧合通过，fp16/bf16 kvLoops≥2 才暴露（V 侧紧凑）。⚠️ 附带教训：SDPA 第二轮中
+  V2 的 RowMuls/RowDivs 广播化即使修正了该守卫仍引入未解析的精度破坏（疑似事件池/调度
+  二阶效应），两轮未收敛按"精度回归当场回退"纪律回退标量实现——**V 侧广播化改造应按
+  V1/V2 分开落地、分别验证，便于二分定位**（bisect 证实 V1 两处广播化正确有效）。
+- ❌ **V2 chunk 级 GM 预取 overlap 与 V2 广播化同属未决竞态族（Heisenbug family），在此族
+  根因闭合前 V2 侧一切 overlap 改造禁止交付**：SDPA R5-C1（ProcessVec2Chunk 循环内
+  prefetch chunk c+1，2026-08-17）8/50 FAIL，全部落在 2B 大 tile 变体（fp16 BIG 且
+  kvLoops≥2 全灭，bf16 边缘 1 例），fp32 两变体全过。**失败特征**（与 R3 V2 广播化同族，
+  四条齐备即可判定同族）：①多次运行逐位不同（非确定竞态）；②失败行输出 = 前一 chunk
+  原值（chunk 陈旧，算术位级正确）；③`PipeBarrier<PIPE_ALL>` 全排空不敏感；④集中爆发于
+  2B dtype + 多 kvLoop。**探针二分法（可复用调查链）**：late-issue 探针（消除重叠、逻辑
+  不变）干净且逐位一致 → 证明重叠本身是竞态源而非逻辑错；early-issue + 全屏障仍失败 →
+  排除简单守卫缺失，指向 buffer 交接层。**已证无效的修复方向**（勿重复投入）：专用
+  parity TBuf + 每 parity 单持久 MTE2_V 事件（严格 1:1）+ 瞬态 V_MTE2 WAR 守卫、撤出
+  inputQue1_ 疑似机制。根因疑似 TQue 双缓冲交接 × 动态事件 ID 交互，待最小复现 + 显式
+  事件 ID 审计闭合（该审计是 V2 侧 B2 向量化与 C1 软流水两个杠杆的共同前置）。

@@ -8,13 +8,13 @@ description: NPU 性能采集与分析，融合 msprof 算子级瓶颈定位与 
 在真实 NPU 上采集算子性能数据，系统化解读指标文件，判定性能是否达标，定位瓶颈类型，并给出可操作的优化建议。
 
 本技能基于 **msprof** 工具链，统一入口为两个脚本：
-- **`msprof_profile_run.sh`** — 性能采集（标准采集 / 对比测试 / 批量并行）
-- **`msprof_perf_summary.py`** — 结果解析（瓶颈分析 / 对比报告 / 批量汇总）
+- **`msprof_profile_run.sh`** — 性能采集（标准采集 / 对比测试 / 快速对比）
+- **`msprof_perf_summary.py`** — 结果解析（瓶颈分析 / 对比报告生成）
 
 | 工具 | 流程文档 | 用途 |
 |------|----------|------|
-| **`msprof_profile_run.sh`** | [`references/msprof-guide.md`](references/msprof-guide.md) | 统一采集入口：标准采集、对比测试、批量并行 |
-| **`msprof_perf_summary.py`** | [`references/msprof-guide.md`](references/msprof-guide.md) | 统一解析入口：瓶颈分析、对比报告生成、批量汇总 |
+| **`msprof_profile_run.sh`** | [`references/msprof-guide.md`](references/msprof-guide.md) | 统一采集入口：标准采集、对比测试、快速对比 |
+| **`msprof_perf_summary.py`** | [`references/msprof-guide.md`](references/msprof-guide.md) | 统一解析入口：瓶颈分析、对比报告生成 |
 | **`perf_summary.py`** | [`references/msprof-op-guide.md`](references/msprof-op-guide.md) | msprof op 归档（需 msopprof） |
 
 ---
@@ -26,7 +26,7 @@ description: NPU 性能采集与分析，融合 msprof 算子级瓶颈定位与 
 对单个可执行文件采集 7 组 aic-metrics + sample-based：
 
 ```bash
-bash scripts/msprof_profile_run.sh --warm-up=3 --output=./msprof_output -- \
+bash scripts/msprof_profile_run.sh --warm-up=1 --output=./msprof_output -- \
     ./matmul_tutorial_mxfp4_pingpong 8448 4096 4096
 
 # 解析结果
@@ -38,20 +38,32 @@ python3 scripts/msprof_perf_summary.py ./msprof_output/PROF_GROUP_* <ops_dir>
 对算子目录下的 `model.py` vs `model_new_ascendc.py` 做对比测试：
 
 ```bash
-bash scripts/msprof_profile_run.sh --compare --output-dir=./output/GELU --warm-up=3 --device=0
+bash scripts/msprof_profile_run.sh --compare --output-dir=./output/GELU --warm-up=1 --device=0
 ```
 
 输出：`performance.json` + `performance.log` + `perf_report.md`
 
-### 3. 快速模式（1 轮采集，只获取 kernel 时间）
+### 3. 快速模式（单卡批量，一次 msprof 采全部 case）
 
-对算子目录做快速对比测试，只跑 1 轮 msprof，不采集 7 个 aic-metrics：
+对算子目录做快速对比测试，不采集 7 个 aic-metrics，**单卡单进程批量**：
+
+- **asc**：`_measure_asc_batch_quick` 给每个 case 预建一个 `torch.npu.Stream()`，
+  `with torch.npu.stream(_s):` 内跑该 case，一个进程顺序跑完全部 case，**只启动 1 次 msprof**；
+  解析 task_time.csv 按 stream_id 归组还原每 case 耗时。失败时逐 case 回退。
+- **ref**：`_measure_batch_reference_quick_cached` 批量 + reference-cache（model.py 不变时只测一次）。
+- 两段测量均持 `_device_flock` 与同卡其他进化 lane 串行协调。
+- 解析必须包含 `MIX_AIC/MIX_AIV/AI_CORE` 等计算 kernel 类型，否则 aicore 时长欠采集约 2.6-3x。
 
 ```bash
-bash scripts/msprof_profile_run.sh --quick --output-dir=./output/GELU --warm-up=3 --device=0
+bash scripts/msprof_profile_run.sh --quick --output-dir=./output/GELU --warm-up=1 --device=0
 ```
 
-输出：`performance.json` + `performance.log` + `perf_report.md`
+输出：`performance.json`（含 `asc_mode: batch|per_case`）+ `performance.log` + `perf_report.md`
+
+> **关于 torch.npu.stream 对 asc 生效的机制**：AscendC 自定义算子经 TORCH_LIBRARY 注册，
+> host 侧启动宏 `EXEC_KERNEL_CMD`（kernel/utils/torch_kernel_helper.h）用
+> `c10_npu::getCurrentNPUStream()` 绑定启动流，故 `with torch.npu.stream(_s):` 内调用 op，
+> kernel 落在 `_s` 上，task_time.csv 可按 stream_id 归组到每个 case。
 
 ### 3.1 MFU 统计（官方 operator_mfu 等价口径，quick 模式扩展）
 
@@ -89,7 +101,7 @@ bash scripts/msprof_profile_run.sh --batch --base-dir=./output_performance --max
 
 ---
 
-## 输入目录结构（对比模式）
+## 输入目录结构（对比/快速模式）
 
 **传统模式（端到端自动开发）：**
 ```
@@ -149,7 +161,7 @@ Markdown 报告包含：
    - 两者皆可用 → 须向用户确认或按项目约定选用其一
    - 两者皆不可用 → 报错，提示检查 CANN / `ASCEND_HOME` 安装
 
-> **需要指令级流水线时序图？** 上板采集（msprof / msopprof）只有 PMU 聚合计数器，无逐指令时序。若目标是查看 MTE2/Cube/Vec 流水线时序图、CV overlap、DoubleBuffer 效果或代码行映射，需走仿真模式 — 见 **ops-simulator** skill（`references/msopprof-simulator-guide.md` / `msopprof-simulator-ops-transformer-guide.md`）。
+> **需要指令级流水线时序图？** 上板采集（msprof / msopprof）只有 PMU 聚合计数器，无逐指令时序。若目标是查看 MTE2/Cube/Vec 流水线时序图、CV overlap、DoubleBuffer 效果或代码行映射，需走仿真模式 — 见 **ops-simulator** skill（`ops/ops-simulator/references/msopprof-simulator-guide.md`）。
 
 ### 参考资源
 

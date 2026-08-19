@@ -42,7 +42,7 @@ bash build.sh --run_example {operator_name} eager cust --vendor_name=custom
 ```bash
 # 位于 {skill_path}/scripts/msprof_profile_run.sh
 bash {skill_path}/scripts/msprof_profile_run.sh \
-     --warm-up=3 \
+     --warm-up=1 \
      --output=./msprof_output \
      -- ./demo arg1 arg2 ...
 ```
@@ -156,7 +156,7 @@ ops/{算子名}/docs/perf/
 
 ## 注意事项
 
-1. **必须 warm-up**：脚本默认 `--warm-up=3` 可调，避免 DVFS 影响首次运行
+1. **必须 warm-up**：脚本默认 `--warm-up=1` 可调，避免 DVFS 影响首次运行
 2. **无频率字段**：`op_summary` 没有 `Current Freq/Rated Freq`；脚本通过 `aicore_time / max_cycles` 反推主频
 3. **MTE2/MTE3 带宽共享**：同时读写 GM 时总带宽共享，评估搬运段负载时宜按 MTE2、MTE3 合并字节量与平台带宽对照
 4. **小数据量场景**：数据量很小时头开销占比会很高，这不一定是算子问题

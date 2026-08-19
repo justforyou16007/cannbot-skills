@@ -11,10 +11,11 @@
 # ----------------------------------------------------------------------------------------------------------
 # msprof runner - 统一性能采集入口
 #
-# 支持三种模式：
+# 支持四种模式：
 #   1. 标准模式 (默认): 对单个可执行文件采集 7 组 aic-metrics + sample-based
 #   2. --compare 模式:  对算子目录下的 model.py vs model_new_ascendc.py 做对比测试
-#   3. --batch 模式:    批量扫描目录下的多个算子子目录，并行执行对比测试
+#   3. --quick 模式:    单卡单进程批量对比（每 case 一个 torch.npu.Stream，一次 msprof 采全部）
+#   4. --batch 模式:    批量扫描目录下的多个算子子目录，并行执行对比测试
 #
 # Usage (标准模式):
 #   bash msprof_profile_run.sh [--warm-up=N] [--output=<dir>] -- <executable> [args...]
@@ -28,19 +29,21 @@
 # Usage (--batch 模式):
 #   bash msprof_profile_run.sh --batch --base-dir=/path/to/output_dir [--max-jobs=N] [--device-start=N]
 #
+
 # Example (标准):
-#   bash msprof_profile_run.sh --warm-up=3 --output=./msprof_output -- \
+#   bash msprof_profile_run.sh --warm-up=1 --output=./msprof_output -- \
 #        ./matmul_tutorial_mxfp4_pingpong 8448 4096 4096
 #
 # Example (对比):
-#   bash msprof_profile_run.sh --compare --output-dir=./output/GELU --warm-up=3 --device=0
+#   bash msprof_profile_run.sh --compare --output-dir=./output/GELU --warm-up=1 --device=0
 #
 # Example (快速):
-#   bash msprof_profile_run.sh --quick --output-dir=./output/GELU --warm-up=3 --device=0
+#   bash msprof_profile_run.sh --quick --output-dir=./output/GELU --warm-up=1 --device=0
 #
 # Example (批量):
 #   bash msprof_profile_run.sh --batch --base-dir=./output_performance --max-jobs=7 --device-start=1
 #
+
 # 产出:
 #   标准模式: <output_dir>/PROF_GROUP_<timestamp>/PROF_<Metric>/ (7 个子目录 + 1 个 Sample)
 #   对比模式: <output_dir>/performance.json + performance.log + perf_report.md
@@ -81,17 +84,20 @@ print_elapsed() {
 }
 
 # 默认参数
-WARM_UP=3
+WARM_UP=1
 OUTPUT_DIR="./msprof_output"
 APP_CMD=()
 
 # 模式开关
-MODE="standard"   # standard | compare | batch | quick
-OUTPUT_DIR_ARG=""  # --compare 模式用的算子目录
+MODE="standard"   # standard | compare | quick
+OUTPUT_DIR_ARG=""  # --compare/--quick 模式用的算子目录
 DEVICE_ID=""
 BASE_DIR=""
 MAX_JOBS=7
 DEVICE_START=1
+REFERENCE_CACHE="${LINGXI_REFERENCE_CACHE:-}"
+QUICK_BATCH=0
+PER_CASE=0
 
 usage() {
     cat <<'EOF'
@@ -101,7 +107,7 @@ Usage: bash msprof_profile_run.sh [OPTIONS] -- <executable> [args...]
        bash msprof_profile_run.sh --batch --base-dir=<dir> [OPTIONS]
 
 通用选项:
-  --warm-up=N     在正式采集之前，先跑 N 次可执行文件（不采集）预热 DVFS。默认 3。
+  --warm-up=N     在正式采集之前，先跑 N 次可执行文件（不采集）预热 DVFS。默认 1。
   --output=<dir>  msprof 结果根目录。默认 ./msprof_output。
   -h, --help      Show this help.
 
@@ -114,6 +120,7 @@ Usage: bash msprof_profile_run.sh [OPTIONS] -- <executable> [args...]
   --device=N             指定 NPU 设备 ID；未指定时自动选择空闲卡
   --repeats=N            重复采集次数（默认 1）
   --retry=N              单 case 解析失败重试次数（默认 2）
+  --reference-cache=PATH 会话级 reference 计时缓存（quick 模式相同 model/case 只跑一次）
   --keep-prof            保留 msprof 原始 PROF 目录（用于深度分析）
 
 快速模式 (--quick):
@@ -122,16 +129,18 @@ Usage: bash msprof_profile_run.sh [OPTIONS] -- <executable> [args...]
   --device=N             指定 NPU 设备 ID；未指定时自动选择空闲卡
   --repeats=N            重复采集次数（默认 1）
   --retry=N              单 case 解析失败重试次数（默认 2）
+  --quick-batch          quick 模式内部使用一次 msprof 批量采集全部 case
+  --per-case             quick 模式强制逐 case 测量（默认行为，用于覆盖 --quick-batch）
   --mfu                  追加官方 operator_mfu 等价口径 MFU 统计（需算子目录提供 flops.py）
-  --mfu-top-k=N          按理论 FLOPs 选取 top-K 大 shape 测 MFU（默认 3）
+  --mfu-top-k=N          按理论 FLOPs 选取 top-K 大 shape 测 MFU（默认 3，保留参数兼容）
   --mfu-peak=N           显式指定芯片 cube 峰值 TFLOPS（默认自动推导）
-  --impl=asc|ref|both    只采集指定实现（MFU 场景建议 asc，省参考实现采集时间）
 
 批量模式 (--batch):
   --batch                启用批量模式：扫描 base-dir 下所有子目录并行测试
   --base-dir=<dir>       包含多个算子输出子目录的根目录
   --max-jobs=N           最大并发数（默认 7）
   --device-start=N       起始 NPU 设备 ID（默认 1）
+
 
 脚本会按顺序用 msprof 采集 7 个 aic-metrics:
   PipeUtilization, ArithmeticUtilization, Memory, MemoryL0, MemoryUB,
@@ -151,11 +160,13 @@ while [[ $# -gt 0 ]]; do
         --device=*)  DEVICE_ID="${1#*=}"; shift ;;
         --repeats=*) REPEATS="${1#*=}"; shift ;;
         --retry=*)   RETRY="${1#*=}"; shift ;;
+        --reference-cache=*) REFERENCE_CACHE="${1#*=}"; shift ;;
+        --quick-batch) QUICK_BATCH=1; shift ;;
+        --per-case)    PER_CASE=1; shift ;;
         --keep-prof) KEEP_PROF=1; shift ;;
         --mfu)       MFU=1; shift ;;
         --mfu-top-k=*) MFU_TOP_K="${1#*=}"; shift ;;
         --mfu-peak=*) MFU_PEAK="${1#*=}"; shift ;;
-        --impl=*)    IMPL="${1#*=}"; shift ;;
         --compare)   MODE="compare"; shift ;;
         --quick)     MODE="quick"; shift ;;
         --batch)     MODE="batch"; shift ;;
@@ -263,6 +274,7 @@ run_compare() {
     [[ -n "${REPEATS:-}" ]] && extra_args+=("--repeats" "$REPEATS")
     [[ -n "${RETRY:-}" ]] && extra_args+=("--retry" "$RETRY")
     [[ "${KEEP_PROF:-0}" == "1" ]] && extra_args+=("--keep-prof")
+    [[ -n "$REFERENCE_CACHE" ]] && extra_args+=("--reference-cache" "$REFERENCE_CACHE")
 
     python3 "${SCRIPT_DIR}/msprof_perf_summary.py" --compare \
         --output-dir "$OUT_DIR" \
@@ -289,10 +301,12 @@ run_quick() {
     [[ -n "$DEVICE_ID" ]] && extra_args+=("--device" "$DEVICE_ID")
     [[ -n "${REPEATS:-}" ]] && extra_args+=("--repeats" "$REPEATS")
     [[ -n "${RETRY:-}" ]] && extra_args+=("--retry" "$RETRY")
+    [[ -n "$REFERENCE_CACHE" ]] && extra_args+=("--reference-cache" "$REFERENCE_CACHE")
+    [[ "${QUICK_BATCH:-0}" == "1" ]] && extra_args+=("--quick-batch")
+    [[ "${PER_CASE:-0}" == "1" ]] && extra_args+=("--per-case")
     [[ "${MFU:-0}" == "1" ]] && extra_args+=("--mfu")
     [[ -n "${MFU_TOP_K:-}" ]] && extra_args+=("--mfu-top-k" "$MFU_TOP_K")
     [[ -n "${MFU_PEAK:-}" ]] && extra_args+=("--mfu-peak" "$MFU_PEAK")
-    [[ -n "${IMPL:-}" ]] && extra_args+=("--impl" "$IMPL")
 
     python3 "${SCRIPT_DIR}/msprof_perf_summary.py" --quick \
         --output-dir "$OUT_DIR" \
@@ -302,6 +316,7 @@ run_quick() {
     print_elapsed "$OUT_DIR"
 }
 
+# ============================================================================
 # ============================================================================
 # 批量模式：多 NPU 并行执行多个算子
 # ============================================================================
@@ -378,6 +393,8 @@ run_batch() {
 }
 
 # ============================================================================
+
+# ============================================================================
 # 主入口
 # ============================================================================
 case "$MODE" in
@@ -389,6 +406,9 @@ case "$MODE" in
         ;;
     quick)
         run_quick
+        ;;
+    batch)
+        run_batch
         ;;
     *)
         echo "ERROR: 未知模式: $MODE" >&2

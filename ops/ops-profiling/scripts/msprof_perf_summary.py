@@ -31,6 +31,8 @@
 
 import argparse
 import csv
+import fcntl
+import hashlib
 import importlib.util
 import inspect
 import json
@@ -46,6 +48,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
@@ -1806,6 +1809,40 @@ def _cleanup_prof_dirs(*dirs):
             shutil.rmtree(d, ignore_errors=True)
 
 
+
+_ASCEND_EVO_LOCK_DIR = "/tmp/ascend_evo_locks"
+
+
+
+def _device_lock_path(device_id: int) -> str:
+    """返回某 NPU 设备对应的共享 flock 锁文件路径。
+
+    锁目录固定为 /tmp/ascend_evo_locks（可用 env ASCEND_EVO_LOCK_DIR 覆盖），
+    跨进化 lane/进程共享——多个并发候选在同一张卡上串行测量靠它协调。
+    """
+    lock_dir = os.environ.get("ASCEND_EVO_LOCK_DIR", _ASCEND_EVO_LOCK_DIR)
+    return os.path.join(lock_dir, f"device_{device_id}.lock")
+
+
+
+@contextmanager
+def _device_flock(device_id: int):
+    """持锁执行一个 case 的测量（阻塞排它）。
+
+    复用文件内 reference-cache 的 fcntl 用法；subprocess.run 默认 close_fds=True，
+    锁不会传给 msprof 子进程，父线程在子进程退出后释放即可。
+    """
+    path = _device_lock_path(device_id)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd = open(path, "a+")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        fd.close()
+
+
 def _run_compare_loop(out_dir, cases, n_cases, args, device_id):
     """Run the measurement loop over all cases. Returns rows and stats."""
     rows, speedups, ref_times, asc_times = [], [], [], []
@@ -1860,6 +1897,446 @@ def _run_compare_loop(out_dir, cases, n_cases, args, device_id):
 
 
 def _run_quick_loop(out_dir, cases, n_cases, args, device_id):
+    """快速模式：根据 --quick-batch/--per-case 选择测量方式。"""
+    if getattr(args, "quick_batch", False) and not getattr(args, "per_case", False):
+        rows, speedups, ref_times, asc_times, _pool, _pool_source, asc_mode =             _run_quick_loop_batch(out_dir, cases, n_cases, args, device_id)
+    else:
+        rows, speedups, ref_times, asc_times =             _run_quick_loop_per_case(out_dir, cases, n_cases, args, device_id)
+        asc_mode = "per_case"
+    return rows, speedups, ref_times, asc_times, [], "none", asc_mode
+
+
+
+def _reference_cache_path(args) -> Optional[Path]:
+    """Return the session-shared reference cache configured by CLI or env."""
+    value = getattr(args, "reference_cache", None)
+    if not value:
+        value = os.environ.get("LINGXI_REFERENCE_CACHE")
+    return Path(value).expanduser().resolve() if value else None
+
+
+
+def _reference_cache_key(mi: _MeasureInput, method: str = "per_case") -> tuple[str, dict]:
+    """Build a stable key for an unchanged reference model and one input case.
+
+    The physical device id is intentionally excluded: lingxi-evo allocates one
+    homogeneous NPU per lane, while a session must share the immutable PyTorch
+    reference timing across those lanes.
+
+    ``method`` distinguishes measurement semantics: 逐 case（每个 case 新进程，含
+    进程级首 kernel 启动开销）与 batch（单进程稳态测量）。两种语义的耗时不可直接
+    混用，用独立的 cache key 避免 batch 结果误用旧的 per-case 缓存值。
+    """
+    model_path = mi.out_dir / "model.py"
+    model_hash = hashlib.sha256(model_path.read_bytes()).hexdigest()
+    payload = {
+        "model_sha256": model_hash,
+        "case_index": mi.case_idx,
+        "case": mi.jsonl_case,
+        "seed": int(mi.args.seed),
+        "warmup": int(mi.args.warmup),
+        "repeats": int(mi.args.repeats),
+        "timing_method": "msprof.quick.Task_Duration",
+        "method": method,
+    }
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest(), payload
+
+
+
+def _read_reference_cache(path: Path) -> dict:
+    if not path.is_file():
+        return {"schema_version": 1, "entries": {}}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        LOGGER.warning("[WARN] Ignoring invalid reference cache: %s", path)
+        return {"schema_version": 1, "entries": {}}
+    if value.get("schema_version") != 1 or not isinstance(value.get("entries"), dict):
+        LOGGER.warning("[WARN] Ignoring unsupported reference cache: %s", path)
+        return {"schema_version": 1, "entries": {}}
+    return value
+
+
+
+def _write_reference_cache(path: Path, cache: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    with tmp.open("w", encoding="utf-8") as stream:
+        json.dump(cache, stream, ensure_ascii=False, indent=2)
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(tmp, path)
+
+
+
+def _measure_reference_quick_cached(mi: _MeasureInput):
+    """Measure the reference at most once per session/cache key.
+
+    The cache lock remains held on a miss while profiling the reference. This
+    prevents simultaneously launched candidates from all paying the same
+    reference cost before the first result is committed.
+    """
+    cache_path = _reference_cache_path(mi.args)
+    if cache_path is None:
+        return _measure_one_impl_quick(mi)
+
+    key, identity = _reference_cache_key(mi)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = cache_path.with_name(cache_path.name + ".lock")
+    with lock_path.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        try:
+            cache = _read_reference_cache(cache_path)
+            cached = cache["entries"].get(key)
+            if cached is not None and cached.get("ref_us") is not None:
+                LOGGER.info(
+                    "[CACHE HIT] reference case %s from %s", mi.case_idx, cache_path
+                )
+                return cached["ref_us"], cached.get("ref_error"), None
+
+            LOGGER.info(
+                "[CACHE MISS] profiling reference case %s once for session", mi.case_idx
+            )
+            ref_us, ref_err, ref_prof_dir = _measure_one_impl_quick(mi)
+            if ref_us is not None:
+                cache["entries"][key] = {
+                    **identity,
+                    "ref_us": ref_us,
+                    "ref_error": ref_err,
+                    "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                }
+                _write_reference_cache(cache_path, cache)
+            return ref_us, ref_err, ref_prof_dir
+        finally:
+            fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+
+
+
+_BATCH_CHUNK_SIZE = 28
+
+_BATCH_WRAPPER_SCRIPT_TEMPLATE = """\
+#!/usr/bin/env python3
+import importlib.util
+import os
+import sys
+import torch
+from pathlib import Path
+
+out_dir = Path({out_dir!r})
+os.environ["ASCEND_RT_VISIBLE_DEVICES"] = "{device_id}"
+sys.path.insert(0, str(out_dir / "kernel" / "build"))
+sys.path.insert(0, str(out_dir))
+
+def _load(path, name):
+    spec = importlib.util.spec_from_file_location(name, path)
+    m = importlib.util.module_from_spec(spec)
+    sys.modules[name] = m
+    spec.loader.exec_module(m)
+    return m
+
+mod = _load(out_dir / "{model_file}", "prof_mod")
+cls = getattr(mod, "{cls_name}")
+
+device = torch.device("npu")
+
+def _move(v):
+    if isinstance(v, torch.Tensor):
+        return v.to(device)
+    if isinstance(v, (list, tuple)):
+        return type(v)(_move(x) for x in v)
+    if isinstance(v, dict):
+        return {{k: _move(x) for k, x in v.items()}}
+    return v
+
+_ref_for_init = None
+try:
+    _ref_for_init = _load(out_dir / "{model_file}", "ref_for_init")
+except Exception:
+    _ref_for_init = None
+
+# 所有 case 的 stream 必须一次性预建并保持存活：
+# 若在循环里逐个创建 stream，上一把 stream 被 GC 释放后 torch 会复用其 ID，
+# 导致多个 case 共享同一 stream_id，task_time.csv 无法按 stream 归组到每个 case。
+_batch_streams = [torch.npu.Stream() for _ in range({n_cases})]
+
+# ---- 每个 case 一个独立 stream（隔离 kernel），按 case 顺序展开 ----
+{case_blocks}
+"""
+
+def _generate_batch_wrapper_script(out_dir, impl, cases, indices, args, device_id):
+    """生成批量 wrapper：每个 case 独占一个 stream，单进程内顺序跑完所有 case。
+
+    cases 与 indices 一一对应；indices 为原始 case 编号（get_init_inputs 按它索引）。
+    """
+    model_file = "model.py" if impl == "reference" else "model_new_ascendc.py"
+    cls_name = "Model" if impl == "reference" else "ModelNew"
+    repeats = max(1, int(getattr(args, "repeats", 1)))
+    blocks = []
+    for pos, (idx, case) in enumerate(zip(indices, cases)):
+        inp = _serialize_jsonl_inputs(case)
+        # 输入构造与 forward 必须都在 case 的 stream 上下文内：
+        # 逐 case 语义会把输入 randn 的 cast 与算子 kernel 一起计入 task 时长，
+        # 若 randn 落在默认 stream，则这些 cast 不会被计入各 case 的 stream 归组，
+        # 导致批量值与逐 case 值不一致。
+        inp_indented = "\n".join("    " + line for line in inp.split("\n"))
+        blocks.append(
+            f"# ---- case {idx} ----\n"
+            f"_s = _batch_streams[{pos}]\n"
+            f"with torch.npu.stream(_s):\n"
+            f"{inp_indented}\n"
+            f"    _inputs_dict = {{_k: _move(_v) for _k, _v in _inputs_dict.items()}}\n"
+            f"    _inputs_list = list(_inputs_dict.values())\n"
+            f"    _init_args = []\n"
+            f"    _init_kwargs = {{}}\n"
+            f"    if _ref_for_init is not None:\n"
+            f"        try:\n"
+            f"            _all_init = _ref_for_init.get_init_inputs()\n"
+            f"            if isinstance(_all_init, list) and {idx} < len(_all_init):\n"
+            f"                _entry = _all_init[{idx}]\n"
+            f"                if isinstance(_entry, dict):\n"
+            f"                    _init_kwargs = _entry\n"
+            f"                elif isinstance(_entry, (list, tuple)):\n"
+            f"                    _init_args = list(_entry)\n"
+            f"        except Exception:\n"
+            f"            pass\n"
+            f"    model = cls(*_init_args, **_init_kwargs).to(device).eval()\n"
+            f"    for _ in range({repeats}):\n"
+            f"        with torch.no_grad():\n"
+            f"            try:\n"
+            f"                _ = model(**_inputs_dict)\n"
+            f"            except TypeError:\n"
+            f"                try:\n"
+            f"                    _ = model(*_inputs_list)\n"
+            f"                except TypeError:\n"
+            f"                    _ = model(tuple(_inputs_list))\n"
+            f"        torch.npu.synchronize()\n"
+        )
+    return _BATCH_WRAPPER_SCRIPT_TEMPLATE.format(
+        out_dir=str(out_dir), device_id=device_id, model_file=model_file,
+        cls_name=cls_name, n_cases=len(cases), case_blocks="\n".join(blocks),
+    )
+
+
+
+def _run_msprof_quick_batch(wrapper_script, output_dir, device_id, warmup):
+    """批量模式：外部 warmup + 单次 msprof 采集（不设置 --aic-metrics）。
+
+    NOTE: 必须带 --ai-core=on，否则 aicore kernel 时长欠采集约 2.6-3x。
+    """
+    wrapper_path = os.path.join(output_dir, "_wrapper_batch.py")
+    os.makedirs(output_dir, exist_ok=True)
+    with open(wrapper_path, "w", encoding="utf-8") as f:
+        f.write(wrapper_script)
+    env = os.environ.copy()
+    for _ in range(max(1, warmup)):
+        subprocess.run([sys.executable, wrapper_path],
+                       capture_output=True, text=True, env=env)
+    cmd = ["msprof", f"--output={output_dir}", "--ai-core=on", "--task-time=on",
+           "--ascendcl=on", sys.executable, wrapper_path]
+    result = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    app_log = _save_app_output(output_dir, result.stdout, result.stderr)
+    if result.returncode != 0:
+        return None, f"msprof failed: {result.stderr[-500:]}\n(app log: {app_log})"
+    app_crash = _extract_app_crash(result.stdout, result.stderr)
+    if app_crash:
+        return None, f"profiled app crashed: {app_crash} (app log: {app_log})"
+    prof_dirs = sorted(Path(output_dir).glob("PROF_*"))
+    if not prof_dirs:
+        return None, f"no PROF directory found (app log: {app_log})"
+    return str(prof_dirs[-1]), None
+
+
+
+def _parse_msprof_duration_quick_batch(prof_group_dir):
+    """批量解析：按 stream_id 归组计算 kernel，返回每个 case 的耗时列表（stream 首现顺序）。
+
+    批量 wrapper 中每个 case 独占一个 stream，因此 stream 首现顺序即 case 顺序。
+    排除 PROFILING_ENABLE/DISABLE、TASK_TIMEOUT_SET、空类型等非计算行；其余全部计入，
+    避免 COMPUTE_KERNEL_TYPES 白名单遗漏 MIX_AIC 等真实计算 kernel。
+    """
+    task_time_patterns = [
+        os.path.join(prof_group_dir, "mindstudio_profiler_output", "task_time_*.csv"),
+        os.path.join(prof_group_dir, "PROF_*", "mindstudio_profiler_output", "task_time_*.csv"),
+    ]
+    task_time_files = []
+    for pattern in task_time_patterns:
+        task_time_files = sorted(glob.glob(pattern))
+        if task_time_files:
+            break
+    if not task_time_files:
+        return None, "no task_time csv found"
+    try:
+        with open(task_time_files[0], "r", encoding="utf-8", errors="replace") as f:
+            rows = list(csv.DictReader(f))
+    except Exception as e:
+        return None, f"read csv error: {e}"
+    stream_order = []
+    stream_sums = {}
+    for r in rows:
+        kt = r.get("kernel_type", "")
+        if kt in _META_KERNEL_TYPES:
+            continue
+        try:
+            d = float(r.get("task_time(us)", ""))
+        except ValueError:
+            continue
+        if d <= 0:
+            continue
+        sid = r.get("stream_id", "")
+        if sid not in stream_sums:
+            stream_order.append(sid)
+            stream_sums[sid] = 0.0
+        stream_sums[sid] += d
+    if not stream_order:
+        return None, "no compute rows found"
+    return [stream_sums[sid] for sid in stream_order], None
+
+
+
+def _measure_batch_quick(out_dir, cases, indices, args, device_id, impl):
+    """分批单次 msprof 采集指定 cases（cases/indices 一一对应）。
+
+    Returns (durations, prof_dir, err)；durations 对齐 cases，已除以 repeats。
+    """
+    repeats = max(1, int(getattr(args, "repeats", 1)))
+    # 共享机上 msprof 的设备 profiling 通道会被并发会话瞬时争抢（"Collect data failed" /
+    # "no task_time"），对每个 chunk 重试 --retry 次（与逐 case 的 _measure_one_impl_quick 一致），
+    # 避免瞬时通道失败直接回退到慢速逐 case。
+    retry = max(0, int(getattr(args, "retry", 2)))
+    impl_abbr = "ref" if impl == "reference" else "asc"
+    all_durations = []
+    prof_dirs = []
+    for start in range(0, len(cases), _BATCH_CHUNK_SIZE):
+        chunk_cases = cases[start:start + _BATCH_CHUNK_SIZE]
+        chunk_indices = indices[start:start + _BATCH_CHUNK_SIZE]
+        try:
+            wrapper = _generate_batch_wrapper_script(
+                out_dir, impl, chunk_cases, chunk_indices, args, device_id)
+        except Exception as e:
+            return None, None, f"batch wrapper generation failed: {e}"
+        tag = getattr(args, "prof_tag", None)
+        tmpdir = (f"/tmp/msprof_quick_{impl_abbr}_{out_dir.name}_batch_{start}"
+                  + (f"_{tag}" if tag else ""))
+        durations = None
+        prof_dir = None
+        last_err = None
+        for attempt in range(1 + retry):
+            _cleanup_prof_dirs(tmpdir)
+            prof_dir, err = _run_msprof_quick_batch(wrapper, tmpdir, device_id, args.warmup)
+            if not prof_dir:
+                last_err = err or "no prof dir"
+            else:
+                durations, perr = _parse_msprof_duration_quick_batch(prof_dir)
+                if durations is None:
+                    last_err = perr
+                # 结构校验：stream 归组的 case 数必须与输入的 case 数一致，且每个 case 都必须有
+                # 非零耗时。任何 case 为零都意味着该 case 的 kernel 未被正确归属到其 stream
+                # （例如 AscendC 内部 kernel 逃逸到其他流），此时整批结果不可信，交由上层回退
+                # 逐 case 测量，绝不静默产出偏小的 asc 值。
+                elif len(durations) != len(chunk_cases):
+                    last_err = (
+                        f"chunk[{start}]: batch stream count {len(durations)} != cases {len(chunk_cases)}")
+                elif any(d <= 0 for d in durations):
+                    last_err = (
+                        f"chunk[{start}]: {sum(1 for d in durations if d <= 0)}/{len(durations)} "
+                        f"cases have zero/negative duration; stream grouping invalid")
+            if durations is not None:
+                break
+            LOGGER.warning("[WARN] batch chunk %s attempt %d/%d failed: %s",
+                           start, attempt + 1, 1 + retry, last_err)
+            time.sleep(0.5)
+        if durations is None:
+            return None, prof_dir, last_err
+        all_durations.extend(d / repeats for d in durations)
+        prof_dirs.append(prof_dir)
+    return all_durations, (prof_dirs[-1] if prof_dirs else None), None
+
+
+
+def _measure_asc_batch_quick(out_dir, cases, indices, args, device_id):
+    """单进程批量测量 asc：每个 case 独占一个 torch.npu.Stream()，一次 msprof 采集全部 case。
+
+    原理：自定义 AscendC op 通过 TORCH_LIBRARY 注册，host 侧 EXEC_KERNEL_CMD 宏
+    （kernel/utils/torch_kernel_helper.h）用 c10_npu::getCurrentNPUStream() 绑定启动流，
+    因此在 `with torch.npu.stream(_s):` 内调用 op，其 kernel 会落到该 case 的 stream，
+    task_time.csv 可按 stream_id 精确归组。早期批量 asc 只测到逐 case 的 ~1/3，根因是
+    解析缺 MIX_AIC（欠采样 2.6-3x），现已在 _parse_msprof_duration_quick_batch 补齐
+    MIX_AIC/MIX_AIV/AI_CORE 等类型；结构校验不过时上层会回退逐 case。
+
+    Returns (durations, prof_dir, err)；durations 对齐 cases，已除以 repeats。
+    """
+    return _measure_batch_quick(out_dir, cases, indices, args, device_id, "ascendc")
+
+
+
+def _measure_batch_reference_quick_cached(out_dir, cases, indices, args, device_id):
+    """批量测量 reference，尊重共享 cache；只在 cache miss 时单次 msprof 采集缺失 case。
+
+    与逐 case 的 _measure_reference_quick_cached 不同：测量时不持有 cache 锁，
+    避免并发 lane 在锁内串行重复测量同一 reference。
+
+    Returns (per_case, prof_dir, err)；per_case[pos] 对齐 cases[pos] =
+    (ref_us, ref_err, ref_prof_dir)。
+    """
+    n = len(cases)
+    results = [None] * n
+    cache_path = _reference_cache_path(args)
+    miss_pos = []
+    if cache_path is None:
+        miss_pos = list(range(n))
+    else:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = cache_path.with_name(cache_path.name + ".lock")
+        with lock_path.open("a+", encoding="utf-8") as lock_stream:
+            fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+            try:
+                cache = _read_reference_cache(cache_path)
+                for pos, idx in enumerate(indices):
+                    mi = _MeasureInput(out_dir, idx, "reference", args, device_id, cases[pos])
+                    key, _ = _reference_cache_key(mi, method="batch")
+                    cached = cache["entries"].get(key)
+                    if cached is not None and cached.get("ref_us") is not None:
+                        results[pos] = (cached["ref_us"], cached.get("ref_error"), None)
+                    else:
+                        miss_pos.append(pos)
+            finally:
+                fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+    if miss_pos:
+        miss_cases = [cases[p] for p in miss_pos]
+        miss_indices = [indices[p] for p in miss_pos]
+        durations, prof_dir, err = _measure_batch_quick(
+            out_dir, miss_cases, miss_indices, args, device_id, "reference")
+        if durations is None:
+            return None, prof_dir, err
+        for offset, pos in enumerate(miss_pos):
+            results[pos] = (durations[offset], None, prof_dir)
+        if cache_path is not None:
+            lock_path = cache_path.with_name(cache_path.name + ".lock")
+            with lock_path.open("a+", encoding="utf-8") as lock_stream:
+                fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+                try:
+                    cache = _read_reference_cache(cache_path)
+                    for offset, pos in enumerate(miss_pos):
+                        idx = indices[pos]
+                        mi = _MeasureInput(out_dir, idx, "reference", args, device_id, cases[pos])
+                        key, identity = _reference_cache_key(mi, method="batch")
+                        cache["entries"][key] = {
+                            **identity,
+                            "ref_us": durations[offset],
+                            "ref_error": None,
+                            "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                        }
+                    _write_reference_cache(cache_path, cache)
+                finally:
+                    fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+    return results, None, None
+
+
+def _run_quick_loop_per_case(out_dir, cases, n_cases, args, device_id):
     """快速模式：Run the measurement loop over all cases (只跑 1 轮 msprof).
 
     Returns rows and stats.
@@ -1926,6 +2403,129 @@ def _run_quick_loop(out_dir, cases, n_cases, args, device_id):
             _cleanup_prof_dirs(ref_prof_dir, asc_prof_dir)
 
     return rows, speedups, ref_times, asc_times
+
+
+
+def _run_quick_loop_batch(out_dir, cases, n_cases, args, device_id):
+    """快速模式：单设备上 asc 批量测量（每 case 一个 torch.npu.Stream，一次 msprof 采集全部）。
+
+    - asc: 优先 _measure_asc_batch_quick 批量采集；解析失败/结构校验不过时逐 case 回退。
+    - ref: _measure_batch_reference_quick_cached 批量（含 reference-cache）；失败时逐 case。
+    - 两段测量均持 _device_flock 与本卡其他进化 lane 串行协调。
+
+    Returns (rows, speedups, ref_times, asc_times, pool, pool_source, asc_mode).
+    """
+    rows, speedups, ref_times, asc_times = [], [], [], []
+    skip = {idx for idx in range(n_cases) if _case_has_empty_tensor(cases[idx])}
+    meas_indices = [idx for idx in range(n_cases) if idx not in skip]
+    meas_cases = [cases[i] for i in meas_indices]
+
+    asc_batch = None
+    asc_prof_batch = None
+    asc_results = {}
+    asc_mode = "per_case"
+    ref_batch = None
+    ref_prof_batch = None
+    ref_results = {}
+
+    if meas_indices:
+        # ---- asc: 单进程批量（每 case 一个 torch.npu.stream）；失败回退逐 case ----
+        with _device_flock(device_id):
+            asc_batch, asc_prof_batch, asc_batch_err = _measure_asc_batch_quick(
+                out_dir, meas_cases, meas_indices, args, device_id)
+        if asc_batch is None:
+            LOGGER.warning("[WARN] batch asc failed (%s); falling back to per-case", asc_batch_err)
+            with _device_flock(device_id):
+                for idx in meas_indices:
+                    mi = _MeasureInput(out_dir, idx, "ascendc", args, device_id, cases[idx])
+                    asc_results[idx] = _measure_one_impl_quick(mi)
+                    us = asc_results[idx][0]
+                    LOGGER.info("[asc] case %s -> %s",
+                                idx, ("%.2fus" % us) if us is not None else "ERR")
+        else:
+            asc_mode = "batch"
+            LOGGER.info("[INFO] batch asc: %d cases in one msprof run (single process)",
+                        len(meas_indices))
+
+        # ---- ref: 批量（含 cache）；失败回退逐 case ----
+        with _device_flock(device_id):
+            ref_batch, ref_prof_batch, ref_batch_err = _measure_batch_reference_quick_cached(
+                out_dir, meas_cases, meas_indices, args, device_id)
+        if ref_batch is None:
+            LOGGER.warning("[WARN] batch reference profiling failed (%s); falling back to per-case",
+                           ref_batch_err)
+            with _device_flock(device_id):
+                for idx in meas_indices:
+                    mi = _MeasureInput(out_dir, idx, "reference", args, device_id, cases[idx])
+                    ref_results[idx] = _measure_reference_quick_cached(mi)
+
+    # ref + 行组装循环（顺序遍历；asc/ref 从批量结果取，批量失败则从逐 case 收集结果取）
+    for idx in range(n_cases):
+        shape, dtype = _extract_shape_dtype_from_jsonl(cases[idx]) if cases else ("?", "?")
+        jsonl_case = cases[idx] if cases else None
+
+        if idx in skip:
+            LOGGER.info(f"{idx:<5} {shape:<35} {dtype:<10} "
+                  f"{'--':>12} {'--':>12} "
+                  f"{'skip':>10}  (empty tensor)")
+            rows.append({
+                "case": idx, "shape": shape, "dtype": dtype,
+                "ref_us": None, "asc_us": None, "speedup": None,
+                "ref_error": None, "asc_error": None,
+                "skipped": "empty_tensor",
+            })
+            continue
+
+        pos = meas_indices.index(idx)
+        if asc_batch is not None:
+            asc_us = asc_batch[pos]
+            asc_err = None
+            asc_prof_dir = asc_prof_batch
+        else:
+            asc_res = asc_results.get(idx)
+            if asc_res is None:
+                asc_us, asc_err, asc_prof_dir = None, "asc measurement missing", None
+            else:
+                asc_us, asc_err, asc_prof_dir = asc_res
+
+        if ref_batch is not None:
+            ref_us, ref_err, _ = ref_batch[pos]
+            ref_prof_dir = ref_prof_batch
+        else:
+            ref_res = ref_results.get(idx)
+            if ref_res is None:
+                ref_us, ref_err, ref_prof_dir = None, "ref measurement missing", None
+            else:
+                ref_us, ref_err, ref_prof_dir = ref_res
+
+        if ref_us is not None and asc_us is not None and asc_us > 0:
+            sp = ref_us / asc_us
+            speedups.append(sp)
+            ref_times.append(ref_us)
+            asc_times.append(asc_us)
+            LOGGER.info(f"{idx:<5} {shape:<35} {dtype:<10} {ref_us:>12.2f} {asc_us:>12.2f} {sp:>9.3f}x")
+        else:
+            LOGGER.info(f"{idx:<5} {shape:<35} {dtype:<10} "
+                  f"{'N/A' if ref_us is None else f'{ref_us:.2f}':>12} "
+                  f"{'N/A' if asc_us is None else f'{asc_us:.2f}':>12} "
+                  f"{'N/A':>10}  (ref_err={ref_err}, asc_err={asc_err})")
+
+        rows.append({
+            "case": idx, "shape": shape, "dtype": dtype,
+            "ref_us": ref_us, "asc_us": asc_us,
+            "speedup": (ref_us / asc_us) if (ref_us and asc_us and asc_us > 0) else None,
+            "ref_error": ref_err,
+            "asc_error": asc_err,
+            "ref_prof_dir": ref_prof_dir,
+            "asc_prof_dir": asc_prof_dir,
+            "asc_device": device_id,
+            "ref_device": device_id,
+        })
+
+        if not args.keep_prof:
+            _cleanup_prof_dirs(ref_prof_dir, asc_prof_dir)
+
+    return rows, speedups, ref_times, asc_times, [], "none", asc_mode
 
 
 # ============================================================================
@@ -2212,7 +2812,7 @@ def run_quick_mode(args):
     LOGGER.info(f"[INFO] in-process warmup={args.warmup}, timed repeats={args.repeats}, "
                 f"ext-warmup={getattr(args, 'ext_warmup', 0)}, impl={getattr(args, 'impl', 'both')}")
     _log_compare_header(out_dir, args)
-    rows, speedups, ref_times, asc_times = _run_quick_loop(
+    rows, speedups, ref_times, asc_times, _pool, _pool_source, asc_mode = _run_quick_loop(
         out_dir, cases, n_cases, args, device_id)
 
     if flops_fn is not None and peak_tflops:
@@ -2230,6 +2830,7 @@ def run_quick_mode(args):
     summary = _compute_compare_summary(csi)
     summary["timing_method"] = "msprof.quick.Task_Duration"
     summary["profiling_mode"] = "quick"
+    summary["asc_mode"] = asc_mode
     if flops_fn is not None and peak_tflops:
         mfu_summary = _build_mfu_summary(rows, peak_tflops, peak_src)
         if mfu_summary:
@@ -2510,6 +3111,11 @@ def main():
     parser.add_argument("--output-md", help="批量模式 Markdown 输出路径")
     parser.add_argument("--output-json", help="批量模式 JSON 输出路径")
 
+    parser.add_argument("--quick-batch", action="store_true",
+                        help="启用 quick batch 模式：单进程一次 msprof 采集全部 case")
+    parser.add_argument("--per-case", action="store_true",
+                        help="强制使用逐 case 测量（默认即逐 case，除非显式 --quick-batch）")
+
     args = parser.parse_args()
 
     # 模式路由
@@ -2535,7 +3141,6 @@ def main():
         except ValueError as e:
             LOGGER.error("%s", e)
             sys.exit(1)
-
 
 if __name__ == "__main__":
     main()

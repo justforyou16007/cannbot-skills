@@ -172,6 +172,35 @@ P1：可能导致边界问题或实现意图不可追溯
   drain 路径是否存在兜底 Wait → 有则记 P0
 - **等级**：P0
 
+### RK-A07 V 写 UB → MTE3 拷出 GM 的交接禁止仅靠 PipeBarrier<PIPE_V>，必须显式 V_MTE3 事件守卫
+
+- **解决问题**：2（V→MTE3 UB 交接时序）
+- **锚点**：`Cast`（或任意 V 管写 UB 的指令）后紧邻将该 UB 区 `DataCopy`/`DataCopyPad`
+  拷出 GM 的位置（典型：finalize 输出段、chunk 结果落盘段）
+- **禁止**：
+  - 仅用 `PipeBarrier<PIPE_V>` 分隔 V 写 UB 与 MTE3 拷出 —— V 管一旦被事件等待 stall
+    （如 chunk 顶 `WaitFlag<MTE2_V>`），标量发射管前跑会把紧随的 MTE3 拷贝提前入队，
+    PipeBarrier 拦不住 → 拷出该 UB 区的**前一次写入残留**（陈旧数据）
+  - 认为"同一 V pipe 内的程序序能自动约束跨 pipe（MTE3）的启动时机"
+- **要求**：
+  - V 管写 UB → MTE3 拷出之间必须有显式 `SetWaitFlag<HardEvent::V_MTE3>`（或等价事件
+    守卫），与数据量、是否尾块无关
+  - **全 dtype 分支守卫类型统一审计**：某分支有显式守卫、另一分支只有 PipeBarrier 时，
+    后者即潜伏竞态——SDPA 实例：fp32 有 V_MTE3 守卫故免疫，fp16/bf16 只有 PipeBarrier
+    故在任何 V 管时序变动（overlap/广播化改造）下必中
+- **失败特征**：非确定竞态（多次运行逐位不同）；失败行 = 前一次写该 UB 区的内容逐位
+  （chunk 陈旧，算术位级正确）；`PipeBarrier<PIPE_ALL>` 全排空不敏感
+- **来源**：SDPA R6 Heisenbug 根因专项（2026-08-18）——根因闭合，判别实验：补守卫后
+  最小复现 20/20 全清 + case35×100 零失败。详 `vector-impl-patterns.md` §8.1
+  V2 overlap 竞态族条目
+- **检查方法**：
+  ```
+  grep -nE 'Cast|DataCopyPad|DataCopy' op_kernel/
+  ```
+  对每个"V 写 UB → MTE3 拷出"相邻对（含跨函数/跨 chunk 边界）：确认中间有显式 V_MTE3
+  事件守卫；仅见 PipeBarrier 记 P0；多 dtype 分支逐分支核对守卫类型一致
+- **等级**：P0
+
 ---
 
 ## 类别 B：容量与 buffer

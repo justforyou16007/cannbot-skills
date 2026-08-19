@@ -472,15 +472,29 @@ AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(notifyId);
   V2 的 RowMuls/RowDivs 广播化即使修正了该守卫仍引入未解析的精度破坏（疑似事件池/调度
   二阶效应），两轮未收敛按"精度回归当场回退"纪律回退标量实现——**V 侧广播化改造应按
   V1/V2 分开落地、分别验证，便于二分定位**（bisect 证实 V1 两处广播化正确有效）。
-- ❌ **V2 chunk 级 GM 预取 overlap 与 V2 广播化同属未决竞态族（Heisenbug family），在此族
-  根因闭合前 V2 侧一切 overlap 改造禁止交付**：SDPA R5-C1（ProcessVec2Chunk 循环内
-  prefetch chunk c+1，2026-08-17）8/50 FAIL，全部落在 2B 大 tile 变体（fp16 BIG 且
-  kvLoops≥2 全灭，bf16 边缘 1 例），fp32 两变体全过。**失败特征**（与 R3 V2 广播化同族，
-  四条齐备即可判定同族）：①多次运行逐位不同（非确定竞态）；②失败行输出 = 前一 chunk
-  原值（chunk 陈旧，算术位级正确）；③`PipeBarrier<PIPE_ALL>` 全排空不敏感；④集中爆发于
-  2B dtype + 多 kvLoop。**探针二分法（可复用调查链）**：late-issue 探针（消除重叠、逻辑
-  不变）干净且逐位一致 → 证明重叠本身是竞态源而非逻辑错；early-issue + 全屏障仍失败 →
-  排除简单守卫缺失，指向 buffer 交接层。**已证无效的修复方向**（勿重复投入）：专用
-  parity TBuf + 每 parity 单持久 MTE2_V 事件（严格 1:1）+ 瞬态 V_MTE2 WAR 守卫、撤出
-  inputQue1_ 疑似机制。根因疑似 TQue 双缓冲交接 × 动态事件 ID 交互，待最小复现 + 显式
-  事件 ID 审计闭合（该审计是 V2 侧 B2 向量化与 C1 软流水两个杠杆的共同前置）。
+- ❌→✅ **V2 overlap 竞态族（Heisenbug family）根因已闭合：finalize 的 Cast→DataCopy UB
+  交接仅靠 `PipeBarrier<PIPE_V>` 不够，必须显式 `SetWaitFlag<V_MTE3>`**（SDPA R6 专项，
+  2026-08-18）。**根因机制**：fp16/bf16 `FinalizeOutputChunk` 的
+  `Cast(outHalf) → PipeBarrier<PIPE_V> → DataCopy(Pad)(outGm)` 交接仅依赖 PipeBarrier
+  保证 V→MTE3 序；当 V 管被事件等待 stall（**任何 V 管时序变动都可触发**——R3 广播化、
+  R5 软流水踩中的正是同一漏网点），标量发射管前跑把紧随的 MTE3 拷贝一并入队，
+  PipeBarrier 拦不住 → MTE3 把 outHalf 中**上一 chunk 的 Cast 残留**拷出。**修复 E1**：
+  fp16/bf16 finalize 两分支各补一条显式 `SetWaitFlag<V_MTE3>`（fp32 路径本有此守卫，
+  这正解释了 dtype 偏斜：fp32 全过、2B 必中）。**失败四特征**（同族判定）：①多次运行
+  逐位不同；②失败行 = 前一 chunk 原值逐位（陈旧源 = 本地 Cast buffer）；③
+  `PipeBarrier<PIPE_ALL>` 全排空不敏感；④集中 2B dtype + 多 kvLoop。**判别链（可复用）**：
+  列级取证（每列非 ref 即 out[r-8] 逐位，陈旧窗口 = 128B Cast 迭代粒度）→ dtype 按守卫
+  类型分组 → late-issue 探针（消重叠保逻辑）逐位一致证重叠本身是竞态源 → 补守卫实验
+  20/20 全清证实。**事件 ID 方向正式证伪**（Set/Wait 账本数学闭合 + E1 零事件层改动即
+  修复）——R3/R5 的"TQue 双缓冲交接 × 动态事件 ID"疑似方向及三类事件层修复（专用
+  parity TBuf + 每 parity 单持久 MTE2_V 事件、瞬态 V_MTE2 WAR 守卫、撤出 inputQue1_）
+  全部打在错误层面，勿再投入。E1 后 C1 软流水正确性已证（50/50×2 + case35×100 零失败，
+  idx=49 -12%），交付禁令解除；但 overlap 交付见下条教训。
+- 💡 **overlap 类优化的收益/开销 case 分化可能无静态谓词可分**：C1（V2 chunk 预取软流水）
+  E1 后正确性闭合，主目标 idx=49 -12%、43/46/40 各 -12%、fp16 锚点提升，但小 fp32 case
+  一致开销 +6~40%（Sq 小、任务数欠载、kvLoops≤2 短流水时，每 tile 前奏 + 每 chunk 事件
+  开销无 overlap 可摊），且 win/loss 与 shape 无干净对应（同构 case 16 胜 / 19 负）→
+  无法按 shape 谓词条件化，整体按纪律回退储备（.round_backup/r6_c1e1/）。兑现路径：
+  运行时条件化（如按 kvLoops×行数工作量阈值启用预取）或削减 per-chunk 事件开销（更深
+  流水摊薄）。**纪律：小 case 密集的任务集上 overlap 类改动必须逐 case 全量 A/B，并预设
+  "无干净谓词则回退"**。

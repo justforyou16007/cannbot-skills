@@ -424,3 +424,77 @@ AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(notifyId);
 - ❌ **CV 1:2 下两 AIV subBlock 都处理全范围**：Scatter/累加被两 subBlock 各做一遍 → 结果 2x。须按 subBlockIdx 切分行/块范围。
 - ❌ **softmaxMax/sum 读取 layout 错**：GM 紧凑 `(B,N,S,G)`，若当 `[dealRows,8]` Brcb 块读 → 行 i 用 G[i\*8] 而非 G[i]（行0 巧合对、行1+ 错）。须 DataCopyPad 紧凑读 + Brcb 行级广播。
 - ❌ **DataCopy(GM↔UB) batch/size 非 8/32B 对齐**：VEC illegal config / CCU address check crash。须 size AlignUp-8（或 32B）多搬，GM 输出段用 DataCopyPad 精确尾段（不可越界写用户输出 tensor）。
+- ❌ **AIV sub-block 写 workspace 目标地址缺 rowStart_ 偏移**：fp32 hi/lo 分片路径下，两 sub-block
+  均向 `workspace[0]` 写入 SplitTileToWs/DataCopy，sub-block 1 覆盖 sub-block 0 的数据 → AIC
+  读到错乱行 → fp32 多 tile 精度灾难（MRE≈1.0, cos≈0.2）。**正确做法**：目标地址必须包含
+  `(uint64_t)rowStart_ * dim` 偏移（如 `kvSlot[(uint64_t)rowStart_ * dimQK]`），确保 sub-block 0
+  写 rows 0-31、sub-block 1 写 rows 32-63。详见 `kernel-rules.md` RK-D01。
+- ❌ **fp16/bf16 的 P（softmax 输出）单次 Cast 后直接 MMA**：P cast 到 fp16/bf16 有固有精度边界
+  （尾数截断），单 tile 碰巧通过，多 tile 在线累加误差增长 → 大 Skv case matched_ratio≈0.88~0.90、
+  MERE 超阈值，误差分布呈全面 1 ULP（非局部错行）。**正确做法（P hi/lo 拆分双 MMA）**：
+  P_fp32 先 Cast 到 P_hi（fp16/bf16），再 `P_lo = Cast(P_fp32 - Cast_back(P_hi))`，
+  PV 用两次 Mmad 累加（`O += P_hi·V; O += P_lo·V`），等价于 P 以 ~2 倍尾数位宽参与 MMA，
+  matched_ratio 0.899→1.0、MERE 1.1e-2→1.6e-5。三个配套约束缺一不可：
+  1. **启用条件统一为 `sizeof(QType)==2`**（fp16 和 bf16 都需要，不要只给 bf16 —— 否则 fp16
+     大 Skv case 全量验证回归）；buffer 分配（如 pBufL1b_）与 Get 的条件必须同口径，
+     防止"只给 bf16 分配但 Get 无条件执行"的 fp16 报错。
+  2. **Cast 写 P_lo 后、DataCopy 前必须 `SetWaitFlag<V_MTE3>` 同步**（命中流水线同步陷阱表
+     第一项）：缺同步则 P_lo 读到未完成 Cast 的结果 → 双 MMA 后全错（err 1~2），且单看
+     双 MMA 通路隔离实验（第二次 Mmad 改用 P_hi，ratio=2.0）是正确的，极易误判方向。
+  3. fp32 路径无此问题（无 Cast 截断），保持单 MMA。
+  来源：ScaledDotProductAttention case[7] bf16 [2,8,577,128→136] 及全量 case[17]/[44] fp16。
+- 💡 **fp32 matmul 的正确前提与已验证路径**：注意区分两层限制——**TileLang 框架**的
+  mma_macro_generator 仅支持 16/8bit 输入（probe 实证），故 TileLang 阶段 fp32 只能表达为
+  Vector；但 **910B2C（Atlas A2）Cube 硬件支持 float×float→float Mmad**（Mmad.md 表7），
+  吞吐为 fp16 的 1/4（cube_k=4，见 cube_instruction_theoretical_perf_summary.md 表1），
+  开 HF32 模式为 1/2（尾数截断、精度有损）。⚠️ 不要写成"平台不支持 fp32 MMA"（SDPA 任务
+  kernel 注释曾误写）。
+  **路径 ① fp32 直接 Cube Mmad 已实证**（SDPA 2026-08-12，`SdpaKernel<float>` 复用 fp16/bf16
+  CV 融合结构，fp32 全程无 Cast 无 hi/lo）：case [2,15,239,192]×Skv=275 从 2307us→185us
+  （12.5x，0.042x→0.522x），MERE 2.6e-7，fp32 谱 geomean 0.32→0.78。实现要点：
+  BASE_K_T=64（双缓冲 L0A/L0B 适配 64KB）、C0=8 K 对齐（恒满足 kDirectionAlign=false 的
+  ceil(K/8)×8）；**小 shape 按 qkElems≥2048 分流保留 Vector**——Cube 的 host 固定开销
+  （workspace at::zeros、tiling H2D、MIX launch）在小 shape 使端到端反转（device kernel time
+  持平 ≠ 端到端持平，阈值须 A/B 实测）。备选：② Q/K/V hi/lo bf16 3-MMA（~1/3 fp16，
+  P hi/lo 同思路已验证）；③ HF32（1/2 fp16，需实测能否过 fp32 atol=1e-3）。
+- ✅ **逐行 GetValue+标量 op 循环的广播化（V1 已验证模式）**：online softmax 的
+  `P = S - runMax` 逐行 `GetValue+Adds(-m)` → `Brcb(runMax) + BinaryRepeat Sub`
+  （x-m ≡ x+(-m) 位级一致）；tail mask 逐行 Add → 单条广播 Add（BinaryRepeatParams
+  src1RepStride=0，mask 向量自动每行复用）。实测消除每 tile 最大一处标量循环（32 次
+  GetValue + 32 条 Adds），fp16 大 case 单 case -73us。Brcb 官方语义注意：源操作数恒连续读
+  （repeat i 读 [8i,8i+8)）、参数为 {dstBlkStride, dstRepStride}、不支持 src/dst 同地址、
+  位于 PIPE_V（详 Brcb.md 与 test_operator_vbrcb.cpp）。
+- ❌ **GM→UB meta 拷贝（MTE2）的守卫类型必须匹配消费者 pipe 而非数据本身**：online softmax
+  的 alpha/sum meta 由 DataCopy（MTE2）载入后，若消费者是标量管 `GetValue`，守卫用
+  `SetWaitFlag<MTE2_S>`；一旦把下游改为 V 管的 Brcb/Mul/Div（广播化改造），守卫必须同步改
+  `MTE2_V`——否则 V 管读到未完成搬运的 meta → 错误 alpha rescale。阴险点：fp32 路径时序
+  余量大可巧合通过，fp16/bf16 kvLoops≥2 才暴露（V 侧紧凑）。⚠️ 附带教训：SDPA 第二轮中
+  V2 的 RowMuls/RowDivs 广播化即使修正了该守卫仍引入未解析的精度破坏（疑似事件池/调度
+  二阶效应），两轮未收敛按"精度回归当场回退"纪律回退标量实现——**V 侧广播化改造应按
+  V1/V2 分开落地、分别验证，便于二分定位**（bisect 证实 V1 两处广播化正确有效）。
+- ❌→✅ **V2 overlap 竞态族（Heisenbug family）根因已闭合：finalize 的 Cast→DataCopy UB
+  交接仅靠 `PipeBarrier<PIPE_V>` 不够，必须显式 `SetWaitFlag<V_MTE3>`**（SDPA R6 专项，
+  2026-08-18）。**根因机制**：fp16/bf16 `FinalizeOutputChunk` 的
+  `Cast(outHalf) → PipeBarrier<PIPE_V> → DataCopy(Pad)(outGm)` 交接仅依赖 PipeBarrier
+  保证 V→MTE3 序；当 V 管被事件等待 stall（**任何 V 管时序变动都可触发**——R3 广播化、
+  R5 软流水踩中的正是同一漏网点），标量发射管前跑把紧随的 MTE3 拷贝一并入队，
+  PipeBarrier 拦不住 → MTE3 把 outHalf 中**上一 chunk 的 Cast 残留**拷出。**修复 E1**：
+  fp16/bf16 finalize 两分支各补一条显式 `SetWaitFlag<V_MTE3>`（fp32 路径本有此守卫，
+  这正解释了 dtype 偏斜：fp32 全过、2B 必中）。**失败四特征**（同族判定）：①多次运行
+  逐位不同；②失败行 = 前一 chunk 原值逐位（陈旧源 = 本地 Cast buffer）；③
+  `PipeBarrier<PIPE_ALL>` 全排空不敏感；④集中 2B dtype + 多 kvLoop。**判别链（可复用）**：
+  列级取证（每列非 ref 即 out[r-8] 逐位，陈旧窗口 = 128B Cast 迭代粒度）→ dtype 按守卫
+  类型分组 → late-issue 探针（消重叠保逻辑）逐位一致证重叠本身是竞态源 → 补守卫实验
+  20/20 全清证实。**事件 ID 方向正式证伪**（Set/Wait 账本数学闭合 + E1 零事件层改动即
+  修复）——R3/R5 的"TQue 双缓冲交接 × 动态事件 ID"疑似方向及三类事件层修复（专用
+  parity TBuf + 每 parity 单持久 MTE2_V 事件、瞬态 V_MTE2 WAR 守卫、撤出 inputQue1_）
+  全部打在错误层面，勿再投入。E1 后 C1 软流水正确性已证（50/50×2 + case35×100 零失败，
+  idx=49 -12%），交付禁令解除；但 overlap 交付见下条教训。
+- 💡 **overlap 类优化的收益/开销 case 分化可能无静态谓词可分**：C1（V2 chunk 预取软流水）
+  E1 后正确性闭合，主目标 idx=49 -12%、43/46/40 各 -12%、fp16 锚点提升，但小 fp32 case
+  一致开销 +6~40%（Sq 小、任务数欠载、kvLoops≤2 短流水时，每 tile 前奏 + 每 chunk 事件
+  开销无 overlap 可摊），且 win/loss 与 shape 无干净对应（同构 case 16 胜 / 19 负）→
+  无法按 shape 谓词条件化，整体按纪律回退储备（.round_backup/r6_c1e1/）。兑现路径：
+  运行时条件化（如按 kvLoops×行数工作量阈值启用预取）或削减 per-chunk 事件开销（更深
+  流水摊薄）。**纪律：小 case 密集的任务集上 overlap 类改动必须逐 case 全量 A/B，并预设
+  "无干净谓词则回退"**。

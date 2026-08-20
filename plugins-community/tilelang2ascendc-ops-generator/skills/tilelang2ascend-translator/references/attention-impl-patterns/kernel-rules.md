@@ -11,6 +11,7 @@
 | 5. UB / L1 / L0 buffer 规划缺少可追溯依据（重点 L1） | RK-B02 |
 | 6. tiling 边界 off-by-one（end 参数语义） | RK-C01 |
 | 7. impl 阶段私改 common.h 契约无留痕 / cube 与 vec 并发改冲突 | RK-A05 |
+| 8. AIV sub-block 写 workspace 目标地址缺 rowStart_ 偏移 → fp32 精度灾难 | RK-D01 |
 
 - **转译实现时**：按“禁止 / 要求”执行。
 - **代码审查时**：按“检查方法”检查；只报告有明确代码证据的违反项。
@@ -146,6 +147,60 @@ P1：可能导致边界问题或实现意图不可追溯
 - **检查方法**：对照 host 与 kernel 的共享定义，确认每个字段、notifyId 和 buffer 数在双方一致；对每个 SetFlag/WaitFlag 核对唯一 ID 与配对。
 - **等级**：P0
 
+### RK-A06 持久事件 ID 的 Set/Wait 必须严格 1:1，End 期禁止二次 Wait
+
+- **解决问题**：2（事件门控双缓冲 / 手工事件管理）
+- **锚点**：`AllocEventID` / `SetFlag<HardEvent>(evtId)` / `WaitFlag<HardEvent>(evtId)` /
+  `ReleaseEventID` 使用位置（典型：L0/L1 事件门控双缓冲的 free/ready 事件池）
+- **禁止**：
+  - 对同一持久事件 ID 做两次连续 Wait 而无中间 Set —— 二次 Wait 永不返回 → 死锁
+    （表现为偶发 1/N hang，非确定性）
+  - End/drain 期对"已被消费者消费过"的持久事件再做兜底 Wait
+  - 事件 ID 在一处分配多处复用且无配对账本
+- **要求**：
+  - 每个持久事件 ID 维护明确的 Set→Wait 严格交替账本；Begin 期预 Set 全部 free 事件、
+    周期内生产/消费严格交替
+  - **End 期仅 `ReleaseEventID` 回收，不做 Wait**（已按此纪律实现 >1000 次启动零挂死）
+  - 新增事件用独立持久 ID，不与既有事件复用
+- **来源**：SDPA R3（2026-08-13）事件门控双缓冲调试中实测双重 Wait 死锁；R4（2026-08-14）
+  按"仅 Release 不 Wait"设计验证零挂死。详 `cube-impl-patterns.md` §8.1 事件门控条目
+- **检查方法**：
+  ```
+  grep -nE 'AllocEventID|ReleaseEventID|SetFlag|WaitFlag' op_kernel/
+  ```
+  对每个持久事件 ID：列出全部 Set/Wait 调用点，确认严格 1:1 交替；重点检查循环退出/
+  drain 路径是否存在兜底 Wait → 有则记 P0
+- **等级**：P0
+
+### RK-A07 V 写 UB → MTE3 拷出 GM 的交接禁止仅靠 PipeBarrier<PIPE_V>，必须显式 V_MTE3 事件守卫
+
+- **解决问题**：2（V→MTE3 UB 交接时序）
+- **锚点**：`Cast`（或任意 V 管写 UB 的指令）后紧邻将该 UB 区 `DataCopy`/`DataCopyPad`
+  拷出 GM 的位置（典型：finalize 输出段、chunk 结果落盘段）
+- **禁止**：
+  - 仅用 `PipeBarrier<PIPE_V>` 分隔 V 写 UB 与 MTE3 拷出 —— V 管一旦被事件等待 stall
+    （如 chunk 顶 `WaitFlag<MTE2_V>`），标量发射管前跑会把紧随的 MTE3 拷贝提前入队，
+    PipeBarrier 拦不住 → 拷出该 UB 区的**前一次写入残留**（陈旧数据）
+  - 认为"同一 V pipe 内的程序序能自动约束跨 pipe（MTE3）的启动时机"
+- **要求**：
+  - V 管写 UB → MTE3 拷出之间必须有显式 `SetWaitFlag<HardEvent::V_MTE3>`（或等价事件
+    守卫），与数据量、是否尾块无关
+  - **全 dtype 分支守卫类型统一审计**：某分支有显式守卫、另一分支只有 PipeBarrier 时，
+    后者即潜伏竞态——SDPA 实例：fp32 有 V_MTE3 守卫故免疫，fp16/bf16 只有 PipeBarrier
+    故在任何 V 管时序变动（overlap/广播化改造）下必中
+- **失败特征**：非确定竞态（多次运行逐位不同）；失败行 = 前一次写该 UB 区的内容逐位
+  （chunk 陈旧，算术位级正确）；`PipeBarrier<PIPE_ALL>` 全排空不敏感
+- **来源**：SDPA R6 Heisenbug 根因专项（2026-08-18）——根因闭合，判别实验：补守卫后
+  最小复现 20/20 全清 + case35×100 零失败。详 `vector-impl-patterns.md` §8.1
+  V2 overlap 竞态族条目
+- **检查方法**：
+  ```
+  grep -nE 'Cast|DataCopyPad|DataCopy' op_kernel/
+  ```
+  对每个"V 写 UB → MTE3 拷出"相邻对（含跨函数/跨 chunk 边界）：确认中间有显式 V_MTE3
+  事件守卫；仅见 PipeBarrier 记 P0；多 dtype 分支逐分支核对守卫类型一致
+- **等级**：P0
+
 ---
 
 ## 类别 B：容量与 buffer
@@ -239,10 +294,48 @@ P1：可能导致边界问题或实现意图不可追溯
 
 ---
 
+## 类别 D：MIX kernel sub-block 数据分区
+
+### RK-D01 AIV sub-block 写 workspace 必须按 rowStart_ 偏移目标地址
+
+- **解决问题**：MIX kernel fp32 hi/lo 分片路径下，多 AIV sub-block 并行向同一块 workspace
+  写入 Q/K/V 分片数据时，sub-block 1 覆盖 sub-block 0 的数据，导致 AIC 读到错误的行段，
+  fp32 精度灾难性退化（MRE≈1.0, cos_sim≈0.2）。
+- **锚点**：`op_kernel/*_vec.h` 中所有 `SplitTileToWs` / `ProducerAcquire` 调用点，
+  以及任何 AIV 侧 `DataCopy(workspace[offset], ub, ...)` 写入跨核共享 workspace 的位置。
+- **禁止**：
+  - 多个 sub-block 向同一 workspace slot 的**相同偏移**写入数据 —— sub-block 1 会覆盖
+    sub-block 0 已写入的数据
+  - 依赖"sub-block 串行执行"假设 —— sub-block 可能并行，写入顺序不确定
+  - 仅源地址包含 `rowStart_` 偏移而目标地址遗漏
+- **要求**：
+  - 每个 sub-block 向 workspace 写入时，目标地址必须包含本 sub-block 的行偏移：
+    `workspace[(uint64_t)rowStart_ * dim]`，确保 sub-block 0 写入 rows 0..SUB_ROWS-1，
+    sub-block 1 写入 rows SUB_ROWS..2*SUB_ROWS-1
+  - 此要求适用于所有 AIV→AIC workspace 写入路径：SplitQ、SplitKV、以及任何 DataCopy
+    写 workspace 后由 AIC ConsumerAcquire 读取的场景
+  - 已经正确包含偏移的现有代码（如 `pSlot[(uint64_t)rowStart_ * BLOCK_N]`）不受影响
+- **来源**：ScaledDotProductAttention fp32 路径 `SplitQ`/`SplitKV` 中两 sub-block 均写
+  `workspace[0]`，sub-block 1 覆盖 sub-block 0 的 Q/K/V hi/lo 数据 → AIC 加载到错乱的行 →
+  attention 权重全错 → 多 tile 精度 MRE=0.79~1.46。单 tile 碰巧通过（有效行数少且 padding
+  行覆盖不影响有效输出）。
+- **检查方法**：
+  ```
+  # 1. 找出所有 sub-block 写 workspace 的位置
+  grep -nE 'ProducerAcquire|SplitTileToWs|DataCopy.*Slot|DataCopy.*slot' op_kernel/*_vec*
+  # 2. 对每个写入点，确认目标地址包含 rowStart_ 偏移
+  grep -nE 'rowStart_' op_kernel/*_vec*
+  ```
+  - 若 ProducerAcquire 返回的 slot 直接传给 SplitTileToWs 或 DataCopy 而无 rowStart_ 偏移 → 记 P0
+  - 人工确认：源地址和目标地址是否都包含 sub-block 行偏移 → 缺任意一侧记 P0
+- **等级**：P0（导致 fp32 精度灾难性退化）
+
+---
+
 ## 扩展占位
 
 后续发现新的代码层常见问题，按上述格式追加条目：
 
-- 在已有类别下追加 `RK-XX<下一个编号>`（A 类下一个 RK-A05，B 类下一个 RK-B03，C 类下一个 RK-C02）
+- 在已有类别下追加 `RK-XX<下一个编号>`（A 类下一个 RK-A06，B 类下一个 RK-B03，C 类下一个 RK-C03，D 类下一个 RK-D02）
 - 若是新类别，新建"类别 X：xxx"小节，编号续接
 - 每条规则同时包含生成端约束（禁止/要求）和审查端方法（检查方法/等级），无需同步两份文件

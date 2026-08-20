@@ -1,6 +1,6 @@
 ---
 name: ops-partial
-description: ops仓算子进化优化子Agent - 根据世界模型策略指导修改ops仓算子代码，并在独立worktree中构建和评估
+description: ops仓算子进化优化子Agent - 根据 KG idea 或 MCTS 兼容方向修改ops仓算子代码，并在独立worktree中构建和评估
 mode: subagent
 model: inherit
 permissionMode: bypassPermissions
@@ -157,7 +157,7 @@ python3 {z_search_root}/plugins-community/ops-perf-evolution/skills/ops-evaluati
 
 ### 阶段7: 写入最终结果
 
-确保 `evaluation_results.json` 存在且包含 `node_id` 和 `implementation_note`。
+确保 `evaluation_results.json` 存在且包含 KG 模式使用的 `idea_id` 或 MCTS 模式使用的 `node_id`，以及 `implementation_note`。
 
 implementation_note.txt 内容：
 - 评估通过: 简述核心优化

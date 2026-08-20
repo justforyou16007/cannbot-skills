@@ -15,7 +15,9 @@
 #   R3   drift_status=replan_required and stage in {round_select, round_generate}
 #   R4   must_run_before_next_round non-empty and stage=round_select
 #   R5   state.evo_dir disagrees with hook-detected evo_dir
-#   R14  ledger entries (lineage.jsonl) have stale null diagnosis vs world_model.json
+#   R14  MCTS ledger entries (lineage.jsonl) have stale null diagnosis vs
+#        world_model.json; explicitly skipped in KG mode because experiments/
+#        claims are the graph's source of truth and there is no wm ledger
 #   R15  open_exploration node has non-empty strategy_combination (must stay [])
 #   R16  open_exploration node has a stub description (<80 chars) after dispatch
 #
@@ -39,6 +41,10 @@ if [[ -z "${evo_dir}" ]]; then
     # No active evolution loop — never block stops
     hook_allow
 fi
+
+# Use the same canonical predicate as state.sh.  This only selects the
+# diagnostic hint; all actual rule checks remain mode-gated in the libraries.
+evolution_mode="$(detect_evo_mode "${evo_dir}")"
 
 # Re-infer state from filesystem before validating rules. This ensures
 # R2/R3/R4 check against hook-derived state, not LLM-written state.
@@ -89,10 +95,15 @@ fi
 
 if [[ -n "${all_violations}" ]]; then
     reason="$(echo "${all_violations}" | head -20)"
+    if [[ "${evolution_mode}" == "kg" ]]; then
+        refine_hint="kg_ops.py refine"
+    else
+        refine_hint="wm_ops.py refine"
+    fi
     hook_block "Stop blocked due to invariant violations:
 ${reason}
 
-Hint: run 'python3 .claude/skills/evolution-world-model/scripts/state_ops.py read --evo-dir ${evo_dir}' to inspect current state, then resolve the issue (complete missing partials, run wm_ops.py refine, finalize-ledger, fix wm corruption, etc.) before retrying.
+Hint: run 'python3 .claude/skills/evolution-world-model/scripts/state_ops.py read --evo-dir ${evo_dir}' to inspect current state, then resolve the issue (complete missing partials, run ${refine_hint}, finalize-ledger for MCTS, fix evidence corruption, etc.) before retrying.
 To bypass in emergency only: export LINGXI_LOOP_HOOK_DISABLE=1"
 fi
 

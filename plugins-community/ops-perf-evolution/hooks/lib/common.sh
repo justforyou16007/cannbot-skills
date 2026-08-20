@@ -33,14 +33,26 @@ _resolve_project_root() {
         echo "${CLAUDE_PROJECT_DIR}"
         return
     fi
-    # script lives at <root>/.claude/hooks/lib/common.sh — walk up 3 levels
+    # Installed layout: <root>/.claude/hooks/lib/common.sh — walk up 3 levels.
+    # Source-tree layout: <root>/hooks/lib/common.sh — walk up 2 levels.
     local self
     self="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    echo "$(cd "${self}/../../.." && pwd)"
+    local candidate
+    candidate="$(cd "${self}/../../.." && pwd)"
+    if [[ -d "${candidate}/.claude/skills" || -d "${candidate}/skills/evolution-world-model" ]]; then
+        echo "${candidate}"
+        return
+    fi
+    candidate="$(cd "${self}/../.." && pwd)"
+    echo "${candidate}"
 }
 
 PROJECT_ROOT="$(_resolve_project_root)"
-STATE_OPS_PY="${PROJECT_ROOT}/.claude/skills/evolution-world-model/scripts/state_ops.py"
+if [[ -f "${PROJECT_ROOT}/.claude/skills/evolution-world-model/scripts/state_ops.py" ]]; then
+    STATE_OPS_PY="${PROJECT_ROOT}/.claude/skills/evolution-world-model/scripts/state_ops.py"
+else
+    STATE_OPS_PY="${PROJECT_ROOT}/skills/evolution-world-model/scripts/state_ops.py"
+fi
 
 hook_log() {
     echo "[${HOOK_NAME}] $*" >&2

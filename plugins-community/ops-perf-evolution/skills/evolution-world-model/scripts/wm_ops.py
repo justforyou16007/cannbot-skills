@@ -2913,6 +2913,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _register_evidence_commands(subparsers)
     _register_audit_commands(subparsers)
     _register_filter_session_commands(subparsers)
+
     return parser
 
 

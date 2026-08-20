@@ -11,8 +11,10 @@
 # ----------------------------------------------------------------------------------------------------------
 """state_ops.py — Per-evolution runtime state machine.
 
-Manages `<evo_dir>/state.json`, a runtime cursor decoupled from
-`world_model.json` (which holds decision-tree evidence). The state file
+Manages `<evo_dir>/state.json`, a runtime cursor decoupled from the
+evolution evidence store.  In KG mode that store is `knowledge_graph.json`;
+in legacy mode it is `world_model.json` (which holds decision-tree evidence).
+The state file
 records *where the agent is right now* (stage, current round, partial
 progress, drift status) so that:
 
@@ -66,6 +68,11 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import Any
+
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+from kg_ops import detect_mode  # noqa: E402
 
 LOGGER = logging.getLogger(__name__)
 
@@ -374,11 +381,14 @@ def _check_stage_artifacts(state: dict, evo_dir: str) -> list[str]:
             if issue:
                 issues.append(issue)
 
-    # When in round_refine, world_model.json must exist
+    # The evidence store is mode-dependent.  The canonical predicate lives in
+    # kg_ops.detect_mode; do not infer KG mode from a second filesystem test.
     if stage in STAGES_ROUND and stage != "round_gate":
-        wm_path = os.path.join(evo_dir, "world_model.json")
-        if not os.path.isfile(wm_path):
-            issues.append(f"missing world_model.json at {wm_path}")
+        mode = detect_mode(evo_dir)
+        model_name = "knowledge_graph.json" if mode == "kg" else "world_model.json"
+        model_path = os.path.join(evo_dir, model_name)
+        if not os.path.isfile(model_path):
+            issues.append(f"missing {model_name} at {model_path}")
 
     # current_round must not exceed max_rounds + 1 (we allow finalize at max+0)
     max_r = int(state.get("max_rounds", 0))
@@ -426,18 +436,20 @@ def cmd_validate(args: argparse.Namespace) -> None:
 # Inference: rebuild state from filesystem evidence
 # ---------------------------------------------------------------------------
 # state.json's LLM-untrusted fields (stage, current_round, partial_status) are
-# re-derived from filesystem evidence every time Stop hook fires or wm_ops
-# select/refine runs. The agent prompt is no longer responsible for keeping
+# re-derived from filesystem evidence every time Stop hook fires or a mode
+# orchestrator (kg_ops.py or legacy wm_ops.py) updates a round. The agent
+# prompt is no longer responsible for keeping
 # these fields correct.
 #
 # Trust sources (in order):
-#   1. world_model.json: session.actual_rounds_completed, requested_rounds
-#      (these are wm_ops's own writes, fully trusted)
+#   1. knowledge_graph.json in KG mode, world_model.json in MCTS mode:
+#      session.actual_rounds_completed, requested_rounds (these are
+#      orchestrator-owned writes, fully trusted)
 #   2. Filesystem: round_N/ directories and parallel_K/evaluation_results.json
 #      existence
 #
 # LLM-trusted fields NOT touched by infer:
-#   - drift_status (set by wm_ops refine + cmd_select)
+#   - drift_status (set by the legacy MCTS path + cmd_select)
 #   - mainline_stall_count (currently unused by hook, reserved for verdict path)
 #   - last_mainline_verdict (currently unused, reserved for verdict path)
 #   - must_run_before_next_round (set by hook/wm_ops, not LLM)
@@ -545,7 +557,7 @@ def _decide_stage(di: _StageDecisionInput) -> str:
 
 
 def _infer_state_from_filesystem(evo_dir: str) -> dict:
-    """Re-derive runtime state from filesystem evidence + world_model.json.
+    """Re-derive runtime state from filesystem evidence + mode store.
 
     Returns a partial state dict containing only the LLM-untrusted fields:
       {"stage": <name>, "current_round": <int>, "partial_status": {...}}
@@ -555,7 +567,7 @@ def _infer_state_from_filesystem(evo_dir: str) -> dict:
     drift_status / stall_count / must_run_before_next_round.
 
     Stage decision table (in priority order):
-      1. No world_model.json    → "shared_prep"  (agent hasn't run wm_init yet)
+      1. No mode evidence store → "shared_prep"  (agent hasn't run init yet)
       2. No round_N directory   → "wm_init"
       3. round_N exists, no parallel_K dirs   → "round_select"
       4. some parallel_K's evaluation_results.json missing → "round_generate"
@@ -567,18 +579,30 @@ def _infer_state_from_filesystem(evo_dir: str) -> dict:
       8. actual_rounds == max_round < requested_rounds → "round_checkpoint"
          (refine done, ready for next round)
     """
-    wm_path = os.path.join(evo_dir, "world_model.json")
-    if not os.path.isfile(wm_path):
+    mode = detect_mode(evo_dir)
+    model_name = "knowledge_graph.json" if mode == "kg" else "world_model.json"
+    model_path = os.path.join(evo_dir, model_name)
+    if not os.path.isfile(model_path):
         return {"stage": "shared_prep", "current_round": 0, "partial_status": {}}
 
     try:
-        with open(wm_path, "r", encoding="utf-8") as f:
-            wm = json.load(f)
+        with open(model_path, "r", encoding="utf-8") as f:
+            model = json.load(f)
     except (json.JSONDecodeError, OSError):
         return {"stage": "shared_prep", "current_round": 0, "partial_status": {}}
 
-    sess = wm.get("session", {}) or {}
+    sess = model.get("session", {}) or {}
     actual_rounds = int(sess.get("actual_rounds_completed", 0) or 0)
+    if mode == "kg":
+        # KG sync writes both fields.  The counter fallback keeps filesystem
+        # inference useful during recovery from an interrupted metadata write,
+        # while the dedicated kg_ops validate command still reports drift.
+        counters = model.get("counters", {}) or {}
+        counter_rounds = int(counters.get("rounds_completed", 0) or 0)
+        if "actual_rounds_completed" not in sess:
+            actual_rounds = counter_rounds
+        else:
+            actual_rounds = max(actual_rounds, counter_rounds)
     requested_rounds = int(sess.get("requested_rounds", 0) or 0)
 
     # Enumerate round_N/ directories

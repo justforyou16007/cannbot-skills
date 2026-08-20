@@ -31,14 +31,17 @@ Decision table (in priority order):
 
 | Condition | Inferred stage |
 |---|---|
-| No `world_model.json` | `shared_prep` |
-| `world_model.json` exists, no `round_N/` dir | `wm_init` |
+| No `knowledge_graph.json` AND no `world_model.json` | `shared_prep` |
+| `knowledge_graph.json` OR `world_model.json` exists, no `round_N/` dir | `wm_init` |
 | `round_N/` exists, no `parallel_K/` subdirs | `round_select` |
 | Some `parallel_K/evaluation_results.json` missing | `round_generate` |
 | All partials done but `wm.session.actual_rounds_completed < max_round` | `round_generate` (refine not run yet) |
 | `actual_rounds_completed == max_round == requested_rounds` AND `evolution-report_*.html` exists in evo_dir | **`done`** (v0.5: pipeline including step 6 report complete) |
 | `actual_rounds_completed == max_round == requested_rounds` AND no report file | `finalize` (step 5 done, step 6 report not yet generated) |
 | `actual_rounds_completed == max_round < requested_rounds` | `round_checkpoint` |
+
+> **知识图谱模式补充**：当 `ideas/` 目录存在时，系统使用知识图谱模式（knowledge_graph.json + ideas/ + experiments/ + claims/）。
+> 当仅有 `world_model.json` 时，使用旧 MCTS 模式。两种模式的状态机阶段名相同。
 
 **Preserved fields (never overwritten by infer)**: `drift_status`, `mainline_stall_count`, `last_mainline_verdict`, `must_run_before_next_round`, `max_rounds`, `agent`, `session_id`, `evo_dir`, `schema_version`. These are set by `wm_ops` (drift), `state_ops init` (config), or remain reserved for future use.
 

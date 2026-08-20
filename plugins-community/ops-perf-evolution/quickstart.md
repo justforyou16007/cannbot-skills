@@ -2,7 +2,7 @@
 
 ## 概述
 
-Ascend C 算子性能进化优化模式适用于**已有 AscendC 内核或 ops 仓库算子的性能提升**场景，通过世界模型驱动的多轮并行进化，在保持精度的前提下逐步优化性能，最终输出 `evolution-report_*.html` 汇总报告。
+Ascend C 算子性能进化优化模式适用于**已有 AscendC 内核或 ops 仓库算子的性能提升**场景。新会话使用 Idea → Experiment → Claim 知识图谱驱动多轮并行进化；已有 `world_model.json` 且没有 `knowledge_graph.json` 的会话继续使用 MCTS 兼容流程。两种模式最终都输出 `evolution-report_*.html` 汇总报告。
 
 ### 工作流
 
@@ -10,8 +10,8 @@ Ascend C 算子性能进化优化模式适用于**已有 AscendC 内核或 ops �
 步骤 0: 参数确认 + 路径判断  (Ops 仓库 / 基线内核)
 步骤 1: 环境检测 + 设备绑定  (NPU、CANN、目标路径)
 步骤 2: 基线性能评估        (ops-profiling / ops-evaluation)
-步骤 3: 世界模型初始化      (evolution-world-model)
-步骤 4: 多轮进化优化        (每轮：策略选择 → 并行生成变体 → 构建/评估 → 证据积累)
+步骤 3: KG 初始化 / MCTS 兼容初始化 (evolution-world-model)
+步骤 4: 多轮进化优化        (KG: query pack → 多 lens idea → LLM jury → 并行实验 → KG refine)
 步骤 5: 最佳方案确定 + 泛化验证
 步骤 6: 生成 evolution-report_*.html
 ```
@@ -81,8 +81,8 @@ CANNBot 会自动调度 `ops-perf-evolution` Agent，由其内部调度 `lingxi-
 1. 解析参数，判断路径类型
 2. 环境检测与设备绑定
 3. 评估基线性能
-4. 初始化世界模型
-5. 多轮并行进化（选择策略 → 生成变体 → 构建/评估 → 证据积累）
+4. 按唯一判定初始化 KG（或识别已有 MCTS 会话）
+5. 多轮并行进化（KG: LLM jury 评审 idea → 生成变体 → 构建/评估 → `kg_ops.py refine`）
 6. 选择最佳方案，进行泛化验证
 7. 生成 `evolution-report_*.html`
 
@@ -94,7 +94,13 @@ CANNBot 会自动调度 `ops-perf-evolution` Agent，由其内部调度 `lingxi-
 output/add_layer_norm_custom_ops-evo_20260520_141500/
 ├── evolution-report_add_layer_norm_custom_20260520_141500.html  ← 浏览器打开看可视化报告
 ├── state.json                                    ← 当前进度（自动维护）
-├── world_model.json                              ← 决策树 + 评测数据
+├── knowledge_graph.json                          ← KG session、计数器与最佳分数（新会话）
+├── ideas/                                        ← 候选优化假设（KG）
+├── experiments/                                  ← 每个并行变体的实验记录（KG）
+├── claims/                                       ← 从累计证据聚合的结论（KG）
+├── graph/edges.jsonl                             ← KG 关系边
+├── gap_map.md / query_pack.md                    ← 缺口图与轮次上下文（KG）
+├── world_model.json                              ← MCTS 决策树（仅存量会话）
 ├── shared/                                       ← 共享文件
 ├── round_1/
 │   ├── parallel_0/
@@ -112,10 +118,10 @@ output/add_layer_norm_custom_ops-evo_20260520_141500/
 | 想看 | 看哪里 |
 |------|--------|
 | 进化整体效果 | `evolution-report_*.html`（浏览器打开） |
-| 最优变体的 kernel 代码 | `world_model.json` 找 best_score 节点 → 它的 `solution_ref` 字段 → 对应的 `round_N/parallel_K/kernel/` |
+| 最优变体的 kernel 代码 | KG 看 `experiments/*.md` 的 `solution_ref`；MCTS 看 `world_model.json` 的 best_score 节点；再定位 `round_N/parallel_K/kernel/` |
 | 每个变体的精度/性能 | `round_N/parallel_K/evaluation_results.json` |
 | 当前进度（任务跑到哪了） | `cat state.json` |
-| 为什么进化停滞 | `world_model.json` 的 `stagnation_count` + `open_questions` 字段 |
+| 为什么进化停滞 | KG 看 `knowledge_graph.json` 的 `stagnation_count`/`stagnation_count_vs_base` 与 `gap_map.md`；MCTS 看 `world_model.json` |
 
 ### Tips
 
@@ -142,7 +148,7 @@ output/add_layer_norm_custom_ops-evo_20260520_141500/
 | `ops-evaluation` | ops 仓库算子构建与评估 | Ops 仓库路径 |
 | `evolution-knowledge` | 优化知识与模式参考 | 所有 |
 | `evolution-strategies` | 优化策略库查询 | 所有 |
-| `evolution-world-model` | 世界模型初始化与更新 | 所有 |
+| `evolution-world-model` | KG 初始化/更新与 MCTS 兼容状态管理 | 所有 |
 | `evolution-report` | 生成进化优化汇总报告 | 所有 |
 
 ## 四、常见问题
@@ -180,5 +186,5 @@ bash init.sh --help
 
 1. 从已有 AscendC 内核或 ops 仓库算子出发，进行多轮并行性能进化优化
 2. 使用 `/plugin install ops-perf-evolution@cannbot` 一键安装，或用 `init.sh` 脚本安装 Claude Code 环境
-3. 世界模型驱动、证据驱动的策略选择，保证优化方向的可积累性
-4. 产出物包含世界模型、状态游标、各轮变体、最佳方案和 `evolution-report_*.html`
+3. KG 用 query pack 与 LLM jury 评审候选 idea，保证优化方向可积累、可追溯
+4. 产出物包含 KG 或 MCTS 证据文件、状态游标、各轮变体、最佳方案和 `evolution-report_*.html`

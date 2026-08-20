@@ -12,6 +12,9 @@ if [[ -n "${LOOP_HOOK_STATE_SOURCED:-}" ]]; then
 fi
 LOOP_HOOK_STATE_SOURCED=1
 
+# shellcheck source=lib/mode.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/mode.sh"
+
 # Detect concrete violations of state.json invariants.
 # Echoes reasons to stdout (caller assembles them); returns 1 if any.
 check_stop_rules() {
@@ -36,6 +39,25 @@ check_stop_rules() {
     fi
 
     # Additional rules that need stage-aware logic beyond schema validation
+
+    local evolution_mode
+    evolution_mode="$(detect_evo_mode "${evo_dir}")"
+
+    # KG integrity is a separate gate from state.json schema validation.  Run
+    # it only for KG sessions; the MCTS branch remains byte-for-byte
+    # behavior-compatible with the legacy hook checks.
+    if [[ "${evolution_mode}" == "kg" ]]; then
+        local kg_ops_path="${PROJECT_ROOT}/.claude/skills/evolution-world-model/scripts/kg_ops.py"
+        [[ -f "${kg_ops_path}" ]] || kg_ops_path="${PROJECT_ROOT}/skills/evolution-world-model/scripts/kg_ops.py"
+        if [[ -f "${kg_ops_path}" ]]; then
+            local kg_validation_output
+            kg_validation_output="$(python3 "${kg_ops_path}" validate --evo-dir "${evo_dir}" 2>&1)"
+            local kg_validation_rc=$?
+            if [[ ${kg_validation_rc} -ne 0 ]]; then
+                echo "R2.KG: ${kg_validation_output}"
+            fi
+        fi
+    fi
 
     local stage
     stage="$(read_state_field "${evo_dir}" "stage")"
@@ -90,15 +112,18 @@ check_stop_rules() {
     # fields, so they cannot be bypassed by agent lying.
     # -----------------------------------------------------------------
 
-    # Read world_model.json's session for requested_rounds / actual_rounds_completed
-    local wm_path="${evo_dir}/world_model.json"
+    # Read the mode-specific session for requested_rounds / actual_rounds_completed.
+    local model_path="${evo_dir}/world_model.json"
+    if [[ "${evolution_mode}" == "kg" ]]; then
+        model_path="${evo_dir}/knowledge_graph.json"
+    fi
     local requested_rounds=""
     local actual_rounds=""
-    if [[ -f "${wm_path}" ]]; then
+    if [[ -f "${model_path}" ]]; then
         requested_rounds="$(python3 -c "
 import json, sys
 try:
-    w = json.load(open('${wm_path}'))
+    w = json.load(open('${model_path}'))
     print(w.get('session',{}).get('requested_rounds',''))
 except Exception:
     pass
@@ -106,7 +131,7 @@ except Exception:
         actual_rounds="$(python3 -c "
 import json, sys
 try:
-    w = json.load(open('${wm_path}'))
+    w = json.load(open('${model_path}'))
     print(w.get('session',{}).get('actual_rounds_completed',''))
 except Exception:
     pass
@@ -168,7 +193,11 @@ except Exception:
             current_round="$(read_state_field "${evo_dir}" "current_round")"
             if [[ "${current_round}" =~ ^[0-9]+$ && "${actual_rounds}" =~ ^[0-9]+$ ]]; then
                 if (( actual_rounds < current_round )); then
-                    echo "R8: round ${current_round} partials all completed but wm.actual_rounds_completed=${actual_rounds}; run wm_ops.py refine before stopping"
+                    if [[ "${evolution_mode}" == "kg" ]]; then
+                        echo "R8: round ${current_round} partials all completed but knowledge_graph.session.actual_rounds_completed=${actual_rounds}; run kg_ops.py refine before stopping"
+                    else
+                        echo "R8: round ${current_round} partials all completed but wm.actual_rounds_completed=${actual_rounds}; run wm_ops.py refine before stopping"
+                    fi
                 fi
             fi
         fi
@@ -178,11 +207,13 @@ except Exception:
     # 仅检查"字段存在"，不强制 18 词表内（容错给 LLM 学习空间）。
     # 触发条件：stage 在 round_refine/round_react/round_checkpoint 或 done 之前
     local wm_path="${evo_dir}/world_model.json"
-    if [[ -f "${wm_path}" ]] && [[ -f "${PROJECT_ROOT}/.claude/skills/evolution-world-model/scripts/wm_ops.py" ]]; then
+    if [[ "${evolution_mode}" == "mcts" ]] && [[ -f "${wm_path}" ]] && [[ -f "${PROJECT_ROOT}/.claude/skills/evolution-world-model/scripts/wm_ops.py" || -f "${PROJECT_ROOT}/skills/evolution-world-model/scripts/wm_ops.py" ]]; then
         case "${stage}" in
             round_refine|round_react|round_checkpoint|round_select)
                 local r13_output
-                r13_output="$(python3 "${PROJECT_ROOT}/.claude/skills/evolution-world-model/scripts/wm_ops.py" \
+                local wm_ops_path="${PROJECT_ROOT}/.claude/skills/evolution-world-model/scripts/wm_ops.py"
+                [[ -f "${wm_ops_path}" ]] || wm_ops_path="${PROJECT_ROOT}/skills/evolution-world-model/scripts/wm_ops.py"
+                r13_output="$(python3 "${wm_ops_path}" \
                     validate-diagnosis --wm-path "${wm_path}" 2>/dev/null)"
                 if [[ -n "${r13_output}" ]]; then
                     # 解析 issues_count > 0 表示有缺 diagnosis 的节点
@@ -220,12 +251,14 @@ print(','.join(miss[:3]))
         esac
     fi
 
-    # R14: ledger must reflect latest diagnoses. After LLM populates
+    # R14 (MCTS only): ledger must reflect latest diagnoses. After LLM populates
     # node.diagnosis, ledger artifacts (lineage.jsonl / attempt-ledger.md)
     # still hold the refine-time snapshot where diagnosis was null. Agent
     # must call `wm_ops.py finalize-ledger` to reconcile.
+    # KG deliberately skips R14: its experiment/claim graph is the source of
+    # truth and has no wm_ledger diagnosis snapshot to reconcile.
     local lineage_path="${evo_dir}/artifacts/lineage.jsonl"
-    if [[ -f "${wm_path}" ]] && [[ -f "${lineage_path}" ]]; then
+    if [[ "${evolution_mode}" == "mcts" ]] && [[ -f "${wm_path}" ]] && [[ -f "${lineage_path}" ]]; then
         case "${stage}" in
             round_checkpoint|round_select|finalize|done)
                 local stale_count
@@ -265,6 +298,12 @@ print(stale)
 # the saved wm has structurally broken nodes — that's a bug at any time.
 check_wm_integrity_rules() {
     local evo_dir="$1"
+    # R15/R16 validate MCTS open-exploration node fields. KG ideas are
+    # reviewed by the LLM jury and have no decision-tree strategy_combination
+    # invariant, so these rules do not apply in KG mode.
+    if is_kg_mode "${evo_dir}"; then
+        return 0
+    fi
     local wm_path="${evo_dir}/world_model.json"
     [[ -f "${wm_path}" ]] || return 0
 

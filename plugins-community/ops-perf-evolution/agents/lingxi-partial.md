@@ -1,6 +1,6 @@
 ---
 name: lingxi-partial
-description: AscendC 算子并行子代理 - 执行 AscendC 内核优化与验证，支持世界模型策略指导
+description: AscendC 算子并行子代理 - 执行 AscendC 内核优化与验证，支持 KG idea 或 MCTS 兼容方向指导
 mode: subagent
 permission:
   edit: allow
@@ -68,13 +68,14 @@ grep -rl "EZ9999" ops/ascendc-docs-search/references/troubleshooting_docs/
 
 **您不需要生成这些文件，直接从优化开始工作。**
 
-## 世界模型策略指导
+## KG/MCTS 证据指导
 
-在提示词中，主 Agent 可能会提供 `[World Model Guidance for this variant]` 部分：
+在提示词中，主 Agent 可能会提供 `[Evidence Guidance for this variant]` 部分。KG 模式传入 idea 和 query pack 摘要，MCTS 模式传入兼容的 node 字段；两者均只描述本变体要验证的方向：
 
 ```
-[World Model Guidance for this variant]
-Node ID: {node_id}
+[Evidence Guidance for this variant]
+Idea ID: {idea_id}
+Node ID (MCTS only): {node_id}
 Optimization Direction: {node_description}
 Assigned Strategy Combination: {strategy_combination}
 Parent Reference: {parent_solution_ref}
@@ -257,14 +258,14 @@ python3 ops/ops-profiling/scripts/msprof_perf_summary.py --compare \
   mkdir -p {output_dir}/profiling
   cp -r {output_dir}/PROF_GROUP_* {output_dir}/profiling/
   ```
-- **失败**（msprof 不可用、超时、脚本报错，或退出码非 0）：记录失败但不终止；后续 `evolved.pipeline` 会写 `null`，`wm_ops.refine` 会在 profiling 缺席时回退到不注入策略推荐
+- **失败**（msprof 不可用、超时、脚本报错，或退出码非 0）：记录失败但不终止；后续 `evolved.pipeline` 会写 `null`，KG 由 `kg_ops.py refine` 标记 profiling 证据缺失，MCTS 由 `wm_ops.py refine` 按原协议处理
 
 **1.5.2 写入 evaluation_results.json 的 `evolved.pipeline`（必须）**
 
 - 从 `--compare` 产物中提取 pipeline 信息：`perf_report.md` 的 pipe 比值段（如 `aiv_mte2_ratio`），或 `profiling/PROF_GROUP_*/` 的 `op_summary_*.csv` 指标（当前脚本不产出独立的 `lingxi_msprof_summary.json`，需要 partial 自行提炼）
 - 写入 `evaluation_results.json` 的 `"evolved": {"pipeline": {...}}` 字段；若 JSON 中已存在 `evolved` 结构，仅追加/更新 `pipeline` 子键
 - 若 msprof 失败或无结构化 pipeline 可提取：仍必须写入 `"evolved": {"pipeline": null}` 显式标记
-- 该字段是主 Agent `wm_ops.py refine` 提取 `profiling_insight.recommended_strategies` 的**唯一数据源**，不得省略
+- 该字段是 KG experiment 与 MCTS 节点提取 profiling insight 的**唯一数据源**，不得省略
 
 **Phase 1.5 完成检查（必须）**：确认 `evaluation_results.json` 中已含 `evolved.pipeline` 键（值可为 dict 或 null）。
 

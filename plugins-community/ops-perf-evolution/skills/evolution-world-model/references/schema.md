@@ -1,14 +1,23 @@
-# 世界模型 JSON Schema 定义
+# 知识图谱 Schema 定义
 
-本文件定义了世界模型的完整 JSON 数据结构。世界模型以文件形式持久化于磁盘：
+本文件定义了演化知识图谱的完整数据结构。知识图谱以文件形式持久化于磁盘：
 
 ```
-output/{op_name}_evo_{timestamp}/world_model.json
+output/{op_name}_evo_{timestamp}/
+  knowledge_graph.json    # 注册表 + 计数器 + session 锚定
+  ideas/                  # 每个 idea 一个 .md 文件
+  experiments/            # 每个 experiment 一个 .md 文件
+  claims/                 # 每个 claim 一个 .md 文件
+  graph/
+    edges.jsonl           # typed edges（关系图谱）
+  gap_map.md              # 知识缺口地图
+  query_pack.md           # 压缩上下文（≤8000 chars）
+  log.md                  # 追加式审计时间线
 ```
 
 ---
 
-## 顶层结构
+## 顶层结构（knowledge_graph.json）
 
 ```json
 {
@@ -22,419 +31,324 @@ output/{op_name}_evo_{timestamp}/world_model.json
     "evo_dir": "output/ai_infra_sparse_flash_attention_gqa_ops-evo_20260430_202933",
     "op_name": "ai_infra_sparse_flash_attention_gqa"
   },
-  // session: session 级身份锚定，防止 agent 失忆后误用历史目录
-  //   session_id: 唯一标识，格式为 {op_name}_ops-evo_{timestamp}
-  //   start_time: ISO8601 时间戳
-  //   requested_rounds: 用户请求的最大轮数
-  //   actual_rounds_completed: 实际已完成的轮数（由 refine 自动更新）
-  //   evo_dir: 本次进化的根目录绝对路径
-  //   op_name: 算子名称
-
-  "baseline_performance": {
-    "speedup": 1.0,       // 基线加速比（描述模式默认1.0，基线模式填入实际测量值）
-    "time_ms": null       // 基线执行时间（ms），可为null
-  },
-
-  "decision_tree": {
-    "nodes": {
-      "<node_id>": { ... }   // 节点字典，key为节点ID
-    }
-  },
-
-  "open_questions": [
-    "<字符串> 当前未解答的性能假设或待验证的优化方向"
-  ],
-
-  "stagnation_count": 0,         // 连续无显著提升的轮数计数器（vs 全局 best_score×1.02）
-  "stagnation_count_vs_base": 0, // 连续本轮最佳未超越父节点得分的轮数计数器（K-Search 风格）
-  "best_score": 1.0,             // 迄今为止所有已评测节点中的最高 speedup 值
-  "world_model_active": true,    // false 表示世界模型初始化失败，已回退到 tiered sampling
-  "solution_db_path": null,      // solution_db.jsonl 的相对路径（血统追踪，可选）
-  "hw_params": null,
-  "discovered_strategies": [],
-  "baseline_evidence": null
-  // 基线 profiling 的硬映射证据（可选，根级字段）。
-  // 由 wm_ops.py attach-baseline-evidence 在跑完 baseline_evaluation 后写入；
-  // 结构与节点的 profiling_evidence 完全一致（见节点结构）。
-  // 非 null 时，用于：
-  //   1) select_nodes 中触发 baseline 对齐惩罚（见 compute_utility w_baseline_mismatch）
-  //   2) 注入 ops-partial / lingxi-partial prompt 的 [Profiling Context] 作为 Baseline 行
-  // null 表示 baseline pipeline 不可用或 attach-baseline-evidence 未被调用，
-  // 系统回退到不做对齐惩罚、prompt 中跳过 Baseline 行的行为
-  // open_exploration 节点发现并提炼的新策略 ID 列表（X 前缀，区别于人工编写的 P/A/D 系列）
-  // 示例：["X1", "X2"]；这些策略已写入策略库，可被后续 strategy_guided 节点引用
-  // 目标芯片硬件规格（由 npu-arch skill 在步骤3.5-HW 写入）
-  // 非 null 时结构：{ chip_model, ub_size_bytes, core_num, peak_bw_gbps,
-  //                   peak_vector_tflops_per_core, alignment_bytes, max_tile_fp16_double_buf }
-  // null 表示查询失败或芯片型号不支持，依赖 hw_params 的后续步骤将静默跳过
-}
-```
-
----
-
-## 节点结构（decision_tree.nodes 中的每个节点）
-
-```json
-{
-  "id": "<字符串> 节点唯一标识符（如 'root', 'n1', 'n2', 'n1_1'）",
-
-  "parent_id": "<字符串> 父节点ID，根节点为 null>",
-
-  "description": "<字符串> 该节点的优化方向描述（1-2句话，说明用什么策略解决什么瓶颈）",
-
-  "strategy_combination": ["P1", "P7"],
-  // 适用于此节点的策略ID列表（对应 plugins-community/ops-perf-evolution/skills/evolution-strategies/references/strategy-index.md 中的ID）
-  // 根节点和自由探索节点为 []
-
-  "mode": "strategy_guided",
-  // 节点探索模式，取值：
-  //   "strategy_guided"   — 默认：使用 strategy_combination 中的策略，或从策略库自由选择
-  //   "open_exploration"  — 开放探索：禁止读取策略库，LLM 从最优内核代码和 profiling 自主推理新优化方向
-  //   "profiling_driven"  — Profiling驱动：基于父节点的 profiling_insight/profiling_evidence 中的具体瓶颈诊断，
-  //                         由 LLM 自主设计针对性优化方案。不限于策略库，但必须针对诊断出的具体瓶颈。
-  //                         与 open_exploration 的区别：profiling_driven 有明确的瓶颈靶点（来自profiling数据），
-  //                         而 open_exploration 是完全自由的第一原理推理。
-  //                         strategy_combination 字段保留为空数组 []，优化方向完全由 description 中的
-  //                         profiling 瓶颈描述指导。
-  //   "workflow_guided"   — 归族 workflow 分支保底：Init 归族命中某族 workflow 分支后生成，
-  //                         必须带 workflow_ref 字段指向族 workflow 文件 + 分支 ID + 阶段顺序。
-  //                         SELECT 为此类节点保留至少 1 个槽位（wm_ops.py _select_workflow_guaranteed）。
-  //                         子 agent 严格按 workflow_ref.stage_order 的阶段顺序优化。
-
-  "workflow_ref": null,
-  // 归族 workflow 分支引用（workflow_guided 节点必填，其余节点为 null）。
-  // 非 null 时结构：{ "family": "conv", "workflow_file": "convolution.md",
-  //                   "branch": "C-6", "branch_condition": "conv3d 三维滑窗",
-  //                   "traits": ["causal", "paged/decode"],  // 正交 trait 列表（可空数组缺省 []）：phase=fwd|bwd / causal / sparse-blocktable / sparse-window / paged-decode / quant / transpose-layout 等
-  //                   "stage_order": ["_common-prerequisites.md C1-C5", "C-6 branch ...", "matmul.md Step 3 GEMM 收尾"] }
-  // 作用：1) 记录该节点遵循的族 workflow 分支；2) SELECT 据此保底 1 槽；
-  //       3) lingxi-partial prompt 据此注入 workflow 分支的阶段顺序 + trait 追加卡，子 agent 按序优化。
-
-  "optimization_type": "bandwidth",
-  // 性能优化类型标签，取值: "bandwidth" | "tiling" | "algorithm" | "register_opt" | "vf_fusion" | "instruction_sched"
-  // - bandwidth: 带宽/搬运优化（P1双缓冲, P7对齐, P10向量化搬运, P11尾块, R5非对齐优化）
-  // - tiling: 分块/并行优化（P2自适应分块, P4多核均衡, P5流水线同步, P8 UB分区）
-  // - algorithm: 算法级重构（P13高层API, open_exploration, R6低延迟归约, R7 SIMD/SIMT混合）
-  // - register_opt: [A5专用] 寄存器优化（R2寄存器复用、减少RegTensor数量避免spill/fill）
-  // - vf_fusion: [A5专用] VF函数融合（R1多VF合并、减少冗余Load/Store）
-  // - instruction_sched: [A5专用] 指令调度优化（R3双发射、R4 Hardware Loop规范、R8 Mutex同步）
-  // 由 Init 和 Refine 自动推导，用于 Select 阶段的多样性保底约束
-  // D/A 系列策略不参与类型推导（它们是精度约束，非性能方向）
-  // A5 (351x/Regbase) 架构新增 register_opt/vf_fusion/instruction_sched 三个类型
-
-  "status": "open",
-  // 节点状态，取值：
-  //   "open"        — 尚未执行，可被选择
-  //   "in_progress" — 当前轮次已选中，正在执行
-  //   "passed"      — 评测通过（编译成功 + 精度正确）
-  //   "failed"      — 评测失败（编译失败 或 精度不通过）
-  //   "completed"   — 特殊状态，仅用于根节点（作为起始点使用）
-
-  "score": null,
-  // 节点的 speedup 值（评测通过后填入，失败节点保持 null）
-
-  "difficulty": 2,
-  // 实现难度估计（1-5整数），失败节点设为5
-  // 用于效用函数计算，难度越高优先级越低
-
-  "depth": 1,
-  // 节点在决策树中的深度（根节点为0，子节点递增）
-
-  "solution_ref": null,
-  // 评测通过后填入该变体的输出路径（如 "round_1/parallel_0"）
-  // 失败或未执行节点为 null
-
-  "parent_code_ref": null,
-  // 父节点实现的 kernel 路径（由 wm_ops.py 从 solution_db 填充，可选）
-  // 格式示例："round_1/parallel_0/{op_name}Custom/op_kernel/{op_name}_custom.cpp"
-
-  "children": [],
-  // 子节点ID列表（评测通过且有实质提升时生成子节点，子节点ID追加到此列表）
-
-  "failure_type": null,
-  // 失败节点的失败原因分类（仅 status="failed" 时有意义，其他节点为 null）：
-  //   "impl_error"         — 实现错误：策略方向本身可行，但子agent代码写错了
-  //                         （如：A6 Rsqrt未做NR迭代、Welford未用FP64累积）
-  //                         → 该方向仍值得重试，difficulty 不设为5
-  //   "strategy_infeasible" — 策略不可行：策略本身与该算子的精度/约束不兼容
-  //                         （如：近似误差量级合理但仍超阈值）
-  //                         → 封锁该方向，difficulty 设为5
-
-  "failure_reason": null,
-  // 一句话说明失败诊断依据（供 Analyze 和子节点 description 引用）
-  // 示例："rmse=25.79 >> 1，判断为 Rsqrt 未做 NR 迭代所致（impl_error）"
-
-  "retry_count": 0
-  // 该策略方向已重试次数（impl_error 节点的修复子节点继承 parent.retry_count + 1）
-  // retry_count >= 2 时即使 impl_error 也不再生成子节点（避免无限重试）
-
-  "profiling_insight": null,
-  // 性能瓶颈分析（可选字段，精度通过后由 lingxi-evo 步骤 4.4.P 填入）
-  // 非 null 时结构：{ "bottleneck": "memory_bound", "recommended_strategies": ["P1","P2"],
-  //                   "profiling_one_liner": "MTE2:45% | Vec:37% | ..." }
-  // null 表示尚未分析或 profiling 数据不存在
-
-  "profiling_evidence": null
-  // 指令级深度空泡分析（可选字段，由 lingxi-evo 步骤 4.4.P2 在触发条件满足时填入）
-  // 数据来源：ops-profiling skill 的 msprof_perf_summary.py --compare 完整采集（op_summary_*.csv）+ run_deep_profiling.py 分析
-  // 非 null 时结构：
-  // {
-  //   "bottleneck_type": "mte2_stall",          // 瓶颈分类: mte2_stall / mte3_stall / tiling_imbalance / scalar_loading / scalar_compute / compute_bound / near_optimal / no_overlap / partial_overlap / undersize_transfer / icache_miss / bus_contention
-  //   "d_class_pct": 62.5,                      // D类空泡占比（跨流水线同步等待）
-  //   "c_class_pct": 15.3,                      // C类空泡占比（标量参数加载阻塞）
-  //   "imbalance_ratio": 1.12,                  // 跨核负载不均衡比（>1.3 为不均衡）
-  //   "primary_bottleneck": "MTE2",             // D类空泡的主等待流水线
-  //   "suggested_strategies": ["P1", "P10"],    // 基于空泡分析推荐的策略
-  //   "anti_strategies": ["P3"],                // 应避免的策略
-  //   "description": "MTE2 数据加载等待是主瓶颈...",
-  //   "top_recommendation": "启用双缓冲隐藏MTE2搬运延迟",
-  //   "pattern_type": "periodic",               // 空泡模式: periodic / sporadic / cold_start_dominant / tail_dominant (T7)
-  //   "overlap_status": "no_overlap",           // 流水线重叠状态: no_overlap / partial_overlap / good_overlap (T8)
-  //   "dominant_subtype": "D_MTE2_WAIT",        // 主导空泡子类型 (二级分类)
-  //   "dma_efficiency": {                       // DMA 搬运效率 (T9)
-  //     "mte2_short_pct": 35.0,                 // MTE2 短搬运占比
-  //     "mte3_short_pct": 20.0                  // MTE3 短搬运占比
-  //   }
-  // }
-  // null 表示深度分析未触发、trace 数据不存在或分析失败
-  // 与 profiling_insight 的关系：profiling_insight 是 CSV 级快速诊断（每轮必做），
-  // profiling_evidence 是 trace 级深度分析（仅在特定条件触发时执行），两者互补
-}
-```
-
----
-
-## 节点 ID 命名规范
-
-- 根节点：`"root"`
-- 第一层子节点：`"n1"`, `"n2"`, `"n3"`, ...
-- 深层子节点：`"n1_1"`, `"n1_2"`, `"n2_1"`, ...（父节点ID + 下划线 + 序号）
-
----
-
-## 完整示例（初始化后的世界模型）
-
-```json
-{
-  "kernel_summary": "FastGELU算子，对输入张量逐元素应用GELU激活函数。计算密集度低，主要为内存带宽瓶颈。支持FP16/BF16，形状可变，存在尾块对齐问题。",
 
   "baseline_performance": {
     "speedup": 1.0,
     "time_ms": null
   },
 
-  "decision_tree": {
-    "nodes": {
-      "root": {
-        "id": "root",
-        "parent_id": null,
-        "description": "基线内核，未应用优化策略",
-        "strategy_combination": [],
-        "status": "completed",
-        "score": 1.0,
-        "difficulty": 1,
-        "depth": 0,
-        "solution_ref": null,
-        "children": ["n1", "n2", "n3", "n4", "n5", "n6"]
-      },
-      "n1": {
-        "id": "n1",
-        "parent_id": "root",
-        "description": "双缓冲流水线 + 32字节对齐，通过计算与数据搬运重叠提升吞吐量",
-        "strategy_combination": ["P1", "P7"],
-        "status": "open",
-        "score": null,
-        "difficulty": 2,
-        "depth": 1,
-        "solution_ref": null,
-        "children": []
-      },
-      "n2": {
-        "id": "n2",
-        "parent_id": "root",
-        "description": "自适应分块 + 多核负载均衡，针对不同输入形状自动选择最优分块策略",
-        "strategy_combination": ["P2", "P4"],
-        "status": "open",
-        "score": null,
-        "difficulty": 3,
-        "depth": 1,
-        "solution_ref": null,
-        "children": []
-      },
-      "n3": {
-        "id": "n3",
-        "parent_id": "root",
-        "description": "向量化数据搬运 + 尾块GatherMask处理，最大化内存带宽利用率",
-        "strategy_combination": ["P10", "P11"],
-        "status": "open",
-        "score": null,
-        "difficulty": 3,
-        "depth": 1,
-        "solution_ref": null,
-        "children": []
-      },
-      "n4": {
-        "id": "n4",
-        "parent_id": "root",
-        "description": "混合精度架构 + FP32中间计算，FP16输入使用FP32中间值保证精度",
-        "strategy_combination": ["D1", "A1"],
-        "status": "open",
-        "score": null,
-        "difficulty": 2,
-        "depth": 1,
-        "solution_ref": null,
-        "children": []
-      },
-      "n5": {
-        "id": "n5",
-        "parent_id": "root",
-        "description": "双缓冲 + 自适应分块组合，综合提升流水线效率和分块适应性",
-        "strategy_combination": ["P1", "P2"],
-        "status": "open",
-        "score": null,
-        "difficulty": 3,
-        "depth": 1,
-        "solution_ref": null,
-        "children": []
-      },
-      "n6": {
-        "id": "n6",
-        "parent_id": "root",
-        "description": "UB内存分区优化 + 流水线同步，精细化UB使用减少等待",
-        "strategy_combination": ["P8", "P5"],
-        "status": "open",
-        "score": null,
-        "difficulty": 4,
-        "depth": 1,
-        "solution_ref": null,
-        "children": []
-      }
-    }
-  },
-
-  "open_questions": [
-    "该算子是内存带宽瓶颈还是计算密集型？需要通过profiling确认",
-    "不同输入形状（大shape vs 小shape）对最优分块策略的影响程度？",
-    "尾块对齐问题是否对整体性能有显著影响？"
-  ],
-
-  "stagnation_count": 0,
-  "stagnation_count_vs_base": 0,
-  "best_score": 1.0,
-  "world_model_active": true,
   "hw_params": null,
-  "discovered_strategies": [],
-  "baseline_evidence": null
-}
-```
+  // 目标芯片硬件规格（由 npu-arch skill 在步骤3.5-HW 写入）
+  // 非 null 时结构：{ chip_model, ub_size_bytes, core_num, peak_bw_gbps, ... }
 
----
+  "baseline_evidence": null,
+  // 基线 profiling 的硬映射证据（可选，根级字段）
+  // 结构与 experiment 的 profiling_evidence 完全一致
 
-## 完整示例（两轮进化后的世界模型）
-
-```json
-{
-  "kernel_summary": "FastGELU算子，内存带宽瓶颈已确认，双缓冲效果显著。尾块对齐影响较小。",
-
-  "baseline_performance": {
-    "speedup": 1.0,
-    "time_ms": 0.5
-  },
-
-  "decision_tree": {
-    "nodes": {
-      "root": {
-        "id": "root", "parent_id": null, "description": "基线内核",
-        "strategy_combination": [], "status": "completed", "score": 1.0,
-        "difficulty": 1, "depth": 0, "solution_ref": null,
-        "children": ["n1", "n2", "n3", "n4", "n5", "n6"]
-      },
-      "n1": {
-        "id": "n1", "parent_id": "root",
-        "description": "双缓冲流水线 + 32字节对齐",
-        "strategy_combination": ["P1", "P7"],
-        "status": "passed", "score": 2.3, "difficulty": 2, "depth": 1,
-        "solution_ref": "round_1/parallel_0",
-        "children": ["n1_1", "n1_2"]
-      },
-      "n1_1": {
-        "id": "n1_1", "parent_id": "n1",
-        "description": "在n1基础上增加向量化数据搬运，进一步提升带宽利用率",
-        "strategy_combination": ["P1", "P7", "P10"],
-        "status": "open", "score": null, "difficulty": 3, "depth": 2,
-        "solution_ref": null, "children": []
-      },
-      "n1_2": {
-        "id": "n1_2", "parent_id": "n1",
-        "description": "在n1基础上增加多核负载均衡，分摊计算压力",
-        "strategy_combination": ["P1", "P7", "P4"],
-        "status": "open", "score": null, "difficulty": 3, "depth": 2,
-        "solution_ref": null, "children": []
-      },
-      "n2": {
-        "id": "n2", "parent_id": "root",
-        "description": "自适应分块 + 多核负载均衡",
-        "strategy_combination": ["P2", "P4"],
-        "status": "passed", "score": 1.7, "difficulty": 3, "depth": 1,
-        "solution_ref": "round_1/parallel_1",
-        "children": []
-      },
-      "n3": {
-        "id": "n3", "parent_id": "root",
-        "description": "向量化数据搬运 + 尾块GatherMask处理",
-        "strategy_combination": ["P10", "P11"],
-        "status": "failed", "score": null, "difficulty": 5, "depth": 1,
-        "solution_ref": null, "children": []
-      }
-    }
-  },
-
-  "open_questions": [
-    "双缓冲（P1）是关键优化，所有变体都应包含它作为基础",
-    "尾块处理（P11）导致编译失败，暂时避免单独使用P11",
-    "n1分支值得深度探索：在P1+P7基础上叠加P10或P4的效果？"
-  ],
-
+  "best_score": 1.0,
   "stagnation_count": 0,
   "stagnation_count_vs_base": 0,
-  "best_score": 2.3,
-  "world_model_active": true,
-  "hw_params": {
-    "chip_model": "910B3",
-    "ub_size_bytes": 196608,
-    "core_num": 40,
-    "peak_bw_gbps": 57.6,
-    "peak_vector_tflops_per_core": 0.2304,
-    "alignment_bytes": 32,
-    "max_tile_fp16_double_buf": 16384
+  "supervisor_used_count": 0,
+  "last_supervisor_round": -2,
+  "open_questions": [],
+  "discovered_strategies": [],
+
+  "idea_registry": {
+    "<idea_slug>": {
+      "stage": "proposed",
+      "outcome": "pending",
+      "utility_score": 14.5,
+      "generation_lens": "profiling_driven",
+      "round_created": 1,
+      "round_tested": null
+    }
   },
-  "discovered_strategies": ["X1"]
+  // idea_registry: 轻量注册表，与 ideas/*.md 保持同步
+  //   stage: proposed | active | piloted | archived
+  //   outcome: unknown | pending | negative | mixed | positive
+  //   utility_score: 最近一次 select 时计算的效用分
+  //   generation_lens: 生成此 idea 的镜头
+  //   round_created: 创建轮次
+  //   round_tested: 被选中测试的轮次（null = 尚未测试）
+
+  // KG Supervisor 运行时状态：与 legacy MCTS 使用相同的初始值和
+  // cooldown/cap 语义；通过 kg_ops.py supervisor 读写，不由 Agent 手改。
+
+  "counters": {
+    "total_ideas": 12,
+    "active_ideas": 4,
+    "total_experiments": 8,
+    "total_claims": 3,
+    "rounds_completed": 2
+  }
 }
 ```
 
 ---
 
-## 字段约束
+## Idea 实体结构（ideas/<slug>.md frontmatter）
+
+```yaml
+---
+type: idea
+node_id: idea:<slug>
+title: "双缓冲 + 512B 对齐消除 MTE2 停顿"
+stage: proposed        # proposed → active → piloted → archived
+outcome: pending       # unknown → pending → negative → mixed → positive
+strategy_tags: [P1, P7]
+optimization_type: bandwidth
+difficulty: 3
+mode: strategy_guided  # strategy_guided | open_exploration | profiling_driven | workflow_guided
+workflow_ref: null      # workflow_guided 时必填，结构见下文
+parent_idea: null       # 启发此 idea 的前序 idea node_id
+parent_experiment: null # 触发此 idea 的实验结果 node_id
+generation_lens: profiling_driven  # 生成此 idea 的镜头
+generation_round: 1
+target_gaps: [G1, G3]   # 此 idea 针对的知识缺口
+tags: [memory_bound, double_buffer]
+added: 2026-08-19T...
+---
+```
+
+### Idea 字段约束
 
 | 字段 | 类型 | 约束 |
 |------|------|------|
-| `status` | string | 必须是 open/in_progress/passed/failed/completed 之一 |
-| `score` | float 或 null | 通过后为正数，失败或未执行为 null |
-| `difficulty` | int | 1-5 整数，失败节点强制设为 5 |
-| `depth` | int | 非负整数，根节点为 0 |
-| `strategy_combination` | string[] | 元素必须是 strategy-index.md 中存在的策略 ID |
-| `failure_type` | string 或 null | 仅失败节点有值："impl_error" 或 "strategy_infeasible" |
-| `failure_reason` | string 或 null | 一句话诊断说明，失败节点必填 |
-| `retry_count` | int | 非负整数，impl_error 修复子节点继承 parent+1；≥2 时不再生成子节点 |
-| `stagnation_count` | int | 非负整数，连续无提升轮数（vs best_score×1.02） |
-| `stagnation_count_vs_base` | int | 非负整数，连续本轮最佳未超越父节点得分的轮数 |
-| `best_score` | float | 始终 ≥ 1.0（至少等于基线） |
-| `hw_params` | object 或 null | null 表示硬件查询失败；非 null 时含 chip_model、ub_size_bytes、core_num、peak_bw_gbps 等字段 |
-| `mode` | string | 节点字段，必须是 strategy_guided、open_exploration、profiling_driven 或 workflow_guided 之一；缺省视为 strategy_guided |
-| `workflow_ref` | object 或 null | workflow_guided 节点必填：{family, workflow_file, branch, branch_condition, traits, stage_order}；traits 为 string[] 可空数组（缺省视为 []，记录该分支正交 trait：phase=causal/sparse/paged/quant/transpose 等）；其余节点为 null。SELECT 为带 workflow_ref 的节点保底 1 槽 |
-| `optimization_type` | string | 必须是 bandwidth/tiling/algorithm 之一 |
-| `discovered_strategies` | string[] | 顶层字段，X 前缀策略 ID 列表；空列表表示本次运行尚未发现新策略 |
-| `session` | object 或 null | session 身份锚定，非 null 时含 session_id、start_time、requested_rounds、actual_rounds_completed、evo_dir、op_name |
-| `profiling_insight` | object 或 null | 节点可选字段；null 表示数据缺失或分析失败；非 null 时含 bottleneck、recommended_strategies、profiling_one_liner 三个子字段 |
-| `profiling_evidence` | object 或 null | 节点可选字段；指令级深度空泡分析结果；null 表示未触发或分析失败；非 null 时含 bottleneck_type、d_class_pct、c_class_pct、imbalance_ratio、suggested_strategies、anti_strategies、pattern_type、overlap_status、dominant_subtype、dma_efficiency 等子字段 |
-| `baseline_evidence` | object 或 null | 顶层可选字段；根级基线 profiling 证据（由 attach-baseline-evidence 写入）；结构同 `profiling_evidence`；null 表示基线 pipeline 不可用或该子命令未被调用；非 null 时必须 `bottleneck_type ∈ BOTTLENECK_STRATEGY_MAP` 的合法键 |
+| `stage` | string | proposed / active / piloted / archived |
+| `outcome` | string | unknown / pending / negative / mixed / positive |
+| `strategy_tags` | string[] | P/D/A/R/X 系列策略 ID；open_exploration 为空数组 |
+| `optimization_type` | string | bandwidth / tiling / algorithm / register_opt / vf_fusion / instruction_sched |
+| `difficulty` | int | 1-5，失败后 +1，初始不用 5 |
+| `mode` | string | strategy_guided / open_exploration / profiling_driven / workflow_guided |
+| `workflow_ref` | object 或 null | workflow_guided 必填：{family, workflow_file, branch, branch_condition, traits, stage_order} |
+| `generation_lens` | string | profiling_driven / method_transfer / gap_analysis / continuation / open_exploration / workflow_guided / supervisor_sourced |
+| `target_gaps` | string[] | gap_map.md 中的 G1, G2, ... 引用 |
+
+### mode 取值说明
+
+| mode | 含义 |
+|------|------|
+| `strategy_guided` | 默认：使用 strategy_tags 中的策略 |
+| `open_exploration` | 开放探索：禁止读取策略库，LLM 自主推理 |
+| `profiling_driven` | Profiling 驱动：基于 profiling 证据针对性设计 |
+| `workflow_guided` | 归族 workflow 分支保底：按 workflow_ref 阶段顺序优化 |
+
+### generation_lens 取值说明
+
+| lens | 驱动方式 | 说明 |
+|------|---------|------|
+| `profiling_driven` | 确定性 + LLM | BOTTLENECK_STRATEGY_MAP 映射 + LLM 细化 |
+| `method_transfer` | 确定性 + LLM | 策略索引 × 算子特征匹配 |
+| `gap_analysis` | gap_map 驱动 | 针对开放知识缺口生成 |
+| `continuation` | 实验结果驱动 | 在成功实验基础上叠加正交优化 |
+| `open_exploration` | 纯 LLM | 第一原理自由推理 |
+| `workflow_guided` | workflow 文件 | 归族命中时按分支阶段优化 |
+| `supervisor_sourced` | Supervisor 外部复核 | Supervisor 返回的 MCTS 形状建议映射成 KG idea |
+
+---
+
+## Experiment 实体结构（experiments/<slug>.md frontmatter）
+
+```yaml
+---
+type: experiment
+node_id: exp:<slug>
+title: "Round 1 Parallel 0: P1+P7"
+idea_id: idea:<slug>
+verdict: yes           # yes | partial | no
+confidence: high       # high | medium | low
+speedup: 2.3
+solution_ref: "round_1/parallel_0"
+round: 1
+parallel_index: 0
+profiling_insight: null  # CSV 级快速诊断
+profiling_evidence: null # 指令级深度空泡分析
+facts: null              # Stage 1 纯事实提取
+diagnosis: null          # Stage 2 LLM 诊断
+failure_type: null       # impl_error | strategy_infeasible
+failure_reason: null
+retry_count: 0
+tags: []
+added: 2026-08-19T...
+---
+```
+
+### Experiment 字段约束
+
+| 字段 | 类型 | 约束 |
+|------|------|------|
+| `verdict` | string | yes / partial / no |
+| `confidence` | string | high / medium / low |
+| `speedup` | float 或 null | 通过后为正数，失败为 null |
+| `failure_type` | string 或 null | 仅 verdict=no 时有值：impl_error / strategy_infeasible |
+| `retry_count` | int | ≥0，impl_error 修复 idea 继承 parent+1；≥2 时不再重试 |
+| `profiling_evidence` | object 或 null | 与旧 schema 的 profiling_evidence 结构完全一致 |
+
+### profiling_evidence 子结构（不变）
+
+```json
+{
+  "bottleneck_type": "mte2_stall",
+  "d_class_pct": 62.5,
+  "c_class_pct": 15.3,
+  "imbalance_ratio": 1.12,
+  "primary_bottleneck": "MTE2",
+  "suggested_strategies": ["P1", "P10"],
+  "anti_strategies": ["P3"],
+  "description": "MTE2 数据加载等待是主瓶颈...",
+  "top_recommendation": "启用双缓冲隐藏MTE2搬运延迟",
+  "pattern_type": "periodic",
+  "overlap_status": "no_overlap",
+  "dominant_subtype": "D_MTE2_WAIT",
+  "dma_efficiency": { "mte2_short_pct": 35.0, "mte3_short_pct": 20.0 }
+}
+```
+
+---
+
+## Claim 实体结构（claims/<slug>.md frontmatter）
+
+```yaml
+---
+type: claim
+node_id: claim:<slug>
+name: "双缓冲对 MTE2 瓶颈算子至关重要"
+status: verified         # drafted → unproven → verified → refuted
+supporting_experiments: [exp:001, exp:003]
+refuting_experiments: []
+strategy_implications: [P1]
+bottleneck_labels: [mte2_stall]
+confidence: 0.92
+added: 2026-08-19T...
+---
+```
+
+### Claim 字段约束
+
+| 字段 | 类型 | 约束 |
+|------|------|------|
+| `status` | string | drafted / unproven / verified / refuted |
+| `confidence` | float | 0.0-1.0 |
+| `strategy_implications` | string[] | 此 claim 验证/否定的策略 ID |
+| `bottleneck_labels` | string[] | 相关瓶颈类型 |
+
+### Claim 生成条件
+
+| 条件 | Claim 类型 | 状态 |
+|------|-----------|------|
+| 3+ 实验确认某策略有效 | strategy_verified | verified (confidence ≥ 0.75) |
+| 2+ 实验确认某策略不可行（且 0 成功） | strategy_refuted | verified (confidence ≥ 0.75) |
+| 2+ 成功实验共享 ≥60% 相同策略 | bottleneck_pattern | unproven (需更多证据) |
+
+---
+
+## 关系图谱（graph/edges.jsonl）
+
+每行一个 JSON 对象：
+
+```json
+{"from": "idea:slug", "to": "exp:slug", "type": "tested_by", "evidence": "...", "added": "..."}
+```
+
+### Edge 类型
+
+| Edge 类型 | From → To | 说明 |
+|-----------|-----------|------|
+| `tested_by` | idea → exp | Idea 被某实验测试 |
+| `supports` | exp → claim/idea | 实验支持 claim 或 idea |
+| `invalidates` | exp → claim/idea | 实验否定 claim 或 idea |
+| `addresses_gap` | idea/claim → gap | 针对某知识缺口 |
+| `inspired_by` | idea → idea | 跨 idea 血统 |
+| `derived_from` | idea → exp | 新 idea 来源于实验结果 |
+| `depends_on` | claim → claim | Claim 依赖链 |
+| `refutes` | claim → claim | Claim 否定链 |
+
+---
+
+## Gap Map（gap_map.md）
+
+```markdown
+# Gap Map
+
+## Active Gaps
+
+### G1: MTE2 停顿缓解——双缓冲之外还有什么
+- **Status**: open
+- **Key**: bottleneck_primary_unexplored:mte2_stall
+- **Kind**: bottleneck_primary_unexplored
+- **Subject**: mte2_stall
+- **Evidence**: exp:001 达到 2.3x (P1+P7)，但残余 MTE2 停顿 35%
+- **Suggested lenses**: profiling_driven, method_transfer
+- **Priority**: 1.8
+
+## Closed Gaps
+
+### G0: 基线瓶颈识别
+- **Status**: closed
+- **Evidence**: 由 claim:baseline-mte2-bound 关闭
+- **Closure reason**: closed by claim:baseline-mte2-bound
+```
+
+Gap ID 格式：G1, G2, ...（递增，不复用）
+
+`Key` 由稳定的语义 kind + invariant subject 派生，不能把易变化的计数或
+示例列表放入身份。旧 gap_map 没有 `Key` 时先按已知描述规则推断，无法推断
+时回退到描述匹配；命中同一 key 只更新原 G<n> 的描述/证据。`closed` gap
+仍保留在地图中，但不计入 open gap 统计，也不进入 query pack。关闭原因
+单独存放在 `Closure reason`；旧文件若把 `closed by ...` 追加在 Evidence 中，
+解析时会恢复到该字段。
+
+---
+
+## Query Pack（query_pack.md，≤8000 chars）
+
+自动生成的压缩摘要，用于 LLM idea 生成的上下文：
+
+| 段落 | 预算 | 来源 | 裁剪优先级 |
+|------|------|------|-----------|
+| 算子摘要 + 基线 | 800 chars | kernel_summary, baseline_evidence | 不裁剪 |
+| Top 5 Gaps + untried coverage | 1200 chars | gap_map.md（按 priority 排序，并保留 canonical `untried_strategies`） | **不优先裁剪** |
+| 禁忌表（失败 ideas） | 1400 chars | ideas/ 中 outcome=negative | **不优先裁剪** |
+| 关键实验 | 1800 chars | experiments/ 中 score 前 N | 可裁剪 |
+| 已验证 Claims | 900 chars | claims/ 中 status=verified | 可裁剪 |
+| 最近链路 | 500 chars | edges.jsonl 最近 10 条 | 优先裁剪 |
+
+**裁剪规则**：gaps 和禁忌表不优先裁剪（anti-repetition 价值最高）。
+
+---
+
+## 与旧 world_model.json 的对应关系
+
+| 旧字段 | 新位置 | 说明 |
+|--------|--------|------|
+| `decision_tree.nodes` | `ideas/*.md` + `experiments/*.md` | 树结构 → 扁平实体 + edges |
+| `nodes[id].status=open` | idea `stage=proposed` | |
+| `nodes[id].status=passed` | experiment `verdict=yes` | |
+| `nodes[id].status=failed` | experiment `verdict=no` | |
+| `nodes[id].score` | experiment `speedup` | |
+| `nodes[id].difficulty` | idea `difficulty` | |
+| `nodes[id].strategy_combination` | idea `strategy_tags` | |
+| `nodes[id].mode` | idea `mode` | |
+| `nodes[id].profiling_evidence` | experiment `profiling_evidence` | |
+| `nodes[id].children` | 通过 edges `inspired_by`/`derived_from` 表达 | |
+| `nodes[id].parent_id` | idea `parent_idea` / `parent_experiment` | |
+| `open_questions` | `gap_map.md` + `claims/` | 结构化替代 |
+| `stagnation_count` | `knowledge_graph.json` 中保留不变 | |
+| `best_score` | `knowledge_graph.json` 中保留不变 | |
+| `hw_params` | `knowledge_graph.json` 中保留不变 | |
+| `baseline_evidence` | `knowledge_graph.json` 中保留不变 | |
+
+---
+
+## 停滞阈值配置（不变）
+
+```
+stagnation_window = 2   // 默认值
+                        // max_rounds <= 3 → 1
+                        // max_rounds == 4 → 2
+                        // max_rounds >= 5 → 3
+
+// 双计数器共享同一阈值，任意一个触发即停止（OR 逻辑）：
+//   stagnation_count ≥ stagnation_window
+//   stagnation_count_vs_base ≥ stagnation_window
+```

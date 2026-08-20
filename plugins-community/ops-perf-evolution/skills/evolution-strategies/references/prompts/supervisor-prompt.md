@@ -40,11 +40,32 @@ Per-shape gating 分布:
   - "max_rounds_reached" — 进化轮数耗尽
   - "stagnation_window_exceeded" — 连续 N 轮无显著提升
   - "generalization_regression_on_node:{node_id}" — multi-shape 模式下 fully_passed 候选泛化退化，需 supervisor 决策
+  - "kg_stall_round:{r}" — KG stagnation_count 或 stagnation_count_vs_base 触发停滞门控
+  - "kg_profiling_driven_all_failed_round:{r}" — 本轮 profiling_driven ideas 全部 verdict=no
+  - "kg_profiling_blind_spot_round:{r}" — 深度 profiling bottleneck 为 near_optimal/balanced 且未达目标
 ）
 
 [WORLD MODEL STATE]
 {world_model_summary}
 （由 wm_ops.py summary 生成的精简概览）
+
+[KNOWLEDGE GRAPH MODE STATE]
+以下变量仅在 KG 模式填充；MCTS 模式填充 "N/A — MCTS 使用上方 WORLD MODEL STATE"：
+知识图谱摘要（由 `kg_ops.py summary` 生成）:
+{knowledge_graph_summary}
+KG query pack（≤8000 字符）:
+{query_pack}
+KG 按轮实验摘要（idea → experiment → verdict/speedup/profiling）:
+{kg_per_round_summary}
+KG 开放问题（含历史 Supervisor bottleneck）:
+{kg_open_questions}
+当前最优实验引用:
+{best_experiment_ref}
+
+KG 模式中不要臆造 MCTS node id、decision_tree 或 fully_passed 节点状态；
+请直接基于 query pack、实验和 claim 证据分析。输出仍保持下方兼容格式，
+由 `kg_ops.py supervisor` 将 `new_nodes[]` 转成 `supervisor_sourced` ideas，
+并用 parent experiment/idea 建立 provenance edges。
 
 [EVOLUTION HISTORY]
 ��尝试策略及结果（按轮次）:
@@ -101,6 +122,11 @@ Per-shape gating 分布:
 
 [OUTPUT FORMAT]
 用以下JSON格式回答（不要输出其他内容）:
+
+KG 模式仍使用与 MCTS 相同的 `new_nodes[]` 字段形状；不要增加
+decision-tree 专有字段。KG 编排器会把每个 node 的 description、
+strategy_combination、mode、optimization_type、difficulty、rationale
+映射为一个 idea，并把 `analysis.bottleneck` 记录到开放问题。
 
 {
   "verdict": "continue" 或 "terminate",

@@ -38,6 +38,15 @@ from report_session_stats import (
     build_resource_stats_section,
 )
 
+# KG mode shares the existing report renderer through a small adapter below.
+# Keep the import path relative to this plugin so the CLI remains cwd
+# independent, just like the world-model scripts.
+_WORLD_MODEL_SCRIPT_DIR = Path(__file__).resolve().parents[2] / "evolution-world-model" / "scripts"
+if str(_WORLD_MODEL_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_WORLD_MODEL_SCRIPT_DIR))
+from kg_ops import detect_mode  # noqa: E402
+from kg_wiki import load_claims, load_experiments, load_ideas  # noqa: E402
+
 LOGGER = logging.getLogger(__name__)
 
 # 数据输出专用 logger：报告输出路径等 CLI 结果走 stdout（agent 调用协议通道），
@@ -109,6 +118,122 @@ def load_json(path: str) -> dict | None:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return None
+
+
+def _normalise_ref(value: str | None, prefix: str) -> str | None:
+    """Normalize an entity reference to the report model's namespaced ID."""
+    if not value:
+        return None
+    value = str(value)
+    return value if value.startswith(f"{prefix}:") else f"{prefix}:{value}"
+
+
+def _kg_to_report_model(output_dir: str, kg_data: dict) -> dict:
+    """Map Idea→Experiment→Claim entities to the legacy renderer shape.
+
+    The HTML template is intentionally shared by both modes.  Ideas become
+    branch nodes and experiments become scored leaves with ``solution_ref``;
+    claims are retained as metadata for the summary/diagnostic consumers.
+    """
+    ideas = load_ideas(output_dir)
+    experiments = load_experiments(output_dir)
+    claims = load_claims(output_dir)
+    nodes: dict[str, dict] = {
+        "root": {
+            "id": "root",
+            "score": 1.0,
+            "strategy_combination": [],
+            "description": "KG baseline",
+            "children": [],
+            "status": "passed",
+            "mode": "root",
+        }
+    }
+
+    def add_child(parent_id: str, child_id: str) -> None:
+        parent = nodes.get(parent_id)
+        if parent is None:
+            parent_id = "root"
+            parent = nodes["root"]
+        children = parent.setdefault("children", [])
+        if child_id not in children:
+            children.append(child_id)
+
+    # Ideas provide the readable branch context.  There is no deterministic
+    # utility score in KG mode, so branch nodes remain unscored until an
+    # experiment supplies evidence.
+    for slug, idea in sorted(ideas.items()):
+        nid = idea.get("node_id") or f"idea:{slug}"
+        parent_id = _normalise_ref(idea.get("parent_idea"), "idea") or "root"
+        stage = idea.get("stage", "proposed")
+        outcome = idea.get("outcome", "pending")
+        status = {"positive": "passed", "negative": "failed", "mixed": "passed"}.get(
+            outcome, "open"
+        )
+        nodes[nid] = {
+            "id": nid,
+            "mode": idea.get("mode", "strategy_guided"),
+            "strategy_combination": idea.get("strategy_tags", []) or [],
+            "description": idea.get("title", slug),
+            "optimization_type": idea.get("optimization_type", "algorithm"),
+            "difficulty": idea.get("difficulty", 3),
+            "parent_id": parent_id,
+            "status": status,
+            "outcome": outcome,
+            "stage": stage,
+            "score": None,
+            "solution_ref": None,
+            "children": [],
+        }
+        add_child(parent_id, nid)
+
+    # Experiments are the scored nodes used by all report trajectory helpers.
+    for slug, experiment in sorted(experiments.items()):
+        nid = experiment.get("node_id") or f"exp:{slug}"
+        parent_id = _normalise_ref(experiment.get("idea_id"), "idea") or "root"
+        verdict = experiment.get("verdict", "no")
+        score = experiment.get("speedup")
+        if not isinstance(score, (int, float)):
+            score = None
+        node = {
+            "id": nid,
+            "mode": "experiment",
+            "strategy_combination": [],
+            "description": experiment.get("title", slug),
+            "parent_id": parent_id,
+            "status": {"yes": "passed", "partial": "passed", "no": "failed"}.get(verdict, "failed"),
+            "verdict": verdict,
+            "score": float(score) if score is not None else None,
+            "solution_ref": experiment.get("solution_ref") or (
+                f"round_{experiment.get('round', 0)}/parallel_{experiment.get('parallel_index', 0)}"
+            ),
+            "failure_type": experiment.get("failure_type"),
+            "failure_reason": experiment.get("failure_reason"),
+            "profiling_insight": experiment.get("profiling_insight"),
+            "profiling_evidence": experiment.get("profiling_evidence"),
+            "facts": experiment.get("facts"),
+            "diagnosis": experiment.get("diagnosis"),
+            "children": [],
+        }
+        nodes[nid] = node
+        add_child(parent_id, nid)
+
+    baseline_performance = kg_data.get("baseline_performance") or {}
+    baseline_time = baseline_performance.get("time_us")
+    if not isinstance(baseline_time, (int, float)) or baseline_time <= 0:
+        time_ms = baseline_performance.get("time_ms")
+        baseline_time = float(time_ms) * 1000 if isinstance(time_ms, (int, float)) and time_ms > 0 else 0.0
+
+    # Preserve all KG metadata while exposing the fields expected by the
+    # renderer's existing helper functions.
+    report_model = dict(kg_data)
+    report_model["_kg_mode"] = True
+    report_model["_kg_baseline_performance"] = baseline_performance
+    report_model["baseline"] = {"time_us": baseline_time}
+    report_model["baseline_time_us"] = baseline_time
+    report_model["claims"] = claims
+    report_model["decision_tree"] = {"root": {"children": nodes["root"]["children"]}, "nodes": nodes}
+    return report_model
 
 
 def _normalize_lingxi_format(eval_data: dict) -> dict:
@@ -373,6 +498,32 @@ def enrich_rounds_from_world_model(rounds: list[dict], wm: dict | None, baseline
         if ref:
             ref_map[ref] = node
 
+    # A KG-only smoke/session may not materialize round_N/parallel_K folders;
+    # the experiment entities still carry the complete trajectory identity.
+    # Add those references before synthesizing renderer-compatible eval data.
+    if wm.get("_kg_mode"):
+        known_refs = {
+            f"round_{item['round']}/parallel_{item['parallel']}"
+            for item in rounds
+        }
+        for node in nodes.values():
+            ref = node.get("solution_ref")
+            match = re.fullmatch(r"round_(\d+)/parallel_(\d+)", str(ref or ""))
+            if not match or ref in known_refs:
+                continue
+            rounds.append({
+                "round": int(match.group(1)),
+                "parallel": int(match.group(2)),
+                "eval": None,
+                "impl_note": node.get("description", ""),
+                "modified_files": [],
+                "modified_files_dir": "",
+                "path": os.path.join(
+                    str(wm.get("session", {}).get("evo_dir", "")), ref
+                ),
+            })
+        rounds.sort(key=lambda item: (item["round"], item["parallel"]))
+
     for r in rounds:
         if r.get("eval"):
             continue
@@ -381,9 +532,36 @@ def enrich_rounds_from_world_model(rounds: list[dict], wm: dict | None, baseline
         if not node:
             continue
         score = node.get("score")
+        verdict = node.get("verdict")
+        if wm.get("_kg_mode"):
+            if verdict == "yes" and isinstance(score, (int, float)) and score > 0:
+                evolved_time = baseline_time / float(score)
+                pipeline = node.get("profiling_evidence") or node.get("profiling_insight") or {}
+                r["eval"] = {
+                    "compilation_success": True,
+                    "precision_passed": True,
+                    "evolved": {"time_us": round(evolved_time, 2), "pipeline": pipeline},
+                    "comparison": {"speedup": float(score)},
+                    "_source": "knowledge_graph",
+                }
+            elif verdict == "partial":
+                r["eval"] = {
+                    "compilation_success": True,
+                    "precision_passed": False,
+                    "evolved": {"time_us": round(baseline_time / float(score), 2)}
+                    if isinstance(score, (int, float)) and score > 0 else {},
+                    "_source": "knowledge_graph",
+                }
+            else:
+                r["eval"] = {
+                    "compilation_success": False,
+                    "precision_passed": False,
+                    "_source": "knowledge_graph",
+                }
+            continue
         if not score or score <= 0:
             continue
-        # Synthesize evaluation data from world model score
+        # MCTS compatibility: retain the original synthesis behavior exactly.
         evolved_time = baseline_time / score
         r["eval"] = {
             "compilation_success": True,
@@ -1837,7 +2015,16 @@ def _extract_baseline_info(baseline_eval: dict | None, wm: dict | None) -> tuple
             baseline_time = wm.get("baseline", {}).get("time_us", 0)
         if baseline_time <= 0:
             baseline_time = wm.get("baseline_time_us", 0)
-        hw_params = wm.get("hw_params", {})
+        if baseline_time <= 0 and wm.get("_kg_mode"):
+            kg_baseline = wm.get("_kg_baseline_performance", {}) or {}
+            baseline_time = kg_baseline.get("time_us", 0) or 0
+            if baseline_time <= 0:
+                time_ms = kg_baseline.get("time_ms", 0)
+                if isinstance(time_ms, (int, float)) and time_ms > 0:
+                    baseline_time = float(time_ms) * 1000
+        hw_params = wm.get("hw_params", {}) or {}
+        if not isinstance(hw_params, dict):
+            hw_params = {}
         if not test_case:
             test_case = wm.get("test_case", {})
     return baseline_time, test_case, hw_params, eval_info
@@ -2046,7 +2233,7 @@ def _parse_round_timing_safe(output_dir: str) -> dict:
 
 
 def _load_report_inputs(args, output_dir: str) -> tuple:
-    """加载报告输入数据：baseline_eval / world_model / 输出目录名解析。
+    """加载报告输入数据：baseline_eval / model / 输出目录名解析。
 
     输入缺失时返回 None（由 main 统一退出）。
     """
@@ -2055,9 +2242,13 @@ def _load_report_inputs(args, output_dir: str) -> tuple:
     if args.pipeline and args.pipeline != "ops-evo":
         pipeline_type = args.pipeline
     baseline_eval = load_json(os.path.join(output_dir, "baseline_evaluation.json"))
-    wm = load_json(os.path.join(output_dir, "world_model_final.json"))
-    if not wm:
-        wm = load_json(os.path.join(output_dir, "world_model.json"))
+    if detect_mode(output_dir) == "kg":
+        kg_data = load_json(os.path.join(output_dir, "knowledge_graph.json"))
+        wm = _kg_to_report_model(output_dir, kg_data) if kg_data else None
+    else:
+        wm = load_json(os.path.join(output_dir, "world_model_final.json"))
+        if not wm:
+            wm = load_json(os.path.join(output_dir, "world_model.json"))
 
     if not baseline_eval and not wm:
         return None
@@ -2202,7 +2393,10 @@ def main():
 
     ri = _resolve_inputs_and_test_case(args, output_dir)
     if ri is None:
-        LOGGER.error("Error: neither baseline_evaluation.json nor world_model_final.json found")
+        LOGGER.error(
+            "Error: no report input found (expected baseline_evaluation.json, "
+            "world_model*.json, or knowledge_graph.json)"
+        )
         sys.exit(2)
 
     rounds, best_variant, best_path, wm_best_score = _collect_and_enrich_rounds(

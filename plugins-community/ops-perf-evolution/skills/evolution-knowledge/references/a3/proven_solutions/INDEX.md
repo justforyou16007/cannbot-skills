@@ -52,11 +52,14 @@ Each entry should follow this template:
 | conv-transpose / deconv (stride=1, 固定开销主导) | X29: Shift-Free Tap-Comb 稠密直算 | 10_ConvTranspose2d evolution |
 | attention (物化式 MHA/MQA/GQA) | X30: 头维-minor Q 布局免 heads-merge kernel | 22_MultiQueryAttention evolution |
 | attention (GQA prefill) | X33: workspace-ring 握手延迟 bound 的 Q-tile 放大 + 投影 GEMM group A-reuse | 21_GroupedQueryAttention evolution |
+| attention (GQA prefill，shape-band 分派) | shape-band host 分派（small 两遍 softmax / medium BQ=64 / large BQ=64-128）+ X33/X45/X46 组合 | 21_GroupedQueryAttention evolution round_1-3 |
 | attention (block-sparse GQA prefill) | 单遍 flash-attention 融合（MIX_AIC_1_2 + P137 紧凑 gather + P hi/lo 双平面） | 80_GqaSparseFwd evolution |
 | softmax (logits 有界) | X31: bounded logits softmax 去 max 减法 | 22_MultiQueryAttention evolution |
 | ssm / GLA / linear-attention (chunked 输出阶段) | X34: GLA 输出阶段 Cube CV 融合重写（MIX_AIC_1_1 + hilo 精度分裂） | ChunkGlaFwdKernelO evolution |
 | deconv, conv (col2im 散射) | X34: Col2im 相位化行归约 | 10_ConvTranspose2d evolution |
 | host-bound 算子（大 workspace 全写） | X39: host 侧全写 workspace 免零初始化（at::empty + 动态 blockDim） | 80_GqaSparseFwd evolution |
+| attention (FA/GQA，wrapper 布局转换开销大) | X47: BSH/BSND-direct 布局直通（strided GM load/store 消除 wrapper permute+contiguous） | FusedInferAttentionScore evolution |
+| attention (N=1 matvec 链：通道/空间/polarized) | X58: N=1 matvec 链归约突破（多相位拆分 + RA 二叉树 ReduceSum + Broadcast 消标量 + PipeBarrier 松弛） | 57_ParallelPolarizedSelfAttention evolution |
 
 _新方案沉淀时按此格式追加行_
 
@@ -589,9 +592,9 @@ full chunk AIC 直读 GM），host op→0，小 case 近翻倍。AIC_ONLY 变体
 
 **Strategy IDs**: P94, P56, P26, X34（OKF 卡 disc_X34）
 
-| 路由/多分支选择 | X35: 路由选中分支消除 | AdaptiveAttention evolution |
+| 路由/多分支选择 | X42: 路由选中分支消除 | AdaptiveAttention evolution |
 
-### X35: 路由选中分支消除（selected-option elimination）
+### X42: 路由选中分支消除（selected-option elimination）
 
 **Source**: AdaptiveAttention evolution, round 1, parallel 2
 **Speedup**: 0.187x → 0.449x geomean (2.40x improvement)，大 shape 5-7.6x
@@ -618,7 +621,7 @@ int64_t opt[B];  // host D2H 读 sel 后 argmax 每 batch 的 option
 - router 代价 << 被跳过分支代价；分支权重可切块寻址
 - 小 shape 下 host D2H 同步开销可能吃收益（评估 threshold）
 
-**Strategy IDs**: X35（OKF 卡 disc_X35，与 X30/X33 正交）
+**Strategy IDs**: X42（OKF 卡 disc_X42，与 X30/X33 正交）
 
 | 向量模拟→Cube 全量重写 | X37: fp32 Cube mmad 替代向量模拟 matmul | LongformerAttention evolution |
 
@@ -689,3 +692,217 @@ pmat.IterateAll();                            // AIC 执行，coreIdx 步进覆�
 - 保留 k0 独立 kernel：分页 gather 需标量索引，折入 AIV 会引入每 task 一次 K/V 握手
 
 **Strategy IDs**: P115, P121, P123, P137, P119, P120, A5, A4；OKF 卡 X39（host workspace 免 memset，x0 侧沉淀）
+| matmul (双 GEMM 链 FFN/QK^T+PV/SwiGLU) | X48: 链式 GEMM M-block 归属调度（第一阶段输出复用） | 2_FFN evolution |
+
+### X48: Chained GEMM M-block Ownership Scheduling (first-stage output reuse)
+
+**Source**: FFN evolution, round 1, parallel 2
+**Speedup**: 0.153x → 0.275x (+80% geomean, 22 cases)；大 shape case4 [1024,1536] 0.074→0.252 (3.4x)、case18 0.060→0.403 (6.7x)、case21 0.034→0.227 (6.5x)
+**Operator type**: matmul (两阶段 GEMM 链：FFN / QK^T+PV / SwiGLU / MoE FFN)
+**Hardware**: Ascend910B2C (DAV_2201)
+
+**Technique description**:
+朴素按 (mi,ni) 输出 tile 分任务的链式 GEMM 会把第一阶段（GEMM1）重复计算 nBlocks 次（同一 M-block 的每个 N-tile 各算一遍 GEMM1+激活）。改为 M-block 归属调度：每核 group 独占其 M-block 的全部 N-tile，GEMM1 每 M-block 只算一次、中间结果 h 在 group 内复用，GEMM2 循环遍历本 group 的 ni。nBlocks 越大收益越大（FFN nBlocks=32 → 0.018x 病态慢被消除）。
+
+**Key code change**:
+```cpp
+// Before: 每个 (mi,ni) tile 独立执行完整串行链 GEMM1→act→GEMM2
+for (tile : allTiles) {           // tile=(mi,ni)
+    GEMM1(x@W1 全N1 -> ws1);      // 对同一 mi 重复 nBlocks 次
+    act(ws1 -> ws2);              // 重复 nBlocks 次
+    GEMM2(ws2@W2[:,ni] -> out);
+}
+// After: M-block 归属，GEMM1 每 mi 只算一次
+// BlockScheduler: mBlocks round-robin 分给 groups，group 独占其 mi 的全部 nBlocks 个 ni
+for (group owns mi) {
+    GEMM1(x@W1 全N1 -> ws1);      // 每个 mi 只算一次
+    act(ws1 -> ws2);              // 每个 mi 只算一次
+    for (ni in group) { GEMM2(ws2@W2[:,ni] -> out); }
+}
+// usedCoreNum = min(核数, mBlocks)
+```
+
+**Applicability conditions**:
+- 两阶段 GEMM 链（第一阶段输出被第二阶段多个 N-tile 消费）
+- 大 N1（nBlocks≥16）时收益最大；小 M（mBlocks<核数）时核利用受限
+- 与 host 固定开销消除（X35/X39）正交；中间结果仍经 GM workspace 时可再叠加 P53/P78 片上链式
+- glu 变体注意 gate/up 双段读取逻辑
+
+**Strategy IDs**: X48
+
+| matmul (双 GEMM 链 FFN/QK^T+PV，小 M 大 N2) | X49: 两阶段 GEMM 跨核生产/消费切分（N-split stage-split + GM-volatile flag） | 2_FFN evolution |
+
+### X49: Two-stage GEMM cross-core producer/consumer split (N-split + GM-volatile flag)
+
+**Source**: FFN evolution, round 2, parallel 2
+**Speedup**: 0.275x → 0.475x (+44% vs round1 最优)；case0 [128,1024] 0.626x（父 0.323，+94%）、case1 [256,2048] 0.321x（父 0.101，+218%）
+**Operator type**: matmul（两阶段 GEMM 链：FFN / QK^T+PV / SwiGLU）
+**Hardware**: Ascend910B2C (DAV_2201)
+
+**Technique description**:
+阶段一（GEMM1）按 M-block 归属（X48）时并行度受 mBlocks 限制（小 M 大 N2 仅 4-8 核工作）。N-split stage-split：生产者核切 K2 成 P 片各产 h 片（GEMM1→act→写 GM），写后 GM volatile flag 广播（release）；消费者全核 G=min(24,nBlocks) 各领 N2 列块轮询 flag（acquire）后做 GEMM2。模式选择：nBlocks>mBlocks 走 N-split，否则 M-block 归属保底。
+
+**Key code change**:
+```cpp
+// Producer (core < P): K2 切片产 h
+GEMM1(x[mi]@W1[:,slice]) -> ws1; act -> h[mi][slice];
+PipeBarrier<PIPE_ALL>; flag[mi][p] = 1;   // release (GM volatile)
+// Consumer (all G cores): 轮询 flag 后做 GEMM2
+AIV: wait flag[mi][0..P) all 1 (GM volatile acquire);
+AIC: GEMM2(h[mi]@W2[:,R_c]) -> out;
+// host 模式选择: schedMode = (nBlocks > mBlocks) ? 1 : 0; G = min(24, nBlocks)
+```
+
+**Applicability conditions**:
+- 两阶段 GEMM 链阶段一为并行度瓶颈（mBlocks < 核数）
+- 已有 X48 M-block 归属但仍核空转时升级
+- flag workspace 必须零初始化（at::zeros，防垃圾 1 误判）；910B2C 无 GM 原子用 volatile flag
+- 与带宽路径（P92/P93）正交；后续可加跨 mi 软件流水（P20）
+
+**Strategy IDs**: X49
+
+
+
+### Shape-band host dispatch for GQA prefill attention (small two-pass / medium BQ=64 / large BQ=64-128)
+
+**Source**: 21_GroupedQueryAttention evolution, rounds 1-3 (round_1/parallel_0-2, round_2/parallel_0-2, round_3/parallel_0-2)
+**Speedup**: baseline full-50 0.816x → best 0.97x (torch.npu.Event basis; band-level: large fp32 0.629→0.928, bf16 medium 0.755→1.005, fp32 medium 0.601→0.627, +4-13% projection GEMM A/B). Precision 50/50 PASS all variants.
+**Operator type**: attention (GQA prefill, fused QKV/out projection)
+**Hardware**: Ascend 910B2C (DAV_2201), MIX AIC/AIV
+
+**Technique description**:
+Host-side shape-band dispatch routes each seq band to a dedicated attention kernel structure, each tuned for its S-regime bottleneck:
+- **small (seq<64)**: two-pass softmax — S=QK^T fits entirely in UB, AIC computes ALL QK^T → sync once → AIV softmax ALL → sync once → AIC computes ALL PV. Only 2 cross-engine syncs vs 2×task-num for per-task workspace-ring handshake (kills aic_scalar=0.46 root cause). Neutral in practice (small shapes are host-launch-bound, attention kernel only 10-15us of ~85us total).
+- **medium (64<=seq<200)**: BQ=64 attention (X33 Q-tile amplification halves AIC↔AIV handshakes) + native fp32 single-pass (X46) + projection GEMM by-group A-reuse (GROUP_BY=6, A over-read 63x→11x).
+- **large (seq>=200)**: BQ=64→128 deep-pipelined online softmax (QK^T(task+1) ahead of PV(task)), Q L1-resident, native fp32 single-pass (X46), P chunked PV stream.
+- Cross-cutting: X45 mNum-adaptive bf16 projection GEMM hybrid (full-K WS only when mNum>MGROUP) fixed the bf16 medium valley; host data-path elimination (X52: single-pass strided-gather transpose + conditional at::empty + mask cache).
+
+**Key code change**:
+```cpp
+// host dispatch (grouped_query_attention.cpp) — shape-band routing
+if (isFp32 && S < 64)      LaunchAttentionSmallBand(...);   // two-pass softmax, 2 syncs
+else if (isFp32 && S < 200) LaunchAttentionFp32SingleMed(...); // BQ=64 + native fp32
+else if (isFp32 && S >= 200) LaunchAttentionFp32Large(...);    // BQ=64/128 deep pipeline
+else if (!isFp32 && 64<=S && S<200 && tasks>=24)
+                           LaunchAttentionFp16Bf16Med(...);   // BQ=64 medium
+else                       LaunchAttentionFp16/Bf16/Fp32(...); // baseline paths
+```
+
+**Applicability conditions**:
+- GQA/FA prefill attention where the S (seq) range spans orders of magnitude (3-897 here) and each S-regime has a different bottleneck (small: host-bound; medium: handshake-bound + projection floor; large: deep pipeline + native fp32)
+- Host dispatch cost ≈ 0 (one branch, analogous to dtype dispatch)
+- Requires: X33 Q-tile template parameterization, X46 native fp32 (no SetHF32Mode), X45 mNum-adaptive GEMM hybrid, X28/X38 small-S KV chunk
+- Precision guard: conditional at::empty only when no K-padding (Dm%64==0 / hd==Dp), else at::zeros (0*NaN=NaN)
+
+**Strategy IDs**: X28, X33, X38, X45, X46, X52
+
+### X56: STRIDE-SPARSE residue-block Cube attention（stride-mask 按 residue 分组只算有效列）
+
+**Source**: 25_StridedAttention evolution, round 1, parallel 2 (x0, open_exploration)
+**Speedup**: 10-case geomean 0.586x → 0.811x vs PyTorch (+38%), 10/10 precision PASS. fp16 大 case 0.269→0.692 / 0.471→0.686, bf16 0.211→0.568 / 0.140→0.417.
+**Operator type**: attention (stride-mask self-attention, MHA)
+**Hardware**: Ascend 910B2C (DAV_2201), MIX AIC/AIV
+
+**Technique description**:
+stride-mask attention 的 mask `score[i,j]` 有限 iff `i%stride==j%stride`，每个 query 行只需自己 residue class 的 Srmax=ceil(S/stride) 个 key。把 attention task 从 `(b,h,query-block)` 重组织为 `(b,h,residue,query-block)`，QK^T/softmax/PV 宽度从 S_pad 收窄到 Srmax16（stride 倍缩减）：Q/V 走 strided 2D block load（行 stride `stride*HDP16`）免 host 重排；fp32 K^T host residue-grouped 到 `[B,H,HDP16,stride*Srmax16]`；per-residue padding mask 替代全 stride×S_pad mask 表；bf16 大 case 从 O(S²) vector attention 切到 Cube attention（P hi/lo 拆分保精度）。
+
+**Key code change**:
+```cpp
+// host tiling (strided_attention.cpp) — residue-block attention
+const int64_t Srmax = CeilDiv(S, stride);          // valid keys per row
+const int64_t Srmax16 = CeilDiv(Srmax, 16) * 16;
+const int64_t S_padA = stride * Srmax16;           // all residue rows in-bounds
+// K^T host residue-grouped (fp32): [B,H,S_pad,HDP16] -> [B,H,HDP16,stride*Srmax16]
+// attention task = (b, h, residue r, query-block), width = Srmax16
+// write-back: sOrig = sl * stride + r
+```
+
+**Applicability conditions**:
+- stride-mask attention（每行仅 1/stride 列有效），stride>=2
+- attention 核心（QK^T/softmax/PV）是大 case 瓶颈、Cube 已建成（P120）
+- bf16 大 case 还在 O(S²) vector attention 时切 Cube + P hi/lo 保精度
+- 与 P123（causal KV skip 循环界裁剪）互补：X56 是重排分组后只算有效列
+
+**Strategy IDs**: X56, P120, P123
+
+### attn+outproj 单 kernel 链融合（SyncAll 分隔）+ native proj BLOCK_M 64 头合并 GEMM
+
+**Source**: 25_StridedAttention evolution, round_1/parallel_2 (x0, open_exploration)
+**Speedup**: 10-case geomean 0.5975x → 0.9237x vs PyTorch (+55%), 10/10 precision PASS. fp32 大 case 0.242→0.375 / 0.293→0.473, fp16 0.274→0.695 / 0.465→0.707, bf16 0.214→0.579 / 0.141→0.419.
+**Operator type**: attention (stride-mask self-attention, MHA)
+**Hardware**: Ascend 910B2C (DAV_2201), MIX AIC/AIV
+
+**Technique description**:
+MIX attention（AIC QK^T/PV + AIV softmax）与 cube outproj 两个串行 kernel 融合为单 kernel：Phase 1 MIX 写 attn [padM,Dp] → SyncAll<true> GM grid barrier → Phase 2 AIC outproj 直接读 attn 写 out [M,D]，L0A/L0B/L0C 两阶段共享。消除 1 launch + attn GM 往返 + host outF32->out copy。配套 native proj BLOCK_M 16→64 头合并 GEMM（task=(b,p,M-chunk)，x M-slice 跨 nH head 复用，x 流量 B*H*3*S*D→B*3*(H/nH)*S*D，cube 利用率 ~2→14 TFLOPs），bf16 切 MIX cube（P hi/lo 拆分保精度）。
+
+**Key code change**:
+```cpp
+// 单 kernel 链融合: Phase1 MIX attention -> SyncAll -> Phase2 AIC outproj
+// (sa_attn_outproj_cube_fp32.cpp)
+// Phase 2 outproj 直写 out [M,D] (dstStride=D, nSize clamp, D%16==0)
+FixpipeParamsV220 fp; fp.nSize = D - n0; fp.mSize = remM; fp.dstStride = D;
+```
+
+**Applicability conditions**:
+- MIX attention + cube outproj 融合算子（FA/GQA/MLA 大 case）
+- native 投影 BLOCK_M 小（16）导致 cube 利用率低（~2 TFLOPs vs 参考 ~14 TFLOPs）
+- SyncAll 需验证目标平台可用且不 deadlock（910B2C 已验证）
+- ⚠️ 注意：x0 全量 50-case 精度 48/50（fp32 stride>=4 大 case MERE 0.04/0.06 fail），交付需先验证全量精度
+
+**Strategy IDs**: X57, X50, X56, X44
+
+### shape-keyed 权重 pad 缓存 + fp16/bf16 workspace at::empty（X52 深化）
+
+**Source**: 25_StridedAttention evolution, round_1/parallel_1 (n2, X52/X39/P54)
+**Speedup**: 10-case geomean 0.5975x → 0.9121x vs PyTorch (+53%), 50-case 精度 50/50 PASS, 50-case 性能 ~0.75x. fp32 [2,157,864] 1005→669us、[2,383,1472] 1998→1233us.
+**Operator type**: attention (stride-mask self-attention, MHA)
+**Hardware**: Ascend 910B2C (DAV_2201)
+
+**Technique description**:
+host 数据通路消除深化：wqT/wkT/wvT/woP 权重 pad（transpose+per-head pad copy）是 (weight, D, H, HD, HDP16, Dp) 的纯函数，eval 中权重跨调用恒定 → shape-keyed 单槽 memo 缓存（(data_ptr+shape+dtype+device) key），每次 forward 省 ~12（fp32）/~10（fp16/bf16）个 host kernel。配 fp16/bf16 workspace at::empty（HDP==HD 守卫，kernel Fixpipe 已写满全部区域时安全）。
+
+**Key code change**:
+```cpp
+// 单槽权重缓存（op_host/strided_attention.cpp）
+static std::unordered_map<size_t, at::Tensor> g_weightCache;
+auto key = hash(data_ptr, D, H, HD, HDP16, Dp, dtype, device);
+if (!g_weightCache.count(key)) {
+    g_weightCache[key] = PadWeightGather(w);  // 单次 strided gather 替代 H 次 slice copy
+}
+// 缓存项持有 wRef 强引用防 data_ptr 复用
+```
+
+**Applicability conditions**:
+- 融合 attention 管线 host 侧有重复权重 pad/transpose（eval/部署中权重恒定）
+- fp16/bf16 大 case workspace 大（~4MB each）且 HDP==HD（无 pad 列）时 at::empty 安全
+- ⚠️ fp32 在-device K^T 转置（col-major nN→zN）在 910B2C 确认损坏（max_diff 40），host transpose 是唯一可靠路径
+
+**Strategy IDs**: X52, X39, P54
+
+### X58: N=1 matvec 链归约 Vector 管道突破（57_ParallelPolarizedSelfAttention）
+
+**Source**: 57_ParallelPolarizedSelfAttention evolution, round_5/parallel_0 (r5a)，突破链 x0→x0b→r3b→r4b→r5a
+**Speedup**: 0.3225x → 1.1148x vs PyTorch (3.46× improvement; 全量 50-case，49/50 valid，精度 PASS)
+**Operator type**: attention / N=1 matvec 链（通道+空间 self-attention），纯 Vector 管道、Cube M=1/N=1 不可用
+**Hardware**: Ascend910B2C (DAV_2201)
+
+**Technique description**:
+N=1 matvec 链注意力（每输出元素 = 权重逐元素乘加链）曾长期被判"1.0x 物理不可达"（matvec 归约架构限制）。四杠杆组合推翻该判断：① **多相位链拆分**（7-phase 消除 gN 倍冗余链重算 + n-split 只读自己 n-slice 消冗余全 X 读）；② **RA 二叉树 ReduceSum**（串行 Add 依赖链 O(S) → 对半 log-depth 树归约）；③ **Broadcast 消灭 GetValue 标量广播**（S-pipe 标量读 → 向量 Broadcast/Duplicate）；④ **PipeBarrier 松弛**（PIPE_ALL→PIPE_V，BroadTile 自带 PIPE_V 时释放 MTE2 X-prefetch 与 V 计算重叠）。叠加 fp16 X 数据路径 + 链 weight tile 双缓冲。
+
+**Key code change**:
+```cpp
+// Before：每 Pass 后 PipeBarrier<PIPE_ALL> + 逐元素 GetValue 标量读 + 串行 Add 链
+PipeBarrier<PIPE_ALL>();
+for (i...) { acc = Adds(acc, xLocal.GetValue(i)*wLocal.GetValue(i), n); }
+
+// After（r5a）：7-phase 拆分 + RA 二叉树 ReduceSum + Broadcast/Duplicate（P99）
+//             + PipeBarrier<PIPE_V>（MTE2 预取与 V 计算重叠）+ fp16 X 路径 + 链 weight 双缓冲
+```
+
+**Applicability conditions**:
+- N=1 matvec 链注意力/归约算子（通道/空间/polarized attention），Vector 管道 bound、Cube 不可用
+- profiling：vector_pipe 主导 + scalar_loading/scalar_compute 次高、mte2 未饱和
+- ⚠️ ColReduceAllRA（带 WholeReduceSum）在 vector-bound kernel +0.9% 回归，用 Level-2/对半树形态
+- ⚠️ 勿重复失败方向：host transpose 权重链、64-granularity c2-split、运行时自适应 X-tile
+
+**Strategy IDs**: X58（关联 P99/P94/P95；与 [[disc_X54]] 全宽归约、[[disc_X25]] 向量权重广播互补）

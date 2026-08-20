@@ -136,3 +136,5 @@ Step 5: all 5 grep checks passed
 - p 只减 tile max → 大 score 溢出 inf。
 - 全 mask 行不兜底 → NaN 输出。
 - 只改 softmax 不改 K/V 加载 → K 仍读两遍，账面收益拿不到。
+- **状态/临时 buffer 别名复用**（3_FusionAttention 实测静默精度杀手）：`chunkMax`/`chunkSum`/`scaleRow`(alpha)/`rowMaxTile` 必须是**各自独立的 TBuf**。形如 `LocalTensor<float> chunkMax = scaleRow;` 的别名，在纯 AIV 两趟时序下可能侥幸正确，一旦与 Cube 流水（QK^T/PV 在片内穿插）共存，ReduceMax 的输出会被后续 Sub/Exp 覆写，max/sum 全错且不报任何运行时错误。Step 5 自检补充：`grep -nE "LocalTensor<float>\\s+\\w+\\s*=\\s*\\w+;" op_kernel/*.cpp` 结果中不得出现状态 buffer 相互赋值。
+- **PV 上 Cube 时 p 必须 Cast 回输入 dtype**：Exp 后 p 是 fp32 UB 张量，若 PV 走 Cube mmad（P120/X60 路线），A 操作数需 Cast 回 half/bf16（`RoundMode::CAST_RINT`）再 `SetTensorA`；fp32 输入则直接用 fp32 Cube（X44/X46）。漏掉这步要么编译期类型不匹配，要么把 fp32 位模式当 fp16 读。

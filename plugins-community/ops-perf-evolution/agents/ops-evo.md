@@ -39,7 +39,7 @@ Supervisor/world-model 协议。
 2. **双模式证据存储**: 新会话使用 Idea → Experiment → Claim 知识图谱；已有 world_model.json 的会话保持 MCTS 兼容
 3. **证据驱动选择**: KG 使用 query pack + LLM jury 审阅候选，MCTS 会话保持旧协议
 4. **Worktree 隔离并行**: 每个变体在独立 git worktree 中构建，避免 build/ 目录冲突
-5. **Session 级设备绑定**: 整个进化生命周期绑定同一张 NPU 卡，评估通过 eval lock 串行排队
+5. **Session 级设备组绑定**: 整个进化生命周期绑定同一组本机 NPU，case 在卡间分片，候选评估通过 eval lock 串行排队
 6. **子 agent 全流程执行**: ops-partial 负责改代码+构建+评估，主 agent 只做调度和证据更新
 7. **兜底机制**: KG 入口或兼容状态检查失败时清晰报告；MCTS 存量会话保持原有回退
 
@@ -123,7 +123,9 @@ Supervisor/world-model 协议。
   - 不提供时退化为单 shape 模式（自动从仓内 benchmark/ST 脚本扣一组）
   - 提供示例：`[{"name":"T1","inputs":[{"name":"x","shape":[2,4096,5120],"dtype":"float16"}],"scalar_args":{"epsilon":1e-5}}, {"name":"T2",...}]`
 - **generalization_shapes** (可选): 泛化保护 shape 列表（schema 同 target_shapes），仅在某变体达成 fully_passed 时跑一次做兜底验证；几何平均 ≥ 1.0x 即通过。不提供时跳过泛化验证（fully_passed 即视为最终达成）
-- **停滞窗口** (可选): 连续多少轮无显著提升后提前终止（默认: 自动计算）；**设备ID** (可选): NPU设备ID（默认: 0）
+- **停滞窗口** (可选): 连续多少轮无显著提升后提前终止（默认: 自动计算）；**设备列表** (可选): 本机 NPU ID，逗号分隔（默认: `0`，如 `0,1,2,3`）
+
+> `parallel_num` 是候选生成并行数，`device_ids` 是单次评估使用的卡数，二者互不等价。多卡仅支持单节点；每个 shape 固定在同一张卡上完成 baseline/evolved 对比。
 
 > **shape 命名约束**：每个 shape 的 `name` 必须在 target_shapes / generalization_shapes 全集内**唯一**，建议短 id 风格（如 `T1`/`G1`），避免冗长名（影响进度展示和报告可读性）。重名时 evaluate 入口直接 raise。
 
@@ -171,35 +173,40 @@ fi
 
 #### 2.1 Session 级设备绑定 + 路径锚定
 
-**关键原则**: 一个算子的整个进化生命周期（baseline + 所有轮次 evolved）绑定同一张卡，确保性能数据可比。
+**关键原则**: 一个算子的整个进化生命周期（baseline + 所有轮次 evolved）绑定同一组卡。每个 shape 固定在同一张卡上完成 baseline/evolved 对比，避免直接比较不同卡的绝对时延。
 
 ```bash
-# 创建设备池目录，同步获取 session 级设备租约（选择显存占用最低的空闲卡）
-DEVICE_POOL_DIR=$(pwd)/output/{op_name}_ops-evo_{timestamp}/device_pool
-mkdir -p $DEVICE_POOL_DIR
-SESSION_DEVICE=$(python3 plugins-community/ops-perf-evolution/skills/ops-evaluation/scripts/device_lease.py \
+# 使用共享设备池原子租用用户指定的整组卡；默认 REQUESTED_DEVICE_IDS=0
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+REQUESTED_DEVICE_IDS="{device_ids}"
+REQUESTED_DEVICE_COUNT=$(awk -F, '{print NF}' <<< "$REQUESTED_DEVICE_IDS")
+DEVICE_POOL_DIR="$(pwd)/output/.ops_evo_device_pool"
+SESSION_ID="{op_name}_ops-evo_${TIMESTAMP}"
+mkdir -p "$DEVICE_POOL_DIR"
+SESSION_DEVICES=$(python3 plugins-community/ops-perf-evolution/skills/ops-evaluation/scripts/device_lease.py \
     acquire-session --pool-dir $DEVICE_POOL_DIR --op-name {op_name} \
-    --session-id {op_name}_ops-evo_{timestamp} --timeout 60)
+    --session-id "$SESSION_ID" --device-ids "$REQUESTED_DEVICE_IDS" \
+    --count "$REQUESTED_DEVICE_COUNT" --timeout 60)
 
 # 校验获取结果
-if [ -z "$SESSION_DEVICE" ] || echo "$SESSION_DEVICE" | grep -q "ERROR"; then
-    echo "FATAL: 无法获取 NPU 设备，所有卡已被其他进化 session 占用"; exit 1
+if [ -z "$SESSION_DEVICES" ] || echo "$SESSION_DEVICES" | grep -q "ERROR"; then
+    echo "FATAL: 无法获取 NPU 设备组，请检查请求列表或其他进化 session 的租约"; exit 1
 fi
-echo "绑定设备: NPU $SESSION_DEVICE"
+echo "绑定设备组: NPU $SESSION_DEVICES"
 ```
 
 若获取失败（报 "occupied by other sessions"）：列出 `$DEVICE_POOL_DIR/session_*_lease.json`，用 `kill -0 {pid}` 检查每个租约 PID 是否存活；PID 已死则执行 `release-session --pool-dir $DEVICE_POOL_DIR --session-id {session_id}` 清理残留后重新 `acquire-session`；仍失败则报错退出。
 
-**后续所有评估命令中的 `{device_id}` 均使用 `$SESSION_DEVICE`。**
+**后续所有评估命令中的 `{device_ids}` 均使用 `$SESSION_DEVICES`。**
 
 ```bash
-EVAL_LOCK_PATH=$DEVICE_POOL_DIR/eval.lock   # 评估锁路径（供子 agent 使用）
+EVAL_LOCK_PATH="$DEVICE_POOL_DIR/eval_${SESSION_ID}.lock"  # 同一 session 的候选评估串行
 ```
 
 **Session 结束时释放设备**（在进化主循环结束后执行）:
 ```bash
 python3 plugins-community/ops-perf-evolution/skills/ops-evaluation/scripts/device_lease.py \
-    release-session --pool-dir $DEVICE_POOL_DIR --session-id {op_name}_ops-evo_{timestamp}
+    release-session --pool-dir "$DEVICE_POOL_DIR" --session-id "$SESSION_ID"
 ```
 
 如果关键检查失败，告诉用户需要修复环境并确认后再继续。
@@ -207,8 +214,8 @@ python3 plugins-community/ops-perf-evolution/skills/ops-evaluation/scripts/devic
 ### 步骤3: 准备共享文件 + 构建baseline
 
 ```bash
-# 使用 date 命令生成 timestamp，创建输出目录
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+# 复用步骤2生成的 session timestamp，创建输出目录
+: "${TIMESTAMP:?TIMESTAMP must be set in step 2}"
 EVO_DIR="$(pwd)/output/{op_name}_ops-evo_${TIMESTAMP}"
 mkdir -p "$EVO_DIR/shared"
 ```
@@ -282,12 +289,12 @@ python3 plugins-community/ops-perf-evolution/skills/ops-evaluation/scripts/evalu
     --call-spec $(pwd)/output/{op_name}_ops-evo_{timestamp}/shared/call_spec.json \
     --baseline-path $(pwd)/output/{op_name}_ops-evo_{timestamp}/baseline \
     --evolved-path $(pwd)/output/{op_name}_ops-evo_{timestamp}/baseline \
-    --device-id $SESSION_DEVICE --task-type {task_type} --shapes-mode all \
+    --device-ids "$SESSION_DEVICES" --task-type {task_type} --shapes-mode all \
     --target-speedup {target_speedup} \
     --output $(pwd)/output/{op_name}_ops-evo_{timestamp}/baseline_evaluation.json
 ```
 
-> **multi-shape 字段**：`baseline_evaluation.json` 含 `shape_results.target` / `shape_results.generalization` per-shape 时间；自评模式下所有 `speedup=1.0`；单 shape call_spec 会被 normalize 成 `target_shapes=[{"name":"default",...}]`（target 长度 1，generalization 为空）。后续变体评估通过 `--baseline-cache baseline_evaluation.json` 复用 per-shape baseline 时间，`shape_results.target[*].baseline_time_us`（或旧 `baseline.time_us`）作为对比基准。
+> **multi-shape / 多卡字段**：`baseline_evaluation.json` 含 `shape_results.target` / `shape_results.generalization` per-shape 时间和 `device_id`，以及 `evaluation_topology.case_assignment`；自评模式下所有 `speedup=1.0`。单 shape call_spec 会被 normalize 成 `target_shapes=[{"name":"default",...}]`。后续变体通过 `--baseline-cache` 复用时必须保持相同设备映射，否则 evaluator 自动放弃缓存并重新采集。
 
 **[注意] 基线测量一致性约束（MUST）**:
 
@@ -499,7 +506,7 @@ python3 plugins-community/ops-perf-evolution/skills/ops-evaluation/scripts/workt
 
 在同一条消息中启动所有 ops-partial；每个调用显式传 subagent_type="ops-partial"、description、run_in_background=true、prompt，且不传 name。KG prompt 使用 idea slug、thesis、strategy tags、target gaps、父实验和 query pack 摘要；MCTS prompt 使用旧流程的方向与父实现上下文。两种模式都必须保持接口不变，先实现可编译内核，再执行编译、精度和性能评估。同轮变体方向应互斥。
 
-ops-partial prompt 模板仍读取 `plugins-community/ops-perf-evolution/skills/evolution-strategies/references/prompts/ops-partial-prompt.md`。必须填充 worktree_base、OP_PATH_RELATIVE、z_search_root、session_device_id、eval_lock_path、baseline_cache_path，以及 idea_id（KG）或 node_id（MCTS）、direction、strategy tags、parent_solution_ref、best_solution_ref、other_variants_summary。KG 的 Profiling Context 从 `knowledge_graph.json.baseline_evidence`、父 experiment 和 query pack 提取；MCTS 继续从 world_model 与 baseline_evaluation 提取，缺失时填 N/A。
+ops-partial prompt 模板仍读取 `plugins-community/ops-perf-evolution/skills/evolution-strategies/references/prompts/ops-partial-prompt.md`。必须填充 worktree_base、OP_PATH_RELATIVE、z_search_root、session_device_ids、eval_lock_path、baseline_cache_path，以及 idea_id（KG）或 node_id（MCTS）、direction、strategy tags、parent_solution_ref、best_solution_ref、other_variants_summary。KG 的 Profiling Context 从 `knowledge_graph.json.baseline_evidence`、父 experiment 和 query pack 提取；MCTS 继续从 world_model 与 baseline_evaluation 提取，缺失时填 N/A。
 
 Multi-shape 评估规则保持不变：strategy tags 含 `P-ShapeSpec-01` 时填 `shapes_mode=target`，否则填 `shapes_mode=all`，并传入 target_speedup。所有变体仍必须通过 `--eval-lock` 排队；构建失败、评估超时和 worktree 清理失败必须记录到对应变体，不得跳过 `evaluation_results.json`。
 

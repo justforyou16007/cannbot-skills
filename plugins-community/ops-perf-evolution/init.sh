@@ -616,15 +616,15 @@ echo ""
 echo -e "  ${BOLD}Quick Start:${NC}"
 if [ "$TOOL" = "opencode" ]; then
   echo -e "  ${CYAN}1.${NC} 启动 CLI: ${GREEN}opencode${NC}"
-  echo -e "  ${CYAN}2.${NC} 输入需求: ${GREEN}${BOLD}对基线内核进行进化优化，npu=0，基线内核路径为 /path/to/baseline/kernel/，目标加速比 3x，进化轮数 3，并行数 5${NC}"
+  echo -e "  ${CYAN}2.${NC} 输入需求: ${GREEN}${BOLD}对基线内核进行进化优化，npu=0,1,2,3，基线内核路径为 /path/to/baseline/kernel/，目标加速比 3x，进化轮数 3，并行数 5${NC}"
 elif [ "$TOOL" = "trae" ]; then
   echo -e "  ${CYAN}1.${NC} 通过 CLI/IDE 启动${NC}"
-  echo -e "  ${CYAN}2.${NC} 输入需求: ${GREEN}${BOLD}对基线内核进行进化优化，npu=0，基线内核路径为 /path/to/baseline/kernel/，目标加速比 3x，进化轮数 3，并行数 5${NC}"
+  echo -e "  ${CYAN}2.${NC} 输入需求: ${GREEN}${BOLD}对基线内核进行进化优化，npu=0,1,2,3，基线内核路径为 /path/to/baseline/kernel/，目标加速比 3x，进化轮数 3，并行数 5${NC}"
 elif [ "$TOOL" = "cursor" ]; then
   echo -e "  ${CYAN}1.${NC} 启动 Cursor IDE"
-  echo -e "  ${CYAN}2.${NC} 输入需求: ${GREEN}${BOLD}对基线内核进行进化优化，npu=0，基线内核路径为 /path/to/baseline/kernel/，目标加速比 3x，进化轮数 3，并行数 5${NC}"
+  echo -e "  ${CYAN}2.${NC} 输入需求: ${GREEN}${BOLD}对基线内核进行进化优化，npu=0,1,2,3，基线内核路径为 /path/to/baseline/kernel/，目标加速比 3x，进化轮数 3，并行数 5${NC}"
 else
   echo -e "  ${CYAN}1.${NC} 启动 CLI: ${GREEN}claude${NC}"
-  echo -e "  ${CYAN}2.${NC} 输入需求: ${GREEN}${BOLD}对基线内核进行进化优化，npu=0，基线内核路径为 /path/to/baseline/kernel/，目标加速比 3x，进化轮数 3，并行数 5${NC}"
+  echo -e "  ${CYAN}2.${NC} 输入需求: ${GREEN}${BOLD}对基线内核进行进化优化，npu=0,1,2,3，基线内核路径为 /path/to/baseline/kernel/，目标加速比 3x，进化轮数 3，并行数 5${NC}"
 fi
 echo ""

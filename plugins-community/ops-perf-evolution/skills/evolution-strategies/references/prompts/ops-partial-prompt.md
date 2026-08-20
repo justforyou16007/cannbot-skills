@@ -186,7 +186,7 @@ Steps:
    - `modified_files/*.cpp, *.h` — 改过的算子源码（保持原始相对结构 op_kernel/*.cpp 等）
    - `modified_files/code_changes.json` — 结构化变更摘要
 6. Apply modified files to worktree and build
-7. Evaluate with eval-lock (baseline vs evolved on bound device)
+7. Evaluate with eval-lock (case shards run on the bound local device group; each baseline/evolved pair stays on one device)
 
 Modification Constraints (STRICTLY ENFORCED):
 - op_kernel/*.cpp, *.h: Free to modify (do not change call signatures)
@@ -200,7 +200,7 @@ Worktree Op Path: {worktree_base}/round_{r}_p{p}/{OP_PATH_RELATIVE}
 Z-Search Root: {z_search_root}
 Install Path: $(pwd)/output/{op_name}_ops-evo_{timestamp}/round_{r}/parallel_{p}/evolved
 Baseline Install Path: $(pwd)/output/{op_name}_ops-evo_{timestamp}/baseline
-Device ID: {session_device_id}
+Device IDs: {session_device_ids}
 Eval Lock Path: {eval_lock_path}
 Baseline Cache: $(pwd)/output/{op_name}_ops-evo_{timestamp}/baseline_evaluation.json
 Call Spec: $(pwd)/output/{op_name}_ops-evo_{timestamp}/shared/call_spec.json

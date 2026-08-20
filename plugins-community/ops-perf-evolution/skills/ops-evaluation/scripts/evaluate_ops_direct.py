@@ -34,13 +34,14 @@ generalization_shapes）两种格式。旧格式在 normalize_call_spec 入口�
         --call-spec call_spec.json \\
         --baseline-path /path/to/baseline \\
         --evolved-path /path/to/evolved \\
-        --device-id 0 --task-type vector \\
+        --device-ids 0,1,2,3 --task-type vector \\
         --shapes-mode target \\
         --target-speedup 1.1 \\
         --output evaluation_results.json
 """
 
 import argparse
+import concurrent.futures
 import json
 import logging
 import math
@@ -50,7 +51,7 @@ import sys
 import tempfile
 import textwrap
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Optional
 
@@ -75,6 +76,48 @@ from common.eval_utils import (  # noqa: E402
     release_eval_lock as _release_eval_lock,
     detect_vendor_subdir,
 )
+
+
+def parse_device_ids(raw: Optional[str]) -> Optional[tuple[int, ...]]:
+    """Parse a comma-separated NPU list, preserving order and rejecting duplicates."""
+    if raw is None or not raw.strip():
+        return None
+
+    result = []
+    seen = set()
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            raise ValueError("device IDs 不能为空")
+        try:
+            device_id = int(token)
+        except ValueError as exc:
+            raise ValueError(f"非法 NPU device ID: {token}") from exc
+        if device_id < 0:
+            raise ValueError(f"NPU device ID 必须非负: {device_id}")
+        if device_id in seen:
+            raise ValueError(f"NPU device ID 重复: {device_id}")
+        seen.add(device_id)
+        result.append(device_id)
+    return tuple(result)
+
+
+def _effective_device_ids(device_id: int,
+                          device_ids: Optional[tuple[int, ...]]) -> tuple[int, ...]:
+    """Resolve the new device list while retaining the legacy scalar default."""
+    if device_ids:
+        return tuple(device_ids)
+    return (device_id,)
+
+
+def build_device_shards(items: list, device_ids: tuple[int, ...]) -> list[tuple[int, list]]:
+    """Round-robin items across devices; omit workers that receive no item."""
+    if not device_ids:
+        raise ValueError("至少需要一个 NPU device ID")
+    shards = {device_id: [] for device_id in device_ids}
+    for index, item in enumerate(items):
+        shards[device_ids[index % len(device_ids)]].append(item)
+    return [(device_id, shard) for device_id, shard in shards.items() if shard]
 
 
 # ============================================================
@@ -513,6 +556,7 @@ def _dscript_shape_loop(cfg: DirectVersionConfig) -> str:
 
             result = {{
                 "name": shape_name, "group": group, "tag": {repr(tag)},
+                "device_id": {cfg.device_id},
                 "precision_passed": True, "correctness_message": "",
                 "time_us": -1, "pipeline": {{}}, "bottleneck": "unknown", "cv_pct": 0.0,
             }}
@@ -543,10 +587,12 @@ def _build_direct_eval_script(cfg: DirectVersionConfig, opp_path: str,
     )
 
 
-def _direct_error_results(shape_plan: list, tag: str, error: str) -> list:
+def _direct_error_results(shape_plan: list, tag: str, error: str,
+                          device_id: Optional[int] = None) -> list:
     """为所有 shape 生成错误结果项。"""
     return [
         {"name": s["name"], "group": s["group"], "tag": tag,
+         "device_id": device_id,
          "error": error, "precision_passed": False, "time_us": -1}
         for s in shape_plan
     ]
@@ -580,12 +626,15 @@ def _run_direct_subprocess(cfg: DirectVersionConfig, script_path: str,
             cfg.tag, stdout[-1000:], proc.stderr[-1000:],
         )
         return _direct_error_results(
-            cfg.shape_plan, cfg.tag, f"子进程未输出结果: rc={proc.returncode}")
+            cfg.shape_plan, cfg.tag, f"子进程未输出结果: rc={proc.returncode}",
+            cfg.device_id)
 
     except subprocess.TimeoutExpired:
-        return _direct_error_results(cfg.shape_plan, cfg.tag, "评估超时")
+        return _direct_error_results(
+            cfg.shape_plan, cfg.tag, "评估超时", cfg.device_id)
     except Exception as e:
-        return _direct_error_results(cfg.shape_plan, cfg.tag, str(e))
+        return _direct_error_results(
+            cfg.shape_plan, cfg.tag, str(e), cfg.device_id)
 
 
 def run_single_version(cfg: DirectVersionConfig) -> list:
@@ -601,7 +650,8 @@ def run_single_version(cfg: DirectVersionConfig) -> list:
 
     if not os.path.isdir(opp_path):
         return _direct_error_results(
-            cfg.shape_plan, cfg.tag, f"OPP directory not found: {opp_path}")
+            cfg.shape_plan, cfg.tag, f"OPP directory not found: {opp_path}",
+            cfg.device_id)
 
     os.makedirs(cfg.profile_dir, exist_ok=True)
 
@@ -704,8 +754,15 @@ def merge_per_shape_results(baseline_results: list, evolved_results: list,
         group = br.get("group", "target")
         bt = br.get("time_us", -1)
         et = er.get("time_us", -1)
+        baseline_device = br.get("device_id")
+        evolved_device = er.get("device_id")
+        same_device = (
+            baseline_device is None
+            or evolved_device is None
+            or baseline_device == evolved_device
+        )
 
-        if bt > 0 and et > 0:
+        if bt > 0 and et > 0 and same_device:
             speedup = round(bt / et, 4)
         else:
             speedup = 0.0
@@ -719,6 +776,7 @@ def merge_per_shape_results(baseline_results: list, evolved_results: list,
 
         entry = {
             "name": name,
+            "device_id": evolved_device if evolved_device is not None else baseline_device,
             "baseline_time_us": bt,
             "evolved_time_us": et,
             "speedup": speedup,
@@ -728,8 +786,13 @@ def merge_per_shape_results(baseline_results: list, evolved_results: list,
             "pipeline": er.get("pipeline", {}),
             "bottleneck": er.get("bottleneck", "unknown"),
             "cv_pct": er.get("cv_pct", 0.0),
-            "compilation_success": (bt > 0 and et > 0),
+            "compilation_success": (bt > 0 and et > 0 and same_device),
         }
+        if not same_device:
+            entry["error"] = (
+                "baseline/evolved device mismatch: "
+                f"{baseline_device} != {evolved_device}"
+            )
         if "error" in er:
             entry["error"] = er.get("error")
             all_compile_ok = False
@@ -804,6 +867,7 @@ class DirectEvalConfig:
     baseline_path: str
     evolved_path: str
     device_id: int = 0
+    device_ids: Optional[tuple[int, ...]] = None
     task_type: str = "vector"
     output_path: Optional[str] = None
     num_trials: int = 50
@@ -815,7 +879,8 @@ class DirectEvalConfig:
     eval_backend: str = "default"
 
 
-def _load_baseline_shape_cache(baseline_cache: str, shape_plan: list):
+def _load_baseline_shape_cache(baseline_cache: str, shape_plan: list,
+                               expected_devices: dict[str, int]):
     """加载 per-shape baseline 缓存；覆盖全部待跑 shape 时返回结果列表，否则 None。"""
     if not baseline_cache or not os.path.isfile(baseline_cache):
         return None
@@ -829,6 +894,7 @@ def _load_baseline_shape_cache(baseline_cache: str, shape_plan: list):
                 cached_baseline.append({
                     "name": r["name"], "group": grp, "tag": "baseline",
                     "time_us": r.get("baseline_time_us", -1),
+                    "device_id": r.get("device_id"),
                     "precision_passed": r.get("baseline_precision_passed", True),
                     "pipeline": {}, "bottleneck": "unknown", "cv_pct": 0.0,
                 })
@@ -837,6 +903,20 @@ def _load_baseline_shape_cache(baseline_cache: str, shape_plan: list):
         need_names = {s["name"] for s in shape_plan}
         if cached_names >= need_names:
             baseline_results = [r for r in cached_baseline if r["name"] in need_names]
+            multi_device = len(set(expected_devices.values())) > 1
+            device_mismatches = [
+                r["name"] for r in baseline_results
+                if (
+                    r.get("device_id") is not None
+                    and r.get("device_id") != expected_devices.get(r["name"])
+                ) or (r.get("device_id") is None and multi_device)
+            ]
+            if device_mismatches:
+                logging.warning(
+                    "Baseline 缓存的设备映射不匹配，重新采集 %d 个 shape: %s",
+                    len(device_mismatches), ",".join(device_mismatches),
+                )
+                return None
             logging.info("使用 baseline 缓存（覆盖 %d 个 shape）", len(baseline_results))
             return baseline_results
     except (json.JSONDecodeError, OSError) as e:
@@ -872,10 +952,101 @@ def _run_baseline_version(cfg: DirectEvalConfig, call_spec: dict, shape_plan: li
     return baseline_run
 
 
+def _order_results(results: list, shape_plan: list) -> list:
+    """Restore deterministic call_spec order after concurrent workers finish."""
+    order = {shape["name"]: index for index, shape in enumerate(shape_plan)}
+    return sorted(results, key=lambda result: order.get(result.get("name"), len(order)))
+
+
+def _run_device_shard(cfg: DirectEvalConfig, call_spec: dict,
+                      device_id: int, shard_plan: list,
+                      baseline_profile_dir: str, evolved_profile_dir: str,
+                      cached: Optional[list]) -> tuple[list, list]:
+    """Run one device worker; baseline and evolved stay on the same card."""
+    shard_cfg = replace(cfg, device_id=device_id, device_ids=(device_id,))
+    baseline_results = _run_baseline_version(
+        shard_cfg, call_spec, shard_plan, baseline_profile_dir, cached)
+
+    logging.info("[NPU %d] 评估 evolved: %s", device_id, cfg.evolved_path)
+    evolved_results = run_single_version(DirectVersionConfig(
+        call_spec=call_spec, install_path=cfg.evolved_path,
+        shape_plan=shard_plan, device_id=device_id,
+        task_type=cfg.task_type, profile_dir=evolved_profile_dir,
+        num_trials=cfg.num_trials, tag="evolved",
+    ))
+    return baseline_results, evolved_results
+
+
+def _run_parallel_device_shards(
+        cfg: DirectEvalConfig, call_spec: dict, shape_plan: list,
+        baseline_profile_dir: str, evolved_profile_dir: str) -> tuple[list, list]:
+    """Distribute shapes to one worker per NPU and merge their outputs."""
+    device_ids = _effective_device_ids(cfg.device_id, cfg.device_ids)
+    shards = build_device_shards(shape_plan, device_ids)
+    device_map = {
+        shape["name"]: device_id
+        for device_id, shard_plan in shards
+        for shape in shard_plan
+    }
+    cached = _load_baseline_shape_cache(
+        cfg.baseline_cache, shape_plan, device_map)
+    cached_map = {item["name"]: item for item in (cached or [])}
+
+    logging.info(
+        "评估拓扑: %d 个 shape / %d 张 NPU，分配=%s",
+        len(shape_plan), len(shards),
+        ", ".join(
+            f"NPU {device_id}:{len(shard_plan)}"
+            for device_id, shard_plan in shards
+        ),
+    )
+
+    baseline_results = []
+    evolved_results = []
+
+    def run_shard(device_id, shard_plan):
+        shard_cached = None
+        if cached is not None:
+            shard_cached = [cached_map[item["name"]] for item in shard_plan]
+        return _run_device_shard(
+            cfg, call_spec, device_id, shard_plan,
+            baseline_profile_dir, evolved_profile_dir, shard_cached)
+
+    if len(shards) <= 1:
+        if not shards:
+            return [], []
+        baseline_results, evolved_results = run_shard(*shards[0])
+    else:
+        with concurrent.futures.ThreadPoolExecutor(
+                max_workers=len(shards), thread_name_prefix="npu-eval") as executor:
+            futures = {
+                executor.submit(run_shard, device_id, shard_plan): device_id
+                for device_id, shard_plan in shards
+            }
+            for future in concurrent.futures.as_completed(futures):
+                device_id = futures[future]
+                try:
+                    shard_baseline, shard_evolved = future.result()
+                except Exception as exc:  # defensive: preserve per-shape failures
+                    shard_plan = next(
+                        plan for dev, plan in shards if dev == device_id)
+                    logging.exception("NPU %d 评估 worker 异常", device_id)
+                    shard_baseline = _direct_error_results(
+                        shard_plan, "baseline", str(exc), device_id)
+                    shard_evolved = _direct_error_results(
+                        shard_plan, "evolved", str(exc), device_id)
+                baseline_results.extend(shard_baseline)
+                evolved_results.extend(shard_evolved)
+
+    return (
+        _order_results(baseline_results, shape_plan),
+        _order_results(evolved_results, shape_plan),
+    )
+
+
 def _run_direct_evals(cfg: DirectEvalConfig, call_spec: dict, shape_plan: list,
                       baseline_profile_dir: str, evolved_profile_dir: str) -> tuple:
-    """在评估锁保护下跑 baseline / evolved 两个版本评估。"""
-    cached = _load_baseline_shape_cache(cfg.baseline_cache, shape_plan)
+    """在评估锁保护下并行跑 baseline / evolved；同一 shape 固定同卡。"""
 
     lock_fd = None
     if cfg.eval_lock:
@@ -884,16 +1055,9 @@ def _run_direct_evals(cfg: DirectEvalConfig, call_spec: dict, shape_plan: list,
         logging.info("评估锁已获取")
 
     try:
-        baseline_results = _run_baseline_version(
-            cfg, call_spec, shape_plan, baseline_profile_dir, cached)
-
-        logging.info("评估 evolved: %s", cfg.evolved_path)
-        evolved_results = run_single_version(DirectVersionConfig(
-            call_spec=call_spec, install_path=cfg.evolved_path,
-            shape_plan=shape_plan, device_id=cfg.device_id,
-            task_type=cfg.task_type, profile_dir=evolved_profile_dir,
-            num_trials=cfg.num_trials, tag="evolved",
-        ))
+        baseline_results, evolved_results = _run_parallel_device_shards(
+            cfg, call_spec, shape_plan,
+            baseline_profile_dir, evolved_profile_dir)
     finally:
         if lock_fd is not None:
             _release_eval_lock(lock_fd)
@@ -953,6 +1117,7 @@ def _build_final_result(cfg: DirectEvalConfig, shape_results: dict,
     )
     gating = determine_gating(aggregate, precision_ok=precision_ok, compile_ok=compile_ok)
     legacy = _synthesize_legacy_fields(shape_results, aggregate)
+    device_ids = _effective_device_ids(cfg.device_id, cfg.device_ids)
 
     final_result = {
         "op_name": cfg.op_name,
@@ -962,6 +1127,19 @@ def _build_final_result(cfg: DirectEvalConfig, shape_results: dict,
         "shape_results": shape_results,
         "aggregate": aggregate,
         "gating": gating,
+        "evaluation_topology": {
+            "mode": (
+                "single_node_multi_device"
+                if len(device_ids) > 1 else "single_device"
+            ),
+            "device_ids": list(device_ids),
+            "case_assignment": {
+                result["name"]: result.get("device_id")
+                for group in ("target", "generalization")
+                for result in shape_results[group]
+            },
+            "normalization": "per_case_same_device_baseline",
+        },
         # 向后兼容
         "baseline": legacy["baseline"],
         "evolved": legacy["evolved"],
@@ -1048,7 +1226,15 @@ def main():
     parser.add_argument("--call-spec", required=True, help="call_spec.json 路径")
     parser.add_argument("--baseline-path", required=True, help="baseline 安装路径")
     parser.add_argument("--evolved-path", required=True, help="evolved 安装路径")
-    parser.add_argument("--device-id", type=int, default=0, help="NPU 设备 ID")
+    device_group = parser.add_mutually_exclusive_group()
+    device_group.add_argument(
+        "--device-id", type=int, default=0,
+        help="单张 NPU 设备 ID（默认 0）",
+    )
+    device_group.add_argument(
+        "--device-ids", type=str, default=None,
+        help="单节点多卡列表，逗号分隔；shape 按轮询分片并行评估",
+    )
     parser.add_argument("--task-type", type=str, default="vector",
                         choices=["vector", "cube", "cv-mix", "unknown"])
     parser.add_argument("--output", type=str, default=None, help="结果输出路径")
@@ -1068,12 +1254,18 @@ def main():
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
+    try:
+        device_ids = parse_device_ids(args.device_ids)
+    except ValueError as exc:
+        parser.error(str(exc))
+
     evaluate_ops_direct(DirectEvalConfig(
         op_name=args.op_name,
         call_spec_path=args.call_spec,
         baseline_path=args.baseline_path,
         evolved_path=args.evolved_path,
         device_id=args.device_id,
+        device_ids=device_ids,
         task_type=args.task_type,
         output_path=args.output,
         num_trials=args.num_trials,

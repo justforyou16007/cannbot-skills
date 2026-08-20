@@ -221,8 +221,10 @@ while ac_iteration < max_ac_iterations:
     编译通过 → 继续 1.3
 
     ── 1.3 功能验证 ──────────────────────────────────
-    bash ops-lab/tilelang-to-ascendc/skills/tilelang2ascend-translator/scripts/evaluate_ascendc.sh \
-        {output_dir}
+    ASCEND_RT_VISIBLE_DEVICES="{npu_devices}" \
+    flock -w 1800 "{eval_lock_path}" \
+        bash ops-lab/tilelang-to-ascendc/skills/tilelang2ascend-translator/scripts/evaluate_ascendc.sh \
+            {output_dir}
 
     验证通过 → break，Phase 1 成功
     验证失败 → ac_verifier_error = 错误输出 → 跳到 1.4 Conductor
@@ -247,8 +249,9 @@ while ac_iteration < max_ac_iterations:
 使用 `msprof_perf_summary.py --compare` 对 lingxi-evo 输出目录跑 msprof **完整采集（8 轮：7 组 aic-metrics + sample）**，产出 `op_summary_*.csv` 和对比报告：
 
 ```bash
-python3 ops/ops-profiling/scripts/msprof_perf_summary.py --compare \
-    --output-dir {output_dir}
+flock -w 1800 "{eval_lock_path}" \
+    python3 ops/ops-profiling/scripts/msprof_perf_summary.py --compare \
+        --output-dir {output_dir} --devices="{npu_devices}"
 ```
 
 > **注意**：当前 `msprof_perf_summary.py` **不支持** `--lingxi / --lingxi-output-dir / --task-type` 参数。能产出 `op_summary_*.csv`（即 pipeline 证据）的完整采集入口是 **`--compare`**；`--quick` 只采集 kernel 时间（无 aic-metrics），产不出 `op_summary_*.csv`，不满足 R9 profiling 门控。
@@ -317,15 +320,18 @@ grep -E "aiv_mte2_ratio|aiv_mte3_ratio|aic_fixpipe_ratio" perf_report.md
 
 精度验证：
 ```bash
-bash ops-lab/tilelang-to-ascendc/skills/tilelang2ascend-translator/scripts/evaluate_ascendc.sh \
-    {output_dir}
+ASCEND_RT_VISIBLE_DEVICES="{npu_devices}" \
+flock -w 1800 "{eval_lock_path}" \
+    bash ops-lab/tilelang-to-ascendc/skills/tilelang2ascend-translator/scripts/evaluate_ascendc.sh \
+        {output_dir}
 ```
 若精度验证失败：恢复 `best_kernel_snapshot`，`no_improve_streak += 1`，跳至 2.5。
 
 性能评测（用 ops-profiling quick 模式；禁止手写自定义计时脚本）：
 ```bash
-bash ops/ops-profiling/scripts/msprof_profile_run.sh --quick \
-    --output-dir={output_dir} --device={npu}
+flock -w 1800 "{eval_lock_path}" \
+    bash ops/ops-profiling/scripts/msprof_profile_run.sh --quick \
+        --output-dir={output_dir} --devices="{npu_devices}"
 ```
 从生成的 `{output_dir}/performance.json` 提取 `new_speedup`（vs PyTorch 的 ref/asc 几何均值）。
 

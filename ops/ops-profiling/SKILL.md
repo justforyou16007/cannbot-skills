@@ -53,7 +53,18 @@ bash scripts/msprof_profile_run.sh --quick --output-dir=./output/GELU --warm-up=
 
 输出：`performance.json` + `performance.log` + `perf_report.md`
 
-### 3.1 MFU 统计（官方 operator_mfu 等价口径，quick 模式扩展）
+### 3.1 单节点多卡 case 分片
+
+`--compare` 和 `--quick` 均可用 `--devices` 指定本机卡组：
+
+```bash
+bash scripts/msprof_profile_run.sh --quick \
+    --output-dir=./output/GELU --warm-up=3 --devices=0,1,2,3
+```
+
+用例按原顺序轮询分配；每张卡串行采集自己的用例，不同卡并行。每个用例的 reference 与 AscendC 实现在同卡测量，再聚合 speedup，避免把不同卡的绝对时延直接相比。设备多于用例时只启用有任务的卡。`performance.json` 记录 `device_ids`、`case_assignment`、`parallel_evaluation` 和每个 case 的 `device_id`，输出仍按原 case 顺序排列。性能聚合建议使用同型号、同频率/功耗模式的 NPU。
+
+### 3.2 MFU 统计（官方 operator_mfu 等价口径，quick 模式扩展）
 
 在 quick 模式基础上追加 **MFU（理论 FLOPs / kernel 时长 / 芯片 cube 峰值）** 统计：
 
@@ -121,7 +132,7 @@ csrc/ops/<op>/test/
 ## 输出格式（对比模式）
 
 Markdown 报告包含：
-- **对比表**：`Case | Shape | DType | 自定义算子(us) | 标杆(us) | 加速比`
+- **对比表**：`Case | NPU | Shape | DType | 自定义算子(us) | 标杆(us) | 加速比`
 - **全量汇总**：用例数、平均加速比、自定义/标杆更优条数
 - **按数据类型汇总**：分 dtype 的统计
 - **简短分析**：整体趋势结论

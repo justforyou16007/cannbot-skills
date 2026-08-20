@@ -12,21 +12,24 @@
 """
 Session 级 NPU 设备租约系统。
 
-核心设计：一个算子的整个进化生命周期（baseline + 所有轮次 evolved）绑定同一张卡，
-确保性能数据可比。多个算子可并行进化，各自绑定不同的卡。
+核心设计：一个算子的整个进化生命周期（baseline + 所有轮次 evolved）绑定同一组卡，
+每个用例在固定卡上完成 baseline/evolved 对比，确保性能数据可比。多个算子可并行进化，
+各自绑定互不重叠的设备组。
 
 两层锁机制：
-1. session lease (flock): 主 agent 持有，整个进化 session 独占一张卡
+1. session lease (metadata + allocation flock): 整个进化 session 独占一组卡
 2. eval lock (flock): 子 agent 竞争，同一 session 内评估串行排队
 
 用法:
     # 主 agent: 获取 session 级设备租约
     lease = SessionDeviceLease(pool_dir="output/session/device_pool")
-    device_id = lease.acquire_session(op_name="FastGELU", timeout=60)
+    device_ids = lease.acquire_session_devices(
+        op_name="FastGELU", session_id="fastgelu_evo", count=2,
+        device_ids=[0, 1, 2, 3], timeout=60)
 
     # 子 agent: 评估前获取排队锁
     with lease.eval_lock(timeout=300):
-        run_evaluation(device_id=device_id)
+        run_evaluation(device_ids=device_ids)
 
     # 主 agent: 进化结束释放
     lease.release_session()
@@ -182,13 +185,17 @@ class SessionDeviceLease:
         self.pool_dir = Path(pool_dir)
         self.pool_dir.mkdir(parents=True, exist_ok=True)
         self._session_lock_fd: Optional[int] = None
-        self._session_device_id: Optional[int] = None
+        self._session_device_ids: List[int] = []
         self._session_id: Optional[str] = None
         self._eval_lock_fd: Optional[int] = None
 
     @property
     def device_id(self) -> Optional[int]:
-        return self._session_device_id
+        return self._session_device_ids[0] if self._session_device_ids else None
+
+    @property
+    def device_ids(self) -> List[int]:
+        return list(self._session_device_ids)
 
     # CLI 模式下 acquire-session 进程写完 lease 即退出，PID 必然失效。
     # 因此不能仅靠 PID 判断租约有效性，需结合租约年龄：
@@ -218,7 +225,26 @@ class SessionDeviceLease:
         timeout: float = 60,
         preferred_device: Optional[int] = None,
     ) -> int:
-        """获取 session 级设备租约。
+        """获取单张 session 级设备租约（兼容旧接口）。"""
+        return self.acquire_session_devices(
+            op_name=op_name,
+            session_id=session_id,
+            count=1,
+            device_ids=device_ids,
+            timeout=timeout,
+            preferred_device=preferred_device,
+        )[0]
+
+    def acquire_session_devices(
+        self,
+        op_name: str,
+        session_id: str,
+        count: int,
+        device_ids: Optional[List[int]] = None,
+        timeout: float = 60,
+        preferred_device: Optional[int] = None,
+    ) -> List[int]:
+        """原子获取同一 session 使用的一组设备。
 
         使用 lease.json + pid 存活检查判断设备是否被占用。
         不依赖 flock 持有，acquire 完成后即可退出进程。
@@ -229,19 +255,26 @@ class SessionDeviceLease:
         3. 所有设备被占用时阻塞等待，超时抛异常
 
         Returns:
-            绑定的 device_id
+            绑定的 device ID 列表
 
         Raises:
             TimeoutError: 超时未获取到设备
             RuntimeError: 无可用设备
         """
-        if self._session_device_id is not None:
+        if self._session_device_ids:
             raise RuntimeError("Session lease already held")
+        if count < 1:
+            raise ValueError("Device lease count must be >= 1")
 
         if device_ids is None:
             device_ids = _detect_npu_devices()
+        device_ids = list(dict.fromkeys(device_ids))
         if not device_ids:
             raise RuntimeError("No NPU devices detected")
+        if count > len(device_ids):
+            raise RuntimeError(
+                f"Requested {count} devices, but only {len(device_ids)} candidates provided"
+            )
 
         # 优先尝试 preferred_device
         if preferred_device is not None and preferred_device in device_ids:
@@ -258,41 +291,58 @@ class SessionDeviceLease:
         deadline = time.monotonic() + timeout
 
         while True:
-            for dev_id in try_order:
-                if not self._is_lease_alive(dev_id):
-                    # 设备空闲，写入 lease 占位
-                    self._session_device_id = dev_id
+            with self._allocation_lock():
+                available = [
+                    dev_id for dev_id in try_order
+                    if not self._is_lease_alive(dev_id)
+                ]
+                if len(available) >= count:
+                    selected = available[:count]
+                    self._session_device_ids = selected
                     self._session_id = session_id
-                    self._write_lease_metadata(dev_id, op_name, session_id)
+                    self._write_lease_metadata(selected, op_name, session_id)
                     logger.info(
-                        f"Session lease acquired: device {dev_id} "
-                        f"for {op_name} (session: {session_id})"
+                        "Session lease acquired: devices %s for %s (session: %s)",
+                        selected, op_name, session_id,
                     )
-                    return dev_id
+                    return list(selected)
 
             # 所有设备被占用，等待重试
             if time.monotonic() >= deadline:
                 raise TimeoutError(
                     f"Failed to acquire session device within {timeout}s. "
-                    f"All devices {device_ids} are occupied by other sessions."
+                    f"Need {count} devices from {device_ids}, but not enough are available."
                 )
             time.sleep(2)
 
-    def adopt_session(self, session_id: str, device_id: Optional[int] = None):
+    @contextmanager
+    def _allocation_lock(self):
+        """Serialize lease inspection + metadata creation across sessions."""
+        lock_path = self.pool_dir / ".allocation.lock"
+        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            _release_lock_quietly(fd)
+            os.close(fd)
+
+    def adopt_session(self, session_id: str, device_id: Optional[int] = None,
+                      device_ids: Optional[List[int]] = None):
         """从已有 lease 文件恢复 session 状态（CLI release-session 场景）。
 
         CLI 下 release-session 是新进程，需要把 lease 元数据中的
         session_id / device_id 回填到本实例，release_session 才能正确清理。
         """
         self._session_id = session_id
-        self._session_device_id = device_id
+        self._session_device_ids = list(device_ids or ([] if device_id is None else [device_id]))
 
     def release_session(self):
         """释放 session 级设备租约（删除 lease 文件）。"""
-        if self._session_device_id is None:
+        if not self._session_device_ids:
             return
 
-        dev_id = self._session_device_id
+        device_ids = list(self._session_device_ids)
         session_id = self._session_id
 
         # 清理 lease 元数据文件
@@ -303,9 +353,12 @@ class SessionDeviceLease:
             except OSError:
                 pass
 
-        self._session_device_id = None
+        self._session_device_ids = []
         self._session_id = None
-        logger.info(f"Session lease released: device {dev_id} (session: {session_id})")
+        logger.info(
+            "Session lease released: devices %s (session: %s)",
+            device_ids, session_id,
+        )
 
     @contextmanager
     def eval_lock(self, timeout: float = 300):
@@ -339,8 +392,8 @@ class SessionDeviceLease:
                 if not acquired:
                     time.sleep(1)
 
-            logger.debug("Eval lock acquired (device %s)", self._session_device_id)
-            yield self._session_device_id
+            logger.debug("Eval lock acquired (devices %s)", self._session_device_ids)
+            yield self.device_id
         finally:
             if acquired:
                 _release_lock_quietly(fd)
@@ -349,11 +402,13 @@ class SessionDeviceLease:
             except OSError:
                 pass
 
-    def _write_lease_metadata(self, device_id: int, op_name: str, session_id: str):
+    def _write_lease_metadata(self, device_ids: List[int], op_name: str,
+                              session_id: str):
         """写入租约元数据文件。"""
         lease_path = self.pool_dir / f"session_{session_id}_lease.json"
         metadata = {
-            "device_id": device_id,
+            "device_id": device_ids[0],
+            "device_ids": device_ids,
             "op_name": op_name,
             "session_id": session_id,
             "pid": os.getpid(),
@@ -386,7 +441,10 @@ class SessionDeviceLease:
                     meta = json.load(fh)
             except (json.JSONDecodeError, OSError):
                 continue
-            if meta.get("device_id") != device_id:
+            leased_devices = meta.get("device_ids")
+            if not isinstance(leased_devices, list):
+                leased_devices = [meta.get("device_id")]
+            if device_id not in leased_devices:
                 continue
             pid = meta.get("pid")
             if pid and _is_pid_alive(pid):
@@ -464,6 +522,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_acq.add_argument("--timeout", type=float, default=60)
     p_acq.add_argument("--device-ids", type=str, default=None)
     p_acq.add_argument("--preferred-device", type=int, default=None)
+    p_acq.add_argument("--count", type=int, default=1,
+                       help="Number of devices to lease atomically (default: 1)")
 
     p_rel = subparsers.add_parser("release-session", help="Release session device lease")
     p_rel.add_argument("--pool-dir", required=True)
@@ -479,27 +539,45 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _parse_device_ids(raw: str) -> Optional[List[int]]:
-    if not raw:
+def _parse_device_ids(raw: Optional[str]) -> Optional[List[int]]:
+    """Parse an ordered, duplicate-free comma-separated device list."""
+    if raw is None or not raw.strip():
         return None
-    return [int(d.strip()) for d in raw.split(",")]
+    result = []
+    seen = set()
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            raise ValueError("device IDs 不能为空")
+        try:
+            device_id = int(token)
+        except ValueError as exc:
+            raise ValueError(f"非法 NPU device ID: {token}") from exc
+        if device_id < 0:
+            raise ValueError(f"NPU device ID 必须非负: {device_id}")
+        if device_id in seen:
+            raise ValueError(f"NPU device ID 重复: {device_id}")
+        seen.add(device_id)
+        result.append(device_id)
+    return result
 
 
 def _cmd_acquire_session(args) -> int:
     lease = SessionDeviceLease(args.pool_dir)
     try:
-        dev = lease.acquire_session(
+        devices = lease.acquire_session_devices(
             op_name=args.op_name,
             session_id=args.session_id,
+            count=args.count,
             device_ids=_parse_device_ids(args.device_ids),
             timeout=args.timeout,
             preferred_device=args.preferred_device,
         )
-        # 同步输出 device_id 后退出
+        # 同步输出逗号分隔的 device IDs 后退出
         # 设备占用状态通过 lease.json + pid 存活检查判断
-        DATA_LOGGER.info("%s", dev)
+        DATA_LOGGER.info("%s", ",".join(str(device) for device in devices))
         return 0
-    except (TimeoutError, RuntimeError) as e:
+    except (TimeoutError, RuntimeError, ValueError) as e:
         logger.error("ERROR: %s", e)
         return 1
 
@@ -510,14 +588,16 @@ def _cmd_release_session(args) -> int:
     # 读取 lease 文件获取 device_id 并回填到实例
     lease_path = Path(args.pool_dir) / f"session_{args.session_id}_lease.json"
     device_id = None
+    device_ids = None
     if lease_path.exists():
         try:
             with open(lease_path, "r") as f:
                 meta = json.load(f)
             device_id = meta.get("device_id")
+            device_ids = meta.get("device_ids")
         except (json.JSONDecodeError, OSError):
             pass
-    lease.adopt_session(args.session_id, device_id)
+    lease.adopt_session(args.session_id, device_id, device_ids)
     lease.release_session()
     logger.info("Session %s released", args.session_id)
     return 0

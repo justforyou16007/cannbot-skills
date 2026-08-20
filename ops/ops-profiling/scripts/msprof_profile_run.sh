@@ -20,10 +20,10 @@
 #   bash msprof_profile_run.sh [--warm-up=N] [--output=<dir>] -- <executable> [args...]
 #
 # Usage (--compare 模式):
-#   bash msprof_profile_run.sh --compare --output-dir=/path/to/op_dir [--warm-up=N] [--device=N]
+#   bash msprof_profile_run.sh --compare --output-dir=/path/to/op_dir [--warm-up=N] [--devices=0,1]
 #
 # Usage (--quick 模式):
-#   bash msprof_profile_run.sh --quick --output-dir=/path/to/op_dir [--warm-up=N] [--device=N]
+#   bash msprof_profile_run.sh --quick --output-dir=/path/to/op_dir [--warm-up=N] [--devices=0,1]
 #
 # Usage (--batch 模式):
 #   bash msprof_profile_run.sh --batch --base-dir=/path/to/output_dir [--max-jobs=N] [--device-start=N]
@@ -89,6 +89,7 @@ APP_CMD=()
 MODE="standard"   # standard | compare | batch | quick
 OUTPUT_DIR_ARG=""  # --compare 模式用的算子目录
 DEVICE_ID=""
+DEVICE_IDS=""
 BASE_DIR=""
 MAX_JOBS=7
 DEVICE_START=1
@@ -112,6 +113,7 @@ Usage: bash msprof_profile_run.sh [OPTIONS] -- <executable> [args...]
   --compare              启用对比模式：测试 model.py vs model_new_ascendc.py
   --output-dir=<dir>     算子输出目录（包含 model.py, model_new_ascendc.py, .jsonl）
   --device=N             指定 NPU 设备 ID；未指定时自动选择空闲卡
+  --devices=LIST         单节点多卡列表（如 0,1,2,3）；case 轮询分片并行
   --repeats=N            重复采集次数（默认 1）
   --retry=N              单 case 解析失败重试次数（默认 2）
   --keep-prof            保留 msprof 原始 PROF 目录（用于深度分析）
@@ -120,6 +122,7 @@ Usage: bash msprof_profile_run.sh [OPTIONS] -- <executable> [args...]
   --quick                启用快速模式：只采集 1 轮（只获取 kernel 时间，不采集 7 个 aic-metrics）
   --output-dir=<dir>     算子输出目录（包含 model.py, model_new_ascendc.py, .jsonl）
   --device=N             指定 NPU 设备 ID；未指定时自动选择空闲卡
+  --devices=LIST         单节点多卡列表（如 0,1,2,3）；case 轮询分片并行
   --repeats=N            重复采集次数（默认 1）
   --retry=N              单 case 解析失败重试次数（默认 2）
   --mfu                  追加官方 operator_mfu 等价口径 MFU 统计（需算子目录提供 flops.py）
@@ -149,6 +152,7 @@ while [[ $# -gt 0 ]]; do
         --output=*)  OUTPUT_DIR="${1#*=}"; shift ;;
         --output-dir=*) OUTPUT_DIR_ARG="${1#*=}"; shift ;;
         --device=*)  DEVICE_ID="${1#*=}"; shift ;;
+        --devices=*) DEVICE_IDS="${1#*=}"; shift ;;
         --repeats=*) REPEATS="${1#*=}"; shift ;;
         --retry=*)   RETRY="${1#*=}"; shift ;;
         --keep-prof) KEEP_PROF=1; shift ;;
@@ -168,6 +172,11 @@ while [[ $# -gt 0 ]]; do
         *)           APP_CMD=("$@"); break ;;
     esac
 done
+
+if [[ -n "$DEVICE_ID" && -n "$DEVICE_IDS" ]]; then
+    echo "ERROR: --device 与 --devices 不能同时使用" >&2
+    exit 1
+fi
 
 # 检查 msprof
 if ! command -v msprof >/dev/null 2>&1; then
@@ -260,6 +269,7 @@ run_compare() {
     # 调用 msprof_perf_summary.py --compare（已融合 kernel_perf.py 功能）
     local extra_args=()
     [[ -n "$DEVICE_ID" ]] && extra_args+=("--device" "$DEVICE_ID")
+    [[ -n "$DEVICE_IDS" ]] && extra_args+=("--devices" "$DEVICE_IDS")
     [[ -n "${REPEATS:-}" ]] && extra_args+=("--repeats" "$REPEATS")
     [[ -n "${RETRY:-}" ]] && extra_args+=("--retry" "$RETRY")
     [[ "${KEEP_PROF:-0}" == "1" ]] && extra_args+=("--keep-prof")
@@ -287,6 +297,7 @@ run_quick() {
     # 调用 msprof_perf_summary.py --quick（只测时间，不采集 7 个 metrics）
     local extra_args=()
     [[ -n "$DEVICE_ID" ]] && extra_args+=("--device" "$DEVICE_ID")
+    [[ -n "$DEVICE_IDS" ]] && extra_args+=("--devices" "$DEVICE_IDS")
     [[ -n "${REPEATS:-}" ]] && extra_args+=("--repeats" "$REPEATS")
     [[ -n "${RETRY:-}" ]] && extra_args+=("--retry" "$RETRY")
     [[ "${MFU:-0}" == "1" ]] && extra_args+=("--mfu")

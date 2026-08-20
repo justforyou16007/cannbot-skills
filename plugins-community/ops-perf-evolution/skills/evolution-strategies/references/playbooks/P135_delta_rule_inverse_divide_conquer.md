@@ -48,8 +48,12 @@ grep -nE "beta|corr|修正|delta|gated" op_kernel/*.{cpp,h} model.py >> /tmp/p13
 grep -nE "InverseCompute|AttnInverseMMCompute|INVERSE_SHAPE" op_kernel/*.{cpp,h}
 # 5.2 无整块串行求逆残留
 grep -nE "solve_triangular" op_kernel/*.{cpp,h} || echo "NO-TRIANGULAR"
-# 5.3 编译 + 精度 + 性能
-bash evaluate_ascendc.sh && bash ops/ops-profiling/scripts/msprof_profile_run.sh --quick --output-dir={output_dir} --device={npu}
+# 5.3 编译 + 精度 + 性能（同一 session 的候选共用评估锁）
+flock -w 1800 "{eval_lock_path}" env ASCEND_RT_VISIBLE_DEVICES="{npu_devices}" \
+  bash evaluate_ascendc.sh && \
+flock -w 1800 "{eval_lock_path}" \
+  bash ops/ops-profiling/scripts/msprof_profile_run.sh --quick \
+    --output-dir={output_dir} --devices="{npu_devices}"
 ```
 
 **grep 全过 + 编译/精度 PASS 才完成**；不满足回 Step 2。

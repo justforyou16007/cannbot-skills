@@ -9,6 +9,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # ----------------------------------------------------------------------------------------------------------
 
+import concurrent.futures
 import json
 import logging
 import os
@@ -45,6 +46,11 @@ from msprof_perf_summary import (
     _find_cls as _find_model_class,
     _clone as _clone_value,
     _move as _move_to_device,
+)
+from multi_device_utils import (
+    distribute_case_indices_round_robin as _distribute_case_indices_round_robin,
+    merge_case_shard_reports as _merge_case_shard_reports_impl,
+    parse_index_list as _parse_index_list,
 )
 
 
@@ -962,15 +968,19 @@ def _setup_paths(kernel_build_dir):
     return inserted_paths
 
 
-def _execute_models(ref_model, cand_model, input_groups, device):
+def _execute_models(ref_model, cand_model, input_groups, device,
+                    case_indices=None):
     """Run both models on all input groups, returning normalized outputs and summaries."""
     ref_outputs = []
     cand_outputs = []
     input_summaries = []
     for index, inputs in enumerate(input_groups):
+        case_index = case_indices[index] if case_indices is not None else index
         ref_inputs = _move_to_device(_clone_value(inputs), device)
         cand_inputs = _move_to_device(_clone_value(inputs), device)
-        input_summaries.extend(_summarize_value(ref_inputs, f"inputs[{index}]"))
+        input_summaries.extend(
+            _summarize_value(ref_inputs, f"inputs[{case_index}]")
+        )
 
         with torch.no_grad():
             ref_out = ref_model(*ref_inputs)
@@ -986,25 +996,28 @@ def _execute_models(ref_model, cand_model, input_groups, device):
     return ref_outputs, cand_outputs, input_summaries
 
 
-def _run_comparisons(ref_model, cand_model, input_groups, device, non_compute=False):
+def _run_comparisons(ref_model, cand_model, input_groups, device,
+                     non_compute=False, case_indices=None):
     all_ok = True
     comparisons = []
     case_oks = []
     ref_outputs, cand_outputs, input_summaries = _execute_models(
-        ref_model, cand_model, input_groups, device)
+        ref_model, cand_model, input_groups, device, case_indices)
     for index, (inputs, ref_out, cand_out) in enumerate(zip(input_groups, ref_outputs, cand_outputs)):
+        case_index = case_indices[index] if case_indices is not None else index
         input_type, _input_dtype = _infer_input_type(inputs)
         ok, comparison = _compare_values(
             ref_out, cand_out, path=f"output[{index}]",
             input_type=input_type, non_compute=non_compute,
         )
-        comparisons.append(f"case[{index}]: {comparison}")
+        comparisons.append(f"case[{case_index}]: {comparison}")
         case_oks.append(ok)
         all_ok = all_ok and ok
     return all_ok, comparisons, input_summaries, case_oks
 
 
-def _run_verification(op: str, non_compute: bool = False):
+def _run_verification(op: str, non_compute: bool = False,
+                      case_indices=None):
     report = _make_verification_report(op)
     report["non_compute"] = non_compute
 
@@ -1037,14 +1050,32 @@ def _run_verification(op: str, non_compute: bool = False):
             init_inputs = cand_module.get_init_inputs()
         else:
             init_inputs = getattr(ref_module, "get_init_inputs", lambda: [])()
-        input_groups = _get_input_groups(ref_module)
+        all_input_groups = _get_input_groups(ref_module)
+        total_case_count = len(all_input_groups)
+        if case_indices is None:
+            selected_indices = list(range(total_case_count))
+        else:
+            selected_indices = list(case_indices)
+            invalid = [
+                index for index in selected_indices
+                if index < 0 or index >= total_case_count
+            ]
+            if invalid:
+                raise ValueError(
+                    f"case index out of range: {invalid}; "
+                    f"valid range is 0..{total_case_count - 1}"
+                )
+        input_groups = [all_input_groups[index] for index in selected_indices]
+        report["case_indices"] = selected_indices
+        report["n_cases_total"] = total_case_count
         device = _get_device()
 
         ref_model = ref_cls(*_clone_value(init_inputs)).to(device).eval()
         cand_model = cand_cls(*_clone_value(init_inputs)).to(device).eval()
 
         all_ok, comparisons, input_summaries, case_oks = _run_comparisons(
-            ref_model, cand_model, input_groups, device, non_compute=non_compute)
+            ref_model, cand_model, input_groups, device,
+            non_compute=non_compute, case_indices=selected_indices)
 
         report["inputs"] = input_summaries
         report["comparisons"] = comparisons
@@ -1438,6 +1469,112 @@ def _run_batch_verification(batch_dir, npu_list, output_dir=None):
     return 0 if all_ok else 1
 
 
+def _load_case_count(op):
+    """Load only the reference input groups to determine shard boundaries."""
+    task_dir = _resolve_task_dir(op)
+    ref_path = task_dir / "model.py"
+    if not ref_path.is_file():
+        raise FileNotFoundError(f"missing reference model: {ref_path}")
+    ref_module = _load_module(ref_path, f"{task_dir.name}_case_discovery")
+    return len(_get_input_groups(ref_module))
+
+
+def _run_case_shard_subprocess(op, npu_id, case_indices, non_compute):
+    """Run one single-task shard in a fresh interpreter bound to one NPU."""
+    env = os.environ.copy()
+    env['ASCEND_RT_VISIBLE_DEVICES'] = str(npu_id)
+    json_fd, json_path = tempfile.mkstemp(suffix='.json', prefix='verify_cases_')
+    os.close(json_fd)
+    command = [
+        sys.executable, str(Path(__file__).resolve()), str(op),
+        '--case-indices', ','.join(str(index) for index in case_indices),
+        '--json-file', json_path,
+    ]
+    if non_compute:
+        command.append('--non-compute')
+
+    start = time.time()
+    try:
+        proc = subprocess.run(
+            command, capture_output=True, text=True, env=env,
+            timeout=max(_SUBPROCESS_TIMEOUT, _SUBPROCESS_TIMEOUT * len(case_indices)),
+        )
+        try:
+            with open(json_path, 'r') as report_file:
+                report = json.load(report_file)
+        except (json.JSONDecodeError, OSError) as exc:
+            report = _make_verification_report(str(op))
+            report['error'] = (
+                f"Failed to read case-shard report: {exc}; "
+                f"exitcode={proc.returncode}; stderr={(proc.stderr or '')[:500]}"
+            )
+    except subprocess.TimeoutExpired:
+        report = _make_verification_report(str(op))
+        report['error'] = f"Timeout while evaluating cases {case_indices}"
+    except Exception as exc:
+        report = _make_verification_report(str(op))
+        report['error'] = (
+            f"Failed to launch case shard {case_indices}: "
+            f"{type(exc).__name__}: {exc}"
+        )
+    finally:
+        try:
+            os.unlink(json_path)
+        except OSError:
+            pass
+
+    report['_npu'] = npu_id
+    report['_elapsed'] = time.time() - start
+    report['_assigned_case_indices'] = list(case_indices)
+    return report
+
+
+def _merge_case_shard_reports(op, reports, npu_list, expected_case_indices):
+    """Merge per-device reports back into the original global case order."""
+    return _merge_case_shard_reports_impl(
+        op=op,
+        reports=reports,
+        npu_list=npu_list,
+        expected_case_indices=expected_case_indices,
+        default_report=_make_verification_report(str(op)),
+    )
+
+
+def _run_single_task_multi_npu(op, npu_list, non_compute=False,
+                               case_indices=None):
+    """Split one operator's cases across local NPUs and evaluate in parallel."""
+    total_case_count = _load_case_count(op)
+    selected = (
+        list(range(total_case_count))
+        if case_indices is None else list(case_indices)
+    )
+    if not selected:
+        raise ValueError("at least one case must be selected")
+    invalid = [index for index in selected if index >= total_case_count]
+    if invalid:
+        raise ValueError(
+            f"case index out of range: {invalid}; "
+            f"valid range is 0..{total_case_count - 1}"
+        )
+    shards = _distribute_case_indices_round_robin(selected, npu_list)
+    logger.info(
+        "Case shards: %s",
+        ', '.join(f"NPU {npu}={len(indices)}" for npu, indices in shards.items()),
+    )
+
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=len(shards), thread_name_prefix='verify-npu') as executor:
+        futures = [
+            executor.submit(
+                _run_case_shard_subprocess, op, npu_id, indices, non_compute)
+            for npu_id, indices in shards.items()
+        ]
+        reports = [future.result() for future in concurrent.futures.as_completed(futures)]
+
+    merged = _merge_case_shard_reports(op, reports, npu_list, selected)
+    return merged
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="AscendC 算子精度验证脚本")
@@ -1456,7 +1593,11 @@ def main():
     )
     parser.add_argument(
         "--npu-list", type=str, default=None,
-        help="多 NPU 并行列表，逗号分隔，如 0,1,2,3（仅批量模式有效，默认仅使用 NPU 0）",
+        help="多 NPU 并行列表，逗号分隔；批量模式分 task，单算子模式分 case",
+    )
+    parser.add_argument(
+        "--case-indices", type=str, default=None,
+        help="仅验证指定 case 下标，逗号分隔（多卡 worker 内部参数）",
     )
     parser.add_argument(
         "--output", type=str, default=None,
@@ -1471,12 +1612,14 @@ def main():
         help="将 JSON 报告写入指定文件（供批量模式子进程使用，避免 stdout 污染）",
     )
     args = parser.parse_args()
+    try:
+        npu_list = _parse_index_list(args.npu_list, "--npu-list") or [0]
+        case_indices = _parse_index_list(args.case_indices, "--case-indices")
+    except ValueError as exc:
+        parser.error(str(exc))
 
     # ── 批量模式 ──
     if args.batch_dir:
-        npu_list = [0]
-        if args.npu_list:
-            npu_list = [int(x.strip()) for x in args.npu_list.split(',')]
         exit_code = _run_batch_verification(args.batch_dir, npu_list, args.output)
         raise SystemExit(exit_code)
 
@@ -1487,7 +1630,16 @@ def main():
                       "[--npu-list <list>] [--output <dir>]")
         raise SystemExit(1)
 
-    report = _run_verification(args.op, non_compute=args.non_compute)
+    if args.npu_list:
+        report = _run_single_task_multi_npu(
+            args.op, npu_list, non_compute=args.non_compute,
+            case_indices=case_indices,
+        )
+    else:
+        report = _run_verification(
+            args.op, non_compute=args.non_compute,
+            case_indices=case_indices,
+        )
 
     # JSON 文件输出模式（供批量模式子进程使用，不受 stdout 污染影响）
     if args.json_file:

@@ -599,7 +599,14 @@ class ModelNew(nn.Module):
 ```
 
 **禁止**在 model_new_ascendc.py 中使用 `torch.*` / `F.*` 计算算子。
-然后调用 `.claude/skills/tilelang2ascend-translator/scripts/evaluate_ascendc.sh {output_dir}` 编译并验证（内部 cmake + make + whl 安装）。
+然后调用 `.claude/skills/tilelang2ascend-translator/scripts/evaluate_ascendc.sh {output_dir}` 编译并验证（内部 cmake + make + whl 安装）。单节点多卡时使用：
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 \
+    bash .claude/skills/tilelang2ascend-translator/scripts/evaluate_ascendc.sh {output_dir}
+```
+
+脚本会把单个任务的全部 case 轮询分片到各卡，每卡一个子进程串行验证，不同卡并行；最终按原 case 下标合并。设备多于 case 时只启用有任务的卡。
 
 ---
 

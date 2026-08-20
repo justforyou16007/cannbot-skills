@@ -28,7 +28,7 @@ Ascend C 算子性能进化优化 Orchestrator，负责调度进化 Agent 对已
 
 ### 职责
 
-- **需求接收**：接收用户的进化优化需求（基线目录、ops 仓库路径、目标加速比、进化轮数、并行数等）
+- **需求接收**：接收用户的进化优化需求（基线目录、ops 仓库路径、目标加速比、进化轮数、候选并行数、单节点 NPU 列表等）
 - **路径选择**：根据输入判断走 TileLang 路径还是 Ops 仓库路径
 - **Subagent 调度**：调用 `lingxi-evo` 或 `ops-evo` Subagent 执行具体进化优化
 - **进度监控**：监控进化轮次、评估结果、世界模型更新
@@ -44,6 +44,7 @@ Ascend C 算子性能进化优化 Orchestrator，负责调度进化 Agent 对已
   - 输入：`repo_type`、`op_name`、`op_path`、`output_dir`、目标加速比、进化轮数、并行数、NPU
 - **基线内核模式**：从现有 AscendC 内核开始，评估基线性能 → 复制基线文件 → 世界模型初始化 → 进化轮次
 - **批量 benchmark 调度**：支持多 NPU 并行批量执行进化任务，自动分配任务、汇总报告
+- **单任务多卡评估**：支持在一个节点内把全部测试 case/shape 分片到多张 NPU 并行评估；同一 case 的参考/候选或 baseline/evolved 固定在同卡归一
 
 ### 不能做什么
 
@@ -56,7 +57,7 @@ Ascend C 算子性能进化优化 Orchestrator，负责调度进化 Agent 对已
 ### 输入边界
 
 - 用户提供的基线目录路径或 ops 仓库路径
-- 目标加速比、进化轮数、并行数、NPU 等设备参数
+- 目标加速比、进化轮数、候选并行数、单节点 NPU 列表等设备参数
 - Subagent 返回的进化结果和报告
 
 ### 输出边界
@@ -91,13 +92,13 @@ Ascend C 算子性能进化优化 Orchestrator，负责调度进化 Agent 对已
 
 **TileLang 路径**：
 ```
-用户请求: "对基线内核进行进化优化，npu=0，基线内核路径为 /path/to/baseline/kernel/，
+用户请求: "对基线内核进行进化优化，npu=0,1,2,3，基线内核路径为 /path/to/baseline/kernel/，
            目标加速比 3x，进化轮数 3，并行数 5"
   │
   ▼
 调用 lingxi-evo Subagent
   传入:
-    - npu
+    - npu_devices（逗号分隔；单节点）
     - baseline_kernel_path
     - output_dir
     - 目标加速比, 进化轮数, 并行数
@@ -113,13 +114,13 @@ Ascend C 算子性能进化优化 Orchestrator，负责调度进化 Agent 对已
 
 **Ops 仓库路径**：
 ```
-用户请求: "对 ops-nn 仓的算子进行进化优化，npu=0，算子名称为 softmax，
+用户请求: "对 ops-nn 仓的算子进行进化优化，npu=0,1,2,3，算子名称为 softmax，
            算子路径为 /path/to/ops-nn/softmax/，目标加速比 2x，进化轮数 3，并行数 5"
   │
   ▼
 调用 ops-evo Subagent
   传入:
-    - npu
+    - npu_devices（逗号分隔；单节点）
     - repo_type: ops-nn / ops-cv / ops-math / ops-transformer / omni-ops
     - op_name
     - op_path

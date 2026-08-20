@@ -96,7 +96,7 @@ LINGXI进化支持基线内核模式（用户提供现有AscendC内核项目目�
 > 在基线内核模式下，进化过程**不得修改**算子的输入/输出/参数接口。所有优化只能在内核实现层面进行（计算逻辑、分块策略、内存布局、双缓冲等），不得改变算子签名。
 
 确认模式后，询问以下参数:
-- **NPU 设备号**: NPU 设备 ID (默认: 0)
+- **NPU 设备列表**: 本机 NPU ID，逗号分隔（默认: `0`；如 `0,1,2,3`）
 - **算子名称**: 简短标识符 (例如: "FastGELU", "Tril")
 - **[基线模式] 基线内核路径**: 现有AscendC内核项目目录路径 (例如: `output/FastGELU_evo_xxx/round_2/parallel_1` 或手写内核目录)
 - **最大轮数** (默认: 2, 推荐: 2-3)；**并行数量**: 每轮并行候选数 (默认: 3, 推荐: 3-5)；**目标加速比** (默认: 3x)
@@ -106,19 +106,36 @@ LINGXI进化支持基线内核模式（用户提供现有AscendC内核项目目�
 
 **重要**: 使用较小的配置(2轮, 3个并行)以获得更快的反馈。
 
+> `parallel_num` 是候选生成并行数，NPU 设备列表是单次评估的卡组，二者互不等价。多卡仅支持单节点；测试 case 轮询分片到各卡，每个 case 的 PyTorch 参考与 AscendC 实现固定在同卡比较。
+
 ### 步骤2: 环境准备
 
 ```bash
-export ASCEND_RT_VISIBLE_DEVICES=${npu}
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+REQUESTED_DEVICE_IDS="{npu_devices}"
+REQUESTED_DEVICE_COUNT=$(awk -F, '{print NF}' <<< "$REQUESTED_DEVICE_IDS")
+DEVICE_POOL_DIR="$(pwd)/output/.ops_evo_device_pool"
+SESSION_ID="{op_name}_evo_${TIMESTAMP}"
+mkdir -p "$DEVICE_POOL_DIR"
+SESSION_DEVICES=$(python3 plugins-community/ops-perf-evolution/skills/ops-evaluation/scripts/device_lease.py \
+    acquire-session --pool-dir "$DEVICE_POOL_DIR" --op-name {op_name} \
+    --session-id "$SESSION_ID" --device-ids "$REQUESTED_DEVICE_IDS" \
+    --count "$REQUESTED_DEVICE_COUNT" --timeout 60)
+[ -n "$SESSION_DEVICES" ] || { echo "FATAL: 无法租用 NPU 设备组"; exit 1; }
+export ASCEND_RT_VISIBLE_DEVICES="$SESSION_DEVICES"
+EVAL_LOCK_PATH="$DEVICE_POOL_DIR/eval_${SESSION_ID}.lock"
 which npu-smi && echo $ASCEND_HOME_PATH   # 验证 CANN 环境；不可用则告知用户需要配置
 ```
+
+整个 session 复用 `$SESSION_DEVICES` 和 `$EVAL_LOCK_PATH`：不同候选的评估用 `flock` 串行，单个候选内部再按 case 多卡并行。session 结束后必须调用 `device_lease.py release-session` 释放整组卡。
 
 ### 步骤3: 准备共享文件 (只执行一次)
 
 创建共享输出目录:
 
 ```bash
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+# 复用步骤2生成的 session timestamp
+: "${TIMESTAMP:?TIMESTAMP must be set in step 2}"
 # 优先使用用户指定的输出目录，否则使用默认目录
 if [[ -n "${OUTPUT_DIR:-}" ]]; then
     EVO_DIR="${OUTPUT_DIR}/${op_name}_evo_${TIMESTAMP}"
@@ -172,7 +189,7 @@ python3 plugins-community/ops-perf-evolution/skills/evolution-world-model/script
        --quick \
        --output-dir={baseline_kernel_path} \
        --warm-up=3 \
-       --device={npu} \
+       --devices="$SESSION_DEVICES" \
        --retry=2
    ```
 
@@ -435,6 +452,7 @@ cp -r "$EVO_DIR/shared"/* "$EVO_DIR/round_{r}/parallel_{p}/"
 - 基线对齐字段从 KG 的 `knowledge_graph.json.baseline_evidence` 或 MCTS 的 `world_model.json.baseline_evidence` 提取；缺失时填 `N/A`，不得猜测。父实验/父节点 profiling 优先于 baseline。
 - `inspirations_text` 第 1 轮必须包含基线内核路径、基线性能、关键代码摘要和接口不变约束；后续轮次可引用上一轮成功/部分成功/失败变体的实现摘要。
 - 子 agent 仍按 AscendC 转译 → 退化检测/功能验证 → Local Refinement 顺序执行；共享文件仍为 `model.py`、`design/`、测试用例和 `kernel/`，评估使用 ops-profiling 的既有脚本。
+- 每个 prompt 必须填充 `npu_devices=$SESSION_DEVICES` 与 `eval_lock_path=$EVAL_LOCK_PATH`；任何精度/性能命令都必须通过该锁，禁止多个候选同时占用同一卡组。
 
 若使用 `prepare_strategy_resources.py`，只对已确定的 strategy tags 生成资源块；MCTS 分支可传原有 `world_model.json`，KG 分支不创建或伪造 MCTS 文件，直接把 query pack 与 idea 证据放入 prompt。`artifacts/lineage.jsonl` 的 read_keys 维护只适用于 MCTS；KG 的引用来源由 experiments/claims/query_pack 维护。
 
@@ -571,7 +589,9 @@ fi
 3. 若最优变体的 `evaluation_results.json` 中 `n_cases_total` **等于** shared 全量 case 数 → 门禁通过
 4. 否则（case 数不符或字段缺失）→ 在 `best_dir` 下基于全量 case 重新执行精度验证：
    ```bash
-   bash ops-lab/tilelang-to-ascendc/skills/tilelang2ascend-translator/scripts/evaluate_ascendc.sh "$best_dir"
+   ASCEND_RT_VISIBLE_DEVICES="$SESSION_DEVICES" \
+   flock -w 1800 "$EVAL_LOCK_PATH" \
+       bash ops-lab/tilelang-to-ascendc/skills/tilelang2ascend-translator/scripts/evaluate_ascendc.sh "$best_dir"
    ```
    - 验证通过 → 更新该变体 `evaluation_results.json` 后继续
    - 验证失败 → **不得**向用户宣称该变体成功；改取次优变体重走本门禁；所有 passed 变体均不通过时，向用户如实汇报"进化产出的变体在全量 case 下精度不通过"
@@ -648,6 +668,13 @@ python3 plugins-community/ops-perf-evolution/skills/evolution-report/scripts/gen
 脚本自动检测 pipeline 类型（通过目录结构 `shared/` + `round_1/` 识别为 lingxi-evo），KG 会读取 `knowledge_graph.json` 中的 baseline、ideas、experiments、claims，MCTS 会读取 `baseline_evaluation.json`/`world_model_final.json`，并结合各轮次 `evaluation_results.json` 生成报告。
 
 **输出**: `"$EVO_DIR/evolution-report_{op_name}_${TIMESTAMP}.html"` — 报告生成后用 `ls -la "$EVO_DIR/evolution-report_*.html"` 验证存在并输出路径。
+
+报告生成或失败信息记录完成后释放设备组：
+
+```bash
+python3 plugins-community/ops-perf-evolution/skills/ops-evaluation/scripts/device_lease.py \
+    release-session --pool-dir "$DEVICE_POOL_DIR" --session-id "$SESSION_ID"
+```
 
 **错误处理**: exit code = 2（关键数据文件缺失）→ 回退检查步骤5.5的验证结果，修复后重试；exit code = 0 但有 stderr 警告 → 报告已生成，警告供人工复核；报告生成失败不阻塞主流程，但必须记录失败原因。
 

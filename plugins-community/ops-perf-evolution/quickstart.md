@@ -62,7 +62,7 @@ bash init.sh global claude      # 全局级
 在交互界面中输入：
 
 ```
-对 ops-nn 仓的算子进行进化优化，npu=0，算子名称为 softmax，
+对 ops-nn 仓的算子进行进化优化，npu=0,1,2,3，算子名称为 softmax，
 算子路径为 /path/to/ops-nn/softmax/，目标加速比 2x，进化轮数 3，并行数 5
 ```
 
@@ -73,7 +73,7 @@ bash init.sh global claude      # 全局级
 在交互界面中输入进化需求：
 
 ```
-对基线内核进行进化优化，npu=0，基线内核路径为 /path/to/baseline/kernel/，
+对基线内核进行进化优化，npu=0,1,2,3，基线内核路径为 /path/to/baseline/kernel/，
 目标加速比 3x，进化轮数 3，并行数 5
 ```
 
@@ -136,7 +136,8 @@ output/add_layer_norm_custom_ops-evo_20260520_141500/
    - **交互方式**：直接指示 agent，例如 "采用 ops-profiling --quick 模式重新采集一遍性能"
    - **手动测试方式（推荐，最准确）**：
      ```bash
-     ASCEND_RT_VISIBLE_DEVICES=5 bash .claude/skills/ops-profiling/scripts/msprof_profile_run.sh --quick --output-dir=path/to/output/kernel
+     bash .claude/skills/ops-profiling/scripts/msprof_profile_run.sh --quick \
+       --output-dir=path/to/output/kernel --devices=0,1,2,3
      ```
 
 ## 三、可用技能
@@ -179,6 +180,10 @@ bash init.sh --help
 ### Q: 进化轮次上限是多少？
 
 由用户传入的 `max_rounds` 参数决定（默认 2）。每轮并行候选数由 `parallel_num` 决定（默认 3）。
+
+### Q: 如何启用单节点多卡评估？
+
+在需求中把 `npu` 写成逗号分隔列表，例如 `npu=0,1,2,3`。`parallel_num` 控制候选生成数量，NPU 列表控制单次评估的卡组；评估器会把全部 case/shape 分片到各卡并行，并在原顺序汇总。目前不支持跨节点调度。
 
 ---
 

@@ -70,9 +70,12 @@ grep -nE "Stage1|Stage2|Stage3|k_cumdecay|v_inner|state.*decay" op_kernel/*.{cpp
 grep -nE "for .*t.*seqLen|for .*i.*<.*seq" op_kernel/*.{cpp,h} || echo "NO-SERIAL-LOOP"
 # 5.3 尾块特化
 grep -nE "lastChunkSize|seqLen.*chunkSize.*%" op_kernel/*.{cpp,h}
-# 5.4 编译 + 精度 + 性能
-bash evaluate_ascendc.sh   # 编译/精度
-bash ops/ops-profiling/scripts/msprof_profile_run.sh --quick --output-dir={output_dir} --device={npu}  # 性能
+# 5.4 编译 + 精度 + 性能（同一 session 的候选共用评估锁）
+flock -w 1800 "{eval_lock_path}" env ASCEND_RT_VISIBLE_DEVICES="{npu_devices}" \
+  bash evaluate_ascendc.sh && \
+flock -w 1800 "{eval_lock_path}" \
+  bash ops/ops-profiling/scripts/msprof_profile_run.sh --quick \
+    --output-dir={output_dir} --devices="{npu_devices}"
 ```
 
 **5 条 grep 全部通过 + 编译/精度 PASS 才算完成**；不满足回 Step 2 改计划表，严禁跳步。

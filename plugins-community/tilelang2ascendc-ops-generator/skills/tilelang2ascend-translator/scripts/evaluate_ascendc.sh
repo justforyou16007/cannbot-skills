@@ -52,7 +52,7 @@ Arguments:
 
 Environment overrides:
   ASCENDC_SOC_VERSION        SoC version (default: Ascend910B3)
-  ASCEND_RT_VISIBLE_DEVICES  Device id (default: 3)
+  ASCEND_RT_VISIBLE_DEVICES  Device id or comma-separated local device list (default: 3)
   ASCENDC_CLEAN_BUILD        Clean build before compiling (default: 1)
   BUILD_TYPE                 CMake build type (default: Release)
 
@@ -61,6 +61,7 @@ Examples:
   bash <path-to-tilelang2ascend-translator>/scripts/evaluate_ascendc.sh current_task
   bash <path-to-tilelang2ascend-translator>/scripts/evaluate_ascendc.sh current_task --non-compute
   ASCENDC_SOC_VERSION=Ascend910B3 bash <path-to-tilelang2ascend-translator>/scripts/evaluate_ascendc.sh current_task
+  ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 bash <path-to-tilelang2ascend-translator>/scripts/evaluate_ascendc.sh current_task
 EOF
 }
 
@@ -133,6 +134,14 @@ pip install dist/*.whl --force-reinstall
 
 cd "${WORKDIR}"
 
+VERIFY_ARGS=("${TASK_DIR}")
+if [[ -n "${NON_COMPUTE_FLAG}" ]]; then
+  VERIFY_ARGS+=("${NON_COMPUTE_FLAG}")
+fi
+if [[ "${ASCEND_RT_VISIBLE_DEVICES}" == *,* ]]; then
+  VERIFY_ARGS+=("--npu-list" "${ASCEND_RT_VISIBLE_DEVICES}")
+fi
+
 PYTHONPATH="${PYTHONPATH_PREFIX}${PYTHONPATH:+:${PYTHONPATH}}" \
   ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES}" \
-  python .claude/skills/tilelang2ascend-translator/scripts/verification_ascendc.py "${TASK_DIR}" ${NON_COMPUTE_FLAG}
+  python .claude/skills/tilelang2ascend-translator/scripts/verification_ascendc.py "${VERIFY_ARGS[@]}"

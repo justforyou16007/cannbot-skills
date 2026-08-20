@@ -49,8 +49,12 @@ grep -nE "lastChunkSize|seqLen.*%|chunkSize_|pad" op_kernel/*.{cpp,h} >> /tmp/p1
 grep -nE "bfloat16_t|bhalf_t|DownCast|CAST_RINT" op_kernel/*.{cpp,h}
 # 5.2 状态常驻（无每 chunk 搬 GM）
 grep -nE "CopyIn.*state|CopyOut.*state" op_kernel/*.{cpp,h} || echo "STATE-RESIDENT"
-# 5.3 编译 + 精度 + 性能
-bash evaluate_ascendc.sh && bash ops/ops-profiling/scripts/msprof_profile_run.sh --quick --output-dir={output_dir} --device={npu}
+# 5.3 编译 + 精度 + 性能（同一 session 的候选共用评估锁）
+flock -w 1800 "{eval_lock_path}" env ASCEND_RT_VISIBLE_DEVICES="{npu_devices}" \
+  bash evaluate_ascendc.sh && \
+flock -w 1800 "{eval_lock_path}" \
+  bash ops/ops-profiling/scripts/msprof_profile_run.sh --quick \
+    --output-dir={output_dir} --devices="{npu_devices}"
 ```
 
 **grep 全过 + 编译/精度 PASS 才完成**；不满足回 Step 2。

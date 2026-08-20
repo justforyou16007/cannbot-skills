@@ -16,7 +16,7 @@
 #      python3 msprof_perf_summary.py <PROF_GROUP_dir> <ops_dir>
 #
 #   2. 对比模式 (--compare): 对算子目录做 model.py vs model_new_ascendc.py 对比测试
-#      python3 msprof_perf_summary.py --compare --output-dir <op_dir> [--warm-up=N] [--device=N]
+#      python3 msprof_perf_summary.py --compare --output-dir <op_dir> [--warm-up=N] [--devices=0,1]
 #
 #   3. 批量模式 (--batch): 扫描多个算子目录，汇总批量报告
 #      python3 msprof_perf_summary.py --batch <base_dir> [--output-md <path>] [--output-json <path>]
@@ -30,6 +30,8 @@
 # ----------------------------------------------------------------------------------------------------------
 
 import argparse
+import concurrent.futures
+import copy
 import csv
 import importlib.util
 import inspect
@@ -1370,7 +1372,8 @@ def _add_compare_header(lines, report):
     lines.append("# 性能评估结果")
     lines.append("")
     lines.append(f"- **Operator**: {report['task']}")
-    lines.append(f"- **Device**: npu:{report['device_id']} (source={report['device_select_source']})")
+    devices = report.get("device_ids", [report["device_id"]])
+    lines.append(f"- **Devices**: npu:{devices} (source={report['device_select_source']})")
     lines.append(f"- **Warmup**: {report['warmup']}")
     lines.append(f"- **Repeats**: {report['repeats']}")
     lines.append(f"- **Seed**: {report['seed']}")
@@ -1384,8 +1387,8 @@ def _add_per_case_table(lines, report):
         return
     lines.append("## 性能对比")
     lines.append("")
-    lines.append("| Case | Shape | DType | 自定义算子(us) | 标杆(us) | 加速比 |")
-    lines.append("| ---- | ----- | ----- | ------------- | -------- | -------------- |")
+    lines.append("| Case | NPU | Shape | DType | 自定义算子(us) | 标杆(us) | 加速比 |")
+    lines.append("| ---- | --- | ----- | ----- | ------------- | -------- | ------ |")
     for case in report["per_case"]:
         shape = case.get("shape", "?")
         dtype = case.get("dtype", "?")
@@ -1395,7 +1398,10 @@ def _add_per_case_table(lines, report):
         ref_str = f"{ref:.2f}" if ref is not None else "N/A"
         asc_str = f"{asc:.2f}" if asc is not None else "N/A"
         sp_str = f"{sp:.3f}" if sp is not None else "N/A"
-        lines.append(f"| {case['case']} | {shape} | {dtype} | {asc_str} | {ref_str} | {sp_str} |")
+        lines.append(
+            f"| {case['case']} | {case.get('device_id', '?')} | {shape} | "
+            f"{dtype} | {asc_str} | {ref_str} | {sp_str} |"
+        )
     lines.append("")
 
 
@@ -1482,6 +1488,7 @@ def _report_compare_to_text(report: Dict[str, Any]) -> str:
     lines.append("=" * 100)
     lines.append(f"Kernel-level Performance (msprof): {report['task']}  "
                  f"(warmup={report['warmup']}, repeats={report['repeats']}, seed={report['seed']})")
+    lines.append(f"Devices: {report.get('device_ids', [report['device_id']])}")
     lines.append("=" * 100)
     lines.append(f"{'Case':<5} {'Shape':<35} {'dtype':<10} {'Ref(us)':>12} {'Asc(us)':>12} {'Speedup':>10}")
     lines.append("-" * 100)
@@ -1544,6 +1551,42 @@ def _select_device_id(args):
     return pick_idle_npu(default=0), "auto"
 
 
+def _parse_device_ids(raw: Optional[str]) -> Optional[List[int]]:
+    """Parse an ordered, duplicate-free comma-separated NPU list."""
+    if raw is None or not raw.strip():
+        return None
+    result = []
+    seen = set()
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            raise ValueError("device IDs 不能为空")
+        try:
+            device_id = int(token)
+        except ValueError as exc:
+            raise ValueError(f"非法 NPU device ID: {token}") from exc
+        if device_id < 0:
+            raise ValueError(f"NPU device ID 必须非负: {device_id}")
+        if device_id in seen:
+            raise ValueError(f"NPU device ID 重复: {device_id}")
+        seen.add(device_id)
+        result.append(device_id)
+    return result
+
+
+def _select_device_ids(args) -> Tuple[List[int], str]:
+    """Select one or more local NPUs from CLI, environment, or auto-detect."""
+    devices = _parse_device_ids(getattr(args, "devices", None))
+    if devices:
+        return devices, "cli"
+    if args.device is not None:
+        return [args.device], "cli"
+    env_devices = _parse_device_ids(os.environ.get("ASCEND_RT_VISIBLE_DEVICES"))
+    if env_devices:
+        return env_devices, "env"
+    return [pick_idle_npu(default=0)], "auto"
+
+
 @dataclass
 class _MeasureInput:
     """封装 _measure_one_impl 的测量参数。
@@ -1575,7 +1618,10 @@ def _measure_one_impl(mi: _MeasureInput):
         wrapper = _generate_wrapper_script(_WrapperConfig(
             mi.out_dir, mi.case_idx, mi.impl, mi.args.seed, mi.device_id,
             mi.args.warmup, mi.jsonl_case))
-        tmpdir = f"/tmp/msprof_{impl_abbr}_{mi.out_dir.name}_c{mi.case_idx}"
+        tmpdir = (
+            f"/tmp/msprof_{impl_abbr}_{mi.out_dir.name}"
+            f"_d{mi.device_id}_c{mi.case_idx}"
+        )
         prof_dir, err = _run_msprof_standard(wrapper, tmpdir, mi.device_id, mi.args.warmup)
         if prof_dir:
             duration, _op_name, parse_err = _parse_msprof_duration(prof_dir)
@@ -1612,7 +1658,8 @@ def _measure_one_impl_quick(mi: _MeasureInput):
             mi.out_dir, mi.case_idx, mi.impl, mi.args.seed, mi.device_id,
             warmup, mi.jsonl_case, repeats))
         tag = getattr(mi.args, "prof_tag", None)
-        tmpdir = (f"/tmp/msprof_quick_{impl_abbr}_{mi.out_dir.name}_c{mi.case_idx}"
+        tmpdir = (f"/tmp/msprof_quick_{impl_abbr}_{mi.out_dir.name}"
+                  f"_d{mi.device_id}_c{mi.case_idx}"
                   + (f"_{tag}" if tag else ""))
         _cleanup_prof_dirs(tmpdir)
         prof_dir, err = _run_msprof_quick(wrapper, tmpdir, mi.device_id, ext_warmup)
@@ -1806,11 +1853,31 @@ def _cleanup_prof_dirs(*dirs):
             shutil.rmtree(d, ignore_errors=True)
 
 
-def _run_compare_loop(out_dir, cases, n_cases, args, device_id):
+def _selected_case_indices(n_cases: int, args) -> List[int]:
+    """Resolve and validate the case subset requested by the caller."""
+    selected = getattr(args, "cases", None)
+    if selected:
+        indices = [int(token) for token in str(selected).split(",") if token.strip()]
+    else:
+        indices = list(range(n_cases))
+    if len(indices) != len(set(indices)):
+        raise ValueError("case 下标不能重复")
+    invalid = [index for index in indices if index < 0 or index >= n_cases]
+    if invalid:
+        raise ValueError(f"case 下标越界: {invalid}; 有效范围 0..{n_cases - 1}")
+    return indices
+
+
+def _run_compare_loop(out_dir, cases, n_cases, args, device_id,
+                      case_indices=None):
     """Run the measurement loop over all cases. Returns rows and stats."""
     rows, speedups, ref_times, asc_times = [], [], [], []
 
-    for idx in range(n_cases):
+    idx_list = case_indices
+    if idx_list is None:
+        idx_list = _selected_case_indices(n_cases, args)
+
+    for idx in idx_list:
         shape, dtype = _extract_shape_dtype_from_jsonl(cases[idx]) if cases else ("?", "?")
         jsonl_case = cases[idx] if cases else None
 
@@ -1820,6 +1887,7 @@ def _run_compare_loop(out_dir, cases, n_cases, args, device_id):
                   f"{'skip':>10}  (empty tensor)")
             rows.append({
                 "case": idx, "shape": shape, "dtype": dtype,
+                "device_id": device_id,
                 "ref_us": None, "asc_us": None, "speedup": None,
                 "ref_error": None, "asc_error": None,
                 "skipped": "empty_tensor",
@@ -1845,6 +1913,7 @@ def _run_compare_loop(out_dir, cases, n_cases, args, device_id):
 
         rows.append({
             "case": idx, "shape": shape, "dtype": dtype,
+            "device_id": device_id,
             "ref_us": ref_us, "asc_us": asc_us,
             "speedup": (ref_us / asc_us) if (ref_us and asc_us and asc_us > 0) else None,
             "ref_error": ref_err,
@@ -1859,18 +1928,17 @@ def _run_compare_loop(out_dir, cases, n_cases, args, device_id):
     return rows, speedups, ref_times, asc_times
 
 
-def _run_quick_loop(out_dir, cases, n_cases, args, device_id):
+def _run_quick_loop(out_dir, cases, n_cases, args, device_id,
+                    case_indices=None):
     """快速模式：Run the measurement loop over all cases (只跑 1 轮 msprof).
 
     Returns rows and stats.
     """
     rows, speedups, ref_times, asc_times = [], [], [], []
 
-    sel = getattr(args, "cases", None)
-    if sel:
-        idx_list = [int(x) for x in str(sel).split(",") if x.strip() != ""]
-    else:
-        idx_list = list(range(n_cases))
+    idx_list = case_indices
+    if idx_list is None:
+        idx_list = _selected_case_indices(n_cases, args)
 
     for idx in idx_list:
         shape, dtype = _extract_shape_dtype_from_jsonl(cases[idx]) if cases else ("?", "?")
@@ -1882,6 +1950,7 @@ def _run_quick_loop(out_dir, cases, n_cases, args, device_id):
                   f"{'skip':>10}  (empty tensor)")
             rows.append({
                 "case": idx, "shape": shape, "dtype": dtype,
+                "device_id": device_id,
                 "ref_us": None, "asc_us": None, "speedup": None,
                 "ref_error": None, "asc_error": None,
                 "skipped": "empty_tensor",
@@ -1914,6 +1983,7 @@ def _run_quick_loop(out_dir, cases, n_cases, args, device_id):
 
         rows.append({
             "case": idx, "shape": shape, "dtype": dtype,
+            "device_id": device_id,
             "ref_us": ref_us, "asc_us": asc_us,
             "speedup": (ref_us / asc_us) if (ref_us and asc_us and asc_us > 0) else None,
             "ref_error": ref_err,
@@ -1926,6 +1996,74 @@ def _run_quick_loop(out_dir, cases, n_cases, args, device_id):
             _cleanup_prof_dirs(ref_prof_dir, asc_prof_dir)
 
     return rows, speedups, ref_times, asc_times
+
+
+def _stats_from_rows(rows: list) -> tuple[list, list, list]:
+    """Rebuild aggregate inputs after concurrent device workers finish."""
+    speedups = [
+        row["speedup"] for row in rows
+        if isinstance(row.get("speedup"), (int, float)) and row["speedup"] > 0
+    ]
+    valid_timing_rows = [
+        row for row in rows
+        if isinstance(row.get("ref_us"), (int, float))
+        and row["ref_us"] > 0
+        and isinstance(row.get("asc_us"), (int, float))
+        and row["asc_us"] > 0
+    ]
+    ref_times = [row["ref_us"] for row in valid_timing_rows]
+    asc_times = [row["asc_us"] for row in valid_timing_rows]
+    return speedups, ref_times, asc_times
+
+
+def _run_loop_multi_device(loop_fn, out_dir, cases, n_cases, args,
+                           device_ids: List[int]):
+    """Run one serial case shard per NPU and merge rows deterministically."""
+    case_indices = _selected_case_indices(n_cases, args)
+    shards = {device_id: [] for device_id in device_ids}
+    for offset, case_index in enumerate(case_indices):
+        shards[device_ids[offset % len(device_ids)]].append(case_index)
+    active_shards = [item for item in shards.items() if item[1]]
+
+    LOGGER.info(
+        "[INFO] Case shards: %s",
+        ", ".join(
+            f"NPU {device_id}={len(indices)}"
+            for device_id, indices in active_shards
+        ),
+    )
+
+    rows = []
+
+    def run_shard(device_id, indices):
+        worker_args = copy.copy(args)
+        worker_args.cases = ",".join(str(index) for index in indices)
+        shard_rows, _speedups, _ref_times, _asc_times = loop_fn(
+            out_dir, cases, n_cases, worker_args, device_id,
+            case_indices=indices,
+        )
+        return shard_rows
+
+    if len(active_shards) <= 1:
+        if active_shards:
+            rows = run_shard(*active_shards[0])
+    else:
+        with concurrent.futures.ThreadPoolExecutor(
+                max_workers=len(active_shards),
+                thread_name_prefix="npu-prof") as executor:
+            futures = [
+                executor.submit(run_shard, device_id, indices)
+                for device_id, indices in active_shards
+            ]
+            for future in concurrent.futures.as_completed(futures):
+                rows.extend(future.result())
+
+    rows.sort(key=lambda row: row.get("case", -1))
+    speedups, ref_times, asc_times = _stats_from_rows(rows)
+    assignment = {
+        str(row["case"]): row.get("device_id") for row in rows
+    }
+    return rows, speedups, ref_times, asc_times, assignment, len(case_indices)
 
 
 # ============================================================================
@@ -2149,8 +2287,9 @@ def run_compare_mode(args):
     """执行对比模式：model.py vs model_new_ascendc.py"""
     out_dir = Path(args.output_dir).resolve()
 
-    device_id, device_src = _select_device_id(args)
-    LOGGER.info(f"[INFO] Using NPU device {device_id} (source={device_src})")
+    device_ids, device_src = _select_device_ids(args)
+    device_id = device_ids[0]
+    LOGGER.info(f"[INFO] Using NPU devices {device_ids} (source={device_src})")
 
     cases, case_source = _load_compare_cases(out_dir)
     n_cases = len(cases)
@@ -2158,21 +2297,31 @@ def run_compare_mode(args):
         LOGGER.info(f"[INFO] Loaded {n_cases} cases from {case_source}")
 
     _log_compare_header(out_dir, args)
-    rows, speedups, ref_times, asc_times = _run_compare_loop(
-        out_dir, cases, n_cases, args, device_id)
+    rows, speedups, ref_times, asc_times, assignment, selected_count = (
+        _run_loop_multi_device(
+            _run_compare_loop, out_dir, cases, n_cases, args, device_ids)
+    )
 
     csi = _CompareSummaryInput(
-        out_dir, rows, speedups, ref_times, asc_times, n_cases, args, device_id, device_src)
+        out_dir, rows, speedups, ref_times, asc_times,
+        selected_count, args, device_id, device_src)
     summary = _compute_compare_summary(csi)
-    _log_and_save_compare_reports(summary, out_dir, speedups, n_cases)
+    summary.update({
+        "device_ids": device_ids,
+        "parallel_evaluation": len(device_ids) > 1,
+        "case_assignment": assignment,
+        "normalization": "per_case_same_device_reference",
+    })
+    _log_and_save_compare_reports(summary, out_dir, speedups, selected_count)
 
 
 def run_quick_mode(args):
     """执行快速模式：model.py vs model_new_ascendc.py（只跑 1 轮 msprof，不采集 7 个 metrics）"""
     out_dir = Path(args.output_dir).resolve()
 
-    device_id, device_src = _select_device_id(args)
-    LOGGER.info(f"[INFO] Using NPU device {device_id} (source={device_src})")
+    device_ids, device_src = _select_device_ids(args)
+    device_id = device_ids[0]
+    LOGGER.info(f"[INFO] Using NPU devices {device_ids} (source={device_src})")
     LOGGER.info("[INFO] Quick mode: 1-round profiling (no aic-metrics)")
 
     cases, case_source = _load_compare_cases(out_dir)
@@ -2212,8 +2361,10 @@ def run_quick_mode(args):
     LOGGER.info(f"[INFO] in-process warmup={args.warmup}, timed repeats={args.repeats}, "
                 f"ext-warmup={getattr(args, 'ext_warmup', 0)}, impl={getattr(args, 'impl', 'both')}")
     _log_compare_header(out_dir, args)
-    rows, speedups, ref_times, asc_times = _run_quick_loop(
-        out_dir, cases, n_cases, args, device_id)
+    rows, speedups, ref_times, asc_times, assignment, selected_count = (
+        _run_loop_multi_device(
+            _run_quick_loop, out_dir, cases, n_cases, args, device_ids)
+    )
 
     if flops_fn is not None and peak_tflops:
         n_mfu = _annotate_rows_mfu(rows, cases, flops_fn, peak_tflops)
@@ -2226,15 +2377,22 @@ def run_quick_mode(args):
                                 f"actual={row['actual_tflops']:>7.2f} TFLOPS  MFU={row['mfu_pct']:.2f}%")
 
     csi = _CompareSummaryInput(
-        out_dir, rows, speedups, ref_times, asc_times, n_cases, args, device_id, device_src)
+        out_dir, rows, speedups, ref_times, asc_times,
+        selected_count, args, device_id, device_src)
     summary = _compute_compare_summary(csi)
     summary["timing_method"] = "msprof.quick.Task_Duration"
     summary["profiling_mode"] = "quick"
+    summary.update({
+        "device_ids": device_ids,
+        "parallel_evaluation": len(device_ids) > 1,
+        "case_assignment": assignment,
+        "normalization": "per_case_same_device_reference",
+    })
     if flops_fn is not None and peak_tflops:
         mfu_summary = _build_mfu_summary(rows, peak_tflops, peak_src)
         if mfu_summary:
             summary["mfu"] = mfu_summary
-    _log_and_save_compare_reports(summary, out_dir, speedups, n_cases)
+    _log_and_save_compare_reports(summary, out_dir, speedups, selected_count)
 
 
 # ============================================================================
@@ -2502,7 +2660,13 @@ def main():
                         help="PROF 临时目录后缀，用于同一 case 多次独立采集互不覆盖")
     parser.add_argument("--seed", type=int, default=0, help="随机种子")
     parser.add_argument("--retry", type=int, default=2, help="单 case 解析失败重试次数")
-    parser.add_argument("--device", type=int, default=None, help="NPU 设备 id")
+    device_group = parser.add_mutually_exclusive_group()
+    device_group.add_argument("--device", type=int, default=None,
+                              help="单张 NPU 设备 id")
+    device_group.add_argument(
+        "--devices", type=str, default=None,
+        help="单节点多卡列表，逗号分隔；case 轮询分片后卡间并行",
+    )
     parser.add_argument("--keep-prof", action="store_true", help="保留 msprof 原始 PROF 目录")
 
     # 批量模式参数
@@ -2511,6 +2675,10 @@ def main():
     parser.add_argument("--output-json", help="批量模式 JSON 输出路径")
 
     args = parser.parse_args()
+    try:
+        _parse_device_ids(args.devices)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     # 模式路由
     if args.compare:

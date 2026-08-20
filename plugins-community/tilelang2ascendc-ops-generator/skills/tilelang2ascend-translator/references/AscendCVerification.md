@@ -6,6 +6,15 @@
 bash skills/tilelang2ascend-translator/scripts/evaluate_ascendc.sh <task>
 ```
 
+单节点多卡验证：
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 \
+    bash skills/tilelang2ascend-translator/scripts/evaluate_ascendc.sh <task>
+```
+
+单任务模式下，各 case 轮询分配到本机 NPU 并行执行；结果按全局 case 下标合并。也可直接运行 `verification_ascendc.py <task> --npu-list 0,1,2,3`。
+
 该脚本会先调用统一构建器 `.claude/skills/tilelang2ascend-translator/scripts/build_ascendc.py` 编译 `<task>/kernel/`，再调用 `.claude/skills/tilelang2ascend-translator/scripts/verification_ascendc.py` 做 reference/candidate 对拍，不再依赖任务目录内的 `run.sh`。
 
 ### model_new_ascendc.py 编写约定

@@ -58,7 +58,7 @@ grep -rl "EZ9999" ops/ascendc-docs-search/references/troubleshooting_docs/
 
 ## 工作流程
 
-从 prompt 的 `[BUILD & EVAL CONTEXT]` 段提取所有构建评估参数（worktree 路径、设备 ID、评估锁路径等），在后续阶段中直接使用。
+从 prompt 的 `[BUILD & EVAL CONTEXT]` 段提取所有构建评估参数（worktree 路径、设备列表、评估锁路径等），在后续阶段中直接使用。
 
 ### 阶段1: 分析原始代码
 
@@ -130,7 +130,7 @@ python3 {z_search_root}/plugins-community/ops-perf-evolution/skills/ops-evaluati
 
 构建失败时读取错误信息、修复代码、重试。3次均失败则写入失败结果到 evaluation_results_json。
 
-### 阶段6: 评估（带设备排队锁）
+### 阶段6: 单节点多卡评估（带设备排队锁）
 
 ```bash
 python3 {z_search_root}/plugins-community/ops-perf-evolution/skills/ops-evaluation/scripts/evaluate_ops_direct.py \
@@ -138,7 +138,7 @@ python3 {z_search_root}/plugins-community/ops-perf-evolution/skills/ops-evaluati
     --call-spec {call_spec_path} \
     --baseline-path {baseline_install_path} \
     --evolved-path {install_path} \
-    --device-id {session_device_id} \
+    --device-ids {session_device_ids} \
     --task-type {task_type} \
     --shapes-mode {shapes_mode} \
     --target-speedup {target_speedup} \
@@ -147,6 +147,8 @@ python3 {z_search_root}/plugins-community/ops-perf-evolution/skills/ops-evaluati
     --baseline-cache {baseline_cache_path} \
     --output {output_dir}/round_{r}/parallel_{p}/evaluation_results.json
 ```
+
+`evaluate_ops_direct.py` 将待测 shape 轮询分配给设备组，每张卡串行处理自己的分片、不同卡并行；同一 shape 的 baseline 与 evolved 必须在同卡完成。设备数多于 shape 数时仅启动有任务的卡。
 
 **Multi-shape 参数说明**（由主 agent 在 prompt 中填充，详见 ops-evo.md §4.3）:
 - `{shapes_mode}`:

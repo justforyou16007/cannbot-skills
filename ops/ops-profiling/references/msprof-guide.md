@@ -49,6 +49,15 @@ bash {skill_path}/scripts/msprof_profile_run.sh \
 
 **关键点**：msprof 的 `op_summary.csv` **没有** `Current Freq/Rated Freq` 和逐核 `time(us)` 字段；逐核分析必须依赖 `PROF_Sample` 下的 `aicore.db`。采集落盘目录树见文末 **数据目录结构 → 临时输出**（根路径为 `--output` 下的 `PROF_GROUP_*`）。
 
+对 `model.py` 与 `model_new_ascendc.py` 的多 case 对比，可在单节点内按卡分片：
+
+```bash
+bash {skill_path}/scripts/msprof_profile_run.sh --quick \
+    --output-dir=./output/GELU --devices=0,1,2,3
+```
+
+每张卡串行处理自己的 case 分片，不同卡并行；同一 case 的 reference/candidate 固定在同卡测量，最终按原 case 顺序汇总。该模式不同于 `--batch`（后者按算子目录分任务）。
+
 ---
 
 ## Step 3：归档 + 统计摘要

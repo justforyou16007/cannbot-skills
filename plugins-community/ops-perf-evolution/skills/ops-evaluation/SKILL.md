@@ -58,6 +58,28 @@ PyBind 只需生成**一次**（基线和进化版本的 aclnn 接口相同）�
 
 ### 步骤 3：评估正确性与性能
 
+进化主流程使用 `evaluate_ops_direct.py`。它支持 multi-shape，以及单节点多卡按 shape 分片：
+
+```bash
+python3 plugins-community/ops-perf-evolution/skills/ops-evaluation/scripts/evaluate_ops_direct.py {op_name} \
+    --call-spec {call_spec_json} \
+    --baseline-path {baseline_install_path} \
+    --evolved-path {evolved_install_path} \
+    --device-ids 0,1,2,3 \
+    --task-type {vector|cube|cv-mix|unknown} \
+    --shapes-mode all \
+    --output {evaluation_results_json}
+```
+
+- `--device-id N`：兼容单卡模式，默认 `0`。
+- `--device-ids LIST`：单节点多卡模式，与 `--device-id` 互斥。shape 按输入顺序轮询分片；一张卡串行执行自己的 shape，不同卡并行。
+- 公平性约束：一个 shape 的 baseline 与 evolved 固定在同卡测量；禁止跨卡直接计算 speedup。
+- 性能聚合建议使用同型号、同频率/功耗模式的 NPU。
+- 设备数多于 shape 数时只启动有任务的卡；汇总结果恢复为 call spec 原顺序。
+- baseline cache 只有在 shape→device 映射一致时才复用。
+
+旧的单 shape 工程仍可调用 `evaluate_ops.py`：
+
 调用 `evaluate_ops.py` 对比基线版本与进化版本。
 
 ```bash
@@ -74,7 +96,7 @@ python3 plugins-community/ops-perf-evolution/skills/ops-evaluation/scripts/evalu
 - 子进程 1：`ASCEND_CUSTOM_OPP_PATH={baseline}/vendors/{vendor_subdir}` → 正确性 + 性能分析
 - 子进程 2：`ASCEND_CUSTOM_OPP_PATH={evolved}/vendors/{vendor_subdir}` → 正确性 + 性能分析
 
-可选参数：
+`evaluate_ops.py` 可选参数：
 - `--device-id`：NPU 设备 ID（默认 0）
 - `--task-type`：用于性能瓶颈分析的算子类型（`vector`、`cube`、`cv-mix`、`unknown`）
 - `--output`：评估结果 JSON 输出路径（默认在 evolved 路径下生成 `evaluation_results.json`）
@@ -83,6 +105,19 @@ python3 plugins-community/ops-perf-evolution/skills/ops-evaluation/scripts/evalu
 ### 步骤 4：对比结果
 
 脚本会自动合并两个版本的性能分析数据，并生成对比报告 `evaluation_results.json`。
+
+多卡结果还包含：
+
+```json
+{
+  "evaluation_topology": {
+    "mode": "single_node_multi_device",
+    "device_ids": [0, 1, 2, 3],
+    "case_assignment": {"T1": 0, "T2": 1},
+    "normalization": "per_case_same_device_baseline"
+  }
+}
+```
 
 ## 输出格式
 

@@ -29,9 +29,15 @@ fi
 # Locate state_ops.py relative to repo root.
 # CLAUDE_PROJECT_DIR is set by Claude Code; fallback to script-relative resolution.
 _resolve_project_root() {
+    # CLAUDE_PROJECT_DIR points at the host project, not necessarily at this
+    # plugin.  Prefer it only when it actually contains the evolution skill;
+    # otherwise native-plugin execution must resolve relative to BASH_SOURCE.
     if [[ -n "${CLAUDE_PROJECT_DIR:-}" && -d "${CLAUDE_PROJECT_DIR}" ]]; then
-        echo "${CLAUDE_PROJECT_DIR}"
-        return
+        if [[ -f "${CLAUDE_PROJECT_DIR}/.claude/skills/evolution-world-model/scripts/state_ops.py" || \
+              -f "${CLAUDE_PROJECT_DIR}/skills/evolution-world-model/scripts/state_ops.py" ]]; then
+            echo "${CLAUDE_PROJECT_DIR}"
+            return
+        fi
     fi
     # Installed layout: <root>/.claude/hooks/lib/common.sh — walk up 3 levels.
     # Source-tree layout: <root>/hooks/lib/common.sh — walk up 2 levels.
@@ -53,6 +59,7 @@ if [[ -f "${PROJECT_ROOT}/.claude/skills/evolution-world-model/scripts/state_ops
 else
     STATE_OPS_PY="${PROJECT_ROOT}/skills/evolution-world-model/scripts/state_ops.py"
 fi
+STATE_OPS_DIR="$(dirname "${STATE_OPS_PY}")"
 
 hook_log() {
     echo "[${HOOK_NAME}] $*" >&2
@@ -94,7 +101,7 @@ find_evo_dir() {
     fi
     python3 -c "
 import sys
-sys.path.insert(0, '${PROJECT_ROOT}/.claude/skills/evolution-world-model/scripts')
+sys.path.insert(0, '${STATE_OPS_DIR}')
 from state_ops import find_evo_dir
 d = find_evo_dir('${start}')
 print(d or '')
@@ -164,4 +171,4 @@ except Exception:
 }
 
 export -f hook_log hook_block hook_allow find_evo_dir read_state_field
-export PROJECT_ROOT STATE_OPS_PY HOOK_DISABLED HOOK_NAME
+export PROJECT_ROOT STATE_OPS_PY STATE_OPS_DIR HOOK_DISABLED HOOK_NAME

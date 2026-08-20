@@ -29,6 +29,12 @@ from pathlib import Path
 from string import Template
 from typing import Any
 
+# Keep sibling imports working when the report module is loaded by another
+# Python entry point (not only when executed as ``python generate_report.py``).
+_REPORT_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_REPORT_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_REPORT_SCRIPT_DIR))
+
 # Session 统计模块（session/timing/token 统计 + 资源消耗区块），从本文件拆分
 from report_session_stats import (
     _get_dir_birthtime,
@@ -138,6 +144,10 @@ def _kg_to_report_model(output_dir: str, kg_data: dict) -> dict:
     ideas = load_ideas(output_dir)
     experiments = load_experiments(output_dir)
     claims = load_claims(output_dir)
+    baseline_performance = kg_data.get("baseline_performance") or {}
+    baseline_score = baseline_performance.get("speedup", 1.0)
+    if not isinstance(baseline_score, (int, float)) or baseline_score <= 0:
+        baseline_score = 1.0
     nodes: dict[str, dict] = {
         "root": {
             "id": "root",
@@ -185,25 +195,27 @@ def _kg_to_report_model(output_dir: str, kg_data: dict) -> dict:
             "solution_ref": None,
             "children": [],
         }
-        add_child(parent_id, nid)
-
     # Experiments are the scored nodes used by all report trajectory helpers.
     for slug, experiment in sorted(experiments.items()):
         nid = experiment.get("node_id") or f"exp:{slug}"
         parent_id = _normalise_ref(experiment.get("idea_id"), "idea") or "root"
         verdict = experiment.get("verdict", "no")
-        score = experiment.get("speedup")
-        if not isinstance(score, (int, float)):
-            score = None
+        evidence_score = experiment.get("speedup")
+        if not isinstance(evidence_score, (int, float)):
+            evidence_score = None
+        score = float(evidence_score) / float(baseline_score) if evidence_score is not None else None
+        parent_idea = ideas.get(str(experiment.get("idea_id", "")).removeprefix("idea:"), {})
+        evaluation = experiment.get("evaluation") if isinstance(experiment.get("evaluation"), dict) else {}
         node = {
             "id": nid,
             "mode": "experiment",
-            "strategy_combination": [],
+            "strategy_combination": parent_idea.get("strategy_tags", []) or [],
             "description": experiment.get("title", slug),
             "parent_id": parent_id,
             "status": {"yes": "passed", "partial": "passed", "no": "failed"}.get(verdict, "failed"),
             "verdict": verdict,
             "score": float(score) if score is not None else None,
+            "evidence_score": float(evidence_score) if evidence_score is not None else None,
             "solution_ref": experiment.get("solution_ref") or (
                 f"round_{experiment.get('round', 0)}/parallel_{experiment.get('parallel_index', 0)}"
             ),
@@ -213,12 +225,34 @@ def _kg_to_report_model(output_dir: str, kg_data: dict) -> dict:
             "profiling_evidence": experiment.get("profiling_evidence"),
             "facts": experiment.get("facts"),
             "diagnosis": experiment.get("diagnosis"),
+            "gating": evaluation.get("gating"),
+            "aggregate": evaluation.get("aggregate"),
+            "shape_results": evaluation.get("shape_results"),
+            "compilation_success": evaluation.get("compilation_success"),
+            "precision_passed": evaluation.get("precision_passed"),
             "children": [],
         }
         nodes[nid] = node
+
+    # Wire topology only after every node exists.  A single-pass attachment
+    # incorrectly orphaned a child whenever its parent slug sorted later.
+    for slug, idea in sorted(ideas.items()):
+        nid = idea.get("node_id") or f"idea:{slug}"
+        parent_id = _normalise_ref(idea.get("parent_experiment"), "exp")
+        if parent_id not in nodes:
+            parent_id = _normalise_ref(idea.get("parent_idea"), "idea")
+        if parent_id not in nodes:
+            parent_id = "root"
+        nodes[nid]["parent_id"] = parent_id
+        add_child(parent_id, nid)
+    for slug, experiment in sorted(experiments.items()):
+        nid = experiment.get("node_id") or f"exp:{slug}"
+        parent_id = _normalise_ref(experiment.get("idea_id"), "idea") or "root"
+        if parent_id not in nodes:
+            parent_id = "root"
+        nodes[nid]["parent_id"] = parent_id
         add_child(parent_id, nid)
 
-    baseline_performance = kg_data.get("baseline_performance") or {}
     baseline_time = baseline_performance.get("time_us")
     if not isinstance(baseline_time, (int, float)) or baseline_time <= 0:
         time_ms = baseline_performance.get("time_ms")
@@ -229,6 +263,10 @@ def _kg_to_report_model(output_dir: str, kg_data: dict) -> dict:
     report_model = dict(kg_data)
     report_model["_kg_mode"] = True
     report_model["_kg_baseline_performance"] = baseline_performance
+    report_model["_kg_evidence_best_score"] = kg_data.get("best_score")
+    raw_best = kg_data.get("best_score")
+    if isinstance(raw_best, (int, float)):
+        report_model["best_score"] = float(raw_best) / float(baseline_score)
     report_model["baseline"] = {"time_us": baseline_time}
     report_model["baseline_time_us"] = baseline_time
     report_model["claims"] = claims
@@ -542,20 +580,27 @@ def enrich_rounds_from_world_model(rounds: list[dict], wm: dict | None, baseline
                     "precision_passed": True,
                     "evolved": {"time_us": round(evolved_time, 2), "pipeline": pipeline},
                     "comparison": {"speedup": float(score)},
+                    "gating": node.get("gating"),
                     "_source": "knowledge_graph",
                 }
             elif verdict == "partial":
                 r["eval"] = {
                     "compilation_success": True,
-                    "precision_passed": False,
+                    "precision_passed": True,
                     "evolved": {"time_us": round(baseline_time / float(score), 2)}
                     if isinstance(score, (int, float)) and score > 0 else {},
+                    "comparison": {"speedup": float(score)}
+                    if isinstance(score, (int, float)) and score > 0 else {},
+                    "gating": node.get("gating"),
                     "_source": "knowledge_graph",
                 }
             else:
+                compile_ok = node.get("compilation_success") is True
+                precision_ok = node.get("precision_passed") is True
                 r["eval"] = {
-                    "compilation_success": False,
-                    "precision_passed": False,
+                    "compilation_success": compile_ok,
+                    "precision_passed": precision_ok,
+                    "gating": node.get("gating"),
                     "_source": "knowledge_graph",
                 }
             continue
@@ -592,6 +637,8 @@ def find_best_variant(rounds: list[dict], baseline_time: float) -> dict | None:
         compilation_ok, precision_ok = _eval_compile_and_precision(ev)
         if not compilation_ok or not precision_ok:
             continue
+        if ev.get("gating") in {"failed", "target_regression", "generalization_regression"}:
+            continue
         evolved_time = ev.get("evolved", {}).get("time_us")
         if evolved_time and evolved_time > 0:
             speedup = baseline_time / evolved_time
@@ -625,8 +672,15 @@ def _trace_back_to_root(start_nid: str, parent_of: dict) -> list:
     """从指定节点沿 parent_of 回溯到根，返回节点 id 路径（不含 "root" 前缀）。"""
     path = [start_nid]
     current = start_nid
+    seen = {start_nid}
     while current in parent_of:
         current = parent_of.get(current)
+        if current in seen:
+            # A malformed hand-edited wiki must not hang report generation.
+            # The validator reports the cycle separately; here we return the
+            # finite prefix so the report can still expose the evidence.
+            break
+        seen.add(current)
         path.insert(0, current)
     return path
 
@@ -646,7 +700,7 @@ def _find_path_by_best_variant(nodes: dict, best_variant: dict,
     endpoint_score = nodes.get(target_node, {}).get("score", 0)
     if endpoint_score is None:
         endpoint_score = 0.0
-    return ["root"] + path, endpoint_score
+    return (path if path and path[0] == "root" else ["root"] + path), endpoint_score
 
 
 def _find_path_by_highest_score(nodes: dict, parent_of: dict) -> tuple:
@@ -654,6 +708,19 @@ def _find_path_by_highest_score(nodes: dict, parent_of: dict) -> tuple:
     best_node_id = None
     best_node_score = -1.0
     for nid, node in nodes.items():
+        # A failed/regressed experiment can still carry a large legacy score
+        # (for example a parent-relative value).  It must never become the
+        # report's fallback "best path" when the exact solution_ref lookup
+        # misses.  Keep the same evidence gate used by the KG best-score
+        # computation.
+        if node.get("status") not in (None, "passed"):
+            continue
+        if str(node.get("verdict", "")).lower() == "no":
+            continue
+        if str(node.get("gating", "")).lower() in {
+            "failed", "target_regression", "generalization_regression",
+        }:
+            continue
         score = node.get("score")
         if score is not None and score > best_node_score:
             best_node_score = score
@@ -661,7 +728,7 @@ def _find_path_by_highest_score(nodes: dict, parent_of: dict) -> tuple:
 
     if best_node_id and best_node_score > 0:
         path = _trace_back_to_root(best_node_id, parent_of)
-        return ["root"] + path, best_node_score
+        return (path if path and path[0] == "root" else ["root"] + path), best_node_score
     return ["root"], 1.0
 
 
@@ -2391,7 +2458,11 @@ def main():
         LOGGER.error("Error: output directory not found: %s", output_dir)
         sys.exit(1)
 
-    ri = _resolve_inputs_and_test_case(args, output_dir)
+    try:
+        ri = _resolve_inputs_and_test_case(args, output_dir)
+    except ValueError as exc:
+        LOGGER.error("Error: %s", exc)
+        sys.exit(2)
     if ri is None:
         LOGGER.error(
             "Error: no report input found (expected baseline_evaluation.json, "

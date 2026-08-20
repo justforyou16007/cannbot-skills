@@ -165,7 +165,7 @@ profiling_insight: null  # CSV 级快速诊断
 profiling_evidence: null # 指令级深度空泡分析
 facts: null              # Stage 1 纯事实提取
 diagnosis: null          # Stage 2 LLM 诊断
-failure_type: null       # impl_error | strategy_infeasible
+failure_type: null       # impl_error | strategy_infeasible | profiling_lost
 failure_reason: null
 retry_count: 0
 tags: []
@@ -180,7 +180,7 @@ added: 2026-08-19T...
 | `verdict` | string | yes / partial / no |
 | `confidence` | string | high / medium / low |
 | `speedup` | float 或 null | 通过后为正数，失败为 null |
-| `failure_type` | string 或 null | 仅 verdict=no 时有值：impl_error / strategy_infeasible |
+| `failure_type` | string 或 null | 仅 verdict=no 时有值：impl_error / strategy_infeasible / profiling_lost；profiling_lost 不进入禁忌表或反证 |
 | `retry_count` | int | ≥0，impl_error 修复 idea 继承 parent+1；≥2 时不再重试 |
 | `profiling_evidence` | object 或 null | 与旧 schema 的 profiling_evidence 结构完全一致 |
 

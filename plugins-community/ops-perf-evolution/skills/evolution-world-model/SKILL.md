@@ -14,7 +14,7 @@ description: "知识图谱驱动的算子演化工具和参考文档。支持 Id
 | **知识图谱模式（KG）** | `knowledge_graph.json` + `ideas/` + `experiments/` + `claims/` | 推荐。多镜头 idea 生成、gap 分析、claim 验证 |
 | **旧 MCTS 模式** | `world_model.json` + `decision_tree.nodes` | 向后兼容 |
 
-唯一模式判定：当 evo_dir 下存在 `knowledge_graph.json` 时使用 KG 模式，否则使用 MCTS 模式。`ideas/` 目录单独存在不足以切换模式；Python 使用 `kg_ops.detect_mode()`，shell hook 使用 `detect_evo_mode()`。
+唯一模式判定：仅已有 `world_model.json` 且无 `knowledge_graph.json` 的存量会话使用 MCTS；新目录（两个证据文件都不存在）默认 KG，初始化后以 `knowledge_graph.json` 固化模式。两个证据文件同时存在属于冲突，必须停止并恢复单一证据源。`ideas/` 目录单独存在不参与判定；Python 使用 `kg_ops.detect_mode()`，shell hook 使用 `detect_evo_mode()`。
 
 ## 文件布局
 

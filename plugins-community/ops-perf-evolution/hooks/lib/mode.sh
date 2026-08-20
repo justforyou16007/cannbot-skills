@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # mode.sh — one canonical mode predicate for shell-side evolution consumers.
 #
-# KG mode is selected only when knowledge_graph.json exists.  An ideas/
-# directory by itself is not sufficient; this mirrors kg_ops.detect_mode().
+# New directories default to KG. Only a world_model.json-only directory is a
+# legacy MCTS session. This mirrors kg_ops.detect_mode().
 
 if [[ -n "${LOOP_HOOK_MODE_SOURCED:-}" ]]; then
     return 0
@@ -11,10 +11,13 @@ LOOP_HOOK_MODE_SOURCED=1
 
 detect_evo_mode() {
     local evo_dir="$1"
-    if [[ -f "${evo_dir}/knowledge_graph.json" ]]; then
-        echo "kg"
-    else
+    if [[ -f "${evo_dir}/knowledge_graph.json" && -f "${evo_dir}/world_model.json" ]]; then
+        echo "conflict"
+        return 1
+    elif [[ -f "${evo_dir}/world_model.json" ]]; then
         echo "mcts"
+    else
+        echo "kg"
     fi
 }
 

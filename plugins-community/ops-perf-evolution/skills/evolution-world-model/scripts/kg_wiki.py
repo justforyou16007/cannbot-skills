@@ -56,7 +56,7 @@ _OPTIMIZATION_TYPES = {
 
 _EXPERIMENT_VERDICTS = {"yes", "partial", "no"}
 _EXPERIMENT_CONFIDENCE = {"high", "medium", "low"}
-_FAILURE_TYPES = {"impl_error", "strategy_infeasible"}
+_FAILURE_TYPES = {"impl_error", "strategy_infeasible", "profiling_lost"}
 
 _CLAIM_STATUSES = {"drafted", "unproven", "verified", "refuted"}
 _CLAIM_POLARITIES = {"positive", "negative"}
@@ -116,6 +116,15 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _safe_int(value: Any, default: int = 0) -> int:
+    if isinstance(value, bool):
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
 def _parse_frontmatter(text: str) -> dict[str, Any]:
     """Parse YAML-ish frontmatter from markdown. Returns dict of key-value pairs."""
     if not text.startswith("---"):
@@ -132,11 +141,21 @@ def _parse_frontmatter(text: str) -> dict[str, Any]:
         match = re.match(r"^(\w[\w_-]*)\s*:\s*(.*)$", line)
         if match:
             key, val = match.group(1), match.group(2).strip()
-            # Parse list values: [a, b, c]
-            if val.startswith("[") and val.endswith("]"):
-                items = [v.strip().strip('"').strip("'")
-                         for v in val[1:-1].split(",") if v.strip()]
-                result[key] = items
+            # Parse JSON-shaped structured values first.  workflow_ref is a
+            # JSON object; list fields use a permissive YAML-ish fallback for
+            # historical unquoted strategy IDs.
+            if ((val.startswith("[") and val.endswith("]"))
+                    or (val.startswith("{") and val.endswith("}"))):
+                try:
+                    result[key] = json.loads(val)
+                except json.JSONDecodeError:
+                    if val.startswith("["):
+                        result[key] = [
+                            v.strip().strip('"').strip("'")
+                            for v in val[1:-1].split(",") if v.strip()
+                        ]
+                    else:
+                        result[key] = val
             # Parse quoted strings
             elif val.startswith('"') and val.endswith('"'):
                 result[key] = val[1:-1].replace('\\"', '"').replace('\\n', '\n')
@@ -399,12 +418,37 @@ def upsert_idea(
                          f"Valid: {sorted(_OPTIMIZATION_TYPES)}")
     if not 1 <= difficulty <= 5:
         raise ValueError(f"difficulty must be 1-5, got {difficulty}")
-    if mode == "workflow_guided" and not workflow_ref:
-        raise ValueError("workflow_guided mode requires workflow_ref")
+    if mode == "workflow_guided":
+        if not isinstance(workflow_ref, dict):
+            raise ValueError("workflow_guided mode requires a workflow_ref object")
+        workflow_ref = dict(workflow_ref)
+        workflow_file = workflow_ref.get("workflow_file") or workflow_ref.get("file")
+        stage_order = workflow_ref.get("stage_order")
+        if not str(workflow_file or "").strip() or not isinstance(stage_order, list) or not stage_order:
+            raise ValueError(
+                "workflow_guided mode requires workflow_ref.workflow_file and non-empty stage_order"
+            )
+        stage_order = [str(stage).strip() for stage in stage_order if str(stage).strip()]
+        if not stage_order:
+            raise ValueError("workflow_guided mode requires a non-empty stage_order")
+        # Persist one canonical shape even when callers use the historical
+        # ``file`` alias; prompt rendering and downstream validators consume
+        # workflow_file/stage_order directly.
+        workflow_ref["workflow_file"] = str(workflow_file).strip()
+        workflow_ref["stage_order"] = stage_order
 
-    strategy_tags = strategy_tags or []
-    target_gaps = target_gaps or []
-    tags = tags or []
+    if isinstance(strategy_tags, str):
+        strategy_tags = [part.strip() for part in strategy_tags.split(",") if part.strip()]
+    elif not isinstance(strategy_tags, list):
+        strategy_tags = []
+    if isinstance(target_gaps, str):
+        target_gaps = [part.strip() for part in target_gaps.split(",") if part.strip()]
+    elif not isinstance(target_gaps, list):
+        target_gaps = []
+    if isinstance(tags, str):
+        tags = [part.strip() for part in tags.split(",") if part.strip()]
+    elif not isinstance(tags, list):
+        tags = []
     slug = _slugify(slug or title)
 
     page_path = root / "ideas" / f"{slug}.md"
@@ -448,12 +492,102 @@ def load_ideas(kg_root: str) -> dict[str, dict]:
         return {}
     ideas = {}
     for md_file in sorted(ideas_dir.glob("*.md")):
-        fm = _parse_frontmatter(_read_text(md_file))
+        text = _read_text(md_file)
+        fm = _parse_frontmatter(text)
         if fm.get("type") == "idea":
+            def _section(name: str, next_name: str | None = None) -> str:
+                start_marker = f"## {name}\n"
+                start = text.find(start_marker)
+                if start < 0:
+                    return ""
+                start += len(start_marker)
+                end = text.find(f"\n## {next_name}\n", start) if next_name else len(text)
+                if end < 0:
+                    end = len(text)
+                value = text[start:end].strip()
+                # The renderer writes these instructional placeholders when a
+                # caller omits prose.  Treat them as missing on round-trip so
+                # retry-safe idea identity does not create a new slug merely
+                # because the serialized page contains its own hint text.
+                if value in {
+                    "_描述这个优化假设的核心思路和预期效果._",
+                    "_列出每个策略 ID 及其在此 idea 中的作用._",
+                }:
+                    return ""
+                return value
+
+            fm["thesis"] = _section("Thesis", "Strategy Rationale")
+            fm["strategy_rationale"] = _section("Strategy Rationale", "Connections")
             slug = md_file.stem
             fm["_path"] = str(md_file)
             ideas[slug] = fm
     return ideas
+
+
+def materialize_idea(
+    kg_root: str,
+    slug: str,
+    *,
+    title: str,
+    thesis: str,
+    description: str = "",
+    strategy_rationale: str = "",
+) -> Path:
+    """Replace an open-exploration scaffold with a concrete jury proposal.
+
+    The regular ``upsert_idea`` CLI has defaults for every field, so using it
+    to edit only a title/thesis can accidentally erase workflow metadata,
+    parentage, or target gaps.  This narrow operation loads the existing
+    entity and preserves all identity fields while changing only the prose
+    supplied by the jury.
+    """
+    ideas = load_ideas(kg_root)
+    current = ideas.get(str(slug).removeprefix("idea:"))
+    if not current:
+        raise FileNotFoundError(f"Idea not found: {slug}")
+    if current.get("mode") != "open_exploration":
+        raise ValueError("materialize_idea is only valid for open_exploration ideas")
+    if not str(title).strip() or len(str(thesis).strip()) < 80:
+        raise ValueError("materialized open_exploration ideas require a concrete title and thesis >= 80 characters")
+    preserved_description = str(description or "").strip()
+    if not preserved_description and current.get("_path"):
+        # The description is the prose between the H1 and ``## Thesis``.  It
+        # is deliberately not a frontmatter field, so recover it here when a
+        # jury only changes the title/thesis through this narrow command.
+        try:
+            current_text = _read_text(Path(str(current["_path"])))
+            heading = f"# {current.get('title', '')}\n"
+            start = current_text.find(heading)
+            thesis_marker = current_text.find("\n## Thesis\n", start + len(heading))
+            if start >= 0 and thesis_marker >= 0:
+                preserved_description = current_text[start + len(heading):thesis_marker].strip()
+        except (OSError, TypeError):
+            preserved_description = ""
+    preserved_rationale = str(strategy_rationale or "").strip()
+    if not preserved_rationale:
+        preserved_rationale = str(current.get("strategy_rationale") or "").strip()
+    return upsert_idea(
+        kg_root,
+        str(slug).removeprefix("idea:"),
+        str(title).strip(),
+        strategy_tags=list(current.get("strategy_tags") or []),
+        optimization_type=str(current.get("optimization_type") or "algorithm"),
+        difficulty=int(current.get("difficulty", 3) or 3),
+        mode="open_exploration",
+        workflow_ref=current.get("workflow_ref"),
+        parent_idea=current.get("parent_idea"),
+        parent_experiment=current.get("parent_experiment"),
+        generation_lens=str(current.get("generation_lens") or "open_exploration"),
+        generation_round=int(current.get("generation_round", 0) or 0),
+        target_gaps=list(current.get("target_gaps") or []),
+        tags=list(current.get("tags") or []),
+        description=preserved_description,
+        thesis=str(thesis).strip(),
+        strategy_rationale=preserved_rationale,
+        stage=str(current.get("stage") or "proposed"),
+        outcome=str(current.get("outcome") or "pending"),
+        update_on_exist=True,
+    )
 
 
 def get_banlist(kg_root: str) -> list[dict]:
@@ -600,6 +734,7 @@ def add_experiment(
     profiling_evidence: dict | None = None,
     facts: dict | None = None,
     diagnosis: dict | None = None,
+    evaluation: dict | None = None,
     failure_type: str | None = None,
     failure_reason: str | None = None,
     retry_count: int = 0,
@@ -617,8 +752,20 @@ def add_experiment(
         raise ValueError(f"Invalid confidence '{confidence}'")
     if failure_type and failure_type not in _FAILURE_TYPES:
         raise ValueError(f"Invalid failure_type '{failure_type}'")
+    for field_name, field_value in (
+        ("profiling_insight", profiling_insight),
+        ("profiling_evidence", profiling_evidence),
+        ("facts", facts),
+        ("diagnosis", diagnosis),
+        ("evaluation", evaluation),
+    ):
+        if field_value is not None and not isinstance(field_value, dict):
+            raise ValueError(f"{field_name} must be a JSON object when provided")
 
-    tags = tags or []
+    if isinstance(tags, str):
+        tags = [part.strip() for part in tags.split(",") if part.strip()]
+    elif not isinstance(tags, list):
+        tags = []
     slug = _slugify(slug or title)
 
     page_path = root / "experiments" / f"{slug}.md"
@@ -628,7 +775,7 @@ def add_experiment(
     was_update = page_path.exists()
 
     # Write sidecar JSON for structured data that doesn't fit in frontmatter
-    # (profiling_insight, profiling_evidence, facts, diagnosis).
+    # (profiling_insight, profiling_evidence, facts, diagnosis, evaluation).
     # This ensures load_experiments() can round-trip all structured fields.
     sidecar_path = root / "experiments" / f"{slug}.json"
     old_sidecar: dict = {}
@@ -650,6 +797,8 @@ def add_experiment(
         facts = old_sidecar.get("facts")
     if diagnosis is None:
         diagnosis = old_sidecar.get("diagnosis")
+    if evaluation is None:
+        evaluation = old_sidecar.get("evaluation")
 
     # Re-render after merging the old values so the markdown page and sidecar
     # remain consistent on update.
@@ -670,6 +819,8 @@ def add_experiment(
         sidecar["facts"] = facts
     if diagnosis is not None:
         sidecar["diagnosis"] = diagnosis
+    if evaluation is not None:
+        sidecar["evaluation"] = evaluation
     if sidecar:
         sidecar_path.write_text(
             json.dumps(sidecar, ensure_ascii=False, indent=2),
@@ -918,16 +1069,22 @@ def sync_knowledge_graph(
 
     idea_registry: dict[str, dict[str, Any]] = {}
     for slug, idea in ideas.items():
+        tested_rounds = [
+            _safe_int(exp.get("round", 0) or 0)
+            for exp in experiments.values()
+            if str(exp.get("idea_id", "")).removeprefix("idea:") == slug
+            and _safe_int(exp.get("round", 0) or 0) > 0
+        ]
         idea_registry[slug] = {
             "stage": idea.get("stage", "proposed"),
             "outcome": idea.get("outcome", "pending"),
             "generation_lens": idea.get("generation_lens", ""),
             "round_created": idea.get("generation_round", 0),
-            "round_tested": None,
+            "round_tested": min(tested_rounds) if tested_rounds else None,
         }
 
     rounds_completed = max(
-        (int(exp.get("round", 0) or 0) for exp in experiments.values()),
+        (_safe_int(exp.get("round", 0) or 0) for exp in experiments.values()),
         default=0,
     )
 
@@ -1165,6 +1322,17 @@ def cmd_upsert_idea(args: argparse.Namespace) -> None:
         if args.target_gaps else []
     tags = [t.strip() for t in args.tags.split(",") if t.strip()] \
         if args.tags else []
+    workflow_ref = None
+    if args.workflow_ref:
+        try:
+            workflow_ref = json.loads(args.workflow_ref)
+        except json.JSONDecodeError:
+            try:
+                workflow_ref = json.loads(Path(args.workflow_ref).read_text(encoding="utf-8"))
+            except (FileNotFoundError, OSError, json.JSONDecodeError) as exc:
+                raise ValueError("--workflow-ref must be a JSON object or readable JSON file") from exc
+        if not isinstance(workflow_ref, dict):
+            raise ValueError("--workflow-ref must contain a JSON object")
 
     upsert_idea(
         args.kg_root, args.slug, args.title,
@@ -1172,6 +1340,7 @@ def cmd_upsert_idea(args: argparse.Namespace) -> None:
         optimization_type=args.optimization_type,
         difficulty=args.difficulty,
         mode=args.mode,
+        workflow_ref=workflow_ref,
         generation_lens=args.generation_lens,
         generation_round=args.generation_round,
         target_gaps=target_gaps,
@@ -1187,6 +1356,17 @@ def cmd_upsert_idea(args: argparse.Namespace) -> None:
     )
 
 
+def cmd_materialize_idea(args: argparse.Namespace) -> None:
+    materialize_idea(
+        args.kg_root,
+        args.slug,
+        title=args.title,
+        thesis=args.thesis,
+        description=args.description or "",
+        strategy_rationale=args.strategy_rationale or "",
+    )
+
+
 def cmd_add_experiment(args: argparse.Namespace) -> None:
     tags = [t.strip() for t in args.tags.split(",") if t.strip()] \
         if args.tags else []
@@ -1195,14 +1375,18 @@ def cmd_add_experiment(args: argparse.Namespace) -> None:
         if not val:
             return None
         try:
-            return json.loads(val)
+            parsed = json.loads(val)
         except json.JSONDecodeError:
             # Try as file path
             try:
-                return json.loads(Path(val).read_text(encoding="utf-8"))
-            except (FileNotFoundError, json.JSONDecodeError):
-                logger.warning("Could not parse JSON arg: %s", val[:80] if val else "")
-                return None
+                parsed = json.loads(Path(val).read_text(encoding="utf-8"))
+            except (FileNotFoundError, OSError, json.JSONDecodeError) as exc:
+                raise ValueError(
+                    f"structured argument must be valid JSON or a readable file: {val[:80]}"
+                ) from exc
+        if not isinstance(parsed, dict):
+            raise ValueError(f"structured argument must contain a JSON object: {val[:80]}")
+        return parsed
 
     add_experiment(
         args.kg_root, args.slug, args.title,
@@ -1217,6 +1401,7 @@ def cmd_add_experiment(args: argparse.Namespace) -> None:
         profiling_evidence=_parse_json_arg(args.profiling_evidence),
         facts=_parse_json_arg(args.facts),
         diagnosis=_parse_json_arg(args.diagnosis),
+        evaluation=_parse_json_arg(args.evaluation),
         failure_type=args.failure_type,
         failure_reason=args.failure_reason,
         retry_count=args.retry_count,
@@ -1312,6 +1497,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_idea.add_argument("--optimization-type", default="algorithm")
     p_idea.add_argument("--difficulty", type=int, default=3)
     p_idea.add_argument("--mode", default="strategy_guided")
+    p_idea.add_argument("--workflow-ref", default=None,
+                        help="JSON object or file path (required for workflow_guided mode)")
     p_idea.add_argument("--generation-lens", default="profiling_driven")
     p_idea.add_argument("--generation-round", type=int, default=0)
     p_idea.add_argument("--target-gaps", default="")
@@ -1325,6 +1512,18 @@ def _build_parser() -> argparse.ArgumentParser:
     p_idea.add_argument("--parent-experiment", default=None)
     p_idea.add_argument("--update-on-exist", action="store_true")
     p_idea.set_defaults(func=cmd_upsert_idea)
+
+    p_materialize = subparsers.add_parser(
+        "materialize_idea",
+        help="Replace an open-exploration scaffold with concrete jury prose",
+    )
+    p_materialize.add_argument("kg_root")
+    p_materialize.add_argument("--slug", required=True)
+    p_materialize.add_argument("--title", required=True)
+    p_materialize.add_argument("--thesis", required=True)
+    p_materialize.add_argument("--description", default="")
+    p_materialize.add_argument("--strategy-rationale", default="")
+    p_materialize.set_defaults(func=cmd_materialize_idea)
 
     # add_experiment
     p_exp = subparsers.add_parser("add_experiment", help="Create/update an experiment")
@@ -1346,6 +1545,8 @@ def _build_parser() -> argparse.ArgumentParser:
                        help="JSON string or file path for extracted facts")
     p_exp.add_argument("--diagnosis", default=None,
                        help="JSON string or file path for diagnosis")
+    p_exp.add_argument("--evaluation", default=None,
+                       help="JSON string or file path for evaluator/gating metadata")
     p_exp.add_argument("--failure-type", default=None)
     p_exp.add_argument("--failure-reason", default=None)
     p_exp.add_argument("--retry-count", type=int, default=0)

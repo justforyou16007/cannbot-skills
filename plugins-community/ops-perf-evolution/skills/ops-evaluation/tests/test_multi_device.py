@@ -106,6 +106,37 @@ class ParallelEvaluationTest(unittest.TestCase):
                 )
             )
 
+    def test_missing_expected_shape_is_a_failed_entry(self):
+        shape_plan = [
+            {"name": "a", "group": "target"},
+            {"name": "b", "group": "target"},
+        ]
+        shape_results, compile_ok = evaluate.merge_per_shape_results(
+            [{"name": "a", "group": "target", "time_us": 10.0, "precision_passed": True}],
+            [{"name": "a", "group": "target", "time_us": 5.0, "precision_passed": True}],
+            {"a": (True, "ok")},
+            expected_shapes=shape_plan,
+        )
+        self.assertFalse(compile_ok)
+        missing = next(item for item in shape_results["target"] if item["name"] == "b")
+        self.assertIn("missing baseline result", missing["error"])
+        self.assertFalse(missing["precision_passed"])
+
+    def test_expected_shape_group_overrides_worker_group(self):
+        shape_plan = [{"name": "target_a", "group": "target"}]
+        shape_results, compile_ok = evaluate.merge_per_shape_results(
+            [{"name": "target_a", "group": "generalization", "time_us": 10.0,
+              "precision_passed": True}],
+            [{"name": "target_a", "group": "generalization", "time_us": 5.0,
+              "precision_passed": True}],
+            {"target_a": (True, "ok")},
+            expected_shapes=shape_plan,
+        )
+        self.assertTrue(compile_ok)
+        self.assertEqual(len(shape_results["target"]), 1)
+        self.assertEqual(shape_results["target"][0]["name"], "target_a")
+        self.assertFalse(shape_results["generalization"])
+
 
 class MultiDeviceLeaseTest(unittest.TestCase):
     def test_device_groups_do_not_overlap(self):
@@ -135,6 +166,29 @@ class MultiDeviceLeaseTest(unittest.TestCase):
             finally:
                 first.release_session()
                 second.release_session()
+
+    def test_reacquiring_same_session_adopts_original_group(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            lease_mod, "_get_device_memory_usage", return_value=0.0
+        ):
+            first = lease_mod.SessionDeviceLease(tmp)
+            resumed = lease_mod.SessionDeviceLease(tmp)
+            try:
+                self.assertEqual(
+                    first.acquire_session_devices(
+                        "op-a", "session-a", 2, [0, 1, 2], timeout=0
+                    ),
+                    [0, 1],
+                )
+                self.assertEqual(
+                    resumed.acquire_session_devices(
+                        "op-a", "session-a", 2, [0, 1, 2], timeout=0
+                    ),
+                    [0, 1],
+                )
+                self.assertEqual(resumed.device_ids, [0, 1])
+            finally:
+                resumed.release_session()
 
 
 if __name__ == "__main__":

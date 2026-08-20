@@ -15,6 +15,34 @@ LOOP_HOOK_STATE_SOURCED=1
 # shellcheck source=lib/mode.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/mode.sh"
 
+# Stage-independent KG integrity gate. It is deliberately separate from
+# check_stop_rules so terminal done/aborted states cannot bypass graph
+# validation, and so a dual-store mode conflict never falls through to MCTS.
+check_kg_integrity_rules() {
+    local evo_dir="$1"
+    local evolution_mode
+    evolution_mode="$(detect_evo_mode "${evo_dir}")"
+    local mode_rc=$?
+    if [[ ${mode_rc} -ne 0 || "${evolution_mode}" == "conflict" ]]; then
+        echo "R1: both knowledge_graph.json and world_model.json exist; session mode is ambiguous"
+        return 0
+    fi
+    [[ "${evolution_mode}" == "kg" ]] || return 0
+    [[ -f "${evo_dir}/knowledge_graph.json" ]] || return 0
+
+    local kg_ops_path="${PROJECT_ROOT}/.claude/skills/evolution-world-model/scripts/kg_ops.py"
+    [[ -f "${kg_ops_path}" ]] || kg_ops_path="${PROJECT_ROOT}/skills/evolution-world-model/scripts/kg_ops.py"
+    if [[ ! -f "${kg_ops_path}" ]]; then
+        echo "R2.KG: kg_ops.py is unavailable; cannot validate KG integrity"
+        return 0
+    fi
+    local output
+    output="$(python3 "${kg_ops_path}" validate --evo-dir "${evo_dir}" 2>&1)"
+    if [[ $? -ne 0 ]]; then
+        echo "R2.KG: ${output}"
+    fi
+}
+
 # Detect concrete violations of state.json invariants.
 # Echoes reasons to stdout (caller assembles them); returns 1 if any.
 check_stop_rules() {
@@ -42,22 +70,6 @@ check_stop_rules() {
 
     local evolution_mode
     evolution_mode="$(detect_evo_mode "${evo_dir}")"
-
-    # KG integrity is a separate gate from state.json schema validation.  Run
-    # it only for KG sessions; the MCTS branch remains byte-for-byte
-    # behavior-compatible with the legacy hook checks.
-    if [[ "${evolution_mode}" == "kg" ]]; then
-        local kg_ops_path="${PROJECT_ROOT}/.claude/skills/evolution-world-model/scripts/kg_ops.py"
-        [[ -f "${kg_ops_path}" ]] || kg_ops_path="${PROJECT_ROOT}/skills/evolution-world-model/scripts/kg_ops.py"
-        if [[ -f "${kg_ops_path}" ]]; then
-            local kg_validation_output
-            kg_validation_output="$(python3 "${kg_ops_path}" validate --evo-dir "${evo_dir}" 2>&1)"
-            local kg_validation_rc=$?
-            if [[ ${kg_validation_rc} -ne 0 ]]; then
-                echo "R2.KG: ${kg_validation_output}"
-            fi
-        fi
-    fi
 
     local stage
     stage="$(read_state_field "${evo_dir}" "stage")"
@@ -331,5 +343,5 @@ print(','.join(r16[:3]))
     fi
 }
 
-export -f check_stop_rules
+export -f check_kg_integrity_rules check_stop_rules
 export -f check_wm_integrity_rules

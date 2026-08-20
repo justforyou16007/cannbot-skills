@@ -195,7 +195,7 @@ fi
 echo "绑定设备组: NPU $SESSION_DEVICES"
 ```
 
-若获取失败（报 "occupied by other sessions"）：列出 `$DEVICE_POOL_DIR/session_*_lease.json`，用 `kill -0 {pid}` 检查每个租约 PID 是否存活；PID 已死则执行 `release-session --pool-dir $DEVICE_POOL_DIR --session-id {session_id}` 清理残留后重新 `acquire-session`；仍失败则报错退出。
+若获取失败：列出 `$DEVICE_POOL_DIR/session_*_lease.json` 诊断，但**不得仅凭 PID 已退出释放租约**——`acquire-session` 本身是短进程，活跃 session 的 metadata PID 正常会死亡。只允许释放本次 `$SESSION_ID` 自己的租约，或由 `device_lease.py` 按 `start_time` 超过 12 小时自动判定并清理的过期租约；其他 session 的新鲜租约必须保留，仍无卡则报错退出。
 
 **后续所有评估命令中的 `{device_ids}` 均使用 `$SESSION_DEVICES`。**
 
@@ -313,7 +313,7 @@ python3 plugins-community/ops-perf-evolution/skills/ops-evaluation/scripts/evalu
 
 #### 3.8. 初始化知识图谱（KG）/ 保留 MCTS 会话兼容
 
-共享文件准备完成后，先固定会话模式，再初始化对应的证据存储。唯一规范是：$EVO_DIR/knowledge_graph.json 存在即为 KG，否则为 MCTS；初始化后不得在同一会话切换模式。
+共享文件准备完成后，先固定会话模式，再初始化对应的证据存储。唯一规范是：仅已有 `world_model.json` 且无 `knowledge_graph.json` 的存量会话为 MCTS；两个文件都不存在的新会话默认 KG；两者同时存在必须报错停止。初始化后不得在同一会话切换模式。
 
 ```bash
 MODE=$(python3 -c "import sys; sys.path.insert(0, 'plugins-community/ops-perf-evolution/skills/evolution-world-model/scripts'); from kg_ops import detect_mode; print(detect_mode('$EVO_DIR'))")
@@ -329,9 +329,11 @@ echo "[INFO] evolution mode: $MODE"
 KG 模式必须通过唯一入口完成初始化；入口建立实体目录和 session/baseline/hardware/kernel 摘要，执行 profiling-driven、method-transfer、gap-analysis、continuation、open-exploration、workflow-guided 多视角初始 idea 生成，并建立 gap map 与不超过 8000 字符的 query pack：
 
 ```bash
-python3 plugins-community/ops-perf-evolution/skills/evolution-world-model/scripts/kg_ops.py init --evo-dir "$EVO_DIR" --session-id "{op_name}_evo_$TIMESTAMP" --op-name "{op_name}" --requested-rounds "{max_rounds}" --parallel-num "{parallel_num}" --baseline-eval "$EVO_DIR/baseline_evaluation.json" --hw-params '{hw_params_json}' --kernel-summary "{kernel_summary}"
+python3 plugins-community/ops-perf-evolution/skills/evolution-world-model/scripts/kg_ops.py init --evo-dir "$EVO_DIR" --session-id "{op_name}_evo_$TIMESTAMP" --op-name "{op_name}" --requested-rounds "{max_rounds}" --parallel-num "{parallel_num}" --baseline-eval "$EVO_DIR/baseline_evaluation.json" --hw-params '{hw_params_json}' --kernel-traits '{kernel_traits_json}' --kernel-summary "{kernel_summary}"
 python3 plugins-community/ops-perf-evolution/skills/evolution-world-model/scripts/kg_ops.py validate --evo-dir "$EVO_DIR"
 ```
+
+其中 `{kernel_traits_json}` 必须来自步骤1-2的结构归族结果；命中族 workflow 时至少包含 `workflow_ref.workflow_file`、`family`、`branch`、`stage_order`（以及已识别的 `traits`/`strategy_tags`）。未命中时传 `{}`，不得按算子名臆造 workflow。
 
 初始化输出必须确认 knowledge_graph.json、ideas/、gap_map.md 和 query_pack.md 均存在。初始 idea 只是候选假设，不是已经验证的结论。
 
@@ -506,7 +508,21 @@ python3 plugins-community/ops-perf-evolution/skills/ops-evaluation/scripts/workt
 
 在同一条消息中启动所有 ops-partial；每个调用显式传 subagent_type="ops-partial"、description、run_in_background=true、prompt，且不传 name。KG prompt 使用 idea slug、thesis、strategy tags、target gaps、父实验和 query pack 摘要；MCTS prompt 使用旧流程的方向与父实现上下文。两种模式都必须保持接口不变，先实现可编译内核，再执行编译、精度和性能评估。同轮变体方向应互斥。
 
-ops-partial prompt 模板仍读取 `plugins-community/ops-perf-evolution/skills/evolution-strategies/references/prompts/ops-partial-prompt.md`。必须填充 worktree_base、OP_PATH_RELATIVE、z_search_root、session_device_ids、eval_lock_path、baseline_cache_path，以及 idea_id（KG）或 node_id（MCTS）、direction、strategy tags、parent_solution_ref、best_solution_ref、other_variants_summary。KG 的 Profiling Context 从 `knowledge_graph.json.baseline_evidence`、父 experiment 和 query pack 提取；MCTS 继续从 world_model 与 baseline_evaluation 提取，缺失时填 N/A。
+KG 模式在启动任何 partial **之前**必须把 jury 选择原子落盘，并把选中 idea 标为 active；重入时以该文件恢复映射，不得重新编号：
+
+```bash
+python3 plugins-community/ops-perf-evolution/skills/evolution-world-model/scripts/kg_ops.py prepare-round --evo-dir "$EVO_DIR" --round "$r" --parallel-map '{parallel_map_json}' --parallel-num "$parallel_num"
+```
+
+`prepare-round` 会写入 `round_{r}/parallel_map.json`。`open_exploration` 脚手架必须先由 jury 用以下保留元数据的命令写成具体、可执行的标题和 thesis（至少 80 字符），然后才能进入该门禁：
+
+```bash
+python3 plugins-community/ops-perf-evolution/skills/evolution-world-model/scripts/kg_wiki.py materialize_idea "$EVO_DIR" --slug "{idea_slug}" --title "{concrete_title}" --thesis "{concrete_thesis}" --strategy-rationale "{rationale}"
+```
+
+不要用带默认字段的普通 `upsert_idea` 覆盖脚手架；它可能擦除 parent/target_gaps/workflow 元数据。`workflow_guided` idea 在创建时还必须通过 `upsert_idea --workflow-ref '{...}'` 持久化工作流来源。
+
+ops-partial prompt 模板仍读取 `plugins-community/ops-perf-evolution/skills/evolution-strategies/references/prompts/ops-partial-prompt.md`。必须填充 worktree_base、OP_PATH_RELATIVE、z_search_root、session_device_ids、eval_lock_path、baseline_cache_path，以及 idea_id（KG）或 node_id（MCTS）、direction、strategy tags、parent_solution_ref、best_solution_ref、other_variants_summary。KG 的 Profiling Context 从 `knowledge_graph.json.baseline_evidence`、父 experiment 和 query pack 提取；MCTS 继续从 world_model 与 baseline_evaluation 提取，缺失时填 N/A。KG 还必须填充 `workflow_ref_block`（非 workflow_guided 时显式写 N/A），并将 `idea_id` 与 `node_id` 同时保留在 Evidence identity 中，避免把 KG Idea ID 误当成 MCTS 节点 ID。
 
 Multi-shape 评估规则保持不变：strategy tags 含 `P-ShapeSpec-01` 时填 `shapes_mode=target`，否则填 `shapes_mode=all`，并传入 target_speedup。所有变体仍必须通过 `--eval-lock` 排队；构建失败、评估超时和 worktree 清理失败必须记录到对应变体，不得跳过 `evaluation_results.json`。
 
@@ -602,7 +618,7 @@ open questions、更新计数器并继续，**C 不得终止进化**。cooldown/
       open_gaps={open_gaps}, stagnation={stagnation_count}/{stagnation_count_vs_base}
 ```
 
-KG 模式用 knowledge_graph.json.session.actual_rounds_completed 与 requested_rounds 判断轮数，用 best_score 和目标判断是否达标；MCTS 模式继续读取原有 session 字段。更新 session anchor（若启用），再回到 4.1 或进入步骤5。目标达成、全部失败、环境错误、连续退化或到达上限时，明确写出终止原因并保留产物。
+KG 模式用 knowledge_graph.json.session.actual_rounds_completed 与 requested_rounds 判断轮数；`best_score` 只用于排序。multi-shape 目标达成必须存在 `experiment.evaluation.gating == "fully_passed"` 的实验，`partial_passed` 或数值达到目标但 gating 为 regression/failed 均不得提前终止。MCTS 模式继续读取原有 session 字段并遵循同一 fully_passed 门禁。更新 session anchor（若启用），再回到 4.1 或进入步骤5。目标达成、全部失败、环境错误、连续退化或到达上限时，明确写出终止原因并保留产物。
 
 **KG 失败分类：**
 

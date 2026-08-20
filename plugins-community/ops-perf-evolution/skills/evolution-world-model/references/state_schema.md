@@ -40,8 +40,7 @@ Decision table (in priority order):
 | `actual_rounds_completed == max_round == requested_rounds` AND no report file | `finalize` (step 5 done, step 6 report not yet generated) |
 | `actual_rounds_completed == max_round < requested_rounds` | `round_checkpoint` |
 
-> **知识图谱模式补充**：当 `ideas/` 目录存在时，系统使用知识图谱模式（knowledge_graph.json + ideas/ + experiments/ + claims/）。
-> 当仅有 `world_model.json` 时，使用旧 MCTS 模式。两种模式的状态机阶段名相同。
+> **知识图谱模式补充**：仅已有 `world_model.json` 且无 `knowledge_graph.json` 的存量会话使用旧 MCTS；新目录默认 KG，初始化后由 `knowledge_graph.json` 固化模式。两者同时存在属于冲突，`ideas/` 目录不参与模式判定。两种模式的状态机阶段名相同。
 
 **Preserved fields (never overwritten by infer)**: `drift_status`, `mainline_stall_count`, `last_mainline_verdict`, `must_run_before_next_round`, `max_rounds`, `agent`, `session_id`, `evo_dir`, `schema_version`. These are set by `wm_ops` (drift), `state_ops init` (config), or remain reserved for future use.
 

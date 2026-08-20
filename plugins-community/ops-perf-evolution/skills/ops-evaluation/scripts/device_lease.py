@@ -292,6 +292,11 @@ class SessionDeviceLease:
 
         while True:
             with self._allocation_lock():
+                existing = self._resume_existing_session_lease(
+                    op_name, session_id, count, device_ids, preferred_device,
+                )
+                if existing is not None:
+                    return existing
                 available = [
                     dev_id for dev_id in try_order
                     if not self._is_lease_alive(dev_id)
@@ -314,6 +319,63 @@ class SessionDeviceLease:
                     f"Need {count} devices from {device_ids}, but not enough are available."
                 )
             time.sleep(2)
+
+    def _resume_existing_session_lease(
+        self, op_name: str, session_id: str, count: int,
+        candidate_devices: List[int], preferred_device: Optional[int],
+    ) -> Optional[List[int]]:
+        """Idempotently adopt a live lease owned by the same session ID.
+
+        Without this check a repeated CLI acquire selected a second card group
+        and overwrote ``session_<id>_lease.json``.  The original cards then
+        appeared free while the resumed evolution could still be using them.
+        """
+        lease_path = self.pool_dir / f"session_{session_id}_lease.json"
+        if not lease_path.is_file():
+            return None
+        try:
+            metadata = json.loads(lease_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        if not isinstance(metadata, dict):
+            return None
+        leased = metadata.get("device_ids")
+        if not isinstance(leased, list):
+            leased = [metadata.get("device_id")]
+        if (
+            not leased
+            or any(isinstance(device, bool) or not isinstance(device, int) for device in leased)
+            or len(set(leased)) != len(leased)
+        ):
+            return None
+        alive = (
+            bool(metadata.get("pid") and _is_pid_alive(metadata["pid"]))
+            or self._is_lease_fresh(str(metadata.get("start_time", "")))
+        )
+        if not alive:
+            for device in leased:
+                self._clean_stale_lease(lease_path, device, metadata.get("pid"))
+            return None
+        if metadata.get("op_name") != op_name:
+            raise RuntimeError(
+                f"Session ID {session_id} is already leased by op {metadata.get('op_name')!r}"
+            )
+        if len(leased) != count:
+            raise RuntimeError(
+                f"Session {session_id} already owns {len(leased)} device(s), requested {count}"
+            )
+        if any(device not in candidate_devices for device in leased):
+            raise RuntimeError(
+                f"Session {session_id} existing devices {leased} are outside requested candidates"
+            )
+        if preferred_device is not None and preferred_device not in leased:
+            raise RuntimeError(
+                f"Session {session_id} already owns {leased}, incompatible preferred device {preferred_device}"
+            )
+        self._session_id = session_id
+        self._session_device_ids = list(leased)
+        logger.info("Session lease resumed: devices %s (session: %s)", leased, session_id)
+        return list(leased)
 
     @contextmanager
     def _allocation_lock(self):

@@ -501,16 +501,16 @@ def _infer_one_partial(round_dir: str, pd: str) -> str:
 
 
 def _infer_partial_status(round_dir: str, parallel_dirs: list) -> tuple[dict, int]:
-    """遍历 parallel 目录推断 partial_status，返回 (status_dict, completed_count)。"""
+    """遍历 parallel 目录，返回 (status_dict, terminal_count)。"""
     partial_status: dict[str, str] = {}
-    completed = 0
+    terminal = 0
     for pd in parallel_dirs:
         idx = pd[len("parallel_"):]
         status = _infer_one_partial(round_dir, pd)
         partial_status[idx] = status
-        if status == "completed":
-            completed += 1
-    return partial_status, completed
+        if status in {"completed", "failed"}:
+            terminal += 1
+    return partial_status, terminal
 
 
 def _has_evolution_report(entries: list) -> bool:
@@ -1008,6 +1008,11 @@ def main() -> None:
     except StateOpsError as e:
         LOGGER.error("state_ops: FATAL — %s", e)
         sys.exit(e.code)
+    except ValueError as e:
+        # Mode conflicts and malformed persisted metadata are user-fixable
+        # integrity errors, not Python tracebacks from the hook protocol.
+        LOGGER.error("state_ops: FATAL — %s", e)
+        sys.exit(2)
     sys.exit(result if isinstance(result, int) else 0)
 
 

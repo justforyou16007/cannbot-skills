@@ -174,6 +174,7 @@ python3 kg_wiki.py update_idea_outcome <evo_dir> \
 对 verdict=no 的 experiment，Agent 判定 failure_type：
 - **impl_error**：策略方向可行，实现有 bug → 不进入策略禁忌表，进入修复队列
 - **strategy_infeasible**：策略本身与算子不兼容 → 进入禁忌表
+- **profiling_lost**：编译/精度证据有效但 profiling 不完整 → 不进入禁忌表或反证，必须补采 profiling
 
 ### Step 4: Claim 生成
 

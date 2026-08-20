@@ -47,8 +47,19 @@ If Mode=strategy_guided:
 
   若 [STRATEGY RESOURCES] 段为空 → 直接以 open_exploration 模式运行：从第一性原理 + Profiling Context 出发设计优化，**禁止去读 cards/P*_*.md**。
 
+If Mode=workflow_guided:
+  This variant is bound to the workflow recorded in [WORKFLOW_REF]. Read the
+  referenced workflow file/section before editing, execute its stage_order in
+  order, and record every applied stage (or a justified skip) in
+  implementation_note.txt. Do not replace the workflow with a generic random
+  strategy; if the workflow is unavailable or inconsistent with the operator,
+  fail explicitly with failure_type=impl_error and explain the missing stage.
+
 [STRATEGY RESOURCES]  ← v3.2 新增段，由主 agent 用 query_strategies / load_playbook 程序化注入
 {strategy_resources_block}
+
+[WORKFLOW_REF]  ← KG workflow-guided provenance (empty for other modes)
+{workflow_ref_block}
 
 [PRECONDITIONS — 已硬过滤]  ← v3.2 新增段
 本变体的策略组合已通过 Preconditions 硬门控（详见 wm_ops filter-candidates 在节点 filtered_by 字段的记录）。
@@ -127,7 +138,8 @@ If Mode=strategy_guided:
 完成 checklist 后，在 `implementation_note.txt` 中说明本算子属于哪一族、应用了哪些 Tiling 要点。
 
 [CONTEXT]
-Node: {node_id} | Parent: {parent_solution_ref} | Best: {best_solution_ref}
+Evidence identity: Mode={mode} | Idea ID (KG)={idea_id} | Node ID (MCTS)={node_id}
+Parent: {parent_solution_ref} | Best: {best_solution_ref}
 
 {inspirations_text}
 

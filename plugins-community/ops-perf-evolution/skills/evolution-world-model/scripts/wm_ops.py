@@ -318,7 +318,18 @@ def _read_precision_passed(eval_path: str) -> bool:
             eres = json.load(f)
     except (json.JSONDecodeError, OSError):
         return False
-    return bool(eres.get("precision_passed"))
+    value = eres.get("precision_passed")
+    if value is None and isinstance(eres.get("comparison"), dict):
+        value = eres["comparison"].get("precision_passed")
+    if value is None and isinstance(eres.get("shape_results"), dict):
+        entries = [
+            item
+            for group in ("target", "generalization")
+            for item in (eres["shape_results"].get(group) or [])
+            if isinstance(item, dict)
+        ]
+        value = bool(entries) and all(item.get("precision_passed") is True for item in entries)
+    return value is True
 
 
 def _collect_missing_profiling(results_dir: str, parallel_map: dict) -> list:
@@ -386,7 +397,19 @@ def _read_precision_flag(eval_path: str):
             eres = json.load(f)
     except (json.JSONDecodeError, OSError):
         return None
-    return bool(eres.get("precision_passed", True))
+    value = eres.get("precision_passed")
+    if value is None and isinstance(eres.get("comparison"), dict):
+        value = eres["comparison"].get("precision_passed")
+    if value is None and isinstance(eres.get("shape_results"), dict):
+        entries = [
+            item
+            for group in ("target", "generalization")
+            for item in (eres["shape_results"].get(group) or [])
+            if isinstance(item, dict)
+        ]
+        if entries:
+            value = all(item.get("precision_passed") is True for item in entries)
+    return True if value is None else bool(value)
 
 
 def _count_precision_failures(results_dir: str, parallel_map: dict) -> tuple:

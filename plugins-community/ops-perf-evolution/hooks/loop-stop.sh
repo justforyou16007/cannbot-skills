@@ -67,6 +67,7 @@ fi
 # Collect wm.json integrity issues (R15/R16). Stage-independent — runs even
 # at terminal stages so a corrupted open_exploration node blocks 'done'.
 wm_integrity="$(check_wm_integrity_rules "${evo_dir}")"
+kg_integrity="$(check_kg_integrity_rules "${evo_dir}")"
 
 # Collect state.json invariant issues (R2-R13). Skipped at terminal stages
 # since R6/R7/R8/etc. assume an in-progress run.
@@ -83,6 +84,14 @@ esac
 all_violations=""
 if [[ -n "${wm_integrity}" ]]; then
     all_violations="${wm_integrity}"
+fi
+if [[ -n "${kg_integrity}" ]]; then
+    if [[ -n "${all_violations}" ]]; then
+        all_violations="${all_violations}
+${kg_integrity}"
+    else
+        all_violations="${kg_integrity}"
+    fi
 fi
 if [[ -n "${state_violations}" ]]; then
     if [[ -n "${all_violations}" ]]; then
@@ -103,7 +112,7 @@ if [[ -n "${all_violations}" ]]; then
     hook_block "Stop blocked due to invariant violations:
 ${reason}
 
-Hint: run 'python3 .claude/skills/evolution-world-model/scripts/state_ops.py read --evo-dir ${evo_dir}' to inspect current state, then resolve the issue (complete missing partials, run ${refine_hint}, finalize-ledger for MCTS, fix evidence corruption, etc.) before retrying.
+Hint: run 'python3 ${STATE_OPS_PY} read --evo-dir ${evo_dir}' to inspect current state, then resolve the issue (complete missing partials, run ${refine_hint}, finalize-ledger for MCTS, fix evidence corruption, etc.) before retrying.
 To bypass in emergency only: export LINGXI_LOOP_HOOK_DISABLE=1"
 fi
 

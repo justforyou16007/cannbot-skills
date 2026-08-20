@@ -172,6 +172,11 @@ thesis: "分析内核循环结构发现：内层循环体 <32B，可通过 4x �
 - scenario-routing 归族判定结果
 - 族 workflow 文件（convolution.md / matmul.md / flashattention.md / reduction.md）
 
+编排器通过 `kg_ops.py init --kernel-traits` 接收该结果；命中 workflow 时，JSON
+至少包含 `workflow_ref.workflow_file`、`workflow_ref.stage_order`、`family` 和
+`branch`，可附带 `traits`、`strategy_tags`。脚本只持久化这些已观测字段，不按
+算子名推断族归属。
+
 **使用条件**：
 Init 归族命中某族 workflow 的任一分支时必须生成至少 1 个 workflow_guided idea。
 

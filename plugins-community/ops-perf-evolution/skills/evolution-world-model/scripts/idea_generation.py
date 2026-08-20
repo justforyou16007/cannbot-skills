@@ -116,11 +116,11 @@ def dedup_ideas(
             ban_sigs.append(set(stags))
 
     # Build existing idea signatures
-    existing_sigs = []
-    for idea in existing_ideas.values():
+    existing_sigs: list[tuple[str, set[str]]] = []
+    for slug, idea in existing_ideas.items():
         stags = idea.get("strategy_tags", [])
         if isinstance(stags, list):
-            existing_sigs.append(set(stags))
+            existing_sigs.append((slug, set(stags)))
 
     accepted = []
     accepted_sigs: list[set[str]] = []
@@ -128,14 +128,24 @@ def dedup_ideas(
     for idea in ideas:
         sig = set(idea.get("strategy_tags", []))
         is_open_exploration = idea.get("mode") == "open_exploration" and not sig
+        is_workflow_guided = (
+            idea.get("mode") == "workflow_guided"
+            and isinstance(idea.get("workflow_ref"), dict)
+        )
         idea_tags = idea.get("tags", [])
         is_retry = isinstance(idea_tags, (list, tuple, set)) and "retry" in idea_tags
+        parent_ref = str(idea.get("parent_idea") or "")
+        parent_slug = parent_ref.removeprefix("idea:")
 
         # Skip Jaccard-based dedup for open_exploration with empty tags —
         # they are differentiated by thesis/title, not by strategy tags.
         # Empty set vs empty set has Jaccard=1.0 which would incorrectly
         # collapse all open exploration ideas into one.
-        if not is_open_exploration:
+        # A workflow-guided candidate is a mandatory provenance-preserving
+        # branch, not a duplicate strategy suggestion.  Keep at least one
+        # even when its strategy tags overlap a profiling/method-transfer
+        # candidate or an old failed idea; the jury decides whether to run it.
+        if not is_open_exploration and not is_workflow_guided:
             # Check banlist (skip comparing against empty banlist entries)
             is_banned = (
                 False if is_retry else any(
@@ -150,7 +160,8 @@ def dedup_ideas(
             # Check existing ideas (skip comparing against empty existing sigs)
             is_dup_existing = any(
                 _jaccard(sig, es) > collision_threshold
-                for es in existing_sigs if es
+                for slug, es in existing_sigs
+                if es and slug != parent_slug
             )
             if is_dup_existing:
                 logger.info("Idea filtered (existing): %s", idea.get("title", "?"))
@@ -396,6 +407,12 @@ def continuation_lens(
     parent_stags = parent_idea.get("strategy_tags", [])
     if not isinstance(parent_stags, list):
         parent_stags = []
+    parent_workflow_ref = parent_idea.get("workflow_ref")
+    workflow_child = (
+        parent_idea.get("mode") == "workflow_guided"
+        and isinstance(parent_workflow_ref, dict)
+    )
+    child_mode = "workflow_guided" if workflow_child else "strategy_guided"
 
     ideas = []
     exp_node_id = exp.get("node_id", f"exp:{experiment_slug}")
@@ -419,7 +436,8 @@ def continuation_lens(
                     "strategy_tags": combo,
                     "optimization_type": _infer_optimization_type(combo),
                     "difficulty": _estimate_difficulty(combo),
-                    "mode": "strategy_guided",
+                    "mode": child_mode,
+                    "workflow_ref": parent_workflow_ref if workflow_child else None,
                     "generation_lens": "continuation",
                     "target_gaps": [],
                     "parent_experiment": exp_node_id,
@@ -446,7 +464,8 @@ def continuation_lens(
                 "strategy_tags": combo,
                 "optimization_type": _infer_optimization_type(combo),
                 "difficulty": _estimate_difficulty(combo),
-                "mode": "strategy_guided",
+                "mode": child_mode,
+                "workflow_ref": parent_workflow_ref if workflow_child else None,
                 "generation_lens": "continuation",
                 "target_gaps": [],
                 "parent_experiment": exp_node_id,
@@ -492,6 +511,93 @@ def open_exploration_lens(
 
 
 # ---------------------------------------------------------------------------
+# Lens 6: Workflow-guided (family routing guarantee)
+# ---------------------------------------------------------------------------
+
+def workflow_guided_lens(kernel_traits: dict | None = None) -> list[dict]:
+    """Create the mandatory workflow branch from the routing result.
+
+    The family router is intentionally outside this deterministic module.  It
+    passes its structured result through ``--kernel-traits`` as either
+    ``workflow_ref`` or ``workflow``.  We only persist the observed routing
+    fields; strategy IDs are optional because the workflow itself may contain
+    the stage-specific cards that the jury will select later.
+    """
+    traits = kernel_traits or {}
+    if not isinstance(traits, dict):
+        return []
+    raw_ref = traits.get("workflow_ref") or traits.get("workflow")
+    if not isinstance(raw_ref, dict):
+        # Accept a flat router payload for convenience while keeping the
+        # canonical persisted shape namespaced under workflow_ref.
+        if traits.get("workflow_file") or traits.get("stage_order"):
+            raw_ref = traits
+        else:
+            return []
+
+    workflow_ref = dict(raw_ref)
+    workflow_file = workflow_ref.get("workflow_file") or workflow_ref.get("file")
+    stage_order = workflow_ref.get("stage_order")
+    if not workflow_file or not isinstance(stage_order, list) or not stage_order:
+        return []
+    workflow_ref["workflow_file"] = str(workflow_file)
+    workflow_ref["stage_order"] = [str(stage) for stage in stage_order if str(stage).strip()]
+    if not workflow_ref["stage_order"]:
+        return []
+    workflow_ref.setdefault("family", traits.get("family", "unknown"))
+    workflow_ref.setdefault("branch", traits.get("branch", "default"))
+    workflow_ref.setdefault("branch_condition", traits.get("branch_condition", ""))
+    raw_traits = workflow_ref.get("traits", traits.get("traits", []))
+    if isinstance(raw_traits, str):
+        raw_traits = [part.strip() for part in raw_traits.split(",") if part.strip()]
+    elif not isinstance(raw_traits, list):
+        raw_traits = []
+    workflow_ref["traits"] = [str(trait) for trait in raw_traits if str(trait).strip()]
+
+    raw_tags = (
+        workflow_ref.get("strategy_tags")
+        or workflow_ref.get("strategy_combination")
+        or traits.get("strategy_tags")
+        or traits.get("strategy_combination")
+        or []
+    )
+    if isinstance(raw_tags, str):
+        raw_tags = [part.strip() for part in raw_tags.split(",") if part.strip()]
+    strategy_tags = [str(tag) for tag in raw_tags if str(tag).strip()]
+    family = str(workflow_ref.get("family") or "operator")
+    branch = str(workflow_ref.get("branch") or "default")
+    title = str(
+        workflow_ref.get("title")
+        or f"{family} {branch} workflow 分支"
+    )
+    thesis = str(
+        workflow_ref.get("thesis")
+        or f"归族命中 {family} 的 {branch} 分支，按 workflow_ref.stage_order "
+           "逐阶段实现并记录每个阶段的判定、应用策略和跳过理由。"
+    )
+    raw_gaps = traits.get("target_gaps", [])
+    if isinstance(raw_gaps, str):
+        target_gaps = [part.strip() for part in raw_gaps.split(",") if part.strip()]
+    elif isinstance(raw_gaps, (list, tuple, set)):
+        target_gaps = [str(gap) for gap in raw_gaps if str(gap).strip()]
+    else:
+        target_gaps = []
+    return [{
+        "title": title,
+        "strategy_tags": strategy_tags,
+        "optimization_type": _infer_optimization_type(strategy_tags),
+        "difficulty": _estimate_difficulty(strategy_tags),
+        "mode": "workflow_guided",
+        "workflow_ref": workflow_ref,
+        "generation_lens": "workflow_guided",
+        "target_gaps": target_gaps,
+        "thesis": thesis,
+        "strategy_rationale": "workflow stage_order is the mandatory execution order",
+        "tags": ["workflow_guided", family, branch],
+    }]
+
+
+# ---------------------------------------------------------------------------
 # Main generation pipeline
 # ---------------------------------------------------------------------------
 
@@ -521,6 +627,11 @@ def generate_ideas_for_init(
     # Lens 3: Gap analysis
     all_ideas.extend(gap_analysis_lens(kg_root, max_ideas=3))
 
+    # Lens 6: Workflow branch guarantee.  The router supplies a structured
+    # workflow_ref through kernel_traits; when absent we do not invent a
+    # family assignment from the operator name.
+    all_ideas.extend(workflow_guided_lens(kernel_traits))
+
     # Lens 5: Open exploration (fill remaining slots)
     remaining = max(2, target_count - len(all_ideas))
     all_ideas.extend(open_exploration_lens(kernel_summary, remaining))
@@ -542,6 +653,22 @@ def generate_ideas_for_init(
     logger.info("Generated %d ideas (deduped from %d) for init. "
                 "Types: %s", len(deduped), len(all_ideas), dict(opt_types))
 
+    # A routed workflow branch is a provenance guarantee, not merely another
+    # scoring candidate.  Preserve one such idea even when profiling/gap
+    # lenses already filled the nominal top-N list; otherwise small
+    # parallel_num values could slice the mandatory branch away.
+    workflow_candidates = [
+        idea for idea in deduped
+        if idea.get("mode") == "workflow_guided"
+        and isinstance(idea.get("workflow_ref"), dict)
+    ]
+    if workflow_candidates and target_count > 0:
+        selected = workflow_candidates[:1]
+        selected.extend(
+            idea for idea in deduped
+            if idea not in selected
+        )
+        return selected[:target_count]
     return deduped[:target_count]
 
 
@@ -598,6 +725,7 @@ def generate_ideas_from_experiment(
                     "optimization_type": parent_idea.get("optimization_type", "algorithm"),
                     "difficulty": min(5, parent_idea.get("difficulty", 3) + 1),
                     "mode": parent_idea.get("mode", "strategy_guided"),
+                    "workflow_ref": parent_idea.get("workflow_ref"),
                     "generation_lens": "continuation",
                     "target_gaps": parent_idea.get("target_gaps", []),
                     "parent_idea": idea_id if idea_id else None,
@@ -629,11 +757,54 @@ def persist_ideas(
     Returns list of created slugs.
     """
     slugs = []
+    existing = load_ideas(kg_root)
     for idx, idea in enumerate(ideas):
         slug = _slugify(idea.get("title", f"idea-r{generation_round}-{idx}"))
-        # Ensure uniqueness
-        if (Path(kg_root) / "ideas" / f"{slug}.md").exists():
-            slug = f"{slug}-{idx}"
+        # Retry-safe identity: the same deterministic idea generated again
+        # after a crash must reuse its entity rather than creating ``-0`` /
+        # ``-1`` variants.  A true slug collision still receives a stable
+        # numeric suffix.
+        wanted_parent = str(idea.get("parent_experiment") or "")
+        wanted_tags = list(idea.get("strategy_tags", []) or [])
+        wanted_parent_idea = str(idea.get("parent_idea") or "")
+        wanted_target_gaps = list(idea.get("target_gaps", []) or [])
+        wanted_thesis = str(idea.get("thesis") or "")
+        wanted_rationale = str(idea.get("strategy_rationale") or "")
+        wanted_lens = str(idea.get("generation_lens") or "profiling_driven")
+        wanted_type = str(idea.get("optimization_type") or "algorithm")
+        try:
+            wanted_difficulty = int(idea.get("difficulty", 3) or 3)
+        except (TypeError, ValueError):
+            wanted_difficulty = 3
+        existing_idea = existing.get(slug)
+        if existing_idea:
+            try:
+                existing_difficulty = int(existing_idea.get("difficulty", 3) or 3)
+            except (TypeError, ValueError):
+                existing_difficulty = -1
+            same = (
+                existing_idea.get("title") == idea.get("title")
+                and list(existing_idea.get("strategy_tags", []) or []) == wanted_tags
+                and str(existing_idea.get("parent_experiment") or "") == wanted_parent
+                and str(existing_idea.get("parent_idea") or "") == wanted_parent_idea
+                and existing_idea.get("mode") == idea.get("mode", "strategy_guided")
+                and existing_idea.get("workflow_ref") == idea.get("workflow_ref")
+                and list(existing_idea.get("target_gaps", []) or []) == wanted_target_gaps
+                and str(existing_idea.get("thesis") or "") == wanted_thesis
+                and str(existing_idea.get("strategy_rationale") or "") == wanted_rationale
+                and str(existing_idea.get("generation_lens") or "profiling_driven") == wanted_lens
+                and str(existing_idea.get("optimization_type") or "algorithm") == wanted_type
+                and existing_difficulty == wanted_difficulty
+            )
+            if same:
+                if slug not in slugs:
+                    slugs.append(slug)
+                continue
+            base_slug = slug
+            suffix = 1
+            while slug in existing:
+                slug = f"{base_slug}-{suffix}"
+                suffix += 1
 
         upsert_idea(
             kg_root, slug, idea["title"],
@@ -653,6 +824,20 @@ def persist_ideas(
             parent_experiment=idea.get("parent_experiment"),
         )
         slugs.append(slug)
+        existing[slug] = {
+            "title": idea.get("title"),
+            "strategy_tags": wanted_tags,
+            "parent_experiment": idea.get("parent_experiment"),
+            "parent_idea": idea.get("parent_idea"),
+            "mode": idea.get("mode", "strategy_guided"),
+            "workflow_ref": idea.get("workflow_ref"),
+            "target_gaps": wanted_target_gaps,
+            "thesis": wanted_thesis,
+            "strategy_rationale": wanted_rationale,
+            "generation_lens": wanted_lens,
+            "optimization_type": wanted_type,
+            "difficulty": wanted_difficulty,
+        }
 
     append_log(kg_root, f"persist_ideas: {len(slugs)} ideas written for round {generation_round}")
     return slugs

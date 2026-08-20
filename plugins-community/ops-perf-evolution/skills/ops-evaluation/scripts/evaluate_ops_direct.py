@@ -732,7 +732,8 @@ def compare_outputs_per_shape(baseline_dir: str, evolved_dir: str,
 
 
 def merge_per_shape_results(baseline_results: list, evolved_results: list,
-                              precision_per_shape: dict) -> tuple:
+                              precision_per_shape: dict,
+                              expected_shapes: Optional[list] = None) -> tuple:
     """按 shape name 对齐 baseline/evolved，计算 speedup 和精度。
 
     Returns:
@@ -746,16 +747,32 @@ def merge_per_shape_results(baseline_results: list, evolved_results: list,
     shape_results = {"target": [], "generalization": []}
     all_compile_ok = True
 
-    for name, br in baseline_map.items():
-        er = evolved_map.get(name)
-        if er is None:
-            continue
+    if expected_shapes is not None:
+        ordered = [
+            (str(shape["name"]), str(shape.get("group", "target")))
+            for shape in expected_shapes
+        ]
+    else:
+        ordered = []
+        seen = set()
+        for row in baseline_results + evolved_results:
+            name = row.get("name")
+            if name is None or name in seen:
+                continue
+            seen.add(name)
+            ordered.append((str(name), str(row.get("group", "target"))))
 
-        group = br.get("group", "target")
-        bt = br.get("time_us", -1)
-        et = er.get("time_us", -1)
-        baseline_device = br.get("device_id")
-        evolved_device = er.get("device_id")
+    for name, expected_group in ordered:
+        br = baseline_map.get(name)
+        er = evolved_map.get(name)
+        # The call-spec shape plan is authoritative.  A worker result carrying
+        # a stale/wrong group must not move a target case into generalization
+        # (or vice versa) and bypass the corresponding gating rule.
+        group = expected_group if expected_shapes is not None else (br or er or {}).get("group", expected_group)
+        bt = br.get("time_us", -1) if br else -1
+        et = er.get("time_us", -1) if er else -1
+        baseline_device = br.get("device_id") if br else None
+        evolved_device = er.get("device_id") if er else None
         same_device = (
             baseline_device is None
             or evolved_device is None
@@ -771,8 +788,8 @@ def merge_per_shape_results(baseline_results: list, evolved_results: list,
         precision_passed, precision_msg = precision_per_shape.get(name, (False, "not_evaluated"))
         # 子进程内部已经判过精度（计算 vs CPU 不做，只 baseline vs evolved 对齐）
         # 若子进程报错 precision_passed=False，叠加 evolved.precision_passed
-        ev_precision = er.get("precision_passed", False) and precision_passed
-        bl_precision = br.get("precision_passed", False)
+        ev_precision = bool(er and er.get("precision_passed", False) and precision_passed)
+        bl_precision = bool(br and br.get("precision_passed", False))
 
         entry = {
             "name": name,
@@ -783,9 +800,9 @@ def merge_per_shape_results(baseline_results: list, evolved_results: list,
             "precision_passed": ev_precision,
             "baseline_precision_passed": bl_precision,
             "correctness_message": precision_msg,
-            "pipeline": er.get("pipeline", {}),
-            "bottleneck": er.get("bottleneck", "unknown"),
-            "cv_pct": er.get("cv_pct", 0.0),
+            "pipeline": er.get("pipeline", {}) if er else {},
+            "bottleneck": er.get("bottleneck", "unknown") if er else "unknown",
+            "cv_pct": er.get("cv_pct", 0.0) if er else 0.0,
             "compilation_success": (bt > 0 and et > 0 and same_device),
         }
         if not same_device:
@@ -793,7 +810,11 @@ def merge_per_shape_results(baseline_results: list, evolved_results: list,
                 "baseline/evolved device mismatch: "
                 f"{baseline_device} != {evolved_device}"
             )
-        if "error" in er:
+        if br is None or er is None:
+            missing_side = "baseline" if br is None else "evolved"
+            entry["error"] = f"missing {missing_side} result for expected shape {name}"
+            all_compile_ok = False
+        elif "error" in er:
             entry["error"] = er.get("error")
             all_compile_ok = False
         shape_results.setdefault(group, []).append(entry)
@@ -1177,7 +1198,7 @@ def evaluate_ops_direct(cfg: DirectEvalConfig) -> dict:
     )
 
     shape_results, compile_ok = merge_per_shape_results(
-        baseline_results, evolved_results, precision_per_shape
+        baseline_results, evolved_results, precision_per_shape, expected_shapes=shape_plan
     )
 
     _apply_self_baseline_fix(cfg, shape_results)

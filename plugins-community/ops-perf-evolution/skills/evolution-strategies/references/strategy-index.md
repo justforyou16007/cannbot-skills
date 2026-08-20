@@ -3,7 +3,7 @@
 Source: 43 production-grade operators + 6 CV fused operator expert implementations (IdeaPool). Select all applicable strategies for your operator, then **Read each referenced detail file** before writing AscendC code.
 
 ## 编号说明
-策略卡共 146 张：P 系列（性能，P1-P131）/ D 系列（数据类型，D1-D5）/ A 系列（精度，A1-A8）/ R 系列（A5 架构，R1-R8）。P 系列编号存在间隙（P15, P23, P27, P31, P36, P39），为预留位。
+策略卡共 157 张：P 系列（性能，P1-P143）/ D 系列（数据类型，D1-D5）/ A 系列（精度，A1-A8）/ R 系列（A5 架构，R1-R8）。P 系列编号存在间隙（P15, P23, P27, P31, P36, P39），为预留位。
 所有有效策略 ID 均在下方表格中列出。Agent 在 strategy_combination 中只应使用下方表格中的 ID。
 
 ## Layer 定义
@@ -300,6 +300,15 @@ P67-P69 为 Vector 计算效率基础策略（Counter 模式、低延迟归约�
 | P138 | host tiling L0 容量守卫 | L1 | flash_attention, matmul, stability | Cube tiling 用写死的 L0 尺寸 → 更小 L0 芯片 InitBuffer 溢出随机 SIGSEGV：`GetCoreMemSize(L0_A/L0_C)` 运行时查询 + groupTile 自适应减半（跨硬件稳定性） | playbooks/P138_host_tiling_l0_capacity_guard.md |
 | P139 | 多槽流水 workspace 全槽零初始化 | L1 | flash_attention, stability | 预发射多槽流水只初始化 slot0 → 后续槽 padded 行残留 NaN/inf 偶发崩溃：零初始化遍历全部槽 + AIC 直读的 score/prob padded 区（防 NaN 稳定性） | playbooks/P139_multi_slot_workspace_zero_init.md |
 | P140 | MLA（kvHeads=1）M-tile 放大 | L1 | flash_attention, mla, tiling | M-tile 上限 = 共享 K/V 的查询行数：GQA 只有 groupSize（小）硬拉无益，MLA（kvHeads=1）可到 qHeads 放大一个数量级，UB/L0 自适应（配合 P138）（1.95x） | playbooks/P140_mla_large_m_tile.md |
+
+## 性能优化策略 — MHA/Attention 实战优化补充 (P142-P143) [Layer: L1-L2]
+
+来自 17_MultiHeadAttention 进化实测沉淀：UB 常驻 O 累加器砍掉 per-KV-tile GM 往返；host 端 launch 合并 + per-shape tiling 缓存压掉中小 shape 的 host 固定开销。
+
+| ID | Strategy | Layer | Tags | When to Apply | Detail File |
+|----|----------|-------|------|---------------|-------------|
+| P142 | Attention UB 常驻 O 累加器 | L2 | attention, flash_attention, ub-resident, o-accumulator, kv-tile, gm-roundtrip | Flash Attention 每 KV tile 更新 O 时把 O_tile 常驻 UB，跨 tile rescale+累加，循环结束再一次性写 GM；砍掉 per-tile MTE2/MTE3 往返。前提：O_tile(M_tile×d) 能放进 UB；与 GM workspace-ring（X38）互斥 | playbooks/P142_attention_ub_o_accumulator.md |
+| P143 | Attention host 端 launch 合并 + per-shape tiling 缓存 | L2 | attention, host-overhead, launch-merge, tiling-cache, split-kernel, h2d-elimination | 910B2C 小 shape/fp32 路径 attention 常被 host 固定开销主导：合并同前向内的 split kernel launch、per-shape 缓存 tiling 与 workspace、用 at::empty 替代 zeros | playbooks/P143_attention_host_launch_merge.md |
 
 ## 精度优化策略 (A1-A8) [Layer: L0]
 

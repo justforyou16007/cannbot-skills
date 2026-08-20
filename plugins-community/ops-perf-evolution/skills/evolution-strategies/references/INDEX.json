@@ -48,11 +48,11 @@
     ]
   },
   "stats": {
-    "cards": 155,
-    "active_cards": 142,
+    "cards": 157,
+    "active_cards": 144,
     "deprecated": 13,
-    "preconditions": 140,
-    "playbooks": 140,
+    "preconditions": 142,
+    "playbooks": 142,
     "families": 8,
     "discovered": 45,
     "okf": 0
@@ -1614,6 +1614,65 @@
       "quantified_gain": [
         "shape: \"SparseFlashAttention MLA case9/11/13（Dk512 kvHeads=1, 910c）\""
       ]
+    },
+    {
+      "source_key": "evolution-strategies#card/P142_attention_ub_o_accumulator",
+      "id": "P142",
+      "title": "P142: Attention UB 常驻 O 累加器",
+      "doc_path": "cards/P142_attention_ub_o_accumulator.md",
+      "complexity": "L2",
+      "op_families": [
+        "attention",
+        "flash_attention"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "mte3_stall",
+          "no_overlap",
+          "partial_overlap"
+        ]
+      },
+      "conflicts_with": [],
+      "synergizes_with": [
+        "P81",
+        "P38",
+        "P119",
+        "P120",
+        "P121"
+      ],
+      "requires": [],
+      "has_preconditions": true,
+      "has_playbook": true,
+      "quantified_gain": []
+    },
+    {
+      "source_key": "evolution-strategies#card/P143_attention_host_launch_merge",
+      "id": "P143",
+      "title": "P143: Attention host 端 launch 合并 + per-shape tiling 缓存",
+      "doc_path": "cards/P143_attention_host_launch_merge.md",
+      "complexity": "L2",
+      "op_families": [
+        "attention",
+        "flash_attention",
+        "matmul"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "scalar_loading",
+          "no_overlap"
+        ]
+      },
+      "conflicts_with": [],
+      "synergizes_with": [
+        "P35",
+        "P54",
+        "P131",
+        "P142"
+      ],
+      "requires": [],
+      "has_preconditions": true,
+      "has_playbook": true,
+      "quantified_gain": []
     },
     {
       "source_key": "evolution-strategies#card/P14_cv_pipeline_preload",
@@ -4284,6 +4343,16 @@
       "doc_path": "preconditions/P140.yaml"
     },
     {
+      "source_key": "evolution-strategies#preconditions/P142",
+      "id": "P142",
+      "doc_path": "preconditions/P142.yaml"
+    },
+    {
+      "source_key": "evolution-strategies#preconditions/P143",
+      "id": "P143",
+      "doc_path": "preconditions/P143.yaml"
+    },
+    {
       "source_key": "evolution-strategies#preconditions/P16",
       "id": "P16",
       "doc_path": "preconditions/P16.yaml"
@@ -4976,6 +5045,16 @@
       "doc_path": "playbooks/P140_mla_large_m_tile.md"
     },
     {
+      "source_key": "evolution-strategies#playbook/P142_attention_ub_o_accumulator",
+      "id": "P142",
+      "doc_path": "playbooks/P142_attention_ub_o_accumulator.md"
+    },
+    {
+      "source_key": "evolution-strategies#playbook/P143_attention_host_launch_merge",
+      "id": "P143",
+      "doc_path": "playbooks/P143_attention_host_launch_merge.md"
+    },
+    {
       "source_key": "evolution-strategies#playbook/P14_cv_pipeline_preload",
       "id": "P14",
       "doc_path": "playbooks/P14_cv_pipeline_preload.md"
@@ -5450,6 +5529,46 @@
       "doc_path": "discovered/disc_X1.md"
     },
     {
+      "source_key": "evolution-strategies#discovered/disc_X2",
+      "id": "X2",
+      "doc_path": "discovered/disc_X2.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X3",
+      "id": "X3",
+      "doc_path": "discovered/disc_X3.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X4",
+      "id": "X4",
+      "doc_path": "discovered/disc_X4.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X5",
+      "id": "X5",
+      "doc_path": "discovered/disc_X5.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X6",
+      "id": "X6",
+      "doc_path": "discovered/disc_X6.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X7",
+      "id": "X7",
+      "doc_path": "discovered/disc_X7.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X8",
+      "id": "X8",
+      "doc_path": "discovered/disc_X8.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X9",
+      "id": "X9",
+      "doc_path": "discovered/disc_X9.md"
+    },
+    {
       "source_key": "evolution-strategies#discovered/disc_X10",
       "id": "X10",
       "doc_path": "discovered/disc_X10.md"
@@ -5498,11 +5617,6 @@
       "source_key": "evolution-strategies#discovered/disc_X19",
       "id": "X19",
       "doc_path": "discovered/disc_X19.md"
-    },
-    {
-      "source_key": "evolution-strategies#discovered/disc_X2",
-      "id": "X2",
-      "doc_path": "discovered/disc_X2.md"
     },
     {
       "source_key": "evolution-strategies#discovered/disc_X20",
@@ -5555,11 +5669,6 @@
       "doc_path": "discovered/disc_X29.md"
     },
     {
-      "source_key": "evolution-strategies#discovered/disc_X3",
-      "id": "X3",
-      "doc_path": "discovered/disc_X3.md"
-    },
-    {
       "source_key": "evolution-strategies#discovered/disc_X30",
       "id": "X30",
       "doc_path": "discovered/disc_X30.md"
@@ -5610,11 +5719,6 @@
       "doc_path": "discovered/disc_X39.md"
     },
     {
-      "source_key": "evolution-strategies#discovered/disc_X4",
-      "id": "X4",
-      "doc_path": "discovered/disc_X4.md"
-    },
-    {
       "source_key": "evolution-strategies#discovered/disc_X40",
       "id": "X40",
       "doc_path": "discovered/disc_X40.md"
@@ -5643,31 +5747,6 @@
       "source_key": "evolution-strategies#discovered/disc_X45",
       "id": "X45",
       "doc_path": "discovered/disc_X45.md"
-    },
-    {
-      "source_key": "evolution-strategies#discovered/disc_X5",
-      "id": "X5",
-      "doc_path": "discovered/disc_X5.md"
-    },
-    {
-      "source_key": "evolution-strategies#discovered/disc_X6",
-      "id": "X6",
-      "doc_path": "discovered/disc_X6.md"
-    },
-    {
-      "source_key": "evolution-strategies#discovered/disc_X7",
-      "id": "X7",
-      "doc_path": "discovered/disc_X7.md"
-    },
-    {
-      "source_key": "evolution-strategies#discovered/disc_X8",
-      "id": "X8",
-      "doc_path": "discovered/disc_X8.md"
-    },
-    {
-      "source_key": "evolution-strategies#discovered/disc_X9",
-      "id": "X9",
-      "doc_path": "discovered/disc_X9.md"
     }
   ]
 }

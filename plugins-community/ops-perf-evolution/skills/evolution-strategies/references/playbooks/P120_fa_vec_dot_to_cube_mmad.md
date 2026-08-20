@@ -35,7 +35,7 @@ grep -nE "GetValue|SetFlag.*V_S|WaitFlag.*V_S" \
 | K 的布局 | 行主序 + 隐式逐元素转置 | ColumnMajor 视图 + nd2nz→nZ 免转置 | op_kernel/*.cpp:L? |
 | Q 的加载 | 每 tile 重复搬 UB | preload 一次常驻 L1 | op_kernel/*.cpp:L? |
 | L0A/L0B/L0C | 未使用 | 全部双缓冲（STAGES=2） | op_kernel/*.cpp:L? |
-| S/P 中间通路 | UB 驻留 | L0C→GM workspace（fp32 S / 输入dtype P） | op_kernel/*.cpp:L? |
+| S/P 中间通路 | UB 驻留 | L0C→GM workspace（fp32 S / 输入dtype P）；**若 `BLOCK_M*KV_CHUNK*4B` 可纳入 UB 预算，优先 C 直写 VECCALC 零 GM scratch（3_FusionAttention 0.03x→0.84x 的关键，配 P117 C position 一致性）** | op_kernel/*.cpp:L? |
 | 标量 GetValue 读 | 逐元素 V→S | 删除（score 由 cube 产出，行归约用 BlockReduceMax/Sum） | op_kernel/*.cpp:L? |
 
 ## Step 3: 代码改造

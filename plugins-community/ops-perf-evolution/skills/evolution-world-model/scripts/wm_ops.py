@@ -1516,10 +1516,28 @@ def _expected_case_count(results_dir: str) -> int | None:
     从 results_dir 的兄弟目录 shared/ 推导：取每个 *.json.bak 备份对中
     .bak 与 .json 行数的较大值之和；无 .bak 时退化为 shared/*.json
     （排除 call_spec.json）。无法确定时返回 None（守卫跳过）。
+
+    main10 模式：当 EVO_DIR/state.json 的 eval_mechanism == "main10" 时，
+    预期 case 数为 shared/*_main10.json 的行数（用户指定的一致子集），
+    而非 .bak 全量数——进化中间轮用 10 个主 case 快速迭代，最终最优变体
+    才恢复全量 .bak 做 50-case 验收（全量守卫在最终轮自动回到 .bak 基准）。
     """
-    shared = os.path.join(os.path.dirname(os.path.abspath(results_dir)), "shared")
+    evo_dir = os.path.dirname(os.path.abspath(results_dir))
+    shared = os.path.join(evo_dir, "shared")
     if not os.path.isdir(shared):
         return None
+
+    # main10 模式：期望 case 数 = main10 文件行数
+    try:
+        state = json.load(open(os.path.join(evo_dir, "state.json")))
+        if state.get("eval_mechanism") == "main10":
+            m10 = sorted(glob.glob(os.path.join(shared, "*_main10.json")))
+            if m10:
+                with open(m10[0], "rb") as f:
+                    n = sum(1 for _ in f)
+                return n or None
+    except (OSError, ValueError):
+        pass  # state.json 缺失/损坏 → 回退到 .bak 全量基准
 
     def _lines(path: str) -> int:
         try:
@@ -1730,7 +1748,7 @@ def _gen_pd_continue_child(node: dict, node_id: str, nodes: dict,
 def _gen_profiling_driven_child(node: dict, node_id: str, nodes: dict,
                                 bottleneck: str, one_liner: str):
     """profiling_driven 补充子节点：瓶颈明确且尚无 pd 子节点时生成。"""
-    if bottleneck in ("balanced", "unknown"):
+    if bottleneck is None or bottleneck in ("balanced", "unknown"):
         return
     existing_pd = [
         c for c in node.get("children", [])

@@ -32,6 +32,7 @@ grep -nE "REGIST_MATMUL_OBJ|MatmulImpl|IterateAll|mmTiling" \
 | bmm2 (M,N,K) | ? | (min(s1Base,sq), d, bmm1N) | op_host/*_tiling.cpp:L? |
 | OrgShape stride | ? | 真实 layout 行 stride | op_host/*_tiling.cpp:L? |
 | CType | ? | DT_FLOAT | op_host/*_tiling.cpp:L? |
+| C position | 缺失 | **与 kernel `MatmulType` C 模板参数严格一致**：kernel C 在 VECCALC（片内消费，X60 零 GM scratch 路线）→ host 必须 `SetCType(TPosition::VECCALC, ...)`；GM≠VECCALC 混配即 507015/静默错 | op_host/*_tiling.cpp:L? |
 | SetBufferSpace | 缺失 | (l1Size, l0cSize) + 返回值检查 | op_host/*_tiling.cpp:L? |
 | SetFixSplit | 缺失 | 仅 d∈(64,128] 时启用 | op_host/*_tiling.cpp:L? |
 | depthA1 微调 | 缺失 | baseK>=singleCoreK && depthA1==2 → 3 | op_host/*_tiling.cpp:L? |
@@ -128,7 +129,13 @@ Step 5: all 5 grep checks passed
 ## 常见陷阱
 
 - bmm1 的 B（K 矩阵）忘加 transpose → shape 错位。
+- **转置三处一致性**（3_FusionAttention 实测）：host tiling `SetBType(..., transB)`、kernel `mmQK_.SetTensorB(kGM, transB)`、`MatmulType<TPosition, CubeFormat, T, transB>` 模板参数，三处必须同值；host=true/device=false 时 Cube 按错误布局读 K，不报错、结果全错。
 - SetBufferSpace 不查返回值 → 超配 L1 时产出不可用 tiling。
 - depthA1 无条件改 3 → K 多轮循环场景读越界 A1。
 - 两个 bmm 共享一份 TCubeTiling → kernel 侧必挂。
 - TilingData 逐字节从 GM 拷贝 → direct-launch 启动开销被放大。
+- **custom-op（torch extension）路径下 Matmul 高阶 API 的 507015 脆弱性**（3_FusionAttention aic_v2 三个并行全部复现）：
+  - 生成的 launch wrapper 已 `SetSysWorkspaceForce`，kernel 内 `REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), ...)` 直接用即可，**禁止再把 user-workspace 参数设为 system workspace**；
+  - **禁止**自定义 `SPLIT_CORE_CUBE/SPLIT_CORE_VEC` 宏去配合 `KERNEL_TYPE_AIC_ONLY`——宏会触发 Matmul server/client 分裂路径，与 AIC-only 声明冲突，首 case 即 507015；
+  - workspace 用 `MatmulGetTmpBufSizeV2(tiling, bufSize)` 计算后取 max 并留余量（实测 ≥1MiB 兜底），不足时大 seq（≥4096）同步超时 507015；
+  - **能跑的 .so ≠ 能 rebuild 的源码**：上述任一参数不一致时旧 build artifact 仍可运行、重编译即崩，达标后必须把 build 产物连同源码一起归档。

@@ -9,10 +9,10 @@ status: active
 op_families: [attention, flash_attention, matmul, moe, conditional-compute]
 bottlenecks: [compute_bound, no_overlap]
 tags: [attention, routing, candidate-layer, conditional-compute, one-hot, branch-elimination, task-dispatch]
-strategy_ids: [X35]
+strategy_ids: [X42]
 ---
 
-# Strategy X35: 路由选中分支消除（one-hot selector 预计算 → 只算被选中分支）
+# Strategy X42: 路由选中分支消除（one-hot selector 预计算 → 只算被选中分支）
 
 ## 核心思路
 当算子在主计算**之前**已由一个廉价 router/selector 产生 **one-hot 选择向量**（如

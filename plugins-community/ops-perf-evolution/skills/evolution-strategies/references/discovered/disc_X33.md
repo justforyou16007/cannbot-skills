@@ -43,6 +43,7 @@ strategy_ids: [X33, X24, P1]
 - attention/FA/GQA 类跨核 workspace-ring 流水 kernel，profiling 显示各管道利用率低（<15-30%）
   但耗时高 → Q-tile 放大减握手次数。
 - MTE2-bound 投影/GEMM，A 侧 over-read 严重 → by-group A-reuse。
+- **前提**：by-group A-reuse 只在投影 GEMM 是 MTE2-bound（aic_mte2_ratio 高、cube 管道明显空置）时有效；若瓶颈是 cube 计算或输出带宽，GROUP_BY 只会增加 L0C 压力并可能回退。
 - 与 X24（AIC_ONLY 纯 cube / AIV_ONLY 纯搬移 kernel）叠加：X24 压 launch 地板，
   P1 L1 双缓冲压 GM->L1 延迟，三组合是 GQA 投影+attention 的有效配方。
 
@@ -50,6 +51,7 @@ strategy_ids: [X33, X24, P1]
 - Q-tile 放大需同步 AIV 每任务处理的 HQ-row 组数（GQA_HALF_Q / softmax tile），
   并处理小 seq 的 AIV padding 浪费（padding-row skip）。
 - GROUP_BY 上限由 L0C 容量决定（GROUP_BY * BLK * BLK * 4B ≤ L0C），设备 fault 需降级。
+- **先判瓶颈再开 A-reuse**：用 msprof 确认 aic_mte2_ratio 高且 cube 管道明显空置；若 cube 已饱和则不要增加 GROUP_BY。
 - 与 P92（A-reuse）区分：P92 是 L1 cache 复用（中性），X33 是显式 task 级 group 复用。
 
 ## 来源

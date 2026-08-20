@@ -26,6 +26,7 @@ softmax 单 kernel 时间可降 ~25%（case44 占整 forward ~40%）。
 - 输入域有界的 softmax（经有限范围投影后 logits 有界，如 x∈[-5,5] 经 nn.Linear 投影）
 - 由实现者确认 logits 上界（可在注释中记录实测上界），并保留恢复 max 减法的开关
 - 与 X30（head-minor 布局）正交可叠加；是 A5（max-trick）的条件反向优化
+- **边界**：P 矩阵需 cast 回 fp16/bf16 时要额外小心——fp16 exp 溢出点仅 ~11.5，删除 max 减法后必须对 logits 做 clamp 或确认上界远低于该阈值；fp32 中间累加域最安全
 
 ## 实现要点
 1. 前提验证：实测 logits 上界 |z|max（如 q·k/sqrt(hd) 经随机权重投影 < 20-40），远低于 fp32 exp 溢出点 88。
@@ -33,6 +34,7 @@ softmax 单 kernel 时间可降 ~25%（case44 占整 forward ~40%）。
 3. 除数用标量 Muls 替代 Div + 重复 divisor UB 缓冲，释放全 tile fp32 slot，tile 行数可提升（32->48~56），固定 barrier 摊到更多行。
 4. 行求和：chunk 化 WholeReduceSum 先全部发出（相互独立），再做 log-depth 成对树合并（barrier O(C)->O(log C)）。
 5. 注释中记录 logits 上界证据与恢复开关；若输入范围未来无界，须加 clamp 或恢复 max 减法。
+6. **失效回滚**：若后续把 online-softmax 改为行归一化、或 logits 缩放/输入分布变化导致上界突破阈值，必须恢复 max 减法；保留单 bool/编译开关，避免代码重构时丢失安全路径。
 
 ## 来源
 自动发现于第 1 轮进化（22_MultiQueryAttention, x0 open_exploration），speedup 1.1267x

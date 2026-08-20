@@ -293,6 +293,56 @@ def flash_attention_reference(q, k, v, sm_scale):
                     print(f"[CPU-600-{slot}] P[0,:8]: {p[0,:8]}")
 ```
 
+## matched_ratio 单项超阈（allclose/MERE 全过）的定位流程
+
+当失败表现为"仅 matched_ratio 不达标"时，按以下流程定位（SPSA D 轮5 定型，
+2026-08-20，修复 fp16/bf16 35/35 翻绿 + fp32 8 例完成结构性不可达举证）：
+
+### 步骤 1：三方对照 + 首个超标 stage 分解
+
+搭建三条数据链**逐级**比对（每级对应一个计算 stage）：
+1. 候选 kernel NPU 输出
+2. 参考 Model NPU 输出
+3. CPU fp64 精确链（同权重同输入，全程 float64）
+
+辅以两个软件模拟：`cand_sim`（候选设计语义模拟）、`ref_sim`（参考舍入模拟）。
+**首个 cand/ref 分叉的 stage 即根因 stage**——若该 stage 处 ref-vs-exact 远大于
+cand-vs-exact，则根因在参考舍入行为（候选未模拟），反之在候选实现。
+
+### 步骤 2：根因在参考侧 → 模拟参考舍入（RoundTrip）
+
+参考的 conv/matmul epilogue 常把中间结果舍入到存储 dtype（**最易被忽略的是
+softmax 前的 logits+bias 舍入**）。修复 = 候选在对应位置做 RoundTrip
+（fp32→存储 dtype→fp32）：
+- **顺序纪律**：先补 softmax 输入舍入，再评估 softmax 输出舍入（后者收益常仅
+  0.005-0.01）；主舍入就位后，此前有害的次级 RoundTrip 可能转正——顺序错误会
+  误判"需要按 dtype 条件化"
+- 每加一个 RoundTrip 必须全量复测（对边界 case 可能是 coin-flip）
+- fp32 路径保持 no-op（无存储 dtype 中间舍入）
+
+### 步骤 3：根因疑似候选侧 → 排除系统性偏差
+
+误差集中少数 channel/行 ≠ 分块 bug：查最坏位置的 mod-分块宽度余数分布，
+均匀分布即与分块无关；候选归约用纯 fp32 累加（对精确值 ~1e-6 级）即可排除自身。
+
+### 步骤 4：疑似结构性不可达 → floor 证据链（4 要素，缺一不可）
+
+1. **cand vs fp64 精确链 = 1.0000**（全元素含小值桶）
+2. **GATE ≡ floor**（参考 NPU vs fp64 精确值的 matched_ratio 与官方实测逐 case
+   一致到小数点后 4 位）
+3. **失败集合跨多次官方运行稳定**（注意 PYTHONHASHSEED 会重抽惰性权重，见
+   error-patterns.md 类型 C）
+4. **输入侧舍入假设（H1/H2/...）逐一证伪**
+
+满足后停止 D 类迭代并归档证据（继续迭代只会 coin-flip 拟合参考噪声）。
+
+### 常见结构性根因：参考 fp32 conv 的 HF32 模式
+
+fp32 的 sv_err=2^-30（近 bit 级）口径下，参考模型 fp32 conv 默认走 HF32
+（`torch_npu.npu.conv.allow_hf32` 默认开，cube 截断乘法输入尾数，MERE ~1.4e-4，
+floor 0.44-0.71）→ 任何精确实现结构性不可达。matmul 默认关 HF32（精确）。
+处置见 error-patterns.md 类型 C 首行（预检 model.py、标志首用锁定、消融须新进程）。
+
 ## 定位完成后
 
 验证问题修复之后，移除所有 DumpTensor 调用，重新验证。

@@ -69,6 +69,26 @@ P1：可能导致边界问题或实现意图不可追溯
   - 确认 notifyId 在本算子内只用于这一对同步 → 复用记 P0
 - **等级**：配对 / 时序 / notifyId 违反记 P0；矩阵表缺失记 P1
 
+### RK-A08 手写 kernel 的 GM→UB copy 覆盖 V 在读 buffer 必须显式 V_MTE2 WAR 守卫
+
+- **解决问题**：手写（非 TileLang 生成）kernel 中，单 chunk case 全部正确、多 chunk case 全错
+- **锚点**：所有循环内 `DataCopy` / `DataCopyPad`（GM→UB）且目标 UB buffer 刚被 V 管读取的位置
+- **禁止**：
+  - 照搬"TileLang 行为"假设自动同步——TileLang 的 AUTO_SYNC 在转译/手写层不存在
+  - GM→UB copy 前不做 WAR 守卫，MTE2 覆盖 V 管尚未读完的 buffer
+- **要求**：
+  - 每个 GM→UB copy 若覆盖 V 刚读过的 buffer，copy 前补 `SetFlag/WaitFlag(V_MTE2)`（WAR）
+  - UB→GM store 后若 V 要复写该 buffer，补 `SetFlag/WaitFlag(MTE3_V)`
+- **来源**：61_SequentialPolarizedSelfAttention（2026-08-19）A 类修复——多 c-chunk case 全错、
+  单 chunk 正常，race 只在循环复用 buffer 时出现
+- **检查方法**：
+  ```
+  grep -nE 'DataCopy' op_kernel/
+  ```
+  对循环体内的每个 GM→UB copy，确认目标 buffer 的上一消费者（V 管）与本次 copy（MTE2）
+  之间有 V_MTE2 守卫 → 缺失记 P0
+- **等级**：P0
+
 ### RK-A02 TQue 必须配对 EnQue / DeQue
 
 - **解决问题**：2（TQue 部分）
@@ -292,6 +312,24 @@ P1：可能导致边界问题或实现意图不可追溯
   ```
 - **等级**：P0
 
+### RK-C03 AscendC::Rsqrt fp32 为快速近似，fp32 精度敏感处必须改 Sqrt+Div
+
+- **解决问题**：fp32 case MERE 超标 2-4×，其余全部正常
+- **锚点**：所有 `AscendC::Rsqrt` 调用（LayerNorm/RMSNorm 方差倒数开方等）
+- **禁止**：fp32 精度敏感路径直接使用 `AscendC::Rsqrt`（官方文档明示不满足双万分之一，
+  为快速近似）
+- **要求**：fp32 路径改 `Sqrt` + `Div(1/x)`（或 `Sqrt` 后 `Duplicate`+除法）；
+  fp16/bf16 路径影响小可保留 Rsqrt（输出 dtype 舍入主导）
+- **来源**：61_SequentialPolarizedSelfAttention（2026-08-19）D 类修复——LayerNorm 的
+  Rsqrt 改 Sqrt+Div 后 fp32 MERE 4.45e-4→5.9e-5，直接决定多 case 通过。
+  对照实证：`AscendC::Exp`/`Sigmoid`（带 tmp）fp32 max rel err 7e-8/1.4e-7，可信
+- **检查方法**：
+  ```
+  grep -nE 'Rsqrt' op_kernel/
+  ```
+  fp32 数据流上的每个 Rsqrt → 记 P0（除非有实测证据证明满足阈值）
+- **等级**：P0（fp32 路径）/ 风险（fp16/bf16 路径）
+
 ---
 
 ## 类别 D：MIX kernel sub-block 数据分区
@@ -329,6 +367,25 @@ P1：可能导致边界问题或实现意图不可追溯
   - 若 ProducerAcquire 返回的 slot 直接传给 SplitTileToWs 或 DataCopy 而无 rowStart_ 偏移 → 记 P0
   - 人工确认：源地址和目标地址是否都包含 sub-block 行偏移 → 缺任意一侧记 P0
 - **等级**：P0（导致 fp32 精度灾难性退化）
+
+### RK-D02 手写双 AIV（cid,vid）kernel 每个 __global__ 入口首行必须设 MIX_AIC_1_2 task type
+
+- **解决问题**：手写（非 TileLang 生成）双 AIV kernel 中 vid=1 槽位输出全零/一半计算
+  静默丢失——`GetSubBlockIdx()` 恒返回 0，两个 sub-block 处理同一半数据
+- **锚点**：所有手写 `extern "C" __global__` kernel 入口（cid,vid 拆分模式）
+- **禁止**：手写 kernel 入口省略 task type 宏（TileLang 生成代码自带，手写易漏）
+- **要求**：每个 `__global__` 入口首行写
+  `KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);`
+  （archive avg_pool3_d/conv2d_base 均有此宏惯例；rms_norm 没有是因为它对 subBlockNum=1
+  也正确，不构成反例）
+- **来源**：61_SequentialPolarizedSelfAttention（2026-08-19）A 类修复——3 个手写 kernel
+  全部漏写，case 2-9 大偏差，补宏后恢复
+- **检查方法**：
+  ```
+  grep -nL 'KERNEL_TASK_TYPE_DEFAULT' op_kernel/*.cpp
+  ```
+  任何手写双 AIV kernel 命中（无宏）→ 记 P0
+- **等级**：P0
 
 ---
 

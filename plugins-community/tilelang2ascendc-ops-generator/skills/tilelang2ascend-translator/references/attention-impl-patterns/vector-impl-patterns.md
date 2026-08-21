@@ -498,3 +498,25 @@ AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(notifyId);
   运行时条件化（如按 kvLoops×行数工作量阈值启用预取）或削减 per-chunk 事件开销（更深
   流水摊薄）。**纪律：小 case 密集的任务集上 overlap 类改动必须逐 case 全量 A/B，并预设
   "无干净谓词则回退"**。
+- ✅ **b 小 c 大的单核 matvec 瓶颈 → 拆 kernel 多核化 + host 谓词分流（SPSA K23 模式，
+  2026-08-20，1 轮达标）**：fused kernel `grid=b` 在 b≤2 且 c=2048 时仅 1-2 个 AIV pair
+  串行执行 c·c2 级 matvec×N（案例：~8M MACs + ~32MB 权重流量，段耗时 ~1400us）。
+  **做法**：将 fused kernel 按数据依赖拆为 N 个小 kernel（launch 边界即全局 barrier），
+  matvec 按输出 64-row/col tile 切分，`grid = b×split`（`split=min(aivCoreNum/b,
+  tiles/2)`，vid 作独立 worker，BalancedRange 均衡划分）。**关键纪律**：
+  1. **host 谓词分流**（案例：`useSplit=(c≥1024 && b≤4)`，命中 8/50 case）——小 case
+     维持原 fused 少-launch 路径，零回归风险；拆分路径只在大 c 小 b 时启用；
+  2. **精度保障三件套**：每 tile/每行 op 顺序与 fused 逐位一致 + 跨 kernel 中间数据走
+     GM fp32 无损 + 原有 RoundTrip（模拟参考舍入）位置保留 → 拆分后 fp32 matched_ratio
+     仍 1.000000、50/50 精度保持；
+  3. 收益判定：段耗时 ~1400us→~100us，远超 6 次额外 launch + workspace 开销；
+     case7 0.332→1.441、case8 0.425→2.036、geomean 1.1985→1.6756。
+  来源：61_SequentialPolarizedSelfAttention（output2/perf_tuning/optimization_log.md）。
+- 💡 **DataCopyPad 尾块正确模式**（TileLang tl_templates/ascend/common.h copy_gm_to_ub
+  实证）：尾块先 `Duplicate` 全 tile 填 0，cp 参数 `{validRows,
+  validCols*sizeof(T), (srcRowLen-validCols)*sizeof(T),
+  (dstN-validCols)*sizeof(T)/32, 0}`（该 dstStride 公式经代数验证恒正确），
+  padParams(isPad=(validCols*sizeof%32!=0), 0, isPad?1:0, 0)。
+- 💡 **ReduceSum 方向与 dtype 限制**：列归约用 `Pattern::Reduce::RA`、行归约用 `AR`；
+  A2 上仅支持 fp32。标量入 GM：`LocalTensor.GetValue` + `Duplicate` 成行再 DataCopyPad
+  （直写慢但可用；与 TileLang 侧"标量 GM 写不生效"不同）。

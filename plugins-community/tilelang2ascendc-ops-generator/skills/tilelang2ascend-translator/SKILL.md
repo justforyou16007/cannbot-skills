@@ -66,7 +66,7 @@ argument-hint: >
 - `.claude/skills/tilelang2ascend-translator/references/scalar-to-vector.md` — 标量计算向量化指南
 - `.claude/skills/tilelang2ascend-translator/references/AscendCVerification.md` — AscendC 验证指南
 - `.claude/skills/tilelang2ascend-translator/references/fp32-cube-path.md` — FP32 cube 路径要点（分形 C0=8、Mmad 16 对齐、SetFmatrix/LoadDataWithTranspose 加载路径）
-- `.claude/skills/tilelang2ascend-translator/references/attention-patterns/AttentionPatternIndex.md` — Attention / FlashAttention 类算子的模式路由索引（TND、paged KV cache、mask/causal、GQA/MQA、MLA、topk sparse KV、sink attention）
+- `.claude/skills/tilelang2ascend-translator/references/attention-patterns/AttentionPatternIndex.md` — Attention / FlashAttention 类算子的模式路由索引（TND、paged KV cache、mask/causal、GQA/MQA、MLA、topk sparse KV、sink attention、FA 反向/FAG）
 - `.claude/skills/tilelang2ascend-translator/references/quant-patterns/QuantPatternIndex.md` — 量化/反量化类算子的模式路由索引（quantize/dequantize、quant_matmul、weight-group-quant、kv-cache-quant、fused-quant、anti-quant）+ 共享参考（决策表/公式/Cast 矩阵/精度铁律/验证标准）
 - `.claude/skills/tilelang2ascend-translator/scripts/evaluate_ascendc.sh` — AscendC 评测脚本
 - `workflows/templates/archive_tasks/` — 历史成功任务，host/kernel 完整参考实现（**编译/运行时错误时优先查阅**）
@@ -111,7 +111,7 @@ argument-hint: >
 0-A.1 🛑 读取 AttentionPatternIndex.md（必须，不可跳过）:
     Read .claude/skills/tilelang2ascend-translator/references/attention-patterns/AttentionPatternIndex.md
 
-0-A.2 🛑 逐条回答"生成前问题"中的 7 个诊断问题，记录命中的模式:
+0-A.2 🛑 逐条回答"生成前问题"中的 8 个诊断问题，记录命中的模式:
     1. 输入是标准 [B,H,S,D] 还是 (T,H,D) 拼接布局？
     2. K/V 是连续 tensor 还是 paged cache？
     3. Hq 和 Hkv 是否相等？
@@ -119,8 +119,10 @@ argument-hint: >
     5. 是否有 sink_k/sink_v？
     6. 是否有 indices/topk？
     7. 是否有 causal、padding、显式 mask？
+    8. 是前向还是反向（是否有 dy/softmax_max/softmax_sum/attention_in 输入、dq/dk/dv 输出）？
     
-    如果 7 项全否定 → 命中"标准 Attention" → 下一步 0-A.3 读 archive 模板
+    如果前 7 项全否定且为前向 → 命中"标准 Attention" → 下一步 0-A.3 读 archive 模板
+    如果第 8 项命中反向 → 下一步 0-A.3 读 fa_backward_pattern.md（可与其余模式组合）
     如果任一命中 → 下一步 0-A.3 读对应的 pattern 文档（可组合）
 
 0-A.3 🛑 只读取命中的文档（渐进式披露，只读需要的）:
@@ -128,7 +130,7 @@ argument-hint: >
 
 0-A.4 🛑 在思考中确认:
     - 已读的 pattern 文档列表及其关键语义边界
-    - 组合顺序（多模式命中时按 TND → Head Sharing → MLA → Sink → Sparse → Paged → Mask 顺序理解）
+    - 组合顺序（多模式命中时按 TND → Head Sharing → MLA → Sink → Sparse → Paged → Mask 顺序理解；反向则按 fa_backward_pattern 的三段式组织计算图）
     - 本算子的 AscendC 转译策略应与命中的 pattern 对齐
 ```
 

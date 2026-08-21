@@ -161,7 +161,7 @@ python custom/{op}/test_{op}.py --level l0
 
 - [references/coding-conventions.md](references/coding-conventions.md) — Buffer 分配 / 索引 / 同步 / 广播 / 测试模板（写代码遇到具体规范时查）
 - [references/vector-parallelism.md](references/vector-parallelism.md) — V 核并行化（用到 vid 切分时查）
-- [references/gemm-cv-fusion.md](references/gemm-cv-fusion.md) — GEMM 与 CV 融合 pass_configs（含 GEMM 或融合算子时查）
+- [references/gemm-cv-fusion.md](references/gemm-cv-fusion.md) — GEMM 与 CV 融合 pass_configs、FA 反向（FAG）CV 融合实例（含 GEMM 或融合算子时查）
 - [references/checklist.md](references/checklist.md) — 22 项上库前检查清单（生成代码后逐项过）
 - [references/troubleshooting.md](references/troubleshooting.md) — 编译 / 运行 / 精度错误排查手册（遇到具体错误时查）
 - [examples/code-skeleton.md](examples/code-skeleton.md) — `{op}.py`（kernel）+ `test_{op}.py`（测试）文件结构骨架

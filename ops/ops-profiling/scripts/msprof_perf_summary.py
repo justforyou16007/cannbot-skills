@@ -633,7 +633,8 @@ def _load_cases_json(out_dir: Path):
     json_files = sorted(out_dir.glob("*.json"))
     json_path = None
     for f in json_files:
-        if not f.name.endswith(".bak") and f.name not in ("performance.json", "perf_report.json"):
+        # call_spec.json 是 evolution 目录的用例参数规格（非测试用例），必须排除
+        if not f.name.endswith(".bak") and f.name not in ("performance.json", "perf_report.json", "call_spec.json"):
             json_path = f
             break
     if not json_path:
@@ -2090,6 +2091,20 @@ def _generate_batch_wrapper_script(out_dir, impl, cases, indices, args, device_i
             f"{inp_indented}\n"
             f"    _inputs_dict = {{_k: _move(_v) for _k, _v in _inputs_dict.items()}}\n"
             f"    _inputs_list = list(_inputs_dict.values())\n"
+            f"    _inputs_real = None\n"
+            f"    try:\n"
+            f"        _refm = _load(out_dir / 'model.py', 'ref_for_inputs_batch')\n"
+            f"        _gen = getattr(_refm, 'get_input_groups', getattr(_refm, 'get_inputs', None))\n"
+            f"        if _gen is not None:\n"
+            f"            _all_g = _gen()\n"
+            f"            if {idx} < len(_all_g):\n"
+            f"                _e = _all_g[{idx}]\n"
+            f"                _inputs_real = list(_e) if isinstance(_e, (list, tuple)) else [_e]\n"
+            f"    except Exception:\n"
+            f"        _inputs_real = None\n"
+            f"    if _inputs_real is not None:\n"
+            f"        _inputs_list = [_move(_v) for _v in _inputs_real]\n"
+            f"        _inputs_dict = {{}}\n"
             f"    _init_args = []\n"
             f"    _init_kwargs = {{}}\n"
             f"    if _ref_for_init is not None:\n"

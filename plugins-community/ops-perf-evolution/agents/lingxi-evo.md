@@ -169,7 +169,7 @@ python3 plugins-community/ops-perf-evolution/skills/evolution-world-model/script
 
    ```bash
    bash ops/ops-profiling/scripts/msprof_profile_run.sh \
-       --quick \
+       --quick --quick-batch \
        --output-dir={baseline_kernel_path} \
        --warm-up=3 \
        --device={npu} \
@@ -540,7 +540,7 @@ cp -r output/{op_name}_evo_{timestamp}/shared/* \
 - **Parent Profiling Context 变量**（优先顺序：父节点 profiling_insight > baseline > N/A）: 若有 `parent_id` 且父节点有 `profiling_insight`，`{profiling_one_liner}`/`{bottleneck}`/`{recommended_strategies}` 取父节点对应字段，profiling_evidence 相关字段取 `parent.profiling_evidence`（若有）；父节点无则从 `baseline_evaluation.json` 提取（若有 pipeline 数据），否则全部填 "N/A"
 - 子 agent 步骤：AscendC 转译（tilelang2ascend-translator skill）→ 退化检测 + 功能验证 → Local Refinement
 - 共享文件引用：`model.py, design/, <op_name>.json, <op_name>.json.bak`；kernel 路径：`kernel/`（非 `{op_name}Custom/op_kernel/`）
-- 评估方式：`ops-profiling` skill（`msprof_profile_run.sh --quick` 模式，对比 model.py vs model_new_ascendc.py，生成 performance.json）
+- 评估方式：`ops-profiling` skill（`msprof_profile_run.sh --quick --quick-batch` 模式，一次 msprof 批量采集全部 case，对比 model.py vs model_new_ascendc.py，生成 performance.json）。**所有 `--quick` 性能测量一律加 `--quick-batch`**（批量采集全部 case，替代逐 case 默认行为；个别 case 复核才单独用 `--per-case`）
 
 **v3.2 Strategy Resources 变量填充**（必须执行）: `{strategy_resources_block}` 由 helper 脚本一次性生成（封装 Preconditions 过滤 + Playbook 加载 + Excluded 段拼装）。**每个 partial 启动前**，主 agent 必须为该节点执行：
 

@@ -135,7 +135,11 @@ def _normalize_lingxi_format(eval_data: dict) -> dict:
             "time_delta_us": comp.get("time_delta_us", 0.0),
             "cv_pct": comp.get("cv_pct", 0.0),
             "measurement_quality": comp.get("measurement_quality", "unknown"),
+            "n_cases_valid": comp.get("n_cases_valid", eval_data.get("n_cases_valid")),
+            "n_cases_total": comp.get("n_cases_total", eval_data.get("n_cases_total")),
         },
+        "n_cases_valid": eval_data.get("n_cases_valid"),
+        "n_cases_total": eval_data.get("n_cases_total"),
     }
 
 
@@ -404,7 +408,7 @@ def _eval_compile_and_precision(ev: dict) -> tuple[bool, bool]:
 
 
 def find_best_variant(rounds: list[dict], baseline_time: float) -> dict | None:
-    """Find the variant with the highest speedup."""
+    """Find the variant with the highest speedup, preferring complete case coverage."""
     best = None
     for r in rounds:
         ev = r.get("eval")
@@ -417,8 +421,26 @@ def find_best_variant(rounds: list[dict], baseline_time: float) -> dict | None:
         evolved_time = ev.get("evolved", {}).get("time_us")
         if evolved_time and evolved_time > 0:
             speedup = baseline_time / evolved_time
-            if best is None or speedup > best["speedup"]:
-                best = {**r, "speedup": speedup, "time_us": evolved_time}
+            # completeness ratio: prefer variants measured on the full case set
+            n_valid = ev.get("n_cases_valid") or ev.get("comparison", {}).get("n_cases_valid")
+            n_total = ev.get("n_cases_total") or ev.get("comparison", {}).get("n_cases_total")
+            try:
+                n_valid = float(n_valid) if n_valid is not None else 0.0
+                n_total = float(n_total) if n_total else 1.0
+            except (TypeError, ValueError):
+                n_valid, n_total = 0.0, 1.0
+            completeness = n_valid / n_total if n_total > 0 else 0.0
+            cand = {**r, "speedup": speedup, "time_us": evolved_time,
+                    "_n_cases_valid": n_valid, "_n_cases_total": n_total,
+                    "_completeness": completeness}
+            if best is None:
+                best = cand
+            else:
+                # primary: completeness (full-set eval wins over partial); tie-break by speedup
+                if completeness > best["_completeness"]:
+                    best = cand
+                elif completeness == best["_completeness"] and speedup > best["speedup"]:
+                    best = cand
     return best
 
 
@@ -712,9 +734,17 @@ def _build_invalid_row(ctx: _RowContext, reason: str, evolved_time=None) -> str:
 
 
 def _build_valid_row(ctx: _RowContext, evolved_time: float,
-                     baseline_time: float, is_best: bool) -> str:
-    """构建有效变体的表格行（最优 / 有效 / 退化徽标）。"""
-    speedup = baseline_time / evolved_time if evolved_time > 0 else 0
+                     baseline_time: float, is_best: bool,
+                     same_run_speedup: float | None = None) -> str:
+    """构建有效变体的表格行（最优 / 有效 / 退化徽标）。
+
+    加速比口径：优先采用同 run canonical（evaluation_results.json 的
+    comparison.speedup = 同一次 msprof 测量的 ref geomean ÷ asc geomean，
+    用户指定权威指标，禁止跨 run 混算）；仅当缺失时退回 vs-baseline
+    (baseline_time / evolved_time)。
+    """
+    speedup = same_run_speedup if same_run_speedup and same_run_speedup > 0 else \
+        (baseline_time / evolved_time if evolved_time > 0 else 0)
     if is_best:
         tr_class = ' class="best"'
         badge = '<span class="badge badge-best">最优</span>'
@@ -766,7 +796,16 @@ def build_evolution_table_rows(rounds: list[dict], wm: dict, baseline_time: floa
             rows.append(_build_invalid_row(row_ctx, "精度失败", evolved_time))
             continue
 
-        rows.append(_build_valid_row(row_ctx, evolved_time, baseline_time, is_best))
+        # 同 run canonical: comparison.speedup（同一 msprof 测量的 ref geomean ÷ asc geomean）
+        same_run_speedup = None
+        comp = ev.get("comparison", {}) if isinstance(ev, dict) else {}
+        if isinstance(comp, dict):
+            _sp = comp.get("speedup")
+            if isinstance(_sp, (int, float)) and _sp > 0:
+                same_run_speedup = _sp
+
+        rows.append(_build_valid_row(row_ctx, evolved_time, baseline_time, is_best,
+                                     same_run_speedup))
     return "\n".join(rows)
 
 
@@ -1572,13 +1611,20 @@ def _check_wm_consistency(wm: dict | None, rounds: list[dict], baseline_time: fl
         evolved_time = ev.get("evolved", {}).get("time_us")
         has_valid_score = bool(node_score) and node_score > 0
         has_valid_time = bool(evolved_time) and evolved_time > 0
-        if has_valid_score and has_valid_time:
+        # 同 run canonical: comparison.speedup 与 world_model score 同口径（ref geomean ÷ asc geomean）
+        comp = ev.get("comparison", {}) if isinstance(ev, dict) else {}
+        same_run_speedup = comp.get("speedup") if isinstance(comp, dict) else None
+        if isinstance(same_run_speedup, (int, float)) and same_run_speedup > 0:
+            computed_speedup = same_run_speedup
+        elif has_valid_score and has_valid_time:
             computed_speedup = baseline_time / evolved_time
-            if abs(computed_speedup - node_score) > 0.05:
-                warnings.append(
-                    f"R{r['round']}-P{r['parallel']} speedup 不一致: "
-                    f"world_model={node_score:.3f}x, eval={computed_speedup:.3f}x"
-                )
+        else:
+            computed_speedup = None
+        if computed_speedup and node_score and abs(computed_speedup - node_score) > 0.05:
+            warnings.append(
+                f"R{r['round']}-P{r['parallel']} speedup 不一致: "
+                f"world_model={node_score:.3f}x, eval={computed_speedup:.3f}x"
+            )
     if missing_nodes:
         warnings.append(
             f"以下变体在世界模型中无对应节点（可能 refine 被跳过）: {', '.join(missing_nodes)}"

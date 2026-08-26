@@ -48,14 +48,14 @@
     ]
   },
   "stats": {
-    "cards": 157,
-    "active_cards": 144,
+    "cards": 161,
+    "active_cards": 148,
     "deprecated": 13,
     "preconditions": 142,
     "playbooks": 142,
     "families": 8,
-    "discovered": 45,
-    "okf": 0
+    "discovered": 60,
+    "okf": 60
   },
   "cards": [
     {
@@ -4054,6 +4054,132 @@
       "quantified_gain": [],
       "deprecated": true,
       "deprecated_reason": "Uses fictional Mutex::Lock API. Overlaps with P28/P29/P30 sync strategies. Zero references."
+    },
+    {
+      "source_key": "evolution-strategies#card/P144_host_pool_bnstats_scalar_pass",
+      "id": "P144",
+      "title": "P144: host 端计算全局池化与 BN 训练统计，标量传参替代设备归约/往返同步",
+      "doc_path": "cards/P144_host_pool_bnstats_scalar_pass.md",
+      "complexity": "L1",
+      "op_families": [
+        "attention",
+        "elementwise",
+        "normalization"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "no_overlap",
+          "scalar_loading"
+        ]
+      },
+      "conflicts_with": [],
+      "synergizes_with": [
+        "P145",
+        "P146",
+        "P147",
+        "A2"
+      ],
+      "requires": [
+        "P147"
+      ],
+      "has_preconditions": true,
+      "has_playbook": false,
+      "quantified_gain": [
+        "shape: \"64_TripletAttention 50-case（910B2C，geomean vs PyTorch）\""
+      ]
+    },
+    {
+      "source_key": "evolution-strategies#card/P145_multilaunch_no_same_launch_gm_rw",
+      "id": "P145",
+      "title": "P145: 多 launch 纯 AIV 流水架构（避免同 launch GM 写后读）",
+      "doc_path": "cards/P145_multilaunch_no_same_launch_gm_rw.md",
+      "complexity": "L1",
+      "op_families": [
+        "attention",
+        "elementwise",
+        "normalization"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "no_overlap",
+          "mte3_stall"
+        ]
+      },
+      "conflicts_with": [],
+      "synergizes_with": [
+        "P144",
+        "P146",
+        "P1"
+      ],
+      "requires": [],
+      "has_preconditions": true,
+      "has_playbook": false,
+      "quantified_gain": [
+        "shape: \"64_TripletAttention 50-case（910B2C，geomean vs PyTorch）\""
+      ]
+    },
+    {
+      "source_key": "evolution-strategies#card/P146_910b2c_alignment_scalar_hardening",
+      "id": "P146",
+      "title": "P146: 910B2C 非对齐 DMA 与标量通道加固套件",
+      "doc_path": "cards/P146_910b2c_alignment_scalar_hardening.md",
+      "complexity": "L1",
+      "op_families": [
+        "attention",
+        "elementwise",
+        "normalization",
+        "broadcast_mask"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "mte2_stall",
+          "scalar_loading",
+          "ub_memory_pressure"
+        ]
+      },
+      "conflicts_with": [],
+      "synergizes_with": [
+        "P144",
+        "P145",
+        "P10",
+        "P66"
+      ],
+      "requires": [],
+      "has_preconditions": true,
+      "has_playbook": false,
+      "quantified_gain": [
+        "shape: \"64_TripletAttention 50-case（910B2C，小 H×W 7×11~21×23 全覆盖）\""
+      ]
+    },
+    {
+      "source_key": "evolution-strategies#card/P147_npu_conv_12sig_rounding_emulation",
+      "id": "P147",
+      "title": "P147: NPU 卷积输入 12-sig-bit 舍入模拟（host 侧复现 F.conv2d 数值）",
+      "doc_path": "cards/P147_npu_conv_12sig_rounding_emulation.md",
+      "complexity": "L1",
+      "op_families": [
+        "attention",
+        "cv_fusion",
+        "elementwise"
+      ],
+      "triggers": {
+        "bottleneck_labels": [
+          "compute_bound",
+          "scalar_compute"
+        ]
+      },
+      "conflicts_with": [],
+      "synergizes_with": [
+        "P144",
+        "P129",
+        "A1"
+      ],
+      "requires": [],
+      "has_preconditions": true,
+      "has_playbook": false,
+      "quantified_gain": [
+        "shape: \"64_TripletAttention 50-case（910B2C，K=3/5/7 全覆盖）\""
+      ]
     }
   ],
   "preconditions": [
@@ -5747,6 +5873,81 @@
       "source_key": "evolution-strategies#discovered/disc_X45",
       "id": "X45",
       "doc_path": "discovered/disc_X45.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X46",
+      "id": "X46",
+      "doc_path": "discovered/disc_X46.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X47",
+      "id": "X47",
+      "doc_path": "discovered/disc_X47.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X48",
+      "id": "X48",
+      "doc_path": "discovered/disc_X48.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X49",
+      "id": "X49",
+      "doc_path": "discovered/disc_X49.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X50",
+      "id": "X50",
+      "doc_path": "discovered/disc_X50.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X51",
+      "id": "X51",
+      "doc_path": "discovered/disc_X51.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X52",
+      "id": "X52",
+      "doc_path": "discovered/disc_X52.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X53",
+      "id": "X53",
+      "doc_path": "discovered/disc_X53.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X54",
+      "id": "X54",
+      "doc_path": "discovered/disc_X54.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X55",
+      "id": "X55",
+      "doc_path": "discovered/disc_X55.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X56",
+      "id": "X56",
+      "doc_path": "discovered/disc_X56.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X57",
+      "id": "X57",
+      "doc_path": "discovered/disc_X57.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X58",
+      "id": "X58",
+      "doc_path": "discovered/disc_X58.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X67",
+      "id": "X67",
+      "doc_path": "discovered/disc_X67.md"
+    },
+    {
+      "source_key": "evolution-strategies#discovered/disc_X68",
+      "id": "X68",
+      "doc_path": "discovered/disc_X68.md"
     }
   ]
 }

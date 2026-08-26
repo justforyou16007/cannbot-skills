@@ -323,9 +323,10 @@ bash ops-lab/tilelang-to-ascendc/skills/tilelang2ascend-translator/scripts/evalu
 
 性能评测（用 ops-profiling quick 模式；禁止手写自定义计时脚本）：
 ```bash
-bash ops/ops-profiling/scripts/msprof_profile_run.sh --quick \
+bash ops/ops-profiling/scripts/msprof_profile_run.sh --quick --quick-batch \
     --output-dir={output_dir} --device={npu}
 ```
+> **`--quick-batch` 必须加**：一次 msprof 批量采集全部 case（每 case 一个 stream），替代默认逐 case 测量，省时且减少噪声暴露窗口。所有 `--quick` 测量一律带 `--quick-batch`；仅个别 case 复核时单独加 `--per-case`。
 从生成的 `{output_dir}/performance.json` 提取 `new_speedup`（vs PyTorch 的 ref/asc 几何均值）。
 
 **2.4 收益判断**

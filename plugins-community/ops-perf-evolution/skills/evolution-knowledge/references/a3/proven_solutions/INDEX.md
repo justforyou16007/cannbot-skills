@@ -60,6 +60,9 @@ Each entry should follow this template:
 
 _新方案沉淀时按此格式追加行_
 
+| elementwise / reduction / cv_fusion（定点迭代求解器） | X63: reciprocal-mul Div 折叠（共享除数倒数乘法） | find_roi evolution |
+| elementwise / reduction / cv_fusion（定点迭代求解器） | X65: order-3 修正初值 + 单次迭代 | find_roi evolution |
+| attention (decode MLA/GQA，过精度机器基线) | X68: decode MLA 精度机器放松（去 Dot2/Kahan）+ 两遍精确 p-rounding + KV-chunk 核切分 | 77_TrtllmBatchDecodeWithKvCacheMla evolution |
 ## Recorded Solutions
 
 ### X1: Causal S2 Block Skipping (FlashAttentionSimple)
@@ -689,3 +692,85 @@ pmat.IterateAll();                            // AIC 执行，coreIdx 步进覆�
 - 保留 k0 独立 kernel：分页 gather 需标量索引，折入 AIV 会引入每 task 一次 K/V 握手
 
 **Strategy IDs**: P115, P121, P123, P137, P119, P120, A5, A4；OKF 卡 X39（host workspace 免 memset，x0 侧沉淀）
+
+### X63: 定点迭代求解器 reciprocal-mul Div 折叠（共享除数倒数乘法）（find_roi）
+
+**Source**: find_roi evolution, round 1, parallel 2 (x0, open_exploration)
+**Speedup**: 5.59x → 7.17x vs PyTorch（+28%；相对基线 5.445x +32%）
+**Operator type**: 逐像素定点迭代求解器（Brown-Conrady 去畸变反解），fp32 pure-Vector，compute-bound
+**Hardware**: Ascend910B2C (DAV_2201)
+
+**Technique description**:
+定点迭代求解器中 x/y 分量更新共享同一除数（radial / z_safe），逐分量各自 Div 是 2 次除法。改为先 1 次 Div 求倒数再用 2 次 Muls 乘回（2 Div → 1 Div + 2 Mul），全算子 12 Div → 6 Div + 6 Mul/像素。必须用精确 `1.0f/x`（Div 指令）求倒数，禁止硬件近似 `Reciprocal()`（实测 1.11px 超容差 22 倍）。
+
+**Key code change**:
+```cpp
+// Before: x_new = (xd - numX) / radial;  y_new = (yd - numY) / radial;  // 2 Div
+// After:
+float invRad = 1.0f / radial;   // 1 Div（共享）
+x_new = (xd - numX) * invRad;    // 1 Mul
+y_new = (yd - numY) * invRad;    // 1 Mul
+// 归一化同理：invZ = 1.0f/max(z_r,TINY); x_n = x_r*invZ; y_n = y_r*invZ
+```
+
+**Applicability conditions**:
+- 定点迭代 / 逐像素求解器：同一迭代内多分量共享分母（radial / z / denominator）
+- 任意「多次 Div 共享同一除数」的向量链（归一化、透视除法、迭代反解）
+- compute_bound 瓶颈（Div 慢指令）；修改后必须实测全量容差（乘法舍入可能影响极值像素）
+- 禁止 Reciprocal() 近似倒数（精度经迭代放大超容差）
+
+**Strategy IDs**: X63
+
+### X65: 定点迭代求解器高阶修正初值 + 单次迭代（order-3 多项式初值）（find_roi）
+
+**Source**: find_roi evolution, round 3, parallel 2 (x0_x1_x1, open_exploration)
+**Speedup**: 8.33x → 14.76x vs PyTorch（+77%；相对基线 5.445x +171%）
+**Operator type**: 逐像素定点迭代求解器（Brown-Conrady 去畸变反解），fp32 pure-Vector，compute-bound
+**Hardware**: Ascend910B2C (DAV_2201)
+
+**Technique description**:
+定点迭代求解器从朴素初值跑 4-5 迭代时，用前向模型逆级数的 order-3 多项式修正初值（`coef2=3k1²-k2`, `coef3=-(5k1³-5k1k2+k3)`），把初值推到接近真根，1 次定点迭代即收敛。去畸变向量开销 63→30 ops/行。不是简单减迭代数（3 迭代 0.047px 接近容差），而是高阶初值换取收敛步数。
+
+**Key code change**:
+```cpp
+// Before: x=x_d; y=y_d; for(5 iters){...Div...}
+// After: order-3 修正初值 + 1 次迭代
+r2d = x_d*x_d + y_d*y_d;
+invPoly = 1 + r2d*(-k1 + r2d*(coef2 + r2d*coef3));  // coef2=3k1²-k2, coef3=-(5k1³-5k1k2+k3)
+x = x_d * invPoly;  y = y_d * invPoly;
+// +1 次定点迭代收敛
+```
+
+**Applicability conditions**:
+- 定点迭代求解器：每像素多迭代反解（去畸变、透视反解、求根），迭代体含 Div/慢指令
+- 迭代 ≥3 且每迭代代价高（compute_bound）；前向模型是多项式/可逆级数
+- 必须实测全量容差（order-3 残余误差随畸变系数幅度变化）
+
+**Strategy IDs**: X65
+
+### X68: decode MLA 精度机器放松（去 Dot2/Kahan）+ 两遍精确 p-rounding + KV-chunk 核切分（77_TrtllmBatchDecodeWithKvCacheMla）
+
+**Source**: 77_TrtllmBatchDecodeWithKvCacheMla evolution, round 1, parallel 2 (x0, open_exploration)
+**Speedup**: 0.058x → 0.5996x vs PyTorch（~10.3x，50/50 精度）
+**Operator type**: decode MLA attention（QK^T→softmax→PV，paged KV），fp16/bf16/fp32
+**Hardware**: Ascend910B2C (DAV_2201)
+
+**Technique description**:
+过 golden(fp64) 的 decode MLA 基线内核背 Dot2 双 fp32 QK（TwoProd+TwoSum 树+跨 chunk DS，~6x QK 向量指令）+ Kahan 补偿 + fp16/bf16 round-trip mimic，大部分是过度设计。① QK 降普通 fp32 点积（nope/rope 分段保留 golden 两次独立原 dtype matmul 的舍入 mimic，去 DS/去 Kahan）——实测 eval 容差（rtol/atol≈1e-3）内 50/50 通过；② 两遍结构 + 精确 p-rounding（`p=round_T(exp2(s2-mGlobal)/denomGlobal)` 复现 golden 的 `(e/denom).to(q_dtype)`），单遍 online softmax 在 PV 前拿不到最终 denom，逐 tile fl_T(e) 舍入点与 golden 不同，近零对消元素超 MERE；③ KV-chunk 核切分（maxChunks 均匀切 + 轻量 combine kernel，maxChunks==1 单核两遍快速路径省 2 launch）。
+
+**Key code change**:
+```cpp
+// Before: Dot2 双 fp32 QK（QkDotDS/ChunkDS/TwoSum 树）+ Kahan 补偿
+// After: 普通 fp32 QK 点积 + 两遍精确 p-rounding
+// pass A: chunk m/denom (online softmax)
+// pass B: p = round_T(exp2(s2 - mGlobal) / denomGlobal); accO += p * K
+// maxChunks==1 时同 kernel 内两遍，省 passB/combine launch
+```
+
+**Applicability conditions**:
+- decode MLA/GQA 注意力，baseline 为过精度背 Dot2/Kahan 机器的纯 AIV 实现
+- eval 容差相对宽松（MERE/allclose rtol/atol≈1e-3），非逐 bit 精确
+- 单遍 flash 在此类精度门禁下不可行（p-rounding 舍入点差异）；两遍是硬约束
+- 910B2C 大列（>256）向量归约 API 不可靠，归约须走 Add/Sub 树或 Cube
+
+**Strategy IDs**: X68, P119, X54

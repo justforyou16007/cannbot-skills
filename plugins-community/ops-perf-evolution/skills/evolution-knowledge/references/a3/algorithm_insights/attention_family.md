@@ -12,6 +12,8 @@ Attention 按**计算特性**分三大类：线性、稀疏、压缩。标准 So
 | **MQA** | CP1 稠密 GEMM-Softmax-GEMM | GQA group=1 退化：全部 Q 共享单份 KV |
 | **FA** | CP2 在线 Softmax 流式分块 | 分块流式遍历 KV，维护 running max/l，不物化 `[S,S]`（与 MHA 数学等价、kernel 骨架不同） |
 
+优化（flashattention.md standard 分支）：S1 P119/P120 结构改写 → S2 P121 CV 流水 → S3 P122 KV 大块化 + **P142**（UB 常驻 O 累加器，凡 FA 流式骨架——MHA/GQA/MQA/MLA/Paged/块跳过——均适用，与 X38 GM workspace ring 二选一）；中小 shape host 固定开销主导 → **P143**（host launch 合并 + per-shape tiling 缓存，MHA/SDPA 实测来源）。
+
 ### 稀疏 Attention（softmax + 稀疏 mask）
 | 小类 | CP | 机制定义 |
 |---|---|---|
@@ -19,7 +21,7 @@ Attention 按**计算特性**分三大类：线性、稀疏、压缩。标准 So
 | **Sparse-块跳过型** | CP3 块级子集遍历 | block-mask/top-k 确定 KV 子集后流式累加，**真正减少 GEMM**（O(N²)→O(N·k)） |
 | **Sparse-展开型** | CP9 unfold 邻域展开 | unfold 抽取块滑窗 + halo 邻域作为 KV，权重仍由 QK^T 产生 |
 
-优化（flashattention.md **sparse trait**）：掩码型 → P123（skip + 边界 mask）+ P118；块跳过型 → **P137**（紧凑化走 Cube，top-k 不再回退 Vector）+ P138/P139（L0 守卫 / 多槽零填充稳定性）+ P76/P77。
+优化（flashattention.md **sparse trait**）：掩码型 → P123（skip + 边界 mask）+ P118，中小 shape host-bound → **P143**；块跳过型 → **P137**（紧凑化走 Cube，top-k 不再回退 Vector）+ P138/P139（L0 守卫 / 多槽零填充稳定性）+ P76/P77，流式累加骨架 → **P142**。
 
 ### 压缩 Attention（KV 压缩表示）
 | 小类 | CP | 机制定义 |
@@ -27,7 +29,7 @@ Attention 按**计算特性**分三大类：线性、稀疏、压缩。标准 So
 | **MLA** | CP3 块跳过 + CP4 分页 + CP11 前处理 | K/V 低秩联合压缩进 latent 维再投影回原维（nope/rope 解耦），KV cache 降至 4%-14% |
 | **Paged** | CP4 分页间接寻址 | KV cache 切定长物理块，block_table 页表映射，只解决内存分配不改变公式 |
 
-优化（flashattention.md）：MLA 分支（P124 nope/rope 拼 K + P125 跨任务预取 + P126 任务表 + **P140** M-tile 放大）；Paged → paged/decode trait（P60/P61/P126）。
+优化（flashattention.md）：MLA 分支（P124 nope/rope 拼 K + P125 跨任务预取 + P126 任务表 + **P140** M-tile 放大）；Paged → paged/decode trait（P60/P61/P126）。两者 kernel 同为 KV-tile 流式骨架 → 叠加 **P142**（UB 常驻 O 累加器）。
 
 ### 线性 Attention（无 QK^T、无 softmax，状态递推 + chunk-scan）
 | 小类 | CP | 机制定义 |
@@ -56,7 +58,7 @@ Attention 按**计算特性**分三大类：线性、稀疏、压缩。标准 So
 | **聚合分发** | CP8 门控广播（通道/空间维） | 先聚合全局/上下文描述子再分发回各位置 |
 | **邻域展开** | CP9 unfold 邻域展开 | unfold 局部邻域 + linear 生成权重（非 QK^T）→ softmax → fold |
 
-路由：**CV-Attn-通道/空间门控/双分支/聚合分发**（CP8，无 `[S,S]`）→ 归 reduction / elementwise；**空间自注意力**（CP1，真 QK^T）→ 归 attention 或按视觉语义处理。
+路由：**CV-Attn-通道/空间门控/双分支/聚合分发**（CP8，无 `[S,S]`）→ **含 conv 2→1 + BN(training) 的（Triplet/BAM/CBAM conv 版）归 flashattention.md `cv-attn` 分支**（P144→P145→P146→P147 快速路由）；**纯 MLP（pool→FC→scale，无 conv）归 reduction / elementwise**；**空间自注意力**（CP1，真 QK^T）→ 归 attention 或按视觉语义处理。
 
 ### 非 Attention（排除）
 | 小类 | CP | 机制定义 |

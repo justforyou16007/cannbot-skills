@@ -254,11 +254,23 @@ def _shape_input_dir(work_root: str, shape_name: str) -> str:
 
 
 def _make_input_tensor(inp: dict, dtype_map: dict):
-    """按输入规格生成单个随机张量。"""
+    """按输入规格生成单个张量。
+
+    支持 inp["value"] 显式覆盖（用于 group_list 等需要特定语义的输入）：
+    - value 为 null  → 返回 None（可选输入传空指针，如 A8W8 的 bias）
+    - value 为 list  → 转为指定 dtype 的张量
+    - 无 value 键    → 按 dtype 随机生成（原逻辑）
+    """
     import torch
+    if "value" in inp:
+        value = inp["value"]
+        if value is None:
+            return None
+        dtype = dtype_map.get(inp["dtype"], torch.float16)
+        return torch.tensor(value, dtype=dtype)
     dtype = dtype_map.get(inp["dtype"], torch.float16)
     shape = inp["shape"]
-    if dtype in (torch.int32, torch.int64):
+    if dtype in (torch.int32, torch.int64, torch.int8):
         return torch.randint(0, 10, shape, dtype=dtype)
     if dtype == torch.bool:
         return torch.randint(0, 2, shape, dtype=torch.uint8).to(torch.bool)
@@ -302,7 +314,7 @@ def generate_inputs(call_spec: dict, work_root: str,
     dtype_map = {
         "float16": torch.float16, "float32": torch.float32,
         "bfloat16": torch.bfloat16, "int32": torch.int32,
-        "int64": torch.int64, "bool": torch.bool,
+        "int64": torch.int64, "int8": torch.int8, "bool": torch.bool,
     }
 
     input_dirs = {}
@@ -348,6 +360,7 @@ def _build_shape_plan(shapes_to_run: dict, input_dirs: dict, call_spec: dict) ->
                 "group": group_name,
                 "input_dir": input_dirs[name],
                 "n_inputs": len(entry.get("inputs", [])),
+                "input_formats": [inp.get("format", "nd") for inp in entry.get("inputs", [])],
                 "scalar_args": scalar_args,
                 "tensor_kwargs_keys": list(tensor_kwargs.keys()),
             })
@@ -418,10 +431,18 @@ def _dscript_env_setup(cfg: DirectVersionConfig, opp_path: str, lib_path: str,
 def _dscript_inputs_load() -> str:
     """生成子进程脚本：输入张量与 tensor_kwargs 加载段。"""
     return """
+                input_formats = shape_item.get("input_formats", [])
                 inputs = []
                 for i in range(n_inputs):
                     t = torch.load(os.path.join(input_dir, f"input_{i}.pt"), weights_only=True)
-                    inputs.append(t.npu())
+                    if t is None:
+                        inputs.append(t)
+                        continue
+                    t = t.npu()
+                    fmt = input_formats[i] if i < len(input_formats) else "nd"
+                    if fmt == "fractal_nz":
+                        t = torch_npu.npu_format_cast(t, torch_npu.Format.FRACTAL_NZ)
+                    inputs.append(t)
 
                 tensor_kwargs = {}
                 for kwarg_name in tensor_kwargs_keys:
@@ -441,34 +462,44 @@ def _dscript_inputs_load() -> str:
 
 
 def _dscript_perf_measure(cfg: DirectVersionConfig) -> str:
-    """生成子进程脚本：warmup_and_measure 性能测量 + pipeline 提取段。"""
-    device_id = cfg.device_id
-    task_type = cfg.task_type
+    """生成子进程脚本：事件计时（torch.npu.Event）性能测量段。
+
+    不使用 msprof（acl.prof.init 每进程只能一次，且多 session 并发时 profiling
+    资源竞争导致计时不稳），改用 NPU Event 事件计时，保证 baseline/evolved
+    计时方法一致、稳定可比。
+    """
     num_trials = cfg.num_trials
-    tag = cfg.tag
     return f"""
                 profile_root = profile_root_base / f"shape_{{shape_name}}"
                 profile_root.mkdir(parents=True, exist_ok=True)
-                median_time, perf_data, output_path, cv_pct = engine.warmup_and_measure(
-                    model=model, inputs=inputs, device_id={device_id},
-                    profile_root=profile_root, num_trials={num_trials},
-                    task_type={repr(task_type)}, model_tag=f"{{shape_name}}_{repr(tag)[1:-1]}"
-                )
-                result["time_us"] = median_time if median_time is not None else -1
-                result["cv_pct"] = cv_pct if cv_pct is not None else 0.0
 
-                if perf_data and isinstance(perf_data, list):
-                    pipeline = {{}}
-                    for row in perf_data:
-                        if isinstance(row, dict):
-                            for key in ("aiv_mte2_ratio", "aiv_vec_ratio", "aiv_scalar_ratio",
-                                        "aiv_mte3_ratio", "aiv_mte2_time(us)", "aiv_vec_time(us)",
-                                        "aiv_scalar_time(us)", "aiv_mte3_time(us)",
-                                        "aiv_icache_miss_rate", "cube_utilization(%)",
-                                        "aic_mac_ratio", "aic_mte1_ratio", "aic_mte2_ratio"):
-                                if key in row and row[key] is not None:
-                                    pipeline[key] = row[key]
-                    result["pipeline"] = pipeline
+                def _measure_events(model, inputs, num_trials):
+                    # warmup
+                    for _ in range(3):
+                        model(*inputs)
+                    torch.npu.synchronize()
+                    times = []
+                    for _ in range(num_trials):
+                        torch.npu.synchronize()
+                        start = torch.npu.Event(enable_timing=True)
+                        end = torch.npu.Event(enable_timing=True)
+                        start.record()
+                        model(*inputs)
+                        end.record()
+                        torch.npu.synchronize()
+                        times.append(start.elapsed_time(end) * 1000.0)
+                    ts = sorted(times)
+                    median = ts[len(ts) // 2]
+                    mean = sum(times) / len(times)
+                    std = (sum((t - mean) ** 2 for t in times) / len(times)) ** 0.5
+                    cv = std / mean * 100.0 if mean > 0 else 0.0
+                    return median, cv
+
+                median_time, cv_pct = _measure_events(model, inputs, {num_trials})
+                result["time_us"] = median_time
+                result["cv_pct"] = cv_pct
+                result["pipeline"] = {{}}
+                result["bottleneck"] = "unknown"
 """
 
 
@@ -491,7 +522,7 @@ def _dscript_output_save(cfg: DirectVersionConfig) -> str:
                 result["precision_passed"] = False
                 result["correctness_message"] = f"评估异常: {{e}}"
                 result["time_us"] = -1
-                logging.error(f"[{{shape_name}}] 评估异常: {{e}}\n{{traceback.format_exc()}}")
+                logging.error(f"[{{shape_name}}] 评估异常: {{e}}\\n{{traceback.format_exc()}}")
 
             all_results.append(result)
 """
@@ -605,17 +636,25 @@ def run_single_version(cfg: DirectVersionConfig) -> list:
 
     os.makedirs(cfg.profile_dir, exist_ok=True)
 
-    shape_plan_json = json.dumps(cfg.shape_plan)
-    eval_script = _build_direct_eval_script(cfg, opp_path, lib_path, shape_plan_json)
+    # acl.prof.init 每进程只能调用一次，多 shape 必须拆分为独立子进程，
+    # 否则第 2 个 shape 的 profiling 初始化失败导致时间 -1。
+    all_results = []
+    for shape_item in cfg.shape_plan:
+        one_plan = [shape_item]
+        shape_plan_json = json.dumps(one_plan)
+        eval_script = _build_direct_eval_script(cfg, opp_path, lib_path, shape_plan_json)
 
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".py", prefix=f"eval_direct_{cfg.tag}_",
-        delete=False, dir=cfg.profile_dir,
-    ) as f:
-        f.write(eval_script)
-        script_path = f.name
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".py", prefix=f"eval_direct_{cfg.tag}_",
+            delete=False, dir=cfg.profile_dir,
+        ) as f:
+            f.write(eval_script)
+            script_path = f.name
 
-    return _run_direct_subprocess(cfg, script_path, opp_path, lib_path)
+        shape_results = _run_direct_subprocess(cfg, script_path, opp_path, lib_path)
+        all_results.extend(shape_results)
+
+    return all_results
 
 
 # ============================================================

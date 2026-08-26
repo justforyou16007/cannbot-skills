@@ -3,7 +3,7 @@
 Source: 43 production-grade operators + 6 CV fused operator expert implementations (IdeaPool). Select all applicable strategies for your operator, then **Read each referenced detail file** before writing AscendC code.
 
 ## 编号说明
-策略卡共 157 张：P 系列（性能，P1-P143）/ D 系列（数据类型，D1-D5）/ A 系列（精度，A1-A8）/ R 系列（A5 架构，R1-R8）。P 系列编号存在间隙（P15, P23, P27, P31, P36, P39），为预留位。
+策略卡共 161 张：P 系列（性能，P1-P147）/ D 系列（数据类型，D1-D5）/ A 系列（精度，A1-A8）/ R 系列（A5 架构，R1-R8）。P 系列编号存在间隙（P15, P23, P27, P31, P36, P39, P141），为预留位。
 所有有效策略 ID 均在下方表格中列出。Agent 在 strategy_combination 中只应使用下方表格中的 ID。
 
 ## Layer 定义
@@ -310,6 +310,16 @@ P67-P69 为 Vector 计算效率基础策略（Counter 模式、低延迟归约�
 | P142 | Attention UB 常驻 O 累加器 | L2 | attention, flash_attention, ub-resident, o-accumulator, kv-tile, gm-roundtrip | Flash Attention 每 KV tile 更新 O 时把 O_tile 常驻 UB，跨 tile rescale+累加，循环结束再一次性写 GM；砍掉 per-tile MTE2/MTE3 往返。前提：O_tile(M_tile×d) 能放进 UB；与 GM workspace-ring（X38）互斥 | playbooks/P142_attention_ub_o_accumulator.md |
 | P143 | Attention host 端 launch 合并 + per-shape tiling 缓存 | L2 | attention, host-overhead, launch-merge, tiling-cache, split-kernel, h2d-elimination | 910B2C 小 shape/fp32 路径 attention 常被 host 固定开销主导：合并同前向内的 split kernel launch、per-shape 缓存 tiling 与 workspace、用 at::empty 替代 zeros | playbooks/P143_attention_host_launch_merge.md |
 
+## CV-Attn（CP8 门控广播）专项策略（P144-P147）
+
+conv-based CV-Attn（Triplet/BAM/CBAM：global pool → conv 2→1 → BN(training) → gate 广播）的「跑通 + 到 1x」充分集。来源：64_TripletAttention_v2（1.28x / 50-50）+ 36_BAM_evo（0.98x）跨算子验证。路由入口：scenario-routing/flashattention.md `cv-attn` 分支。P144-P147 一轮串完即可达 1x；随后按 profiling 证据追加 P104/X58（多核）或 P128/P129（Cube conv）。
+
+| ID | Strategy | Layer | Tags | When to Apply | Detail File |
+|----|----------|-------|------|---------------|-------------|
+| P144 | host 端 zpool/BN-stats 计算 + 标量传参 | L1 | attention, host-compute, scalar | 含 global pool + BN(training)，host 原本做 D2H 回读 + stream sync；910B2C RA ReduceSum >16 列不可靠 | cards/P144_host_pool_bnstats_scalar_pass.md |
+| P145 | 多 launch 免同 launch GM 写后读 | L1 | attention, architecture | 910B2C 同 launch 内 MTE3→MTE2 写后读不可靠（npuSynchronize 崩溃/数值错乱）；跨相位数据走独立 launch | cards/P145_multilaunch_no_same_launch_gm_rw.md |
+| P146 | 910B2C 32B 对齐/标量通道加固 | L1 | attention, alignment, scalar | 小 H×W 算子的 blockLen 32B 对齐、单 block 读不可靠、列读 strided、广播 8× 缓冲、标量通道 async | cards/P146_910b2c_alignment_scalar_hardening.md |
+| P147 | NPU conv 12-sig-bit 舍入模拟 | L1 | attention, precision, conv | 自写向量卷积/host 预计算 conv 输入时，K=3 大 case 相对误差 ~1e-3 超桶：对激活+核套 RoundTo12Sig | cards/P147_npu_conv_12sig_rounding_emulation.md |
 ## 精度优化策略 (A1-A8) [Layer: L0]
 
 | ID | Strategy | Layer | Tags | When to Apply | Detail File |
@@ -372,6 +382,19 @@ P67-P69 为 Vector 计算效率基础策略（Counter 模式、低延迟归约�
 | X43 | Cube 输出 FixPipe 融合 Epilogue（C_TYPE=输出 dtype+SetBias，acc 不落 GM） | L2 | matmul, cv-fusion, epilogue, fixpipe, launch-reduction | matmul+向量后处理（bias/cast/轻量 elementwise，不含跨行归约）的融合算子，把独立 epilogue kernel 下沉进 Cube FixPipe 段：C_TYPE 直接设为输出 dtype（fp16/bf16）+ EnableBias/SetBias 在 FixPipe 内做 fp32 acc+bias 后 F322F16/BF16 写 GM，acc [M,N] 完全不落 GM、launch 数 -1、消除 acc 的 GM 写/读往返。SetBias 必须 per-N-tile 全局列偏移 SetBias(biasGlobal[nIdx*singleN])（grid-stride 切分下内置偏移不按列块走，否则多 N-tile 时 bias 加错列）；一个 ascendc_library 只能放一个 MIX cube kernel（CV 融合算子，两路独立发现：0.451x→0.620/0.633x +40%） | discovered/disc_X43.md |
 | X44 | fp32 Cube mmad 全量重写替代向量模拟 matmul（SetHF32(false) 全精度） | L2 | matmul, attention, cube, fp32, vector-simulated-matmul, precision | 基线把 matmul 实现为 AIV 向量标量模拟（16×16 tile 逐点 GetValue 累加）绕过 Cube 是数量级性能杀手：算子内全部 matmul 改 Matmul 高阶 API（ASCENDC_CUBE_ONLY+REGIST_MATMUL_OBJ+IterateAll）直接走 fp32 Cube，910B2C 上 SetHF32(false) 关闭 HF32 精度截断获全精度（MERE~1e-6；HF32(true) 仅 10-bit 尾数不够 fp32 rtol=1.2e-4）。工程红线：fp32 向量 op count 须 ≥8 且为 8 的倍数；非 2 幂 nPad 手写 halving 归约会越界，改 WholeReduceMax/Sum；uint8 位图 mask 须 256-bit block 对齐（attention 族多 matmul 流水: 0.0013x→4.149x vs PyTorch，小 shape 2-3x、大 shape 7-9x） | discovered/disc_X44.md |
 | X45 | 融合管线 GM 往返消除（split-into-GEMM-load + weight-stationary + attention 软件流水） | L2 | attention, gqa, gm-roundtrip, weight-stationary, l1-residency, software-pipelining | 大 fp32 投影 GEMM 为 MTE2(GM→L1)-bound（aic_mte2_ratio~0.68，cube/fixpipe idle）时，融合管线中间张量落 GM 再读回全是浪费，三个独立杠杆：① A 侧 split-into-GEMM-load——fp32→fp16 hi/lo 拆分 AIV 就地 UB 完成经 workspace ring 交 AIC，A tile 整 [64,kPad] 驻留 L1 跨 column-task 复用（须 bx 行块粒度派生，每 task 重拆会回归）；② B 侧 weight-stationary 混合网格（MGROUP=6）——B tile 每 k-step 只载一次跨 6 个 M 块复用，仅 mNum>MGROUP 且任务数≥核数才启用（WS 额外屏障对小 shape 反噬 8-13%），L0C 128KB 约束 MGROUP*64*64*4B（MGROUP=7 尾块不均回归）；③ attention 段软件流水（21_GroupedQueryAttention: 0.657→0.926x，A 侧 +1.3~10.3%、B 侧 c35 +12%） | discovered/disc_X45.md |
+| X46 | 原生 fp32 Cube 单 pass 投影/attention 替代 fp16 hi/lo 3-mmad（对齐 PyTorch fp32 参考路径） | L2 | discovered | 见 discovered/disc_X46.md | discovered/disc_X46.md |
+| X47 | 融合 attention 结构消除 + core_softmax 块向量化 + launch 合并 | L2 | discovered | 见 discovered/disc_X47.md | discovered/disc_X47.md |
+| X48 | 链式 GEMM M-block 归属调度（第一阶段输出复用） | L2 | discovered | 见 discovered/disc_X48.md | discovered/disc_X48.md |
+| X49 | 两阶段 GEMM 跨核生产/消费切分（N-split stage-split + GM-volatile flag） | L2 | discovered | 见 discovered/disc_X49.md | discovered/disc_X49.md |
+| X50 | 融合 decode MLA kernel — 5→2 kernel + (j,head-block) 并行 + KV tile 跨 head 复用 | L2 | discovered | 见 discovered/disc_X50.md | discovered/disc_X50.md |
+| X51 | 大 S 小 landmark 统一 cube-core 路由阈值扩展 | L2 | discovered | 见 discovered/disc_X51.md | discovered/disc_X51.md |
+| X52 | Host 数据通路消除（reshape-materialization 消除 + 条件 at::empty + 单 pass strided-gather transpose） | L2 | discovered | 见 discovered/disc_X52.md | discovered/disc_X52.md |
+| X53 | 批量 2D online softmax（跨 head-group 向量化，热循环 0 标量）+ 自适应 head-group tiling | L2 | discovered | 见 discovered/disc_X53.md | discovered/disc_X53.md |
+| X54 | (q, head-block) 任务切分 + 全宽 per-head 归约 + 双缓冲 tile gather + PV 行树归约 | L2 | discovered | 见 discovered/disc_X54.md | discovered/disc_X54.md |
+| X55 | Shared-im2col 双分支 Conv-on-Cube（一份 im2col 供两分支 + HF32-for-fp32 conv 路由） | L2 | discovered | 见 discovered/disc_X55.md | discovered/disc_X55.md |
+| X56 | STRIDE-SPARSE residue-block Cube attention（stride-mask 按 residue 分组只算有效列） | L2 | discovered | 见 discovered/disc_X56.md | discovered/disc_X56.md |
+| X57 | attn+outproj 单 kernel 链融合 + native proj BLOCK_M 64 头合并 GEMM | L2 | discovered | 见 discovered/disc_X57.md | discovered/disc_X57.md |
+| X58 | N=1 matvec 链归约突破（多相位拆分 + RA 二叉树 ReduceSum + Broadcast 消标量 + PipeBarrier 松弛） | L2 | discovered | 见 discovered/disc_X58.md | discovered/disc_X58.md |
 | X59 | Nibble 分形批转置（可分离偏移表+向量链整批+DMA合并） | L2 | quantization, transpose, conversion, datapath, bandwidth-bound | int4/fp4 nibble→ZN 分形的 kernel 内转换在无 shift 指令平台（310P）向量 op 密集+碎 DMA 主导（带宽效率<10%）时：连续窗口合并成批（nibble 提取链整批 8K 元素）、转置用单次大 gather+可分离偏移表 T[n][k]=P[n]+Q[k]（Duplicate+Add 外积向量化建表免 N*K 标量 SetValue）、MTE2 背靠背+MTE3 合并连续大块且与下批向量链重叠（quant_batch_matmul_v4 W4A8 310P: 5 shape 2.66-3.53x, geomean 3.43x, 精度 bit-exact） | discovered/disc_X59.md |
 | X60 | 向量链发射最小化（代数重写+calcount合并） | L2 | quantization, conversion, datapath, issue-bound | 向量链密集且每 op 跟屏障、Scalar busy 与 Vector busy 同高（发射率墙 ~4-5ns/指令）时：位代数恒等式重写数值链（伴随掩码 And 替代 floor 技巧链，21 call/13 屏障→9 call/5 屏障）+ N 次小 calcount 同类 call 合并为 1 个大 call（微指令流不变，省 call site 发射开销）。恒等式须代数可证 bit-exact；先查头文件排除 API 死路（m200 Gatherb NOT_SUPPORT、Gather 128 half/repeat）(quant_batch_matmul_v4 W4Trans 310P round2: T2 1.40x, Vector 848→616us Scalar 310→83us) | discovered/disc_X60.md |
 | X61 | 硬件转置指令替代 vgather 通路（v4dtrans+strided copy 交织） | L2 | conversion, quantization, transpose, datapath, issue-bound | vgather 被 Gather repeat 上限钉死在发射率墙时查 platform_config Intrinsic 清单找专用转置指令: 310P3 无 v4trans 但有 v4dtrans/vtranspose, Transpose(NCHW2NHWC) 一次完成 [C,HW]->[HW,C] tile 转置(几何 dst[hw*C+c]=src[c*HW+hw], 上板首测); 每窗 2 次 Transpose(两路分量)+2 次 strided UB->UB DataCopy 行交织替代全部 vgather 微指令(4 发射单元/窗 vs 32 条); E/H 暂存覆盖流水线死 buffer, offset 表随 gather 删除 (quant_batch_matmul_v4 W4Trans 310P round3: T2 3.99x 累计, Vector 567→163us) | discovered/disc_X61.md |
@@ -405,7 +428,7 @@ P67-P69 为 Vector 计算效率基础策略（Counter 模式、低延迟归约�
 | Special / Complex ops | D2, D3 | P85, P88, P96, P102 |
 | CV Matmul (Cube+Vector) | D1, D3, P1, P4, P7, A3 | P14, P17, P46, P47, P49, P51, P52, P63, P70, P71, P72, P73, P78, P79, P83, P86, P87, P90, P92, P93, P102, P103, P104, P105, P106, P107, P108, P117, P120 |
 | CV FFN (MoE) | D1, D3, P1, P4, A1 | P46, P48, P49, P50, P73, P75, P88 |
-| Flash Attention | D1, P1, P5, A4, A5 | P14, P16, P17, P18, P29, P38, P53, P57, P58, P60, P61, P76, P77, P80, P90, P91, P115-P126（**按 scenario-routing/flashattention.md 的分支路由 + 基础链 + trait 追加选用，勿平铺**） |
+| Flash Attention | D1, P1, P5, A4, A5 | P14, P16, P17, P18, P29, P38, P53, P57, P58, P60, P61, P76, P77, P80, P90, P91, P115-P126, P142（UB 常驻 O，与 X38 二选一）, P143（host launch 合并，中小 shape）（**按 scenario-routing/flashattention.md 的分支路由 + 基础链 + trait 追加选用，勿平铺**） |
 | SSM/Scan（GDN-KDA/GLA） | D1, P1, A2, A5 | P132-P136（**按 scenario-routing/ssm-scan.md 分支选用**）；近邻 P109/P110、X15/X16 |
 | Reduction (mean/sum/max/min) | D1, P1, P2, A1, A2 | P68, P69, P109, P110 |
 | Sort / TopK | D1, P1, P2, A7 | P96, P111 |
@@ -443,3 +466,6 @@ P67-P69 为 Vector 计算效率基础策略（Counter 模式、低延迟归约�
 | sync_overhead | P4, A4 | P111, P115 | — |
 | vec_underutilization | P112 | P67, P69 | — |
 | tail_block | P11 | P112, P113, P114 | — |
+
+| X67 | MatmulImpl 中档 M per-(M,N) 三候选网格自适应分发 | L2 | discovered | 见 discovered/disc_X67.md | discovered/disc_X67.md |
+| X68 | decode MLA 精度机器放松（去 Dot2/Kahan）+ 两遍精确 p-rounding + KV-chunk 核切分 | L2 | discovered | 见 discovered/disc_X68.md | discovered/disc_X68.md |

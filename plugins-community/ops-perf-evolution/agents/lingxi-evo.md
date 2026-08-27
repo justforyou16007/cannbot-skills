@@ -8,6 +8,7 @@ skills:
   - npu-arch
   - ops-profiling
   - evolution-report
+  - lingxi-remote-execution
 tools: Agent(lingxi-partial), Agent(general-purpose), Read, Write, Edit, Bash, Glob, Grep, Task
 ---
 
@@ -71,6 +72,83 @@ tools: Agent(lingxi-partial), Agent(general-purpose), Read, Write, Edit, Bash, G
 
 每次探索必须产出具体的可编译代码，不能只停留在分析阶段。
 
+## 远程执行模式（可选 SSH 后端，不改变本地流程）
+
+**何时走 local / ssh**：本地有 NPU 且环境可用 -> 走原 local 流程（本节可整体忽略）。
+仅当用户明确要求远程执行（本地无 NPU、或要求多算子绑定远端不同卡并行）时才启用本节。
+启用后**只替换执行后端**：进化状态机、世界模型初始化、匿名/阻塞调用规则、
+`evaluation_results.json` / 报告消费契约全部不变。
+
+**能力来源**：`skills/lingxi-remote-execution`（CLI 与协议详见其 SKILL.md 与
+references/）。核心保证：session sticky 绑卡（基线到最终复测同一张卡）、主机级
+设备池跨进程原子分配、同卡 verify/profile 串行 / 异卡并行、构建走独立 build slot
+不占卡、SSH 断开不杀远端任务、job 幂等提交、pip 只装 job 私有目录
+（`--target`，不污染远端全局环境）。
+
+**接入步骤**（替换原流程中的执行环节，其余步骤照旧）：
+
+1. **环境准备（步骤2 的远程分支）**：运行完整路径的 `remote_exec.py preflight`。
+   配置应在 `required_paths` 中列出远端真实 `verification_ascendc.py` 与
+   `msprof_perf_summary.py`。SSH、CANN、npu-smi、msprof、构建工具、设备池或这些
+   文件任一检查失败，都必须先修环境，禁止直接提交 job。
+
+2. **session 绑卡并持续续租（步骤3 创建 EVO_DIR 后立即执行）**：
+   ```bash
+   REMOTE_EXEC=plugins-community/ops-perf-evolution/skills/lingxi-remote-execution/scripts/remote_exec.py
+   python3 "$REMOTE_EXEC" --config <config> --host <alias> \
+       --state-file "$EVO_DIR/remote_session.json" lease acquire \
+       --session "{op_name}_evo_${TIMESTAMP}" --owner {op_name} --ttl 7200
+
+   python3 "$REMOTE_EXEC" --config <config> --host <alias> \
+       --state-file "$EVO_DIR/remote_session.json" lease heartbeat \
+       --lease-id <lease_id> --watch --interval 30 \
+       > "$EVO_DIR/remote_heartbeat.log" 2>&1 &
+   REMOTE_HEARTBEAT_PID=$!
+   ```
+   baseline、所有候选、深度 Profiling 和最终复测必须使用该 session。watch 覆盖
+   两次 job 之间的设计时间，runner 覆盖 job 内部。禁止手工设置设备环境变量。
+
+3. **基线评估（步骤3B.3 的远程分支）**：先把只读基线复制到
+   `$EVO_DIR/baseline_remote/`，在副本中恢复全量 case；把该副本作为 `--src`，使用
+   `--preset ascendc-eval`。`--verify-cmd` 指向远端真实验证脚本，
+   `--profile-cmd` 指向远端真实 `msprof_perf_summary.py --compare`，参数中的候选
+   路径使用 `{bundle_dir}`，需要设备号时使用 `{device_id}`。必须带
+   `--wait --fetch --fetch-dest "$EVO_DIR/baseline_remote"`；CLI 会去掉远端 bundle 前缀，
+   恢复 performance.json / perf_report.md / profiling/ 的本地路径。job 不是
+   `succeeded` 时 CLI 返回非零，禁止生成 baseline 结论。不得把远程产物写回用户
+   提供的基线目录。
+
+4. **轮次生成（步骤4.3 的远程分支）**：通过 prompt 模板的
+   `{remote_execution_block}` 注入 config、host、state_file、session_id 和 job_id。
+   job_id 建议 `{session}_r{轮次}_p{并行号}_a{尝试号}`：同一次中断重试复用 ID；
+   修改源码后的新尝试必须换 ID。候选 build 可并行；同 session 的 verify/profile
+   在绑定卡上排队串行。
+
+5. **所有后续 NPU 阶段都走远端**：步骤4.4.3 深度 Profiling、4.4.4 补采、步骤5
+   全量 case 门禁和最终复测都提交 remote job。远程模式下如果 transcript 出现本地
+   npu-smi / evaluate_ascendc.sh / msprof 执行，视为后端混用并停止。
+
+6. **异常恢复**：先读 `$EVO_DIR/remote_session.json`，再执行：
+   ```bash
+   python3 "$REMOTE_EXEC" --config <config> --host <alias> \
+       --state-file "$EVO_DIR/remote_session.json" recover \
+       --session "{session_id}" --reattach
+   ```
+   已在跑的 job 用 `job status` 续查；中断在提交阶段可用同一 job_id 重试。
+   `lease_lost` 时只有重新取得原卡才能续跑；若原卡不可用，CLI 会拒绝换卡，必须
+   新建 session 并重跑 baseline。
+
+7. **最终释放（步骤6 报告完成后执行，异常退出也尽力执行）**：
+   ```bash
+   kill "$REMOTE_HEARTBEAT_PID" 2>/dev/null || true
+   python3 "$REMOTE_EXEC" --config <config> --host <alias> \
+       --state-file "$EVO_DIR/remote_session.json" lease release --lease-id <lease_id>
+   ```
+
+**多算子并行**：完整进化由 Orchestrator 为每个算子启动一个独立本 agent；每个
+agent 有独立 session/state/world model，远端设备池让它们各占不同卡，卡满后排队。
+`remote_exec.py batch` 只执行一组预定义评估 job，不执行完整进化。禁止手工分配卡号。
+
 ## 工作流程
 
 **[注意] 工具调用纪律**: 步骤1-3 必须严格串行执行（每步完成后再执行下一步），每条消息最多发出 5 个并行工具调用。只有步骤4.3 中启动 lingxi-partial 子 agent 时才使用大规模并行（parallel_num 个 Agent 调用）。
@@ -96,7 +174,9 @@ LINGXI进化支持基线内核模式（用户提供现有AscendC内核项目目�
 > 在基线内核模式下，进化过程**不得修改**算子的输入/输出/参数接口。所有优化只能在内核实现层面进行（计算逻辑、分块策略、内存布局、双缓冲等），不得改变算子签名。
 
 确认模式后，询问以下参数:
-- **NPU 设备号**: NPU 设备 ID (默认: 0)
+- **执行后端**: `local`（默认）或 `ssh`。local 才询问 NPU 设备号（默认 0）；
+  ssh 不接受固定卡号，需收集 `remote_hosts.json` 路径、host alias、远端验证脚本与
+  Profiling 脚本绝对路径、目标 SoC（如 `Ascend910B3`），并由设备池分配卡
 - **算子名称**: 简短标识符 (例如: "FastGELU", "Tril")
 - **[基线模式] 基线内核路径**: 现有AscendC内核项目目录路径 (例如: `output/FastGELU_evo_xxx/round_2/parallel_1` 或手写内核目录)
 - **最大轮数** (默认: 2, 推荐: 2-3)；**并行数量**: 每轮并行候选数 (默认: 3, 推荐: 3-5)；**目标加速比** (默认: 3x)
@@ -112,6 +192,9 @@ LINGXI进化支持基线内核模式（用户提供现有AscendC内核项目目�
 export ASCEND_RT_VISIBLE_DEVICES=${npu}
 which npu-smi && echo $ASCEND_HOME_PATH   # 验证 CANN 环境；不可用则告知用户需要配置
 ```
+
+**远程模式分支**：若启用「远程执行模式」，本步骤改为对远端主机执行 preflight
+（见上方「远程执行模式」第 1 步），不要在本地 export 设备变量。
 
 ### 步骤3: 准备共享文件 (只执行一次)
 
@@ -151,10 +234,15 @@ python3 plugins-community/ops-perf-evolution/skills/evolution-world-model/script
 
 #### 步骤3B.3: 评估基线内核性能（在进化开始前必须执行）
 
+先确定本步骤唯一使用的目录：local 后端令 `BASELINE_EVAL_DIR={baseline_kernel_path}`；
+SSH 后端校验基线路径后，将其复制到 `$EVO_DIR/baseline_remote/`，令
+`BASELINE_EVAL_DIR=$EVO_DIR/baseline_remote`。SSH 后端后续的 case 恢复、上传、
+产物取回和 baseline JSON 生成都只操作该副本，用户基线保持只读。
+
 0. **全量 case 守卫（必须先于基线评估执行）**: 基线项目若继承自生成管线的精简态（`*.json.bak` 行数 > 对应 `.json` 行数），必须先用备份恢复全量，否则 baseline 与后续变体的 case 集不一致、所有加速比不可比：
 
    ```bash
-   for bak in {baseline_kernel_path}/*.json.bak; do
+   for bak in "$BASELINE_EVAL_DIR"/*.json.bak; do
        json_file="${bak%.bak}"
        [ -f "$json_file" ] || continue
        bak_n=$(wc -l < "$bak"); json_n=$(wc -l < "$json_file")
@@ -165,25 +253,31 @@ python3 plugins-community/ops-perf-evolution/skills/evolution-world-model/script
    done
    ```
 
-1. **使用 `ops-profiling` skill 的对比模式评估基线性能**（确保目录包含 `model.py` PyTorch参考实现、`model_new_ascendc.py` AscendC实现、测试用例 `*.json`/`*.jsonl`）:
+1. **评估基线性能**（确保目录包含 `model.py` PyTorch参考实现、
+   `model_new_ascendc.py` AscendC实现、测试用例 `*.json`/`*.jsonl`）：local
+   后端执行下面的 ops-profiling 命令；SSH 后端执行「远程执行模式」第 3 步的完整
+   baseline job，并等待成功、取回产物，禁止执行下面的本地命令。
 
    ```bash
    bash ops/ops-profiling/scripts/msprof_profile_run.sh \
        --quick \
-       --output-dir={baseline_kernel_path} \
+       --output-dir="$BASELINE_EVAL_DIR" \
        --warm-up=3 \
        --device={npu} \
        --retry=2
    ```
 
-   该命令自动编译并运行两个实现，msprof 只采集 1 轮 kernel 时间，生成 `performance.json`、`performance.log` 和 `perf_report.md`。
+   local 命令自动编译并运行两个实现，msprof 只采集 1 轮 kernel 时间，生成
+   `performance.json`、`performance.log` 和 `perf_report.md`。SSH job 使用
+   `--compare`，preset 会自动保留并归档后续世界模型需要的原始数据到
+   `profiling/`。
 
 2. **读取性能结果并生成 `baseline_evaluation.json`**:
 
    ```bash
    python3 plugins-community/ops-perf-evolution/skills/evolution-world-model/scripts/generate_baseline_eval.py \
-       --perf-json "{baseline_kernel_path}/performance.json" \
-       --baseline-path "{baseline_kernel_path}" \
+       --perf-json "$BASELINE_EVAL_DIR/performance.json" \
+       --baseline-path "$BASELINE_EVAL_DIR" \
        --output "output/{op_name}_evo_{timestamp}/baseline_evaluation.json" \
        --op-name "{op_name}" \
        --timestamp "{timestamp}"
@@ -259,7 +353,9 @@ with open('$EVO_DIR/shared/call_spec.json', 'w') as f:
 
 按照预加载的 `npu-arch` skill 指引查询目标芯片硬件规格，获得结构化 `hw_params`：
 
-1. **芯片检测**：`npu-smi info` 获取芯片型号（如 910B3；910B 有 B1/B2/B2C/B3/B4/B4-1 等多个子型号，核数/频率/L2/GM 各异，必须精确到子型号）
+1. **芯片检测**：local 后端用 `npu-smi info`；SSH 后端读取远端 preflight 的
+   npu-smi 结果及配置的 `soc`，不得在本地执行 npu-smi。获取芯片型号时必须精确到
+   子型号（如 910B3；910B 有 B1/B2/B2C/B3/B4/B4-1 等多个子型号，核数/频率/L2/GM 各异）
 2. **参数查询**：架构级参数（UB/L0/L1/Cube 阵列等）查 `npu-arch` 的 `references/npu-hardware-params.md`；子型号差异参数（核数、频率、L2、GM）以 CANN 包芯片配置文件 `${ASCEND_HOME_PATH}/<arch>/data/platform_config/*.ini`（如 `ai_core_cnt`、`cube_freq_mhz`、`l2_size`、`memory_size`）或算子代码内运行时接口 `PlatformAscendC.GetCoreNumAic()/GetCoreNumAiv()/GetCoreMemSize()` 为准
 3. **derived_params 计算**（910B 系列 ddr_rate=32，vec_calc_size=128B，cube 16×16×16）：
    - `peak_bw_gbps = ddr_rate (Bytes/cycle) × freq_mhz / 1000`
@@ -532,15 +628,16 @@ cp -r output/{op_name}_evo_{timestamp}/shared/* \
 **lingxi-partial 子agent prompt模板**: 读取 `plugins-community/ops-perf-evolution/skills/evolution-strategies/references/prompts/lingxi-partial-prompt.md` 获取完整 prompt 模板，按下方变量填充规则填充后启动子 agent。
 
 **Prompt 变量填充规则**:
+- `{remote_execution_block}`：local 后端填入 `Backend: local — 使用 lingxi-partial 文档中的本地评估命令。`。SSH 后端必须填入完整的 `[REMOTE EXECUTION MODE]` 块，至少包含本次 host/config/state_file/session_id、绑定的 device_id（仅用于审计，禁止传给 job）、目标 SoC、远端验证脚本绝对路径、远端 profiling 脚本绝对路径、当前 partial 的 `job_id_prefix`，以及已展开到当前 `output_dir` 的、使用**字面完整 remote_exec.py 路径**的 `job submit --preset ascendc-eval --soc ... --wait --fetch` 命令。命令必须同时带 `--verify-cmd`、`--profile-cmd` 和 `--artifacts evaluation_results.json performance.json performance.log perf_report.md profiling`。preset 会为 `msprof_perf_summary.py --compare` 自动追加 `--keep-prof` 并归档到 profiling。修改上传源码后 attempt 加一；仅断线重试复用同一 job_id。禁止留下 `<...>` 一类占位符。
 - `{node_description}`: 必须包含策略的核心实现要点（子 agent 不再读策略文件）
 - `{other_variants_summary}`: 同轮其他变体的方向摘要（用于方向互斥检查），每行一条，格式：
   `- parallel_{p2}: opt_type={optimization_type_2} sig=[{frozen_strategy_sig_2}] | {node_description_2} (策略: {strategy_combination_2})`
   其中 `sig` = strategy_combination 按字母序排序后逗号拼接（如 `P1,P10`）；`opt_type` = 该变体的 `optimization_type` 字段（缺失时按 strategy_combination 推断）。只有 1 个变体则填 "（无其他并行变体）"
 - Baseline 对齐变量（来自 `wm.baseline_evidence`，由步骤 3 的 `attach-baseline-evidence` 写入）: 非 null 时 `{baseline_bottleneck_type}` = `bottleneck_type`、`{baseline_suggested_strategies}` = `suggested_strategies`（逗号拼接取前 6 个）、`{baseline_anti_strategies}` = `anti_strategies`（逗号拼接，空列表填 `[]`）；为 null 或缺失时三个字段全部填 `N/A`（子 agent 看到 `N/A` 自动跳过对齐检查）
 - **Parent Profiling Context 变量**（优先顺序：父节点 profiling_insight > baseline > N/A）: 若有 `parent_id` 且父节点有 `profiling_insight`，`{profiling_one_liner}`/`{bottleneck}`/`{recommended_strategies}` 取父节点对应字段，profiling_evidence 相关字段取 `parent.profiling_evidence`（若有）；父节点无则从 `baseline_evaluation.json` 提取（若有 pipeline 数据），否则全部填 "N/A"
-- 子 agent 步骤：AscendC 转译（tilelang2ascend-translator skill）→ 退化检测 + 功能验证 → Local Refinement
+- 子 agent 步骤：AscendC 转译（tilelang2ascend-translator skill）→ 退化检测 + 按选定后端做功能验证 → Local Refinement
 - 共享文件引用：`model.py, design/, <op_name>.json, <op_name>.json.bak`；kernel 路径：`kernel/`（非 `{op_name}Custom/op_kernel/`）
-- 评估方式：`ops-profiling` skill（`msprof_profile_run.sh --quick` 模式，对比 model.py vs model_new_ascendc.py，生成 performance.json）
+- 评估方式：local 后端使用 `ops-profiling`；SSH 后端只能使用 `{remote_execution_block}` 中的远程 job，并从取回的 performance.json 读取结果。
 
 **v3.2 Strategy Resources 变量填充**（必须执行）: `{strategy_resources_block}` 由 helper 脚本一次性生成（封装 Preconditions 过滤 + Playbook 加载 + Excluded 段拼装）。**每个 partial 启动前**，主 agent 必须为该节点执行：
 
@@ -711,7 +808,7 @@ python3 plugins-community/ops-perf-evolution/skills/evolution-world-model/script
 **执行流程**（使用 ops-profiling 的 msprof_perf_summary.py）：
 
 1. **运行深度 profiling 分析（诊断模式）**：
-   当前 `msprof_perf_summary.py` 无 `--diagnose / --profiling-dir / --task-type` 参数。深度分析基于该节点已有的 Phase 1.5 `--compare` 产物（`{node.solution_ref}/profiling/PROF_GROUP_*/PROF_*/op_summary_*.csv` 与 `perf_report.md`），由 `wm_ops.py deep-profiling` 内部调用 `run_deep_profiling.py` 提炼；仅当节点尚未采集 `--compare` 数据时，先补采：
+   当前 `msprof_perf_summary.py` 无 `--diagnose / --profiling-dir / --task-type` 参数。深度分析基于该节点已有的 Phase 1.5 `--compare` 产物（`{node.solution_ref}/profiling/**/op_summary_*.csv` 与 `perf_report.md`），由 `wm_ops.py deep-profiling` 内部调用 `run_deep_profiling.py` 提炼。仅当节点尚未采集 `--compare` 数据时补采：local 后端执行下面命令；SSH 后端为该 solution_ref 提交新的完整远程 job 并取回产物，禁止执行下面命令。
    ```bash
    python3 ops/ops-profiling/scripts/msprof_perf_summary.py --compare \
        --output-dir "output/{op_name}_evo_{timestamp}/{node.solution_ref}"
@@ -743,7 +840,7 @@ python3 plugins-community/ops-perf-evolution/skills/evolution-world-model/script
 
 **4.4.4 Profiling 完整性检查（不可跳过）**
 
-进入 4.5 REACT 前执行：对本轮 `profiling_insight is null` 的 passed 节点，输出「[注意] 以下节点缺少 profiling_insight，补执行 CSV Profiling」并逐个补跑 `msprof_perf_summary.py --compare --output-dir {node.solution_ref}`（无 `--diagnose`；同 Phase 1.5 完整采集，并归置 op_summary 到 `profiling/`），从 perf_report.md / op_summary 提炼写入 `node.profiling_insight`。补跑后仍缺失的，输出「[注意] {n} 个节点 CSV Profiling 失败，profiling_insight 保持 null。后续 SELECT 中这些节点的子节点将不获得 w_evidence 加分」——不填充默认值，保持 null。
+进入 4.5 REACT 前执行：对本轮 `profiling_insight is null` 的 passed 节点，输出「[注意] 以下节点缺少 profiling_insight，补执行 CSV Profiling」并逐个补采。local 后端运行 `msprof_perf_summary.py --compare --output-dir {node.solution_ref}`；SSH 后端为该目录提交新的完整远程 job 并取回产物。随后归置 op_summary 到 `profiling/`，从 perf_report.md / op_summary 提炼写入 `node.profiling_insight`。补跑后仍缺失的，输出「[注意] {n} 个节点 CSV Profiling 失败，profiling_insight 保持 null。后续 SELECT 中这些节点的子节点将不获得 w_evidence 加分」——不填充默认值，保持 null。
 
 **4.4.5 世界模型分析（Analyze）**
 
@@ -955,7 +1052,9 @@ python3 plugins-community/ops-perf-evolution/skills/evolution-world-model/script
 1. 定位全局最优变体目录 `best_dir = $EVO_DIR/{best_node.solution_ref}`
 2. 校验 case 文件完整性：`best_dir` 下每个 `*.json.bak` 与对应 `.json` 行数必须一致；不一致则用 `.bak` 恢复
 3. 若最优变体的 `evaluation_results.json` 中 `n_cases_total` **等于** shared 全量 case 数 → 门禁通过
-4. 否则（case 数不符或字段缺失）→ 在 `best_dir` 下基于全量 case 重新执行精度验证：
+4. 否则（case 数不符或字段缺失）→ 在 `best_dir` 下基于全量 case 重新执行精度验证。
+   local 后端执行下面命令；SSH 后端提交一个新的最终门禁 job（源码为 `best_dir`，
+   同一 session，含 verify + profile，等待并取回），禁止执行下面的本地命令：
    ```bash
    bash ops-lab/tilelang-to-ascendc/skills/tilelang2ascend-translator/scripts/evaluate_ascendc.sh "$best_dir"
    ```
@@ -1028,6 +1127,10 @@ python3 plugins-community/ops-perf-evolution/skills/evolution-report/scripts/gen
 **输出**: `"$EVO_DIR/evolution-report_{op_name}_${TIMESTAMP}.html"` — 报告生成后用 `ls -la "$EVO_DIR/evolution-report_*.html"` 验证存在并输出路径。
 
 **错误处理**: exit code = 2（关键数据文件缺失）→ 回退检查步骤5.5的验证结果，修复后重试；exit code = 0 但有 stderr 警告 → 报告已生成，警告供人工复核；报告生成失败不阻塞主流程，但必须记录失败原因。
+
+**远程模式收尾**：报告生成尝试完成后，停止 heartbeat watcher，再按「远程执行
+模式」第 7 步释放设备租约；即使报告失败也要释放。最后汇报绑定卡号、每个 job 的
+终态和 release 结果。只有 release 已执行或明确记录失败原因后，lingxi-evo 才可返回。
 
 ---
 

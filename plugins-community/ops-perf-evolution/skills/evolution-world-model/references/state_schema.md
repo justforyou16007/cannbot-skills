@@ -140,7 +140,7 @@ Routing:
 
 | Rule | Check (against subagent transcript) | Why |
 |---|---|---|
-| **S1** | `lingxi-partial`: transcript must contain `bash <path>/evaluate_ascendc.sh ...` (or `sh ...`). `ops-partial`: must contain `python <path>/build_ops.py` or `evaluate_ops_direct.py`. Passive `cat`/`grep` references do NOT count. | Detects agent claiming completion without running the evaluation script |
+| **S1** | `lingxi-partial`: transcript must contain either local `bash <path>/evaluate_ascendc.sh ...` (or `sh ...`) or remote `python <path>/remote_exec.py ... job submit ...`. `ops-partial`: must contain `python <path>/build_ops.py` or `evaluate_ops_direct.py`. Passive `cat`/`grep` references do NOT count. | Detects agent claiming completion without running the selected local/SSH evaluation backend |
 
 (S6 was prototyped but removed — it relied on NLP-style success-marker matching like "通过"/"ok"/"done" in `last_assistant_message`, which had 25% false-positive rate on real partial transcripts. E.g. "ok" inside "tokens" or "通过" inside "通过 GM tiling buffer 传递" (verb form) caused spurious blocks. S1 alone catches the core lie of fake completion; main Stop hook's R2/R7/R8 catch filesystem-level artifact gaps; S6 was redundant + unreliable.)
 
@@ -158,7 +158,7 @@ to bypass, which is much harder.
 
 All anti-skip rules check **filesystem evidence**, not LLM-written fields. They cannot be bypassed by agent claiming "task done" in chat:
 
-- **Lie 1**: "All 3 partials passed precision" — actual `evaluation_results.json` content is written by `evaluate_ascendc.sh` script, agent can't fake it. `wm_ops.py refine` reads the real content.
+- **Lie 1**: "All 3 partials passed precision" — local mode must execute `evaluate_ascendc.sh`; SSH mode must execute a remote job and consume its immutable `state.json`/logs before writing `evaluation_results.json`. `wm_ops.py refine` reads the resulting artifact rather than the claim.
 - **Lie 2**: "Profiling completed" — R9 walks `parallel_K/profiling/` for `op_summary_*.csv`. Missing files = msprof skipped.
 - **Lie 3**: "All 3 rounds done" — R6 reads `wm.session.actual_rounds_completed` (written only by `wm_ops.py refine`).
 - **Lie 4**: "All 3 parallel variants completed" — R7 counts actual `parallel_K/` directories.

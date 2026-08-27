@@ -321,8 +321,8 @@ ${case_guard_output}
 
 Red-line rule #7: 禁止修改/截断/抽样测试用例 json。评估耗时来自 case 数量是预期成本。
 You MUST re-run the full evaluation now on the FULL case set:
-  1. bash ops-lab/tilelang-to-ascendc/skills/tilelang2ascend-translator/scripts/evaluate_ascendc.sh <parallel_dir>
-  2. bash ops/ops-profiling/scripts/msprof_profile_run.sh --quick --output-dir=<parallel_dir> ...
+  1. local backend: bash .../evaluate_ascendc.sh <parallel_dir>, then run the standard ops-profiling command; OR
+  2. SSH backend: submit a new remote_exec.py job submit for <parallel_dir> with full-case verify + profile and fetch its artifacts.
   3. Rewrite evaluation_results.json from the full-case results.
 Results measured on a case subset are invalid and will be discarded by refine.
 To bypass in emergency only: export LINGXI_LOOP_HOOK_DISABLE=1"

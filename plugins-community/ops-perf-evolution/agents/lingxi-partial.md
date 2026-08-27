@@ -147,6 +147,32 @@ Mode: {mode}
 
 **全量 case 的定义**: `<op_name>.json` 中的全部用例，行数必须与 `<op_name>.json.bak` 一致。基于 case 子集得出的 precision_passed / speedup 一律无效。
 
+## 远程执行模式（REMOTE EXECUTION MODE，可选）
+
+当主 Agent 的 prompt 中 `[EXECUTION BACKEND]` 包含 `[REMOTE EXECUTION MODE]`
+（含 host alias、config、`--state-file`、session_id、device_id、远端脚本绝对路径和
+已展开的提交命令）时，**只替换执行环节**：
+内核代码修改、策略遵从、防作弊红线、`evaluation_results.json` 契约全部不变。
+
+- **Phase 1.3 / 1.5 / 2.3 合并执行**：不再本地跑 `evaluate_ascendc.sh` 或
+  msprof。逐字使用 prompt 后端块中的 `remote_exec.py job submit` 命令；该命令在
+  一个 job 中顺序执行 build、全量精度验证和 `--compare` profiling，然后通过
+  `--wait --fetch --fetch-dest {output_dir}` 取回结果。不得自行猜测远端仓库路径，
+  也不得用占位脚本代替后端块给出的绝对路径。
+- **取回产物**：preset 自动为 `msprof_perf_summary.py --compare` 保留原始采集，
+  并在释放设备锁后归档到远端 `bundle/profiling/`；fetch 去掉 bundle 前缀，因此
+  本地直接得到 `profiling/case_*_{ref,asc}/PROF_GROUP_*/**`。
+  `performance.json` / `op_summary_*.csv` / `perf_report.md` 与本地执行产物
+  契约一致，照常执行 `evolved.pipeline` 写入，不再从远端 `/tmp` 手工复制。
+- **设备与幂等**：设备由主 Agent 的 session lease 决定（sticky 绑卡），您
+  **不要也不能**指定设备；后端块给出 `job_id_prefix`。同一份源码在 SSH 断线后
+  重试时复用原 job_id；任何上传文件变化后 attempt 加一，使用新 job_id。
+- **失败处理**：job 的 `failure_class` 中 `transport` -> 直接重试提交；
+  `environment` -> 停止并上报主 Agent；`build`/`correctness`/`profile` -> 走
+  原有 Conductor 错误分类（A/B/C 类）；`lease_lost`/`cancelled` -> 上报主 Agent。
+- **禁止**：在远程模式下本地执行任何 npu/msprof 命令；在 spec/env 中手工指定
+  `ASCEND_RT_VISIBLE_DEVICES`（校验会拒绝）；修改取回产物的内容（只能按原样消费）。
+
 ## 工作流程
 
 ### Phase 1: AscendC 优化与验证（迭代循环）
@@ -220,8 +246,12 @@ while ac_iteration < max_ac_iterations:
     编译通过 → 继续 1.3
 
     ── 1.3 功能验证 ──────────────────────────────────
+    local 后端：
     bash ops-lab/tilelang-to-ascendc/skills/tilelang2ascend-translator/scripts/evaluate_ascendc.sh \
         {output_dir}
+
+    SSH 后端：执行 [EXECUTION BACKEND] 中当前 attempt 的完整 job；
+    job 已包含 build + 全量精度 + profiling，不再执行上面的本地命令。
 
     验证通过 → break，Phase 1 成功
     验证失败 → ac_verifier_error = 错误输出 → 跳到 1.4 Conductor
@@ -243,7 +273,9 @@ while ac_iteration < max_ac_iterations:
 
 **1.5.1 运行 msprof 采集**
 
-使用 `msprof_perf_summary.py --compare` 对 lingxi-evo 输出目录跑 msprof **完整采集（8 轮：7 组 aic-metrics + sample）**，产出 `op_summary_*.csv` 和对比报告：
+local 后端使用 `msprof_perf_summary.py --compare` 对 lingxi-evo 输出目录跑 msprof
+**完整采集（8 轮：7 组 aic-metrics + sample）**。SSH 后端复用 Phase 1.3 job 已
+取回的 profiling 产物，禁止在本地重跑。local 命令如下：
 
 ```bash
 python3 ops/ops-profiling/scripts/msprof_perf_summary.py --compare \
@@ -287,15 +319,15 @@ python3 ops/ops-profiling/scripts/msprof_perf_summary.py --compare \
 
 **2.1 性能瓶颈诊断（必须执行，允许失败）**
 
-> msprof 采集已在 Phase 1.5 完成，`{output_dir}/profiling/PROF_GROUP_*/PROF_*/op_summary_*.csv` 必已存在（或明确失败）。本阶段直接消费该产物；如果 Phase 2 后续 2.4 命中新版本，需在 2.4 末尾重跑 Phase 1.5 刷新 pipeline。
+> msprof 采集已在 Phase 1.5 完成，`{output_dir}/profiling/**/op_summary_*.csv` 必已存在（或明确失败）。本阶段直接消费该产物；如果 Phase 2 后续 2.4 命中新版本，需在 2.4 末尾重跑 Phase 1.5 刷新 pipeline。
 
 **第一层：CSV 级快速诊断**
 
-> **注意**：当前 `msprof_perf_summary.py` **不支持 `--diagnose`**。诊断基于 Phase 1.5 `--compare` 已产出的数据（`perf_report.md` 的 pipe 比值、`performance.json` 的 per_case、`profiling/PROF_GROUP_*/PROF_*/op_summary_*.csv` 的 aic/aiv 指标），由 partial 自行读取提炼 `bottleneck`：
+> **注意**：当前 `msprof_perf_summary.py` **不支持 `--diagnose`**。诊断基于 Phase 1.5 `--compare` 已产出的数据（`perf_report.md` 的 pipe 比值、`performance.json` 的 per_case、`profiling/**/op_summary_*.csv` 的 aic/aiv 指标），由 partial 自行读取提炼 `bottleneck`：
 
 ```bash
 # 无独立 --diagnose 命令；直接读取 --compare 产物判断瓶颈
-ls profiling/PROF_GROUP_*/PROF_*/op_summary_*.csv     # pipeline/指标原始数据
+find profiling -name 'op_summary_*.csv' -type f       # pipeline/指标原始数据
 grep -E "aiv_mte2_ratio|aiv_mte3_ratio|aic_fixpipe_ratio" perf_report.md
 ```
 
@@ -314,7 +346,7 @@ grep -E "aiv_mte2_ratio|aiv_mte3_ratio|aic_fixpipe_ratio" perf_report.md
 
 **2.3 重新验证（精度 + 性能）**
 
-精度验证：
+local 后端精度验证：
 ```bash
 bash ops-lab/tilelang-to-ascendc/skills/tilelang2ascend-translator/scripts/evaluate_ascendc.sh \
     {output_dir}
@@ -327,6 +359,10 @@ bash ops/ops-profiling/scripts/msprof_profile_run.sh --quick \
     --output-dir={output_dir} --device={npu}
 ```
 从生成的 `{output_dir}/performance.json` 提取 `new_speedup`（vs PyTorch 的 ref/asc 几何均值）。
+
+SSH 后端：kernel 更新后将 attempt 加一，执行后端块中的完整远程 job。它同时完成
+精度和性能采集；直接从取回的 `performance.json` 提取 `new_speedup`，不得执行上面
+两条本地命令。
 
 **2.4 收益判断**
 若 `new_speedup > best_speedup × 1.02`（提升 ≥ 2%）：
@@ -377,4 +413,4 @@ bash ops/ops-profiling/scripts/msprof_profile_run.sh --quick \
 - 文件操作范围限制在 `{output_dir}/` 目录内
 - 无论成功失败，**必须写入 evaluation_results.json**
 - 中文输出，最小化修改原则
-- 评估必须通过 evaluate_ascendc.sh 完成，不要绕过
+- local 后端评估必须通过 evaluate_ascendc.sh；SSH 后端必须通过 prompt 中的完整远程 job，二者禁止混用

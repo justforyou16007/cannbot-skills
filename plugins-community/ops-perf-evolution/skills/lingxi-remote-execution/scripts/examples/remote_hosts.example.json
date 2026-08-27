@@ -1,0 +1,44 @@
+{
+  "_comment": [
+    "lingxi-remote-execution 主机配置示例。",
+    "只写 ssh 目标（alias 或 user@host）与参数；不写口令/私钥内容，",
+    "认证依赖你现有的 ~/.ssh/config、ssh-agent 或交互式输入。",
+    "transport=local 用于本机调试/测试（不经 ssh 直接执行 worker）。"
+  ],
+  "hosts": {
+    "npu-a": {
+      "transport": "ssh",
+      "ssh_host": "npu-a",
+      "ssh_args": ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"],
+      "remote_root": "/home/npuuser/lingxi-remote",
+      "remote_python": "python3",
+      "env_script": "/usr/local/Ascend/ascend-toolkit/set_env.sh",
+      "required_paths": [
+        "/srv/cannbot-skills/plugins-community/tilelang2ascendc-ops-generator/skills/tilelang2ascend-translator/scripts/verification_ascendc.py",
+        "/srv/cannbot-skills/ops/ops-profiling/scripts/msprof_perf_summary.py"
+      ],
+      "devices": "auto",
+      "max_build_slots": 4
+    },
+    "npu-b": {
+      "transport": "ssh",
+      "ssh_host": "npuuser@192.168.1.50",
+      "ssh_args": [],
+      "remote_root": "/data/lingxi-remote",
+      "remote_python": "/usr/bin/python3.9",
+      "env_script": "/usr/local/Ascend/ascend-toolkit/set_env.sh",
+      "required_paths": [
+        "/data/cannbot-skills/plugins-community/tilelang2ascendc-ops-generator/skills/tilelang2ascend-translator/scripts/verification_ascendc.py",
+        "/data/cannbot-skills/ops/ops-profiling/scripts/msprof_perf_summary.py"
+      ],
+      "devices": [0, 1, 2, 3],
+      "max_build_slots": 8
+    },
+    "local-debug": {
+      "transport": "local",
+      "remote_root": "/tmp/lingxi-remote-debug",
+      "devices": [0],
+      "max_build_slots": 2
+    }
+  }
+}

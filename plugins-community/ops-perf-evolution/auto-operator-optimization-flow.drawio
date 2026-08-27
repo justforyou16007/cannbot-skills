@@ -1,0 +1,425 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mxfile host="drawio" version="31.1.8" type="device">
+  <diagram id="p1" name="01 总览">
+    <mxGraphModel dx="1600" dy="1000" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="24" pageHeight="16" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+        <mxCell id="p1_title" value="自动算子性能进化优化流程（CANNBot）" style="text;html=1;align=left;verticalAlign=middle;fontSize=22;fontStyle=1;fontColor=#1f2937;" vertex="1" parent="1">
+          <mxGeometry x="40" y="20" width="920" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="p1_in" value="输入：用户优化请求&#xa;• 基线内核目录，或 REPO_ROOT / op_path&#xa;• op_name、repo_type、NPU 设备号&#xa;• target_speedup、max_rounds、parallel_num&#xa;• 可选 target_shapes / generalization_shapes&#xa;• 可选 output_dir、停滞与局部改进参数" style="shape=parallelogram;perimeter=parallelogramPerimeter;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=12;align=left;verticalAlign=top;spacing=8;" vertex="1" parent="1">
+          <mxGeometry x="40" y="120" width="330" height="190" as="geometry"/>
+        </mxCell>
+        <mxCell id="p1_classify" value="判断：输入路径属于哪一类？&#xa;TileLang 特征：model.py、model_new_ascendc.py、kernel/&#xa;Ops 仓特征：op_kernel/、op_host/、build.sh&#xa;其他基线目录：默认进入 lingxi 基线模式" style="rhombus;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;align=center;verticalAlign=middle;spacing=8;" vertex="1" parent="1">
+          <mxGeometry x="470" y="125" width="280" height="190" as="geometry"/>
+        </mxCell>
+        <mxCell id="p1_lingxi" value="子 Agent：lingxi-evo&#xa;前台阻塞、不得传 name&#xa;职责：基线内核评估 → shared → 世界模型 → 多轮并行变体 → 报告&#xa;内部调用：lingxi-partial 后台并行（无 name）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=12;align=left;verticalAlign=top;spacing=8;" vertex="1" parent="1">
+          <mxGeometry x="840" y="80" width="380" height="190" as="geometry"/>
+        </mxCell>
+        <mxCell id="p1_ops" value="子 Agent：ops-evo&#xa;前台阻塞、不得传 name&#xa;职责：仓类型派生 → 设备租约 → baseline 构建评估 → worktree 多轮进化 → 报告&#xa;内部调用：ops-partial 后台并行（无 name）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=12;align=left;verticalAlign=top;spacing=8;" vertex="1" parent="1">
+          <mxGeometry x="840" y="320" width="380" height="190" as="geometry"/>
+        </mxCell>
+        <mxCell id="p1_common" value="共同骨架（详见第 4 页）&#xa;固定 EVO_DIR 与 session anchor&#xa;GATE → SELECT → GENERATE → REFINE → REACT → CHECKPOINT&#xa;每轮必须写回 world_model.json；状态游标防止跳步" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=13;align=left;verticalAlign=top;spacing=8;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1320" y="180" width="390" height="210" as="geometry"/>
+        </mxCell>
+        <mxCell id="p1_out" value="输出：EVO_DIR&#xa;• 最佳变体与修改文件&#xa;• world_model_final.json&#xa;• evolution-report_*.html&#xa;• 进化摘要：轮次、速度、精度、策略路径&#xa;• Ops 路径额外输出 modified_files/，可按提示应用回仓库" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=12;align=left;verticalAlign=top;spacing=8;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1810" y="180" width="400" height="210" as="geometry"/>
+        </mxCell>
+        <mxCell id="p1_constraint" value="全局约束：不改算子输入输出接口；不跳过世界模型初始化、REFINE、报告；所有 cp / mv / rm 前校验路径非空且存在；评估必须使用规定脚本，禁止手写计时或评估脚本；性能有实质提升时按 OKF maintain 协议沉淀知识。" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=12;align=left;verticalAlign=middle;spacing=8;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="1320" y="450" width="890" height="110" as="geometry"/>
+        </mxCell>
+        <mxCell id="p1_skill_label" value="相关 Skills：触发点与数据责任" style="text;html=1;align=left;verticalAlign=middle;fontSize=16;fontStyle=1;fontColor=#334155;" vertex="1" parent="1">
+          <mxGeometry x="40" y="650" width="500" height="40" as="geometry"/>
+        </mxCell>
+        <mxCell id="p1_s1" value="npu-arch&#xa;何时：识别目标芯片&#xa;写入：world_model.json.hw_params&#xa;关键：chip_model、UB、core_num、带宽、tile 上限" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;align=left;verticalAlign=top;spacing=6;" vertex="1" parent="1">
+          <mxGeometry x="40" y="710" width="270" height="135" as="geometry"/>
+        </mxCell>
+        <mxCell id="p1_s2" value="ops-profiling&#xa;何时：基线、变体或深度分析&#xa;读写：performance.json、perf_report.md、op_summary_*.csv、evolved.pipeline&#xa;禁止：自定义计时" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;align=left;verticalAlign=top;spacing=6;" vertex="1" parent="1">
+          <mxGeometry x="330" y="710" width="270" height="135" as="geometry"/>
+        </mxCell>
+        <mxCell id="p1_s3" value="ops-evaluation&#xa;何时：Ops 构建、部署、正确性与性能&#xa;调用：build_ops、evaluate_ops_direct、worktree_manager、device_lease&#xa;写入：baseline / evolved 安装与 evaluation_results.json" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;align=left;verticalAlign=top;spacing=6;" vertex="1" parent="1">
+          <mxGeometry x="620" y="710" width="270" height="135" as="geometry"/>
+        </mxCell>
+        <mxCell id="p1_s4" value="evolution-world-model&#xa;何时：Init / Select / Refine / Analyze&#xa;读写：world_model.json、state.json、lineage ledger&#xa;职责：证据驱动选择、失败诊断、停滞与漂移" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;align=left;verticalAlign=top;spacing=6;" vertex="1" parent="1">
+          <mxGeometry x="910" y="710" width="270" height="135" as="geometry"/>
+        </mxCell>
+        <mxCell id="p1_s5" value="evolution-knowledge&#xa;何时：Init 查知识、失败反查、策略提炼&#xa;首选：OKF；回退：A3 经典库&#xa;写入：OKF 卡片、proven_solutions、索引" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;align=left;verticalAlign=top;spacing=6;" vertex="1" parent="1">
+          <mxGeometry x="1200" y="710" width="270" height="135" as="geometry"/>
+        </mxCell>
+        <mxCell id="p1_s6" value="evolution-strategies&#xa;何时：归族、策略组合、兼容性检查、X 策略发现&#xa;读：scenario-routing、strategy-index、compatibility、playbook&#xa;写：discovered/disc_Xn.md、INDEX.json" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;align=left;verticalAlign=top;spacing=6;" vertex="1" parent="1">
+          <mxGeometry x="1490" y="710" width="270" height="135" as="geometry"/>
+        </mxCell>
+        <mxCell id="p1_s7" value="evolution-report&#xa;何时：所有轮次结束后强制调用&#xa;读：baseline、world_model_final、call_spec、各轮评估与会话记录&#xa;写：evolution-report_*.html，并执行 15 项自检" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;align=left;verticalAlign=top;spacing=6;" vertex="1" parent="1">
+          <mxGeometry x="1780" y="710" width="270" height="135" as="geometry"/>
+        </mxCell>
+        <mxCell id="p1_e1" value="TileLang / 其他" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=11;labelBackgroundColor=#ffffff;exitX=1;exitY=0.35;entryX=0;entryY=0.5;" edge="1" parent="1" source="p1_classify" target="p1_lingxi">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="p1_e2" value="Ops 仓" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=11;labelBackgroundColor=#ffffff;exitX=1;exitY=0.75;entryX=0;entryY=0.5;" edge="1" parent="1" source="p1_classify" target="p1_ops">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="p1_e3" value="调用（前台阻塞）" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=11;labelBackgroundColor=#ffffff;exitX=1;exitY=0.5;entryX=0;entryY=0.35;" edge="1" parent="1" source="p1_lingxi" target="p1_common">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="p1_e4" value="调用（前台阻塞）" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=11;labelBackgroundColor=#ffffff;exitX=1;exitY=0.5;entryX=0;entryY=0.65;" edge="1" parent="1" source="p1_ops" target="p1_common">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="p1_e5" value="产出" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=11;labelBackgroundColor=#ffffff;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="p1_common" target="p1_out">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="p1_e6" value="约束" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;dashed=1;endArrow=open;fontSize=11;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="p1_common" target="p1_constraint">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="p1_e7" value="按阶段调用" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;dashed=1;endArrow=open;fontSize=11;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="p1_common" target="p1_s4">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="p1_e8" value="按需调用" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;dashed=1;endArrow=open;fontSize=11;labelBackgroundColor=#ffffff;exitX=0.25;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="p1_common" target="p1_s1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="p1_e9" value="按需调用" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;dashed=1;endArrow=open;fontSize=11;labelBackgroundColor=#ffffff;exitX=0.35;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="p1_common" target="p1_s2">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="p1_e10" value="Ops 路径" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;dashed=1;endArrow=open;fontSize=11;labelBackgroundColor=#ffffff;exitX=0.65;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="p1_common" target="p1_s3">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="p1_e11" value="按需调用" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;dashed=1;endArrow=open;fontSize=11;labelBackgroundColor=#ffffff;exitX=0.75;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="p1_common" target="p1_s5">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="p1_e12" value="按需调用" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;dashed=1;endArrow=open;fontSize=11;labelBackgroundColor=#ffffff;exitX=0.85;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="p1_common" target="p1_s6">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="p1_e13" value="收尾强制调用" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;dashed=1;endArrow=open;fontSize=11;labelBackgroundColor=#ffffff;exitX=0.95;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="p1_common" target="p1_s7">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+  <diagram id="p2" name="02 Lingxi 路径">
+    <mxGraphModel dx="1600" dy="1200" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="24" pageHeight="24" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+        <mxCell id="p2_title" value="Lingxi 基线内核路径：从现有 AscendC / TileLang 产物开始" style="text;html=1;align=left;verticalAlign=middle;fontSize=22;fontStyle=1;fontColor=#1f2937;" vertex="1" parent="1">
+          <mxGeometry x="40" y="20" width="1100" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="p2_input" value="输入字段&#xa;npu、op_name、baseline_kernel_path&#xa;target_speedup、max_rounds、parallel_num&#xa;stagnation_window、Max Improve Rounds、Improve Stagnation Window&#xa;接口保留：输入输出张量、属性、dtype 与签名不可变" style="shape=parallelogram;perimeter=parallelogramPerimeter;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=12;align=left;verticalAlign=top;spacing=8;" vertex="1" parent="1">
+          <mxGeometry x="40" y="110" width="520" height="190" as="geometry"/>
+        </mxCell>
+        <mxCell id="p2_env" value="环境准备&#xa;设置 ASCEND_RT_VISIBLE_DEVICES=npu&#xa;检查 npu-smi 与 ASCEND_HOME_PATH&#xa;失败：停止流程并报告环境问题&#xa;调用相关：npu-arch、ops-profiling" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;align=left;verticalAlign=top;spacing=8;" vertex="1" parent="1">
+          <mxGeometry x="40" y="340" width="520" height="160" as="geometry"/>
+        </mxCell>
+        <mxCell id="p2_dir" value="创建并锚定会话&#xa;固定 TIMESTAMP，生成 EVO_DIR/{op_name}_evo_{timestamp}/shared&#xa;session_anchor.py write：记录 op_name、evo_dir、requested_rounds&#xa;后续禁止用 ls / find 动态猜目录；不确定时必须 read anchor" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;align=left;verticalAlign=top;spacing=8;" vertex="1" parent="1">
+          <mxGeometry x="40" y="540" width="520" height="180" as="geometry"/>
+        </mxCell>
+        <mxCell id="p2_read" value="读取与描述基线&#xa;读取 kernel/、model.py、design/（若存在）&#xa;从 model.py 或 kernel 推导自然语言算子描述&#xa;必要字段：输入输出数量、shape、dtype、参数名与默认值&#xa;接口约束继续沿用到所有变体" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;align=left;verticalAlign=top;spacing=8;" vertex="1" parent="1">
+          <mxGeometry x="40" y="760" width="520" height="190" as="geometry"/>
+        </mxCell>
+        <mxCell id="p2_case" value="判断：*.json.bak 行数是否大于对应 .json？" style="rhombus;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;align=center;verticalAlign=middle;spacing=8;" vertex="1" parent="1">
+          <mxGeometry x="40" y="990" width="240" height="150" as="geometry"/>
+        </mxCell>
+        <mxCell id="p2_restore" value="是：先 cp 备份恢复全量 case&#xa;目标 .json 行数恢复为 .json.bak 行数&#xa;原因：基线和变体必须使用同一全量 case 集" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=12;align=left;verticalAlign=top;spacing=8;" vertex="1" parent="1">
+          <mxGeometry x="330" y="990" width="230" height="150" as="geometry"/>
+        </mxCell>
+        <mxCell id="p2_perf" value="调用 ops-profiling：msprof_profile_run.sh --quick&#xa;输入：baseline_kernel_path 下 model.py、model_new_ascendc.py、*.json / *.jsonl&#xa;写入：performance.json（geomean / mean / per_case / 时间）、performance.log、perf_report.md&#xa;判定：n_cases_valid、asc_error、avg_speedup、baseline_time_us" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=12;align=left;verticalAlign=top;spacing=8;" vertex="1" parent="1">
+          <mxGeometry x="40" y="1190" width="520" height="210" as="geometry"/>
+        </mxCell>
+        <mxCell id="p2_baseline" value="生成 baseline_evaluation.json&#xa;调用 evolution-world-model/scripts/generate_baseline_eval.py&#xa;写入：baseline_time_us、baseline_speedup、baseline_precision_passed、baseline_compilation_success&#xa;并保留 ops_profiling_result：geomean_speedup、mean_speedup、per_case 等&#xa;后续 target_speedup 以 PyTorch 统一口径比较" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=12;align=left;verticalAlign=top;spacing=8;" vertex="1" parent="1">
+          <mxGeometry x="40" y="1450" width="520" height="210" as="geometry"/>
+        </mxCell>
+        <mxCell id="p2_shared" value="建立 shared/ 共享输入&#xa;cp 基线目录全部内容到 shared/；包括 kernel/、model.py、design/、全量 *.json、*.json.bak&#xa;生成 shared/call_spec.json：inputs[]（name、shape、dtype）、scalar_args、tensor_kwargs、case_count&#xa;所有 parallel 目录必须复制整个 shared/，禁止只拷贝部分文件&#xa;输出：可被所有轮次复用的基线模板" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=12;align=left;verticalAlign=top;spacing=8;" vertex="1" parent="1">
+          <mxGeometry x="40" y="1710" width="520" height="240" as="geometry"/>
+        </mxCell>
+        <mxCell id="p2_hw_wm" value="Init：硬件、知识、策略与世界模型&#xa;1. npu-arch：npu-smi + platform_config / PlatformAscendC → hw_params&#xa;2. evolution-knowledge：OKF 按 op_family / bottleneck 查 active 卡，未命中回退 A3 guide&#xa;3. evolution-strategies：先 scenario-routing 归族，再选 workflow / compatibility / playbook&#xa;4. 设计 parallel_num×2 strategy_guided + open_exploration 节点，补 workflow_guided 槽位&#xa;5. 写 world_model.json：kernel_summary、baseline_performance、decision_tree.nodes、open_questions、best_score、hw_params、baseline_evidence、discovered_strategies、world_model_active" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=12;align=left;verticalAlign=top;spacing=8;" vertex="1" parent="1">
+          <mxGeometry x="690" y="110" width="600" height="300" as="geometry"/>
+        </mxCell>
+        <mxCell id="p2_feasible" value="目标可达性预检&#xa;check_target_feasibility.py 读取 baseline_evaluation、target_speedup、op_family&#xa;若 feasible=false 或 alarm 非空：写入 world_model.open_questions，但不硬阻断" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;align=left;verticalAlign=top;spacing=8;" vertex="1" parent="1">
+          <mxGeometry x="690" y="450" width="600" height="150" as="geometry"/>
+        </mxCell>
+        <mxCell id="p2_state" value="初始化 state.json&#xa;state_ops.py init：agent=lingxi-evo、session_id、max_rounds、parallel_num&#xa;阶段从 init / shared_prep / wm_init 进入 round_gate&#xa;关键字段：stage、current_round、partial_status、drift_status、must_run_before_next_round、evo_dir、actual_rounds_completed（由 refine 推进）" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=12;align=left;verticalAlign=top;spacing=8;" vertex="1" parent="1">
+          <mxGeometry x="690" y="640" width="600" height="190" as="geometry"/>
+        </mxCell>
+        <mxCell id="p2_loop" value="进入共享进化循环（第 4 页）&#xa;每轮：GATE 判断 → wm_ops select → 建目录并发 lingxi-partial → 产物检查 → wm_ops refine → 诊断 / profiling / Analyze → REACT → CHECKPOINT&#xa;partial 结果必须落在 round_N/parallel_P/evaluation_results.json" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=13;fontStyle=1;align=left;verticalAlign=top;spacing=8;" vertex="1" parent="1">
+          <mxGeometry x="690" y="870" width="600" height="190" as="geometry"/>
+        </mxCell>
+        <mxCell id="p2_final" value="最终结果门禁&#xa;session_anchor.py verify + wm_ops.py session-verify，失败则停止摘要&#xa;最优变体全量 case 守卫：.json 与 .json.bak 行数一致，n_cases_total 等于 shared 全量数&#xa;保存 world_model_final.json；展示前 3 个实现、最佳路径、性能与精度" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=12;align=left;verticalAlign=top;spacing=8;" vertex="1" parent="1">
+          <mxGeometry x="690" y="1100" width="600" height="220" as="geometry"/>
+        </mxCell>
+        <mxCell id="p2_report" value="报告收尾（必须执行）&#xa;报告前验证：baseline_evaluation.json 含 baseline_time_us、world_model_final/world_model、shared/call_spec、round_1/parallel_0&#xa;调用 evolution-report/scripts/generate_report.py EVO_DIR&#xa;读：baseline、world_model_final、call_spec、各轮 evaluation_results、kernel diff、会话记录&#xa;写：evolution-report_*.html；报告自检警告只记录，不跳过生成" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=12;align=left;verticalAlign=top;spacing=8;" vertex="1" parent="1">
+          <mxGeometry x="690" y="1360" width="600" height="220" as="geometry"/>
+        </mxCell>
+        <mxCell id="p2_output" value="Lingxi 输出目录&#xa;world_model.json / world_model_final.json&#xa;baseline_evaluation.json&#xa;shared/model.py、shared/&lt;op_name&gt;.json、shared/call_spec.json、shared/design/、shared/kernel/&#xa;round_N/parallel_P/kernel/、model_new_ascendc.py、evaluation_results.json、implementation_note.txt&#xa;evolution-report_*.html" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=12;align=left;verticalAlign=top;spacing=8;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="690" y="1620" width="600" height="250" as="geometry"/>
+        </mxCell>
+        <mxCell id="p2_e1" value="配置" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=11;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="p2_input" target="p2_env"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p2_e2" value="环境通过" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=11;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="p2_env" target="p2_dir"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p2_e3" value="固定路径" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=11;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="p2_dir" target="p2_read"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p2_e4" value="读取完成" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=11;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="p2_read" target="p2_case"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p2_e5" value="是" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=11;labelBackgroundColor=#ffffff;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="p2_case" target="p2_restore"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p2_e6" value="否 / 恢复后" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=11;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="p2_case" target="p2_perf"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p2_e7" value="恢复后继续" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=11;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.75;entryY=0;" edge="1" parent="1" source="p2_restore" target="p2_perf"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p2_e8" value="performance.json" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=11;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="p2_perf" target="p2_baseline"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p2_e9" value="shared 准备完成" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=11;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="p2_baseline" target="p2_shared"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p2_e10" value="baseline_evaluation + call_spec" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=11;labelBackgroundColor=#ffffff;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="p2_shared" target="p2_hw_wm"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p2_e11" value="alarm 也不阻断" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=11;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="p2_hw_wm" target="p2_feasible"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p2_e12" value="初始化完成" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=11;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="p2_feasible" target="p2_state"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p2_e13" value="state stage=wm_init" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=11;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="p2_state" target="p2_loop"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p2_e14" value="目标 / 失败 / 轮次终止" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=11;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="p2_loop" target="p2_final"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p2_e15" value="world_model_final" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=11;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="p2_final" target="p2_report"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p2_e16" value="HTML 报告" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=11;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="p2_report" target="p2_output"><mxGeometry relative="1" as="geometry"/></mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+  <diagram id="p3" name="03 Ops 路径">
+    <mxGraphModel dx="1600" dy="1200" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="24" pageHeight="24" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+        <mxCell id="p3_title" value="Ops 仓路径：构建、设备绑定、Worktree 隔离与多 shape 门控" style="text;html=1;align=left;verticalAlign=middle;fontSize=22;fontStyle=1;fontColor=#1f2937;" vertex="1" parent="1">
+          <mxGeometry x="40" y="20" width="1200" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="p3_input" value="输入字段&#xa;REPO_ROOT、category / op_path、op_name 或 custom_op_name&#xa;repo_type、SOC、device、max_rounds、parallel_num、target_speedup&#xa;可选 target_shapes、generalization_shapes、output_dir、停滞窗口&#xa;所有 shape name 必须全局唯一" style="shape=parallelogram;perimeter=parallelogramPerimeter;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=12;align=left;verticalAlign=top;spacing=8;" vertex="1" parent="1">
+          <mxGeometry x="40" y="110" width="560" height="190" as="geometry"/>
+        </mxCell>
+        <mxCell id="p3_repo" value="判断：仓类型与路径派生&#xa;build.sh 含 -n / --op-name 且有 src/ → omni-ops&#xa;标准仓：OP_PATH=REPO_ROOT/category/op_name，BUILD_OP_NAME=目录名&#xa;omni-ops：OP_PATH=REPO_ROOT/src/ops-transformer/category/op_name，BUILD_OP_NAME=原名&#xa;同时派生 OP_PATH_RELATIVE" style="rhombus;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;align=center;verticalAlign=middle;spacing=8;" vertex="1" parent="1">
+          <mxGeometry x="40" y="340" width="560" height="220" as="geometry"/>
+        </mxCell>
+        <mxCell id="p3_env" value="环境检测与 session 设备租约&#xa;检查 npu-smi、ASCEND_HOME_PATH、build.sh、OP_PATH、仓类型&#xa;omni-ops 额外检查 omni_custom_ops wheel&#xa;device_lease.py acquire-session：创建 device_pool/session_*_lease.json&#xa;绑定 SESSION_DEVICE 与 EVAL_LOCK_PATH=.../device_pool/eval.lock&#xa;获取失败：检查残留 PID，必要时 release-session；仍失败则停止" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=12;align=left;verticalAlign=top;spacing=8;" vertex="1" parent="1">
+          <mxGeometry x="40" y="600" width="560" height="230" as="geometry"/>
+        </mxCell>
+        <mxCell id="p3_shared" value="创建 EVO_DIR 与 shared&#xa;固定 TIMESTAMP，写 session_anchor：op_name、evo_dir、requested_rounds&#xa;cp OP_PATH 到 shared/original/，保存 op_kernel、op_host、CMakeLists 等&#xa;所有路径变量先做非空、存在、非空目录校验&#xa;后续所有轮次沿用同一 EVO_DIR 与 SESSION_DEVICE" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;align=left;verticalAlign=top;spacing=8;" vertex="1" parent="1">
+          <mxGeometry x="40" y="870" width="560" height="200" as="geometry"/>
+        </mxCell>
+        <mxCell id="p3_spec" value="生成 shared/call_spec.json&#xa;优先读取 tests/benchmark/benchmark_*.py 或 tests/st/test_*.py 参数&#xa;否则从 op_host/*_def.cpp 与测试数据推导函数签名&#xa;字段：op_namespace、op_func、target_shapes[]、generalization_shapes[]、output_count&#xa;每个 shape：name、inputs[{name, shape, dtype}]、scalar_args&#xa;旧格式 inputs / scalar_args 自动 normalize 为 default target" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;align=left;verticalAlign=top;spacing=8;" vertex="1" parent="1">
+          <mxGeometry x="40" y="1110" width="560" height="230" as="geometry"/>
+        </mxCell>
+        <mxCell id="p3_omni" value="仅 omni-ops 分支&#xa;若 omni_custom_ops 未安装：在 torch_ops_extension 中 source baseline set_env.bash，执行 build_and_install.sh&#xa;全程共享一个 wheel，通过 ASCEND_CUSTOM_OPP_PATH 热替换算子库&#xa;标准仓跳过，使用 torch.ops.npu.npu_{op_name}" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;align=left;verticalAlign=top;spacing=8;" vertex="1" parent="1">
+          <mxGeometry x="40" y="1380" width="560" height="180" as="geometry"/>
+        </mxCell>
+        <mxCell id="p3_build" value="构建 baseline&#xa;ops-evaluation/build_ops.py：build.sh --pkg --vendor_name=custom --soc --ops -j&#xa;install-path 必须是绝对路径；写入 baseline/vendors/custom_*&#xa;omni-ops 使用仓自带 build.sh -n op -c soc，产物目录为 output/，vendor 为 omni_custom_transformer&#xa;随后推导 task_type：vector / cube / cv-mix / unknown" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;align=left;verticalAlign=top;spacing=8;" vertex="1" parent="1">
+          <mxGeometry x="40" y="1600" width="560" height="230" as="geometry"/>
+        </mxCell>
+        <mxCell id="p3_eval" value="调用 ops-evaluation/evaluate_ops_direct.py 评估 baseline&#xa;--call-spec shared/call_spec.json、--baseline-path=--evolved-path=baseline&#xa;--device-id SESSION_DEVICE、--task-type、--shapes-mode all、--target-speedup&#xa;写 baseline_evaluation.json：eval_backend、baseline.time_us、shape_results.target / generalization、aggregate&#xa;自评 speedup=1.0；后续变体必须复用 baseline-cache，禁止切换 eval_backend" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=12;align=left;verticalAlign=top;spacing=8;" vertex="1" parent="1">
+          <mxGeometry x="40" y="1870" width="560" height="250" as="geometry"/>
+        </mxCell>
+        <mxCell id="p3_wm" value="Init 世界模型与状态&#xa;npu-arch → world_model.hw_params；knowledge → OKF / A3；strategies → 归族、策略组合、P104–P115 覆盖（匹配时）&#xa;写 world_model.json：session、baseline_performance、decision_tree.nodes、open_questions、best_score、baseline_evidence&#xa;state_ops.py init：agent=ops-evo、stage、current_round、parallel_num、drift_status、must_run_before_next_round&#xa;attach-baseline-evidence 把 pipeline 瓶颈映射到根级 baseline_evidence" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=12;align=left;verticalAlign=top;spacing=8;" vertex="1" parent="1">
+          <mxGeometry x="720" y="110" width="620" height="300" as="geometry"/>
+        </mxCell>
+        <mxCell id="p3_loop" value="进入共享进化循环（第 4 页）&#xa;SELECT 后为每个 parallel_p 创建独立 git worktree&#xa;后台调用 ops-partial：改代码 → 只保存真实 diff → build_ops → evaluate_ops_direct（eval lock）&#xa;主 Agent 收集 evaluation_results.json，校验 artifact、eval_backend、diff，再 cleanup 保留最优 worktree&#xa;REFINE 是本轮结果写入 world_model 的唯一入口" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=13;fontStyle=1;align=left;verticalAlign=top;spacing=8;" vertex="1" parent="1">
+          <mxGeometry x="720" y="470" width="620" height="240" as="geometry"/>
+        </mxCell>
+        <mxCell id="p3_final" value="最终结果&#xa;session_anchor.verify + wm_ops.session-verify，失败不输出摘要&#xa;读取 actual_rounds_completed / requested_rounds，提前停止必须透明标注&#xa;保存 world_model_final.json；展示前 3 个变体、最佳耗时、speedup、precision、modified_files 路径&#xa;释放 session 设备租约 release-session" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=12;align=left;verticalAlign=top;spacing=8;" vertex="1" parent="1">
+          <mxGeometry x="720" y="770" width="620" height="220" as="geometry"/>
+        </mxCell>
+        <mxCell id="p3_report" value="强制调用 evolution-report&#xa;generate_report.py EVO_DIR --pipeline ops-evo&#xa;读取 baseline_evaluation、world_model_final、call_spec、各轮 evaluation_results、modified_files、会话记录&#xa;自检：占位符、best valid、speedup 一致性、决策树拓扑、diff、耗时与 token&#xa;输出 evolution-report_{op_name}_{timestamp}.html" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=12;align=left;verticalAlign=top;spacing=8;" vertex="1" parent="1">
+          <mxGeometry x="720" y="1050" width="620" height="220" as="geometry"/>
+        </mxCell>
+        <mxCell id="p3_output" value="Ops 输出目录&#xa;baseline/、baseline_evaluation.json、shared/original/、shared/call_spec.json&#xa;device_pool/session_*_lease.json、eval.lock&#xa;worktrees/（只保留最优或按清理策略）&#xa;round_N/parallel_P/modified_files/、code_changes.json、implementation_note.txt、evaluation_results.json&#xa;world_model_final.json、evolution-report_*.html" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=12;align=left;verticalAlign=top;spacing=8;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="720" y="1330" width="620" height="250" as="geometry"/>
+        </mxCell>
+        <mxCell id="p3_e1" value="配置" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=11;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="p3_input" target="p3_repo"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p3_e2" value="变量已派生" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=11;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="p3_repo" target="p3_env"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p3_e3" value="设备已绑定" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=11;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="p3_env" target="p3_shared"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p3_e4" value="共享代码" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=11;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="p3_shared" target="p3_spec"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p3_e5" value="call_spec" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=11;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="p3_spec" target="p3_omni"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p3_e6" value="omni 分支完成或跳过" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=11;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="p3_omni" target="p3_build"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p3_e7" value="baseline 安装" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=11;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="p3_build" target="p3_eval"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p3_e8" value="baseline_evaluation" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=11;labelBackgroundColor=#ffffff;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="p3_eval" target="p3_wm"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p3_e9" value="初始化完成" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=11;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="p3_wm" target="p3_loop"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p3_e10" value="终止条件满足" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=11;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="p3_loop" target="p3_final"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p3_e11" value="快照与租约释放" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=11;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="p3_final" target="p3_report"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p3_e12" value="报告与字段一致性自检" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=11;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="p3_report" target="p3_output"><mxGeometry relative="1" as="geometry"/></mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+  <diagram id="p4" name="04 共享进化循环">
+    <mxGraphModel dx="1800" dy="1200" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="27" pageHeight="18" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+        <mxCell id="p4_title" value="共享进化循环：每一轮都必须留下文件证据并推进 state.json" style="text;html=1;align=left;verticalAlign=middle;fontSize=22;fontStyle=1;fontColor=#1f2937;" vertex="1" parent="1">
+          <mxGeometry x="40" y="20" width="1200" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="p4_state" value="state.json 状态机：init → shared_prep → baseline_build（仅 Ops）→ wm_init → round_gate → round_select → round_generate → round_refine → round_react → round_checkpoint → finalize → report → done&#xa;阻塞规则：partial 未完成不能停；evaluation_results 缺失不能 refine；drift_status=replan_required 必须先注入 fresh-source prompt；must_run_before_next_round 非空必须补跑 msprof；EVO_DIR 必须与 session 锚定一致" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=12;align=left;verticalAlign=middle;spacing=8;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="40" y="90" width="2240" height="110" as="geometry"/>
+        </mxCell>
+        <mxCell id="p4_gate" value="4.1 GATE&#xa;输入：world_model.json、state.json、r、max_rounds、target_speedup&#xa;判断 A：所有节点 status≠open？是→搜索空间耗尽，进入 finalize&#xa;判断 B：stagnation_count≥1、stagnation_count_vs_base≥1，或半程 best_score&lt;target×0.5？是→按冷却和上限调用 Supervisor&#xa;判断 C：state.drift_status=replan_required？是→下一步 SELECT 前给所有 partial 注入 fresh-source exploration，且强制至少 ceil(parallel_num/2) 个 open_exploration&#xa;输出：继续 / 终止 / supervisor 新节点 / drift_replan" style="rhombus;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;align=left;verticalAlign=top;spacing=8;" vertex="1" parent="1">
+          <mxGeometry x="40" y="260" width="340" height="330" as="geometry"/>
+        </mxCell>
+        <mxCell id="p4_select" value="4.2 SELECT&#xa;调用 wm_ops.py summary，再调用 select --path world_model.json --n parallel_num&#xa;utility = 3.0×parent_score + 2.5×(5−difficulty) + 0.75×depth + root_explore + profiling_evidence&#xa;自动保证：workflow_guided 至少 1 槽、optimization_type 多样性、parent 分支多样性、open_exploration 保留位&#xa;写 world_model.nodes[id].status=in_progress；记录 parallel_index→node_id；输出 strategy_combination、parent_solution_ref、profiling context、difficulty、depth" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;align=left;verticalAlign=top;spacing=8;" vertex="1" parent="1">
+          <mxGeometry x="420" y="260" width="340" height="330" as="geometry"/>
+        </mxCell>
+        <mxCell id="p4_generate" value="4.3 GENERATE&#xa;共同输入：shared/、selected_nodes、parallel_map、strategy resources&#xa;Lingxi：mkdir round_N/parallel_P，cp shared/*，prepare_strategy_resources.py，后台无 name 调 lingxi-partial；收集 evaluation_results.json&#xa;Ops：worktree_manager create；后台无 name 调 ops-partial；子 agent 在 worktree 改代码、构建、评估并写回 round_N/parallel_P&#xa;强制：所有 partial 必须真正并行；超时 30 分钟 TaskStop；check_round_artifacts 检查内核存在、真实 diff、评估完整、编译产物&#xa;输出：evaluation_results、implementation_note、pipeline 缺失标记、artifact issues" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;align=left;verticalAlign=top;spacing=8;" vertex="1" parent="1">
+          <mxGeometry x="800" y="260" width="370" height="390" as="geometry"/>
+        </mxCell>
+        <mxCell id="p4_refine" value="4.4 REFINE（唯一的世界模型写回入口）&#xa;调用 wm_ops.py refine：读每个 evaluation_results.json，更新 status / score / solution_ref / profiling_insight / children / stagnation / best_score，生成 pending_diagnosis.json 与 round_summary&#xa;立即验证所有 round_N/parallel_P 已进入 decision_tree，否则重试 refine，连续失败则提前收尾&#xa;Stage 2：passed 节点 facts → LLM diagnosis_text、bottleneck_labels≤3、confidence、next_round_hint；validate-diagnosis；finalize-ledger 写 lineage.jsonl、attempt-ledger.md 并把 hint 应用到 open 子节点&#xa;失败节点：knowledge failure_pattern 反查；impl_error 生成修复子节点，strategy_infeasible 封锁 difficulty=5&#xa;按条件对最佳 passed 节点做深度 profiling；补齐 profiling_insight；Analyze 更新最多 5 条 open_questions；soft-demoted 分支做语义证伪复核&#xa;输出：更新 world_model.json、state.drift_status、must_run_before_next_round" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;align=left;verticalAlign=top;spacing=8;" vertex="1" parent="1">
+          <mxGeometry x="1210" y="260" width="400" height="470" as="geometry"/>
+        </mxCell>
+        <mxCell id="p4_react" value="4.5 REACT（每轮最多一个分支）&#xa;分支 1：profiling_driven 全失败且冷却 / 上限允许 → Supervisor，添加新节点或记录 reasoning&#xa;分支 2：深度 profiling 为 balanced / near_optimal 但 best_score&lt;target×0.7 → Supervisor，转算法 / 数据流 / 架构视角&#xa;分支 3：open_exploration passed 且 score&gt;best_score_before×1.10 → 读取代码与 implementation_note，查 strategy-index / OKF 判断新颖性&#xa;新 X 策略：写 discovered/disc_Xn.md 与 OKF 卡片，追加 strategy-index.md、world_model.discovered_strategies，重建 evolution-strategies INDEX.json；跨算子再写 proven_solutions 与 OKF proven-solution" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;align=left;verticalAlign=top;spacing=8;" vertex="1" parent="1">
+          <mxGeometry x="1650" y="260" width="350" height="390" as="geometry"/>
+        </mxCell>
+        <mxCell id="p4_checkpoint" value="4.6 CHECKPOINT&#xa;显示：实现数、编译 / 精度通过数、最佳与平均加速比、节点状态、停滞计数、profiling 覆盖数&#xa;Lingxi 单 shape：evaluation_results.speedup（vs PyTorch）达 target 或本轮全失败则停止；否则下一轮&#xa;Ops 单 shape：variant speedup（vs baseline）达 target 或全失败则停止&#xa;Ops multi-shape：fully_passed 先泛化；target_regression 不可做 parent；partial_passed 可继续；泛化退化必须 Supervisor 选择 shape_spec / switch_branch / terminate&#xa;自然耗尽但有 passed：profiling 门控可补 CSV / 深度 profiling，发现新方向则 max_rounds+=2，只允许一次" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;align=left;verticalAlign=top;spacing=8;" vertex="1" parent="1">
+          <mxGeometry x="2040" y="260" width="370" height="430" as="geometry"/>
+        </mxCell>
+        <mxCell id="p4_decide" value="判断：本轮是否终止？&#xa;是：target reached / 全部失败 / 搜索空间耗尽 / Supervisor 确认终止 / 无新 profiling 方向&#xa;否：r += 1，回到 GATE&#xa;若 Ops fully_passed：先跑 shapes-mode generalization，读取 shape_results.generalization、aggregate.generalization_geo_mean_speedup、any_generalization_regression" style="rhombus;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;align=center;verticalAlign=middle;spacing=8;" vertex="1" parent="1">
+          <mxGeometry x="1130" y="820" width="390" height="180" as="geometry"/>
+        </mxCell>
+        <mxCell id="p4_loopback" value="继续：更新 actual_rounds_completed，r += 1，返回 4.1 GATE" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;align=left;verticalAlign=middle;spacing=8;" vertex="1" parent="1">
+          <mxGeometry x="40" y="840" width="760" height="120" as="geometry"/>
+        </mxCell>
+        <mxCell id="p4_finalize" value="结束：进入步骤 5 Finalize → session verify → 最优实现门禁 → world_model_final.json → 步骤 6 evolution-report" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=12;fontStyle=1;align=left;verticalAlign=middle;spacing=8;" vertex="1" parent="1">
+          <mxGeometry x="1640" y="840" width="770" height="120" as="geometry"/>
+        </mxCell>
+        <mxCell id="p4_contract" value="本轮文件契约&#xa;输入：world_model.json、state.json、shared/ 或 worktree、baseline_evaluation.json&#xa;写入：round_N/parallel_P/evaluation_results.json（编译、精度、speedup / time、pipeline、implementation_note）、profiling/、pending_diagnosis.json、lineage.jsonl、attempt-ledger.md&#xa;REFINE 后：world_model 节点字段 status / score / solution_ref / profiling_insight / profiling_evidence / facts / diagnosis / next_round_hint / failure_type / children；state.stage 与 drift_status 同步推进" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=12;align=left;verticalAlign=top;spacing=8;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="40" y="1050" width="1170" height="220" as="geometry"/>
+        </mxCell>
+        <mxCell id="p4_nodes" value="世界模型节点最小字段&#xa;id、parent_id、description、strategy_combination、mode、workflow_ref、optimization_type、status、score、difficulty、depth、solution_ref、parent_code_ref、children、failure_type、failure_reason、retry_count&#xa;Profiling：profiling_insight={bottleneck,recommended_strategies,profiling_one_liner}；profiling_evidence={bottleneck_type,d_class_pct,c_class_pct,imbalance_ratio,primary_bottleneck,suggested_strategies,anti_strategies,dma_efficiency...}&#xa;根字段：session、baseline_performance、best_score、open_questions、hw_params、baseline_evidence、discovered_strategies、world_model_active" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=12;align=left;verticalAlign=top;spacing=8;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="1250" y="1050" width="1160" height="220" as="geometry"/>
+        </mxCell>
+        <mxCell id="p4_e1" value="进入选择" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=11;labelBackgroundColor=#ffffff;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="p4_gate" target="p4_select"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p4_e2" value="节点分配" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=11;labelBackgroundColor=#ffffff;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="p4_select" target="p4_generate"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p4_e3" value="评估产物" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=11;labelBackgroundColor=#ffffff;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="p4_generate" target="p4_refine"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p4_e4" value="world_model 写回" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=11;labelBackgroundColor=#ffffff;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="p4_refine" target="p4_react"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p4_e5" value="条件后处理" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=11;labelBackgroundColor=#ffffff;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="p4_react" target="p4_checkpoint"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p4_e6" value="轮次决策" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=11;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="p4_checkpoint" target="p4_decide"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p4_e7" value="否" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=11;labelBackgroundColor=#ffffff;exitX=0;exitY=0.5;entryX=1;entryY=0.5;" edge="1" parent="1" source="p4_decide" target="p4_loopback"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p4_e8" value="是" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=11;labelBackgroundColor=#ffffff;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="p4_decide" target="p4_finalize"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p4_e9" value="回到 GATE" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=11;labelBackgroundColor=#ffffff;exitX=0.5;exitY=0;entryX=0.5;entryY=1;" edge="1" parent="1" source="p4_loopback" target="p4_gate"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p4_e10" value="Supervisor 介入或终止" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;dashed=1;endArrow=open;fontSize=11;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="p4_gate" target="p4_finalize"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p4_e11" value="字段契约" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;dashed=1;endArrow=open;fontSize=11;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="p4_refine" target="p4_contract"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p4_e12" value="字段契约" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;dashed=1;endArrow=open;fontSize=11;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="p4_refine" target="p4_nodes"><mxGeometry relative="1" as="geometry"/></mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+  <diagram id="p5" name="05 Skills 与文件字段">
+    <mxGraphModel dx="1800" dy="1300" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="27" pageHeight="22" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+        <mxCell id="p5_title" value="相关 Skills 与文件字段契约：谁在何时读写什么" style="text;html=1;align=left;verticalAlign=middle;fontSize=22;fontStyle=1;fontColor=#1f2937;" vertex="1" parent="1">
+          <mxGeometry x="40" y="20" width="1200" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="p5_npu" value="npu-arch&#xa;触发：目标芯片识别、架构差异、条件编译判断&#xa;读取：npu-smi；references/npu-hardware-params.md；platform_config/*.ini；PlatformAscendC 运行时能力&#xa;推导：peak_bw_gbps、peak_vector_tflops_per_core、peak_cube_tflops_per_core、max_tile_fp16_double_buf&#xa;写入：world_model.json.hw_params = chip_model、ub_size_bytes、core_num、peak_bw_gbps、peak_vector_tflops_per_core、alignment_bytes、max_tile_fp16_double_buf" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;align=left;verticalAlign=top;spacing=7;" vertex="1" parent="1">
+          <mxGeometry x="40" y="100" width="520" height="235" as="geometry"/>
+        </mxCell>
+        <mxCell id="p5_prof" value="ops-profiling&#xa;触发：Lingxi 基线 / 变体、Ops 对比、深度瓶颈分析&#xa;调用：msprof_profile_run.sh --quick / --compare；msprof_perf_summary.py&#xa;写入：performance.json（geomean_speedup、mean_speedup、median/min/max、per_case、可选 mfu）、performance.log、perf_report.md&#xa;深度证据：profiling/PROF_GROUP_*/PROF_*/op_summary_*.csv；从 pipe 比值提炼 evolved.pipeline；禁止手写计时" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;align=left;verticalAlign=top;spacing=7;" vertex="1" parent="1">
+          <mxGeometry x="590" y="100" width="520" height="235" as="geometry"/>
+        </mxCell>
+        <mxCell id="p5_eval" value="ops-evaluation&#xa;触发：Ops 仓 baseline / evolved 构建、部署、精度与性能&#xa;调用：build_ops.py、generate_pybind.py、evaluate_ops.py、evaluate_ops_direct.py、worktree_manager.py、device_lease.py&#xa;写入：baseline/evolved 安装目录；evaluation_results.json；device_pool/session_*_lease.json；eval.lock&#xa;规则：安装路径绝对；baseline 与 evolved 使用相同 eval_backend；评估通过 eval lock" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;align=left;verticalAlign=top;spacing=7;" vertex="1" parent="1">
+          <mxGeometry x="1140" y="100" width="520" height="235" as="geometry"/>
+        </mxCell>
+        <mxCell id="p5_wm" value="evolution-world-model&#xa;触发：初始化、选择、轮次写回、诊断、深度 profiling、状态恢复&#xa;确定性命令：wm_ops select / refine / diagnose / deep-profiling / attach-baseline-evidence；state_ops init / read / add-read-keys；session_anchor write / read / verify&#xa;写 world_model.json：session、baseline_performance、decision_tree.nodes、open_questions、stagnation_count、best_score、world_model_active、hw_params、baseline_evidence、discovered_strategies&#xa;写 state.json：stage、current_round、max_rounds、partial_status、drift_status、must_run_before_next_round、last_mainline_verdict、evo_dir&#xa;附属：pending_diagnosis.json、facts / diagnosis、lineage.jsonl、attempt-ledger.md、deep_profiling_result.json" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;align=left;verticalAlign=top;spacing=7;" vertex="1" parent="1">
+          <mxGeometry x="1690" y="100" width="600" height="235" as="geometry"/>
+        </mxCell>
+        <mxCell id="p5_knowledge" value="evolution-knowledge&#xa;触发：Init 选方向、失败诊断、策略提炼与 maintain&#xa;检索顺序：OKF references/okf/ → A3 references/a3/ → strategy library → proven_solutions → WebSearch&#xa;查询维度：op_family、bottleneck、phenomenon、failed_combination、kind、status&#xa;写 OKF：先查重；frontmatter schema_version=okf.v1、kind、id/key、confidence、status、op_families、bottlenecks、tags、来源与证据；更新后重建 INDEX.json&#xa;经典层：proven_solutions/INDEX.md 只追加跨算子方案" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;align=left;verticalAlign=top;spacing=7;" vertex="1" parent="1">
+          <mxGeometry x="40" y="380" width="520" height="235" as="geometry"/>
+        </mxCell>
+        <mxCell id="p5_strategies" value="evolution-strategies&#xa;触发：归族、选策略、兼容性检查、资源注入、发现 X 策略&#xa;读取：scenario-routing/README.md、_common-prerequisites.md、族 workflow、strategy-index.md、strategy-compatibility.md、preconditions/、playbooks/、families/&#xa;写：discovered/disc_Xn.md；strategy-index.md 末尾追加 X 行；world_model.discovered_strategies；generate_index_json.py 重建 INDEX.json&#xa;约束：P/D/A/R 精选库只读；discovered/ 可写；workflow_guided 必须带 workflow_ref 与 stage_order；X 策略先读全文并查重" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;align=left;verticalAlign=top;spacing=7;" vertex="1" parent="1">
+          <mxGeometry x="590" y="380" width="520" height="235" as="geometry"/>
+        </mxCell>
+        <mxCell id="p5_report" value="evolution-report&#xa;触发：步骤 5 完成后，无论成功、失败、停滞都必须运行&#xa;读取：baseline_evaluation.json；world_model_final.json / world_model.json；shared/call_spec.json；round_N/parallel_P/evaluation_results.json；implementation_note；Lingxi kernel diff 或 Ops modified_files vs shared/original；会话 JSONL 与 round_* 时间戳&#xa;写：evolution-report_{op_name}_{timestamp}.html&#xa;自检：占位符、最佳变体有效性、speedup 一致、测试用例、模型、apply-cmd、耗时、token、决策树、diff、新文件、重复目标路径、无源代码修改" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;align=left;verticalAlign=top;spacing=7;" vertex="1" parent="1">
+          <mxGeometry x="1140" y="380" width="520" height="235" as="geometry"/>
+        </mxCell>
+        <mxCell id="p5_agents" value="Agent 边界&#xa;lingxi-evo / ops-evo：调度、世界模型推理、结果汇总，不直接改 kernel；顶层调用前台阻塞且无 name&#xa;lingxi-partial / ops-partial：后台并行执行实现、构建、评估；调用必须显式 subagent_type，且无 name&#xa;partial 必须写 evaluation_results.json，无论成功失败都不能只在聊天中返回结果&#xa;general-purpose Supervisor：仅停滞、profiling 全失败或 profiling 盲区等条件触发，前台阻塞" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;align=left;verticalAlign=top;spacing=7;" vertex="1" parent="1">
+          <mxGeometry x="1690" y="380" width="600" height="235" as="geometry"/>
+        </mxCell>
+        <mxCell id="p5_shared" value="shared/&#xa;Lingxi：model.py、&lt;op_name&gt;.json、&lt;op_name&gt;.json.bak、call_spec.json、design/block_level、design/tile_level、kernel/&#xa;Ops：original/op_kernel、original/op_host、CMakeLists 等；call_spec.json 使用 op_namespace、op_func、target_shapes、generalization_shapes、output_count&#xa;作用：所有并行变体的只读基线模板；Lingxi 目录必须整体 cp shared/*，Ops partial 只从 shared/original 取真实差异文件" style="shape=cylinder3;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;align=left;verticalAlign=top;spacing=7;" vertex="1" parent="1">
+          <mxGeometry x="40" y="710" width="520" height="260" as="geometry"/>
+        </mxCell>
+        <mxCell id="p5_base" value="baseline_evaluation.json&#xa;Lingxi：baseline_time_us、baseline_speedup、baseline_precision_passed、baseline_compilation_success、ops_profiling_result&#xa;Ops：eval_backend、baseline.time_us、shape_results.target/generalization、aggregate、gating 对齐所需 baseline cache&#xa;根级 attach-baseline-evidence 后：bottleneck_type、suggested_strategies、anti_strategies 等 profiling 证据，供 SELECT 与 partial prompt" style="shape=cylinder3;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;align=left;verticalAlign=top;spacing=7;" vertex="1" parent="1">
+          <mxGeometry x="600" y="710" width="520" height="260" as="geometry"/>
+        </mxCell>
+        <mxCell id="p5_world" value="world_model.json / state.json&#xa;world_model 根：session、kernel_summary、baseline_performance、decision_tree、open_questions、stagnation_count、stagnation_count_vs_base、best_score、world_model_active、solution_db_path、hw_params、discovered_strategies、baseline_evidence&#xa;node：id、parent_id、description、strategy_combination、mode、workflow_ref、optimization_type、status、score、difficulty、depth、solution_ref、children、failure_type、failure_reason、retry_count、profiling_insight、profiling_evidence、facts、diagnosis、next_round_hint&#xa;state：stage、current_round、max_rounds、partial_status、drift_status、must_run_before_next_round、evo_dir、session_id、last_updated_at" style="shape=cylinder3;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;align=left;verticalAlign=top;spacing=7;" vertex="1" parent="1">
+          <mxGeometry x="1160" y="710" width="600" height="300" as="geometry"/>
+        </mxCell>
+        <mxCell id="p5_variant" value="round_N/parallel_P/evaluation_results.json&#xa;Lingxi：compilation_success、precision_passed、speedup（vs PyTorch）、base_time_ms、gen_time_ms、evolved.pipeline、local_refinement_rounds、local_refinement_gain、implementation_note、n_cases_total&#xa;Ops：node_id、comparison.compilation_success、precision_passed、speedup（vs baseline）、time_delta_us、bottleneck_change、cv_pct、evolved.pipeline、implementation_note；multi-shape 还有 shape_results、aggregate、gating、parent_eligible&#xa;旁证：kernel/ 或 modified_files/ 必须有真实代码差异" style="shape=cylinder3;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;align=left;verticalAlign=top;spacing=7;" vertex="1" parent="1">
+          <mxGeometry x="40" y="1040" width="600" height="300" as="geometry"/>
+        </mxCell>
+        <mxCell id="p5_profile" value="profiling/ 与性能数据&#xa;performance.json：geomean_speedup、mean_speedup、median、min、max、per_case、可选 mfu&#xa;perf_report.md：对比表、pipeline 比值与瓶颈分析入口&#xa;profiling/PROF_GROUP_*/PROF_*/op_summary_*.csv：PipeUtilization、ArithmeticUtilization、Memory、L2Cache、ResourceConflictRatio 等字段&#xa;world_model.profiling_insight：bottleneck、recommended_strategies、profiling_one_liner；profiling_evidence：bottleneck_type、空泡、负载均衡、DMA 效率、suggested / anti strategies" style="shape=cylinder3;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;align=left;verticalAlign=top;spacing=7;" vertex="1" parent="1">
+          <mxGeometry x="680" y="1040" width="600" height="300" as="geometry"/>
+        </mxCell>
+        <mxCell id="p5_artifacts" value="诊断与血缘文件&#xa;pending_diagnosis.json：待 LLM 判断的失败节点&#xa;implementation_note.txt：实际改动、失败原因或方向不可行&#xa;code_changes.json：Ops 实际修改文件与空变更记录&#xa;artifacts/lineage.jsonl：source_keys、节点与策略血缘&#xa;attempt-ledger.md：诊断、尝试、证据记录&#xa;generalization_eval.json：shape_results.generalization、generalization_geo_mean_speedup、any_generalization_regression" style="shape=cylinder3;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=11;align=left;verticalAlign=top;spacing=7;" vertex="1" parent="1">
+          <mxGeometry x="1320" y="1040" width="500" height="300" as="geometry"/>
+        </mxCell>
+        <mxCell id="p5_final" value="最终文件&#xa;world_model_final.json：步骤 5 从当前 world_model.json 快照&#xa;evolution-report_*.html：报告与 15 项自检结果&#xa;Ops 最佳：modified_files/ 可复制回 OP_PATH；Lingxi 最佳：kernel/ 路径供应用与 diff&#xa;设备资源：release-session 后保留会话证据文件" style="shape=cylinder3;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;align=left;verticalAlign=top;spacing=7;" vertex="1" parent="1">
+          <mxGeometry x="1860" y="1040" width="430" height="300" as="geometry"/>
+        </mxCell>
+        <mxCell id="p5_e1" value="写 hw_params" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;dashed=1;endArrow=open;fontSize=10;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="p5_npu" target="p5_world"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p5_e2" value="写 performance / pipeline" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;dashed=1;endArrow=open;fontSize=10;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="p5_prof" target="p5_profile"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p5_e3" value="读写评估" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;dashed=1;endArrow=open;fontSize=10;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="p5_eval" target="p5_variant"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p5_e4" value="Init / Select / Refine / Analyze" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;dashed=1;endArrow=open;fontSize=10;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="p5_wm" target="p5_world"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p5_e5" value="查询 / 维护" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;dashed=1;endArrow=open;fontSize=10;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="p5_knowledge" target="p5_artifacts"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p5_e6" value="策略与索引" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;dashed=1;endArrow=open;fontSize=10;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="p5_strategies" target="p5_artifacts"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p5_e7" value="汇总与自检" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;dashed=1;endArrow=open;fontSize=10;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="p5_report" target="p5_final"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p5_e8" value="共享输入" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;dashed=1;endArrow=open;fontSize=10;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="p5_shared" target="p5_variant"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p5_e9" value="基线时间与对齐" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;dashed=1;endArrow=open;fontSize=10;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="p5_base" target="p5_variant"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p5_e10" value="评估证据" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;dashed=1;endArrow=open;fontSize=10;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="p5_variant" target="p5_profile"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p5_e11" value="诊断写回" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;dashed=1;endArrow=open;fontSize=10;labelBackgroundColor=#ffffff;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="p5_profile" target="p5_world"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p5_e12" value="报表数据" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;dashed=1;endArrow=open;fontSize=10;labelBackgroundColor=#ffffff;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="p5_artifacts" target="p5_final"><mxGeometry relative="1" as="geometry"/></mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+  <diagram id="p6" name="06 Partial Agents">
+    <mxGraphModel dx="1800" dy="1300" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="27" pageHeight="22" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+        <mxCell id="p6_title" value="两个 Partial Agent：实现边界、评估步骤与结果字段" style="text;html=1;align=left;verticalAlign=middle;fontSize=22;fontStyle=1;fontColor=#1f2937;" vertex="1" parent="1">
+          <mxGeometry x="40" y="20" width="1200" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="p6_ltitle" value="lingxi-partial：共享目录内优化 AscendC 内核" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=15;fontStyle=1;align=center;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="40" y="100" width="1060" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="p6_linput" value="输入：prompt 中的 node_id、node_description、strategy_combination、mode、parent_solution_ref、best_solution_ref、profiling context、strategy resources、Max Improve Rounds&#xa;目录：model.py、全量 &lt;op_name&gt;.json / .json.bak、kernel/（基线或父变体）、design/&#xa;若有父节点：先读父 kernel 并以 patch 为起点；路径操作前校验 output_dir 与 kernel 非空且存在" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=11;align=left;verticalAlign=top;spacing=7;" vertex="1" parent="1">
+          <mxGeometry x="40" y="190" width="1060" height="180" as="geometry"/>
+        </mxCell>
+        <mxCell id="p6_lmode" value="模式判断&#xa;strategy_guided：按 prompt 方向实现，必要时读至多一个策略文件并做 compatibility 检查&#xa;open_exploration：禁止读 strategy-index / strategies，基于代码和 profiling 第一原理推理&#xa;profiling_driven：围绕 Profiling Context 瓶颈；workflow_guided：严格按 workflow_ref.stage_order 与 strategy resources 执行" style="rhombus;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;align=left;verticalAlign=top;spacing=7;" vertex="1" parent="1">
+          <mxGeometry x="40" y="400" width="1060" height="160" as="geometry"/>
+        </mxCell>
+        <mxCell id="p6_lphase1" value="Phase 1：优化、编译、功能验证，最多 3 次迭代&#xa;修改 kernel/；A 类代码 / 算法错误可生成修复建议后重试；B 类环境错误终止；同一子类型连续 3 次失败终止&#xa;验证：evaluate_ascendc.sh；通过即得到 compilation_success=true、precision_passed=true，否则记录错误&#xa;多 shape 且含 P-ShapeSpec-01：保留 TILING_KEY_IS(0) default，新增 specialized KernelImpl、host tiling 分支与 TILING_KEY_IS(N) 入口；否则 default 改动必须在 implementation_note 声明 default-safe" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;align=left;verticalAlign=top;spacing=7;" vertex="1" parent="1">
+          <mxGeometry x="40" y="590" width="1060" height="230" as="geometry"/>
+        </mxCell>
+        <mxCell id="p6_lprofile" value="Phase 1.5：通过后必跑完整 msprof compare&#xa;调用 msprof_perf_summary.py --compare；复制 PROF_GROUP_* 到 profiling/&#xa;从 perf_report.md / op_summary_*.csv 提炼 pipeline，追加 evaluation_results.evolved.pipeline；采集失败也必须显式写 pipeline=null&#xa;该字段是 wm_ops refine 生成 profiling_insight.recommended_strategies 的唯一来源" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;align=left;verticalAlign=top;spacing=7;" vertex="1" parent="1">
+          <mxGeometry x="40" y="850" width="1060" height="180" as="geometry"/>
+        </mxCell>
+        <mxCell id="p6_refine" value="Phase 2：Local Refinement（条件满足且 Max Improve Rounds&gt;0 才循环，否则写 local_refinement_rounds=0）&#xa;读取 profiling/、perf_report.md、performance.json、op_summary；判断 bottleneck 与 recommended_strategies；balanced 且远低于目标时可做指令级细化&#xa;以 best_kernel_snapshot 为基准，精度验证后用 ops-profiling --quick 取 new_speedup；new_speedup&gt;best_speedup×1.02 才接受，否则恢复快照并累计 no_improve_streak；达到 Improve Stagnation Window 退出&#xa;若最终有提升：重跑 Phase 1.5 刷新 pipeline；写 local_refinement_rounds 与 local_refinement_gain" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;align=left;verticalAlign=top;spacing=7;" vertex="1" parent="1">
+          <mxGeometry x="40" y="1060" width="1060" height="250" as="geometry"/>
+        </mxCell>
+        <mxCell id="p6_loutput" value="Phase 3：无论成功失败都写结果&#xa;evaluation_results.json：compilation_success、precision_passed、speedup（vs PyTorch）、base_time_ms、gen_time_ms、evolved.pipeline、local_refinement_rounds、local_refinement_gain、implementation_note&#xa;implementation_note：通过写核心优化；编译失败写错误；精度失败写已实现 / 偏离；不能只在对话中返回&#xa;禁止修改 model.py、截断测试用例、作弊缓存、改变 forward 签名、跳过必要预处理或降低原始精度" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;align=left;verticalAlign=top;spacing=7;" vertex="1" parent="1">
+          <mxGeometry x="40" y="1340" width="1060" height="250" as="geometry"/>
+        </mxCell>
+        <mxCell id="p6_otitle" value="ops-partial：独立 Worktree 内改仓库、构建、评估" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=15;fontStyle=1;align=center;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="1200" y="100" width="1090" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="p6_oinput" value="输入：BUILD &amp; EVAL CONTEXT&#xa;worktree_base、worktree_op_path、REPO_ROOT、OP_PATH_RELATIVE、build_op_name、soc、SESSION_DEVICE、eval_lock、baseline_cache、call_spec、task_type、shapes_mode、target_speedup&#xa;共享：shared/original/ 下 op_kernel/*.cpp、*.h、op_host/*_tiling.h、*_tiling.cpp、*_def.cpp；父节点非空时读 parent modified_files" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=11;align=left;verticalAlign=top;spacing=7;" vertex="1" parent="1">
+          <mxGeometry x="1200" y="190" width="1090" height="180" as="geometry"/>
+        </mxCell>
+        <mxCell id="p6_omodify" value="阶段 1–2：读代码并按方向修改&#xa;op_kernel/*.cpp、*.h：可自由修改，但不改调用签名&#xa;op_host/*_tiling.h、*_tiling.cpp：可改，不改字段名&#xa;op_host/*_def.cpp：仅编译选项 / 优化属性，禁止改输入输出 / dtype 约束&#xa;多 shape 含 P-ShapeSpec-01：default kernel 保留，新增 specialized variant、host shape 判定 + SetTilingKey、device TILING_KEY_IS 分发" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;align=left;verticalAlign=top;spacing=7;" vertex="1" parent="1">
+          <mxGeometry x="1200" y="400" width="1090" height="210" as="geometry"/>
+        </mxCell>
+        <mxCell id="p6_odiff" value="阶段 3：保存真实修改&#xa;对比 worktree 与 shared/original，只复制有实际差异的文件到 round_N/parallel_P/modified_files/&#xa;再次 diff -rq 校验；无差异时不伪造目录，写 code_changes.json 的空变更列表与 implementation_note&#xa;输出：code_changes.json、implementation_note.txt、modified_files/" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=11;align=left;verticalAlign=top;spacing=7;" vertex="1" parent="1">
+          <mxGeometry x="1200" y="640" width="1090" height="170" as="geometry"/>
+        </mxCell>
+        <mxCell id="p6_obuild" value="阶段 5：构建（最多 3 次重试）&#xa;先校验 worktree_op_path、modified_files、install_path、baseline_install_path&#xa;把 modified_files 复制到 worktree 对应位置，确认与 original 有差异&#xa;调用 build_ops.py --repo-root --op-name --soc --install-path；失败读取最后 50 行错误并修复，三次失败写失败结果" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;align=left;verticalAlign=top;spacing=7;" vertex="1" parent="1">
+          <mxGeometry x="1200" y="840" width="1090" height="180" as="geometry"/>
+        </mxCell>
+        <mxCell id="p6_oeval" value="阶段 6：带排队锁的评估&#xa;调用 evaluate_ops_direct.py：op_name、call_spec、baseline-path、evolved-path、device-id、task-type、shapes-mode、target-speedup、eval-lock、baseline-cache、output&#xa;target：P-ShapeSpec-01 只跑目标 shape；否则 all；fully_passed 后另跑 generalization&#xa;评估必须同时给出编译、精度、每 shape 时间与 speedup；无论成功失败写 evaluation_results.json" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;align=left;verticalAlign=top;spacing=7;" vertex="1" parent="1">
+          <mxGeometry x="1200" y="1050" width="1090" height="200" as="geometry"/>
+        </mxCell>
+        <mxCell id="p6_ooutput" value="阶段 7：最终结果与主 Agent 消费字段&#xa;evaluation_results.json：node_id、implementation_note、baseline / evolved、comparison.compilation_success、precision_passed、speedup、time_delta_us、bottleneck_change、evolved.pipeline、shape_results、aggregate、gating、parent_eligible&#xa;主 Agent 先检查 eval_backend 与 baseline 一致，再 check_round_artifacts，再 cleanup worktree，最后 wm_ops refine&#xa;允许的最终应用路径：只把最佳 modified_files/ 复制回 OP_PATH；不要复制整个 worktree" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;align=left;verticalAlign=top;spacing=7;" vertex="1" parent="1">
+          <mxGeometry x="1200" y="1280" width="1090" height="250" as="geometry"/>
+        </mxCell>
+        <mxCell id="p6_le1" value="输入" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=10;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="p6_linput" target="p6_lmode"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p6_le2" value="按 mode" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=10;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="p6_lmode" target="p6_lphase1"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p6_le3" value="精度通过" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=10;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="p6_lphase1" target="p6_lprofile"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p6_le4" value="pipeline 证据" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=10;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="p6_lprofile" target="p6_refine"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p6_le5" value="最终写回" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=10;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="p6_refine" target="p6_loutput"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p6_oe1" value="BUILD &amp; EVAL CONTEXT" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=10;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="p6_oinput" target="p6_omodify"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p6_oe2" value="代码差异" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=10;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="p6_omodify" target="p6_odiff"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p6_oe3" value="modified_files" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=10;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="p6_odiff" target="p6_obuild"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p6_oe4" value="安装产物" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=10;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="p6_obuild" target="p6_oeval"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p6_oe5" value="评估 JSON" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=10;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="p6_oeval" target="p6_ooutput"><mxGeometry relative="1" as="geometry"/></mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

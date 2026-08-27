@@ -36,8 +36,9 @@ CLI:
     Exit 0 if no violations, 1 otherwise.
 
 Audit rules (v0.4 first cut, extensible):
-  S1: lingxi-partial must have invoked `bash <path>/evaluate_ascendc.sh ...`
-      via Bash. Passive `cat`/`grep` references don't count.
+  S1: lingxi-partial must have invoked either local `evaluate_ascendc.sh` or
+      remote `remote_exec.py ... job submit ...` via Bash. Passive references
+      don't count.
       ops-partial must have invoked `python <path>/build_ops.py` or
       `evaluate_ops_direct.py`.
 
@@ -196,6 +197,20 @@ def _bash_invokes(transcript_path: str, script_basename: str,
     return False
 
 
+def _bash_invokes_remote_job_submit(transcript_path: str) -> bool:
+    """True only for an executed remote_exec.py `job submit` command."""
+    pattern = re.compile(
+        r"\bpython3?\s+(?:-u\s+)?\S*remote_exec\.py\b[^;|&\n]*?\bjob\s+submit\b"
+    )
+    for call in iter_tool_calls(transcript_path):
+        if call["name"] != "Bash":
+            continue
+        command = re.sub(r"\\\s*\n", " ", call["input"].get("command", ""))
+        if pattern.search(command):
+            return True
+    return False
+
+
 def _wrote_path_matching(transcript_path: str, regex: re.Pattern) -> bool:
     """True if any Write/Edit targets a path matching the regex."""
     return _has_call_matching(
@@ -293,11 +308,14 @@ def cmd_audit_playbook(args: argparse.Namespace) -> int:
 def _check_s1_invocation(args: argparse.Namespace) -> list[str]:
     """S1: partial 必须实际执行评估脚本（被动 cat/grep 引用不算）。"""
     if args.partial_type == "lingxi-partial":
-        if not _bash_invokes(args.transcript, "evaluate_ascendc.sh",
-                             r"\b(?:bash|sh)\s+"):
+        ran_local = _bash_invokes(args.transcript, "evaluate_ascendc.sh",
+                                  r"\b(?:bash|sh)\s+")
+        ran_remote = _bash_invokes_remote_job_submit(args.transcript)
+        if not (ran_local or ran_remote):
             return [
-                "S1: lingxi-partial did not execute evaluate_ascendc.sh "
-                "(no `bash <path>/evaluate_ascendc.sh ...` invocation found; "
+                "S1: lingxi-partial did not execute local evaluate_ascendc.sh "
+                "or remote_exec.py job submit "
+                "(no actual local/remote evaluation invocation found; "
                 "passive cat/grep references don't count)"
             ]
         return []

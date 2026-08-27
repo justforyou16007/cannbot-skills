@@ -122,7 +122,7 @@ if m:
 " 2>/dev/null)
   if [ -z "$INCLUDED_SKILLS" ]; then
     warn "Failed to parse skill dependencies from AGENTS.md, using fallback"
-    INCLUDED_SKILLS="npu-arch ops-profiling ops-evaluation evolution-report evolution-knowledge evolution-strategies evolution-world-model"
+    INCLUDED_SKILLS="npu-arch ops-profiling ops-evaluation evolution-report evolution-knowledge evolution-strategies evolution-world-model lingxi-remote-execution"
   fi
 else
   err "AGENTS.md not found at $PLUGIN_ROOT/AGENTS.md"

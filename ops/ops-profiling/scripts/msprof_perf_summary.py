@@ -2287,19 +2287,25 @@ def _generate_batch_wrapper_script(out_dir, impl, cases, indices, args, device_i
 
 
 
-def _ensure_task_time_csv(prof_group_dir):
-    """确保 PROF 目录里有 task_time.csv，缺失时同步重跑 msprof 导出步骤。
+# msprof 导出产物缺失时的同步修复（quick-batch 依赖 task_time.csv）
+_TASK_TIME_CSV_PATTERNS = ("mindstudio_profiler_output/task_time_*.csv",
+                           "PROF_*/mindstudio_profiler_output/task_time_*.csv")
 
-    msprof 的 task_time.csv 由独立的分析/导出子进程生成，偶尔被跳过或晚于主进程退出
-    （表现为"no task_time csv found"误判失败）。这里直接以子进程同步执行
+
+def _ensure_msprof_export(prof_group_dir, patterns):
+    """确保 msprof 导出产物（task_time.csv / op_summary.csv）存在，缺失时同步重跑导出步骤。
+
+    msprof 的导出产物由独立的分析/导出子进程生成，偶尔被跳过或晚于主进程退出
+    （表现为 "no task_time csv found" / 空 op_summary 误判失败）。这里直接以子进程同步执行
     `msprof --export=on --output=<PROF目录> --task-time=on` 强制重新导出——
-    确定性生成、无需轮询等待。返回 True 表示 csv 已就绪。
+    原始设备数据在采集时已落盘，随时重跑导出都能确定性重建，无需轮询等待。
+
+    Returns True 表示至少一个指定产物已就绪。
     """
-    for pattern in ("mindstudio_profiler_output/task_time_*.csv",
-                    "PROF_*/mindstudio_profiler_output/task_time_*.csv"):
-        if glob.glob(os.path.join(prof_group_dir, pattern)):
+    for pattern in patterns:
+        if glob.glob(os.path.join(prof_group_dir, pattern), recursive=True):
             return True
-    LOGGER.info("[INFO] task_time.csv missing in %s; forcing synchronous msprof export",
+    LOGGER.info("[INFO] msprof export artifact missing in %s; forcing synchronous export",
                 prof_group_dir)
     try:
         res = subprocess.run(
@@ -2311,9 +2317,8 @@ def _ensure_task_time_csv(prof_group_dir):
     except Exception as e:  # noqa: BLE001
         LOGGER.warning("[WARN] msprof export-repair raised: %s", e)
         return False
-    for pattern in ("mindstudio_profiler_output/task_time_*.csv",
-                    "PROF_*/mindstudio_profiler_output/task_time_*.csv"):
-        if glob.glob(os.path.join(prof_group_dir, pattern)):
+    for pattern in patterns:
+        if glob.glob(os.path.join(prof_group_dir, pattern), recursive=True):
             return True
     return False
 
@@ -2578,7 +2583,7 @@ def _measure_batch_quick(out_dir, cases, indices, args, device_id, impl):
                 last_err = err or "no prof dir"
             else:
                 # 导出竞态修复：task_time.csv 缺失时同步重跑 msprof export，确定性生成
-                _ensure_task_time_csv(prof_dir)
+                _ensure_msprof_export(prof_dir, _TASK_TIME_CSV_PATTERNS)
                 durations, perr = _parse_msprof_duration_quick_batch(prof_dir)
                 if durations is None:
                     last_err = perr

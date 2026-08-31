@@ -2520,12 +2520,28 @@ def _parse_msprof_duration_batch(prof_group_dir: str, n_cases: int):
 
 
 
+def _max_input_numel(case):
+    """从 jsonl case 提取最大输入张量元素数；无张量时返回 None。"""
+    try:
+        mx = 0
+        for inp in case.get("inputs", []):
+            if inp.get("type") == "tensor" and inp.get("shape"):
+                n = 1
+                for s in inp["shape"]:
+                    n *= int(s)
+                mx = max(mx, n)
+        return mx or None
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
 def _plausible_batch_durations(durations, cases):
-    """量纲 sanity（msprof 批量结果）：拒绝零/负/NaN，以及小 shape 上荒谬的巨大耗时。
+    """量纲 sanity（msprof 批量结果）：拒绝零/负/NaN，以及极小 shape 上荒谬的巨大耗时。
 
     msprof 在并发争抢下偶发 stream 归组污染，会把小 case 的耗时放大 1000-10000×
-    （如 [1,196,96] 报成 150ms+）。对小 shape（max 维 <= 1024）超过 50ms 即判不可信，
-    大 shape 天然耗时高，不做限制。
+    （如 [1,196,96] 报成 150ms+）。按**输入张量元素量**判断：元素量 <= 100k 且耗时
+    > 100ms 判不可信；元素量大的 case 天然耗时高不做限制（4D shape 如 [8,512,33,41]
+    max 维小但元素量 5.5M，不应误杀——原 max-维判定对这类误判）。
     """
     if len(durations) != len(cases):
         return False
@@ -2536,14 +2552,9 @@ def _plausible_batch_durations(durations, cases):
             return False
         if math.isnan(v) or v <= 0 or v > 300_000_000.0:
             return False
-        shape, _dt = _extract_shape_dtype_from_jsonl(case)
-        if shape:
-            try:
-                max_dim = max(int(x) for x in shape.strip("[]").replace(" ", "").split(","))
-                if max_dim <= 1024 and v > 50_000.0:
-                    return False
-            except (ValueError, AttributeError):
-                pass
+        numel = _max_input_numel(case)
+        if numel is not None and numel <= 100_000 and v > 100_000.0:
+            return False
     return True
 
 

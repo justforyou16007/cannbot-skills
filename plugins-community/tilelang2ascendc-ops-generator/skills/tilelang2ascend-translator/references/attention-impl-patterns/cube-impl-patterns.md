@@ -300,7 +300,7 @@ AscendC::Fixpipe(dst, src, params);
   （正确性代价 bf16/fp16 大 case -4~-7%，应接受）。
 - ❌ **ring 流水只在单 task 内连续，任务边界整体排空**：每个 q-block 任务支付 LoadQ + 2-tile
   ramp + 2-tile drain，实测边界成本 13~21us/task（≈3~5 个 tile），kvLoops 小（≤5）的任务边界
-  占比 30~45%。**正确做法（任务级平坦流水，archive flash_attention_gqa 已验证）**：
+  占比 30~45%。**正确做法（任务级平坦流水，GQA 类 attention 已验证）**：
   Process 改为 (task × kvTile) 全局单一 cycle 循环，TaskInfo ring[3] 传递
   (bz,by,bx,kvIdx,isFirstKV,isLastKV,qBufParity)，AIC 每迭代 MM1(c)+MM2(c-lag)、AIV 每迭代
   V1(c)+V2(c-lag)，flag 序列与 CV1:2 计数与原结构保持不变。实现前必须逐条做竞态分析

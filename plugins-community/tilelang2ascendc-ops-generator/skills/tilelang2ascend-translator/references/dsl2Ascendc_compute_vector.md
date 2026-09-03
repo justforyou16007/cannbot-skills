@@ -119,5 +119,5 @@ AscendC 代码通常把工作负载循环封装在 `Process()` 中。
 #### C. Vector 侧常用 API 注意事项
 
 - `T.tile.cast(dst, src, mode, count)` 可稳定使用 `count`
-- 参考 `archive_tasks/rms_norm/kernel/vector_tile.h`，Vector 侧 GM<->UB 搬运默认优先封装成 `DataCopyPad`
+- Vector 侧 GM<->UB 搬运默认优先封装成 `DataCopyPad`（`vector_tile.h` 式工具封装）
 - `TBuf` 从 GM `DataCopyPad` 后若马上被 Vector 侧消费，必须插入 `PipeBarrier<PIPE_MTE2>()`

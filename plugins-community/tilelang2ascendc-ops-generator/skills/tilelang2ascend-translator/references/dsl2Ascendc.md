@@ -61,8 +61,8 @@ TileLang 中有多少个 `T.prim_func`，AscendC 侧就至少要有多少个独�
 
 这一类文件主要承载 tile 级的数据搬运、分块计算封装和局部流水组织，是把 DSL 里的 tile-level 设计落到 AscendC 时最常见的公共工具。
 
-- 纯 Vector 算子：通常需要构建 `vector_tile.h` 一类工具，可以参考 `rms_norm` 的 kernel 写法，例如 `archive_tasks/rms_norm/kernel/` 下对 `vector_tile.h` 的使用
-- 纯 Cube 算子：通常需要构建 `matmul_tile.h` 一类工具，可以参考 `matmul_leakyrelu` 的 kernel 写法，例如 `archive_tasks/matmul_leakyrelu/kernel/matmul_tile.h`
+- 纯 Vector 算子：通常需要构建 `vector_tile.h` 一类工具（GM↔UB 搬运与逐行计算的封装，参考 rms_norm 类算子的成熟写法）
+- 纯 Cube 算子：通常需要构建 `matmul_tile.h` 一类工具（L1/L0 面板管理与 Mmad 流水封装，参考 matmul 类算子的成熟写法）
 - C/V 融合算子：通常两类工具都要结合具体分工一起看
 
 ### 2. `workspace_queue.h` 与跨核同步

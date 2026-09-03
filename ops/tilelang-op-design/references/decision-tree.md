@@ -124,4 +124,4 @@ Conv 类算子（`nn.Conv*` / `F.conv*`）必须按以下三模式显式选型�
 - **禁止默认标量逐元素 gather** 的 im2col 设计；k'=(ci,kh,kw) 解码按段连续块/向量化表达；标量豁免仅限占比 <5% 的偶发小尾块（主数据路径不可豁免）
 - dtype 适配（fp32 走 hi/lo fp16 拆分、bf16 替代）时必须声明「保留的优化结构清单」：fused/normal 模式、零标量、批量转置、epilogue 跨行块处理逐项标注 保留/丢弃+理由
 - 权重 repack 结果是（weight 内容, shape, dtype）的确定函数，设计中标注可由 host 侧 LRU 缓存
-- AscendC 侧实现细节与实测收益见 `plugins-community/tilelang2ascendc-ops-generator/skills/tilelang2ascend-translator/references/dsl2Ascendc_compute_conv.md`
+- **完整 conv2d 设计模板**（§0 三模式选型 + API 映射 + Tiling + K 顺序契约 + 风险点 + 交付清单）见 [`examples/conv2d-template.md`](../examples/conv2d-template.md)。生成 conv2d 类算子时先读本模板再走 `examples/design-template.md` 通用骨架。

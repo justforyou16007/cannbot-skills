@@ -69,4 +69,4 @@ per row m:
 ## 6. 参考实现
 
 - `skills/tilelang2ascend-translator/references/ascendc_dynamic_quant_kb.md` — 完整实现 + TQue/Cast 约束。
-- `workflows/templates/archive_tasks/reshape_matmul_rowwise_quant_int8/` — rowwise int8 quant 收尾（注意其 reference 是 vendor kernel，Tier 2；新算子若 CPU oracle 需 Tier 1）。
+- rowwise int8 quant 收尾类实现（注意其 reference 若是 vendor kernel 则属 Tier 2；新算子若 CPU oracle 需 Tier 1）。

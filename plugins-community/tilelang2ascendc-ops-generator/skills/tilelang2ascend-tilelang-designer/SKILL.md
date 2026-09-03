@@ -460,7 +460,7 @@ TileLang 精度结果不作为交付的 correctness gate（交付精度以 Phase
    禁止进入下游 AscendC 转译（Phase 4）。
 ```
 
-本步骤调用 `ops/tilelang-perf-optimization` skill **本体**（Step 1-5 迭代闭环），对 TileLang 实现做测量驱动的性能迭代。skill 文档中的项目布局按以下映射理解：`examples/{op}/` → `{output_dir}/`，测试入口 → 本项目的 TileLang 测试脚本（`evaluate_tilelang.sh` 的 python 入口或等效脚本）。达标线：**geomean ≥ 0.6x**（TileLang kernel 时间 vs PyTorch reference kernel 时间，msprof 采集）。
+本步骤调用 `ops/tilelang-perf-optimization` skill **本体**（Step 1-5 迭代闭环），对 TileLang 实现做测量驱动的性能迭代。skill 文档中的项目布局按以下映射理解：`examples/{op}/` → `{output_dir}/`，测试入口 → 本项目的 TileLang 测试脚本（`evaluate_tilelang.sh` 的 python 入口或等效脚本）。达标线：**MFU ≥ 50%**（ops-profiling skill采集）。
 
 #### 4a. 前置判定（能否测量）
 

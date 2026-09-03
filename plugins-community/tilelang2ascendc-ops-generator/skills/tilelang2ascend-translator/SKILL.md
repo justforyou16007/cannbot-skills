@@ -69,7 +69,6 @@ argument-hint: >
 - `.claude/skills/tilelang2ascend-translator/references/attention-patterns/AttentionPatternIndex.md` — Attention / FlashAttention 类算子的模式路由索引（TND、paged KV cache、mask/causal、GQA/MQA、MLA、topk sparse KV、sink attention、FA 反向/FAG）
 - `.claude/skills/tilelang2ascend-translator/references/quant-patterns/QuantPatternIndex.md` — 量化/反量化类算子的模式路由索引（quantize/dequantize、quant_matmul、weight-group-quant、kv-cache-quant、fused-quant、anti-quant）+ 共享参考（决策表/公式/Cast 矩阵/精度铁律/验证标准）
 - `.claude/skills/tilelang2ascend-translator/scripts/evaluate_ascendc.sh` — AscendC 评测脚本
-- `workflows/templates/archive_tasks/` — 历史成功任务，host/kernel 完整参考实现（**编译/运行时错误时优先查阅**）
 
 ### 🛑 官方文档目录（asc-devkit，强制查阅）
 
@@ -85,7 +84,8 @@ argument-hint: >
 | `asc-devkit/docs/guide/算子实践参考/SIMD算子实现/矢量编程/TBuf的使用.md` | UB 临时缓冲区管理 | 分配 TBuf 时 |
 | `asc-devkit/docs/guide/算子实践参考/SIMD算子实现/融合算子编程/` | 多步计算融合模式 | 融合算子时 |
 | `asc-devkit/examples/01_simd_cpp_api/` | 官方 SIMD C++ 示例 | API 用法不确定时 |
-| `workflows/templates/archive_tasks/rms_norm/` | EXEC_KERNEL_CMD 正确传参模式 | 编写 op_host 时 |
+
+EXEC_KERNEL_CMD 正确传参模式（所有 tiling 参数为独立标量左值）见步骤 0.2 与步骤 1 的传参铁律。
 
 除非用户明确指定其他目录，否则默认使用传入的 `output_dir` 作为当前任务目录。
 其他任务目录可以作为参考实现。
@@ -121,7 +121,8 @@ argument-hint: >
     7. 是否有 causal、padding、显式 mask？
     8. 是前向还是反向（是否有 dy/softmax_max/softmax_sum/attention_in 输入、dq/dk/dv 输出）？
     
-    如果前 7 项全否定且为前向 → 命中"标准 Attention" → 下一步 0-A.3 读 archive 模板
+    如果前 7 项全否定且为前向 → 命中"标准 Attention" → 无专项 pattern 文档，按标准
+    FlashAttention 结构（Q 分块循环 + online softmax rescale + PV 累加 + C/V split）转译
     如果第 8 项命中反向 → 下一步 0-A.3 读 fa_backward_pattern.md（可与其余模式组合）
     如果任一命中 → 下一步 0-A.3 读对应的 pattern 文档（可组合）
 
@@ -206,8 +207,7 @@ argument-hint: >
     asc-devkit/docs/guide/算子实践参考/SIMD算子实现/矢量编程/基础矢量算子.md
     → 确认 CopyIn→Compute→CopyOut 的完整流水线模式
 
-0.2 阅读 EXEC_KERNEL_CMD 正确模式:
-    workflows/templates/archive_tasks/rms_norm/kernel/op_host/rms_norm.cpp
+0.2 确认 EXEC_KERNEL_CMD 正确模式:
     → 确认: 所有 tiling 参数必须是独立标量左值，禁止传 struct 指针
     → 确认: blockDim = usedCoreNum（多核统一分发），禁止 host 侧逐核循环
     → 确认: 核数来源于平台 API 动态获取（GetCoreNumAic/Aiv），非硬编码常量
@@ -391,9 +391,10 @@ argument-hint: >
           - DAV_3510 (A5) → 禁止使用 MatmulImpl，必须走 Blaze/tensor_api 路径
     - reduction → Read .claude/skills/ascendc-tiling-design/references/reduction/algorithms.md
     - sort → Read .claude/skills/ascendc-tiling-design/references/sort/alg-two-level-mrgsort.md
-    - conv → Read workflows/templates/archive_tasks/conv2d_base/kernel/op_kernel/ 的
-      im2col / wrepack / conv / epilogue 四类 kernel（至少 fp16 版本全文），
-      确认其零标量（无 SetValue/GetValue 逐元素访问）、xtrans + fused 布局结构
+    - conv → Read 本 skill 的 references/dsl2Ascendc_compute_conv.md /
+      references/dsl2Ascendc_compute_cube.md（必须全文），
+      确认 im2col / wrepack / conv / epilogue 四类 kernel 的零标量
+      （无 SetValue/GetValue 逐元素访问）、xtrans + fused 布局结构
     - 其他类别 → 视 patterns.md 中指引继续阅读
 
 0-T.3 🛑 在思考中确认 Tiling 实现约束:
@@ -430,8 +431,8 @@ argument-hint: >
     - GEMM 模式必须按 compute_conv.md 第二章三模式（normal / direct 1x1 /
       fused img2col LoadData3D 随路展开）显式选型；满足 fused 条件却退回 normal
       必须在思考中说明理由
-    - 禁止默认标量逐元素 gather 实现 im2col（archive conv2d_base 全部 kernel 零
-      SetValue/GetValue）；标量豁免仅限偶发小尾块（如 <32B k' 尾块）——
+    - 禁止默认标量逐元素 gather 实现 im2col（正确范式为全向量化，零
+      SetValue/GetValue 逐元素访问）；标量豁免仅限偶发小尾块（如 <32B k' 尾块）——
       主数据路径（im2col k' gather 主体、epilogue 主写出、wrepack 主存储）
       不属于豁免范围，占比 <5% 的偶发路径才可豁免且须注释说明理由
     - 复用/移植历史任务实现时，0-T.3 逐条核对不得省略；历史实现的性能结构缺陷
@@ -443,11 +444,8 @@ argument-hint: >
     - dtype 适配（fp32 hi/lo fp16 拆分、bf16 等）时必须声明「保留的优化结构清单」：
       fused/normal 模式、零标量、TransDataTo5HD 批量转置、epilogue 跨行块处理
       逐项确认保留或说明丢弃理由
-    - 声称"与 archive conv2d_base 同结构"时必须附证据（SetValue/GetValue grep
+    - 声称"与已验证 conv 参考结构一致"时必须附证据（SetValue/GetValue grep
       计数、xtrans/fused 标志存在性对照），无证据视为未验证
-
-0-T.4 🛑 查阅历史成功任务（可选但强烈建议）:
-    - 若存在 workflows/templates/archive_tasks/ 下与本算子形态最接近的参考实现，优先阅读其 host/kernel 代码
 ```
 
 **门禁规则**：
@@ -492,7 +490,7 @@ argument-hint: >
 - 使用平台 API 获取 `GetCoreMemSize(UB)`
 - Block 级 tiling: Cache Line 512B 对齐，formerNum/formerLength/tailNum/tailLength
 - UB 级 tiling: bufferCoefficient 推导，32B 对齐 tileLength
-- **🛑 EXEC_KERNEL_CMD 传参铁律**: 所有 tiling 参数必须是**独立标量左值**，**禁止传 struct 指针**。参照 `workflows/templates/archive_tasks/rms_norm/kernel/op_host/rms_norm.cpp` 的正确模式
+- **🛑 EXEC_KERNEL_CMD 传参铁律**: 所有 tiling 参数必须是**独立标量左值**，**禁止传 struct 指针**
 - blockDim = usedCoreNum（多核统一分发），kernel 内部通过 `GetBlockIdx()` 计算工作范围
 - `EXEC_KERNEL_CMD` 所有参数必须为**左值**（具名变量），禁止传入临时变量/右值/字面量。`double` 先转 `float` 局部变量，`bool` 用 `int64_t` 替代，表达式先赋给局部变量再传入
 
@@ -622,9 +620,9 @@ class ModelNew(nn.Module):
 | **编译错误: API 签名不匹配** | `asc-devkit/docs/api/Ascend-C-API列表.md` → 定位 API → 查阅该 API 的独立 .md 文档确认正确签名 |
 | **编译错误: 类型不匹配** | `asc-devkit/docs/api/SIMD-API/基础API/Memory矢量计算/类型转换/Cast.md` 确认 dtype 支持矩阵 |
 | **编译错误: GlobalTensor/LocalTensor** | `asc-devkit/docs/api/SIMD-API/基础数据结构/` 下对应简介.md |
-| **运行时 vector core exception / UB 违例 / all-zero output** | ① 🛑 **优先执行步骤 0-C** 完成 sync checklist<br>② `asc-devkit/docs/guide/算子实践参考/.../TBuf的使用.md` 检查 buffer 大小<br>③ `workflows/templates/archive_tasks/rms_norm/` 对比 EXEC_KERNEL_CMD 传参模式<br>④ 检查是否有 struct 指针被传给 `EXEC_KERNEL_CMD`（常见根因） |
+| **运行时 vector core exception / UB 违例 / all-zero output** | ① 🛑 **优先执行步骤 0-C** 完成 sync checklist<br>② `asc-devkit/docs/guide/算子实践参考/.../TBuf的使用.md` 检查 buffer 大小<br>③ 对照 EXEC_KERNEL_CMD 传参铁律（独立标量左值）逐项检查<br>④ 检查是否有 struct 指针被传给 `EXEC_KERNEL_CMD`（常见根因） |
 | **运行时 hang/死锁 / 跨核数据不流通** | 🛑 **必须先执行步骤 0-C**（含读取 ascendc-sync-guide.md 全文 + 6 项 checkpoint），再逐项排查 |
-| **运行时 vector core timeout (507034)** | 🛑 这是硬件级别的 core 挂起错误。按顺序排查:<br>① **work buffer 尺寸**: 检查所有 API 的 work buffer (ReduceSum/Cos/Sin/Broadcast) 是否通过 GetXxxMaxMinTmpSize 正确计算 — 硬编码不足是最常见根因<br>② **Buffer 总溢出**: 计算所有 InitBuffer 分配的总 UB 字节数，确认不超过 GetCoreMemSize(UB)<br>③ **PipeBarrier 配对**: 每个 GM→UB (MTE2) 后必须有 PIPE_MTE2 barrier; 每个 V 计算块结束后必须有 PIPE_V barrier; 每个 UB→GM (MTE3) 前必须有 PIPE_V barrier<br>④ **循环边界**: 检查所有循环的边界类型一致性 (int32_t vs int64_t)，确认不会因类型不匹配导致死循环<br>⑤ **隔离法**: 将 kernel 逐步简化为 identity copy，每次恢复一个操作，定位触发 timeout 的具体 API<br>⑥ **参考历史**: 查阅 workflows/templates/archive_tasks/ 中相似规模的融合算子，对比 work buffer 计算方式 |
+| **运行时 vector core timeout (507034)** | 🛑 这是硬件级别的 core 挂起错误。按顺序排查:<br>① **work buffer 尺寸**: 检查所有 API 的 work buffer (ReduceSum/Cos/Sin/Broadcast) 是否通过 GetXxxMaxMinTmpSize 正确计算 — 硬编码不足是最常见根因<br>② **Buffer 总溢出**: 计算所有 InitBuffer 分配的总 UB 字节数，确认不超过 GetCoreMemSize(UB)<br>③ **PipeBarrier 配对**: 每个 GM→UB (MTE2) 后必须有 PIPE_MTE2 barrier; 每个 V 计算块结束后必须有 PIPE_V barrier; 每个 UB→GM (MTE3) 前必须有 PIPE_V barrier<br>④ **循环边界**: 检查所有循环的边界类型一致性 (int32_t vs int64_t)，确认不会因类型不匹配导致死循环<br>⑤ **隔离法**: 将 kernel 逐步简化为 identity copy，每次恢复一个操作，定位触发 timeout 的具体 API |
 | **精度不匹配 (MERE/MARE 超标)** | 调用 `ascendc-precision-debug` skill（见步骤 4） |
 
 **⚠️ 在查阅完成并在思考中列出根因分析之前，禁止 Edit/Write 任何 kernel 代码。**

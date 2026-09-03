@@ -242,18 +242,16 @@ input 里 `quant_scale` 可能是 fp16 / bf16 / fp32（取决于 case）。kerne
 
 ## 9. 参考实现指针
 
-- 当前 task：`output/11_DequantSwigluQuant/`
+- DequantSwigluQuant 已验证实例（50 个 benchmark shape 全部 `Status: pass`）的结构要点：
   - mode 0 / mode 1 拆分到独立 kernel
-  - software sigmoid helper 在 `kernel/kernel_common.h`
+  - software sigmoid helper 收敛到公共 kernel 头（`kernel_common.h` 式）
   - host wrapper 端做 mode-1 even/odd permute（含 ws）和 quant_scale dtype 归一化
-  - 全 50 个 benchmark shape 通过 `Status: pass / Result: pass`
 
-- 相关 archive_tasks：
-  - `archive_tasks/quant_matmul/` — int8 matmul + dequant scale
-  - `archive_tasks/reshape_matmul_rowwise_quant_int8/` — rowwise dynamic int8
-    quant 收尾（**注意**：这个 task 的 reference 是 NPU vendor kernel，
-    不是 CPU fp32，所以它用 hw 超越函数完全合规——属于 Tier 2 路径而非
-    Tier 1。**新算子开发不要直接照抄它的 sigmoid 部分**到 CPU oracle 场景）
+- 相关可复用模式：
+  - int8 matmul + dequant scale（quant_matmul 类任务）
+  - rowwise dynamic int8 quant 收尾（**注意**：此类任务若 reference 是 NPU vendor
+    kernel 而非 CPU fp32，则其用 hw 超越函数完全合规——属于 Tier 2 路径而非
+    Tier 1。**新算子开发不要直接照抄其 sigmoid 部分**到 CPU oracle 场景）
 
 ## 10. 常用 AscendC API 速查（Tier 1 实现需要的）
 

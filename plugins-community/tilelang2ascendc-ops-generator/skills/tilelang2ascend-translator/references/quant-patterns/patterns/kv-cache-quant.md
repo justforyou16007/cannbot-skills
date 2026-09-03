@@ -71,6 +71,6 @@ per row（每核处理连续 NH 行）:
 
 ## 6. 参考实现
 
-- `output/TurboQuantStore*` — KV-cache int4 量化 store 完整产物（4 个变体）。
+- KV-cache int4 量化 store（TurboQuantStore 类，4 个变体）已有完整验证产物。
 - `ops/ascendc-tiling-design/references/flashattention/subfamilies/quantization_design.md` — FA 反量化契约。
 - `model/model-infer-quantization/references/quantization-structure-cards.md` 结构卡 C — 模型级 cache scale 边界。

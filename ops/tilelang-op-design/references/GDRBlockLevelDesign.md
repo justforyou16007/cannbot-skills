@@ -1,7 +1,7 @@
 # Chunked Gated Delta Rule（GDR）Block-Level Design
 
 > 算子：Chunked Gated Delta Rule（chunk 版门控 Delta 规则，线性注意力）
-> 源实现：`workflows/templates/archive_tasks/chunk_gated_delta_rule/design/block_level/`
+> 源实现：chunk_gated_delta_rule 算子的 block_level 设计（关键结构已内联于本文）
 > 本文是 [BlockLevelDesign.md](./BlockLevelDesign.md) 的一个算子实例：stateful（状态沿 chunk
 > 递推）线性注意力的块级组织。只讲三件事：**三阶段划分、任务划分、求逆的性能优化**。
 

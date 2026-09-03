@@ -511,8 +511,8 @@ AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(notifyId);
      仍 1.000000、50/50 精度保持；
   3. 收益判定：段耗时 ~1400us→~100us，远超 6 次额外 launch + workspace 开销；
      case7 0.332→1.441、case8 0.425→2.036、geomean 1.1985→1.6756。
-  来源：61_SequentialPolarizedSelfAttention（output2/perf_tuning/optimization_log.md）。
-- 💡 **DataCopyPad 尾块正确模式**（TileLang tl_templates/ascend/common.h copy_gm_to_ub
+  来源：61_SequentialPolarizedSelfAttention 任务实测。
+- 💡 **DataCopyPad 尾块正确模式**（TileLang 运行时 `copy_gm_to_ub` 模板
   实证）：尾块先 `Duplicate` 全 tile 填 0，cp 参数 `{validRows,
   validCols*sizeof(T), (srcRowLen-validCols)*sizeof(T),
   (dstN-validCols)*sizeof(T)/32, 0}`（该 dstStride 公式经代数验证恒正确），

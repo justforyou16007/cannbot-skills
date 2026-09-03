@@ -44,13 +44,13 @@
 | CSA（cmp_topk>0） | cmp_ratio = 4 且 topk ∈ {512, 1024} |
 
 Ascend950 放宽：ori_mask_mode ∈ {0,3,4}、win ≥ -1（-1 = 无限）、cmp_mask_mode ∈ {0,3}、
-cmp_ratio ∈ [1,128]。**归档 CSV 的 golden/tilelang 语义用例（no-mask、causal、
+cmp_ratio ∈ [1,128]。**既有用例集中 golden/tilelang 语义用例（no-mask、causal、
 小 topk CSA）在 910B 直调必报 EZ0024**——用 selector 过滤（见 §5）。
 
 ## 3. 直调部署路径（本机验证通过）
 
 ```bash
-cd /home/y00889327/ops-transformer/build
+cd <ops-transformer 源码目录>/build
 cmake .. -DASCEND_OP_NAME=sparse_flash_mla,sparse_flash_mla_metadata
 cmake --build . --target sparse_flash_mla_ascend910b -j 1      # TTK 实例化，单实例约 25-30 分钟
 cmake --build . --target op_host_aclnn cust_opapi optiling cust_opmaster \
@@ -74,8 +74,8 @@ export LD_LIBRARY_PATH=$ASCEND_HOME_PATH/opp/vendors/custom_transformer/op_api/l
   gen/compile_pids.txt` + 杀残留 asc_opc，否则报 "Another process is using this dir"。
 - **直调适配层**：aclnn C API 包装 + `TORCH_LIBRARY_FRAGMENT(npu)` catchall
   （`m.def(schema, TORCH_FN(fn))`）——零 tensor 参数算子（metadata）无需 dispatch
-  key 即可 `torch.ops.npu.*` 调用；at::Tensor→aclTensor 转换照搬 ops-transformer
-  `aclnn_common.h`（CANN Open License，随归档携带）。直调主算子 q 仅支持
+  key 即可 `torch.ops.npu.*` 调用；at::Tensor→aclTensor 转换参考 aclnn 适配层
+  通用的 `aclnn_common.h` 模式（CANN Open License）。直调主算子 q 仅支持
   fp16/bf16（fp32 报 EZ1001 dtype 不支持）。
 
 ## 4. 调用契约（直调 wrapper 必须遵守）
@@ -87,13 +87,13 @@ export LD_LIBRARY_PATH=$ASCEND_HOME_PATH/opp/vendors/custom_transformer/op_api/l
   `seqused_ori_kv=[ori_seq]`、`seqused_cmp_kv=[cmp_seq]`、`cmp_residual_kv=[ori_seq % ratio]`。
 - **CSA topk 语义**（对照 arch35 `ComputeS2LoopInfo`/`GetRealCmpS2Idx`）：每查询行
   仅考虑 indices 前 `min(topk, threshold)` 项；-1 终止；>=threshold 跳过但继续扫。
-- **metadata 格式**：`[1024]` int32，字段顺序见
-  `kernel/op_kernel/sparse_flash_mla_metadata.h`（FA: core_enable/bn2/m/s2 start/end/
+- **metadata 格式**：`[1024]` int32，字段顺序见 metadata kernel 头文件
+  （FA: core_enable/bn2/m/s2 start/end/
   workspace_idx/s2_max_num;FD: core_enable/bn2_idx/m_idx/workspace_idx/num/m_start/m_num）。
 
 ## 5. 验证管线要点
 
-- **selector 钩子模式**（与 tilelang 管线同构）：归档 model.py 提供
+- **selector 钩子模式**（与 tilelang 管线同构）：model.py 提供
   `get_input_groups()`（全量）/ `get_input_groups_ascendc()`（910B 支持子集）/
   `get_input_groups_tilelang()`（除 CSA）；`verification_ascendc.py::_get_input_groups`
   优先取 ascendc selector。CSV 保持全量，golden/tilelang 语义不丢。
@@ -105,11 +105,3 @@ export LD_LIBRARY_PATH=$ASCEND_HOME_PATH/opp/vendors/custom_transformer/op_api/l
   ascendc 直调 2/2 pass（swa_decode + swa_prefill，matched_ratio=1.0）。
   如需 910B 直调 HCA/CSA，按 §2 约束加参数对齐用例（ratio 128/4、topk 512）。
 
-## 6. 归档与相关文档
-
-- 归档：`workflows/templates/archive_tasks/sparse_flash_mla/`（总 README + CSV +
-  golden + model_new_ascendc/tilelang + design/{block,tile}_level + kernel/）
-- 构建/部署/契约细节：归档 `kernel/README.md`
-- 演进知识库（lessons/）：`process/ttk-packaged-op-direct-call-910b.md`、
-  `process/archive-csv-soc-constraint-selector.md`、
-  `precision/mere-input-distribution-softmax-zero-crossing.md`

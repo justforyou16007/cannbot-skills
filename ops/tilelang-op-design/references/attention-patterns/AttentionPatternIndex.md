@@ -16,7 +16,7 @@
 | `indices` / `topk` / selected token / sparse gather | `@references/attention-patterns/references/topk_kv_sparse_pattern.md` |
 | `sink_k` / `sink_v` / sink token / fixed prefix KV source | `@references/attention-patterns/references/sink_pattern.md` |
 | `dy` / `softmax_max` / `softmax_sum` / `attention_in` 输入、`dq/dk/dv` 输出 → **FA 反向（FAG）** | `@references/attention-patterns/references/fa_backward_pattern.md` |
-| **以上全部不命中** → 标准 Attention `[B, H, S, D]` | `workflows/templates/archive_tasks/flash_attention/` — block/tile 设计模板 |
+| **以上全部不命中** → 标准 Attention `[B, H, S, D]` | 标准 FlashAttention 结构（Q 分块循环 + online softmax rescale + PV 累加 + C/V split 流水） |
 
 ## 组合顺序
 
@@ -52,4 +52,4 @@
 7. 是否有 causal、padding、显式 mask？
 8. 是前向还是反向（是否有 dy/softmax_max/softmax_sum/attention_in 输入）？
 
-根据答案选择上面的文档。若 7 个问题全部否定 → 标准 Attention，读最后一行指向的 `workflows/templates/archive_tasks/flash_attention/` 中的 block/tile 设计实现，作为标准 MHA 的 block 级 Q 分块循环、O 分块循环、softmax rescale、C/V split 流水线设计参考。
+根据答案选择上面的文档。若 7 个问题全部否定 → 标准 Attention，按标准 MHA 结构组织：block 级 Q 分块循环、O 分块循环、softmax rescale、C/V split 流水线。

@@ -8,10 +8,6 @@
 计算结构、模板体系、实测性能画像与已验证优化点，用于指导 DSL（TileLang）FA 反向设计
 到 AscendC kernel 的转译与调优。
 
-参照实现归档：`output/flash_attention_score_grad_archive/`（arch22 S1s2Bn2gs1s2 通用路径
-独立 re-host，8/8 用例精度 PASS，含 verify_archive.py 验证脚本与 docs/perf/ 实测归档）。
-设计文档原文：归档 `docs/FAG算子设计介绍.md`。
-
 ---
 
 ## 1. 计算流程（6 步，P 重计算式反向）
@@ -38,7 +34,7 @@
 
 ## 2. 参照实现的 kernel 架构（三段式单入口）
 
-生产 arch22 实现为 Pre → Main → Post 三个阶段；归档 re-host 将三者融合进**单个
+生产 arch22 实现为 Pre → Main → Post 三个阶段；工程落地时将三者融合进**单个
 kernel 入口顺序执行**（阶段间 `SyncALLCores`）：
 
 | 阶段 | 职责 | 关键事实 |
@@ -61,34 +57,34 @@ dv 由 Pre 清零 dvGm + Main 直接累加覆盖。
 3. 独立 host stub 无系统 workspace 偏移：入口内自行 `SetSysWorkspaceForce` +
    `GetUserWorkspace`，host 额外分配 16MB（dav-c220 RESERVED_WORKSPACE）。
 4. 生产编译选项对齐：`--cce-auto-sync=off --cce-long-call=true`（kernel 内显式同步）。
-5. （S1s2Bn2 小 shape 路径 re-host 实测）mm12 非 fp32 输出为 NZ、BNSD 走 POST2KERNEL
+5. （S1s2Bn2 小 shape 路径实测）mm12 非 fp32 输出为 NZ、BNSD 走 POST2KERNEL
    融合 Post、**scale 施加挂载在 pseType==PSE_OUTER_ADD_MUL_TYPE(1) 分支上**
-   （无 pse 也必须置 1，否则 P 未乘 scale 直接 exp 溢出）、cube_op_bn2.h 的裸布局常量
-   需在独立 TU 显式补文件作用域定义。调试手段：host 侧 dump user workspace
+   （无 pse 也必须置 1，否则 P 未乘 scale 直接 exp 溢出）、参照实现公共头文件中的裸布局
+   常量需在独立 TU 显式补文件作用域定义。调试手段：host 侧 dump user workspace
    分区域比对（S/dP 为 NZ、mm34Input 为 fp16）+ kernel 内 DumpTensor 定位到
    softmax 输入未乘 scale。
 
 ## 3. 生产多模板体系（arch22，按优先级路由）
 
-设计文档 §5：模板按 shape 特征路由，序号越小越泛化。**统一走泛化模板是有实测代价的**
+模板按 shape 特征路由，序号越小越泛化。**统一走泛化模板是有实测代价的**
 （见 §4）：
 
 | 模板 | 核间/核内切分 | 路由条件 | 适用场景 |
 |---|---|---|---|
-| S1s2Bn2gs1s2（泛化，归档路径） | 核间 BN2GS1，核内 S1/S2 | 支持所有 shape（兜底） | 大 S；小 S 时 CV 交互频繁 |
-| S1s2Bn2 | 核间 B/N2，核内 G/S1/S2 | S1<1024 && S2<1024 && (B·N2·2>CoreNum \|\| G==1) | 小 S 大 BN2 / MHA（**归档已 re-host**，实测加限 D≤64：D>64 时移植路径慢于泛化） |
+| S1s2Bn2gs1s2（泛化兜底） | 核间 BN2GS1，核内 S1/S2 | 支持所有 shape | 大 S；小 S 时 CV 交互频繁 |
+| S1s2Bn2 | 核间 B/N2，核内 G/S1/S2 | S1<1024 && S2<1024 && (B·N2·2>CoreNum \|\| G==1) | 小 S 大 BN2 / MHA（实测加限 D≤64：D>64 时该路径慢于泛化模板） |
 | Ngs1s2Bn | 核间 B/N2.o，核内 N2.i/G/S1/S2 | G·S1·S2≤32KB && G==1 && S2<1536 | 小 G·S1·S2 |
 | Bngs1s2B | 核间 B，核内 B.i/N2/G/S1/S2 | N2·G·S1·S2≤64·128 | 极小内层 |
 | SameAB（_sab 后缀） | UB 切 S1S2，多核切 S2 | S1≥1024 or S2≥1024；确定性；TND 大 S | Cube 主核视角，V0/V1 复用左矩阵、L0C 累加 |
 
 - `_sab` 后缀 = Cube 主核模板（V0 统一发起 matmul，V0/V1 各处理一半）；
-  减少带宽诉求，大部分场景更优（设计文档 §6.1）。
+  减少带宽诉求，大部分场景更优。
 - 确定性计算走独立 det 模板（避免多核同地址累加）。
 
 ## 4. 实测性能画像（Ascend910B2，msprof 7 组 aic-metrics）
 
-对归档泛化路径（S1s2Bn2gs1s2）8 个用例（MHA/GQA、fp16/bf16/fp32、causal、D≠Dv、
-D=177/192 非常规 head dim）：
+对泛化路径（S1s2Bn2gs1s2）的 8 个用例（MHA/GQA、fp16/bf16/fp32、causal、D≠Dv、
+D=177/192 非常规 head dim）实测：
 
 ### 4.1 瓶颈定性（小 shape，S≤512）
 
@@ -102,13 +98,13 @@ D=177/192 非常规 head dim）：
 
 结论：小 shape 下泛化模板的 **CV 同步与标量控制结构成本** 是主瓶颈（scalar 75%+），
 其次是核间切分的尾核不均。生产算子对这类用例路由到 SAB/S1s2Bn2 模板正是为了
-规避该结构成本。归档 2026-08-14 已补充 S1s2Bn2 路由（D≤64 小 shape 命中，
-命中用例提速 10~40%），vs 生产算子纯 kernel geomean 0.91x → 0.92~0.98x。
+规避该结构成本。补充 S1s2Bn2 路由后（D≤64 小 shape 命中），命中用例提速 10~40%，
+vs 生产算子纯 kernel geomean 0.91x → 0.92~0.98x。
 
 ### 4.2 对照数据
 
 - vs torch 组合参考实现（fp32，24 个 kernel/迭代：Cast 20% + 逐元素 ~50% +
-  matmul 仅 20%）：归档单融合 kernel **全面领先，geomean 2.20x**（quick 口径，
+  matmul 仅 20%）：单融合 kernel **全面领先，geomean 2.20x**（quick 口径，
   1.23x~3.94x）。
 - vs 生产算子（npu_fusion_attention_grad，纯 kernel）：geomean **0.91x**；
   非常规 head dim（D=177、D=192/128）反超 1.2x~2.0x。
@@ -117,7 +113,7 @@ D=177/192 非常规 head dim）：
 
 ## 5. 优化点清单（按已验证/潜在分类）
 
-### 5.1 已落地验证（本归档，含实测收益）
+### 5.1 已落地验证（含实测收益）
 
 1. **host 输出 at::zeros → at::empty**：Pre+Main+Post 已全量覆写输出，host zeros 纯冗余。
    收益：消除 3 个 ZerosLike kernel（case0 device 时间 ↓11.3%），geomean 0.83x→0.91x。
@@ -141,7 +137,7 @@ D=177/192 非常规 head dim）：
 4. **CV 配比调优**：A2 上 C:V=1:2、数据配比 1:16（nRatio=8）是生产默认值；
    DSL 侧 S1_c/S1_v 配比应作为 tiling 参数可调。
 5. **double buffer / CV preload**：V 侧 ping-pong double buffer 与 Cube 双发
-   （C 侧提前发射两块）是流水下限保障（设计文档 §4）；目标使 MTE2 或 Vector
+   （C 侧提前发射两块）是流水下限保障；目标使 MTE2 或 Vector
    达 bound。
 
 ## 6. 转译检查清单（DSL FA 反向 → AscendC）
@@ -163,3 +159,108 @@ D=177/192 非常规 head dim）：
       舍入即超线，torch 模拟复现），**生产算子逐位一致地同样失败**（inner_precise 无效）。
       判定 dq 应改用 mean(|diff|)/mean(|golden|)、绝对误差 + matched_ratio，
       或以生产算子输出为 golden；不要为通过该指标把 dq 链路改 fp32（性能代价大且偏离生产设计）。
+
+---
+
+## 7. 扩展语义（sliding window + softcap）转译与性能迭代实证（50 case 全量）
+
+在 §1-§2 的最简形态之上扩展 **sliding window（window_left/right）+ softcap（tanh 钳制）**
+语义（生产算子泛化路径不支持，DSL 侧原生实现），BSHD 输入。50 case 覆盖 fp32/fp16/bf16、
+causal/window/softcap 组合、GQA g∈{2,3,4,7}、D∈{16..128}、Sq 3~400。
+
+### 7.1 性能演进账本（稳态 event 口径）
+
+| 阶段 | 结构 | vs torch |
+|---|---|---|
+| 初版（阶段式拆分 7 launch，精度 50/50） | C1→V1→C2dq→post→C2kv→post 全串行 | quick 0.96x（失真口径）；大 case 稳态 0.53x |
+| +结构优化 6 项（host 精简/GQA 累加/ws fp16/条带切分/mask tile 跳过/ZeroL1 跳过） | 5 launch | 大 case 0.90x（quick 5-case） |
+| +CV 融合（fag_main MIX kernel） | Pre→Main→Post 单入口（对齐 §2 三段式融合结构） | 稳态 fp32 3.8x / fp16 1.78x |
+| +守卫链/向量链收尾（opt4） | 同上 | **50-case 稳态 geomean 3.85x，50/50 全胜**（小 4.9-9.9x / 中 2.1-5.2x / 大 1.78-3.88x） |
+
+关键结论：**阶段式拆分是"正确性优先"的合法首版，但 CV 融合是逼近生产实现的必经路径**
+（CV 融合后大 shape 收益 ~1.9x）；torch 总账上 mask tile 跳过 + window/softcap
+原生支持带来额外收益，最终 50-case 稳态 geomean 3.85x。
+
+### 7.2 结构优化清单（全部实测，按收益排序）
+
+1. **Host 精简（fp32 e2e ~1.8x，CPU-bound 消除）**：症状为 host 纯发射耗时（6934us）>
+   device（4986us）。措施：wrapper 8 次物化 transpose 改 BNSD 直传 + mma trans 标志；
+   softmax_max/sum 的 select+contiguous+cast+copy 链改 kernel 内 stride 读；
+   rowIdx/colIdx 的 at::arange 改 kernel 内 createvecindex；wsP/wsDS 的 at::zeros
+   去除（ws 布局无 pad 行时 c2kv 从不读 pad，原 zeros 纯防御性；**注意：核内清零
+   无 pad 行的 ws 会 GM 越界**）。host op ~25 → ~11。
+2. **mask tile 跳过（causal case c1 767→185us、v1 593→215us）**：全 mask tile 不进
+   grid。**注意：生产算子 sparse_mode=0（全 tile 计算）路径并无此技术**，它来自
+   生产 sparse 分支；DSL 设计应原生包含（hi/lo 边界求 tile 相交，空相交跳过整个
+   tile 的 C+V 计算）。
+3. **ZeroL1 满 tile 跳过（c2dq 653→256us、c2kv 1319→560us）**：全零 operand tile
+   跳过拷贝本身；**MTE1_MTE2/MTE2_MTE1 守卫必须无条件保留**（L1 复用 WAR 竞态，
+   曾致 dq 大面积小误差）。
+4. **wsS/wsDP fp32→fp16 存储（ws 流量减半）**：fixpipe F322F16/F322BF16（官方
+   CAST_RINT 语义）随路转换，与 golden 舍入一致，50/50 精度不回退。
+5. **核间连续条带切分**：StripRange（former/base 均衡）替代 `task += cores` 轮询，
+   改善 L2 局部性（§4.1 实测核间负载不均最高 31.8% 佐证该维度收益真实）。
+6. **GQA dk/dv 累加**：fp32 走 CAST_DV（L0C 组内累加直写输出、跳过 post_kv）；
+   fp16/bf16 受 §7.3-2 镜像约束保留 g-slab + post 归约。
+7. **kernel 合并 7→5 发射**（fag_c2 / fag_post 合并），launch 边界即全设备同步，
+   每次合并都是纯收益。
+
+### 7.3 精度契约（违反即系统性偏差或 NaN，全部实测取证）
+
+1. **torch 标量乘口径 per-dtype**：`fp16 tensor × python float` 标量先舍入 fp16；
+   `bf16 tensor × python float` 标量保持 fp32(opmath) 计算后再舍入；fp32 全精度。
+   host 侧 scale/softcap 必须 per-dtype 舍入（bf16 用错口径引入 ~2^-9 系统偏差，
+   全量 bf16 case MERE 超标）。
+2. **fp16/bf16 golden 逐头 RINT 实体化镜像**：golden 对 matmul 输出逐头 RINT 实体化
+   后再做 GQA group-sum，因此 **GQA 组内不可 L0C 直接累加**（破坏镜像）；仅 fp32
+   可 CAST_DV 直写。
+3. **尾 k 块分形宽度一致性**：GEMM A 侧 L0A 固定 64 宽加载时，B 侧 L1 stride/L0B
+   装载/Mmad k 也必须固定 64（`krA=AlignUp(kr,16)<64` 时两侧分形条带宽度不匹配，
+   m 第二个 16 行分形起读到错位 pad 零——大 shape dq 全错的主因）；pad 行须来自
+   ZeroL1 清零区保证数学等价。
+4. **索引装载尾部残留 NaN**：列索引按 `ceil32(vn*4)` 字节装载时尾部残留前序行索引
+   （值 < Skv）→ pad 列误判 valid → `at::empty` 垃圾（Inf/NaN 位型）经 `NaN*0=NaN`
+   漏入 dS pad 列。装载宽度必须覆盖全部有效+pad 区（或显式清零）；连跑内存复用时
+   才暴露，单 case 调试不可复现。
+
+### 7.4 MIX kernel / CV 融合工程坑（本算子两轮实证）
+
+- **flagId 安全段 {2..10, 14}**：MatmulImpl 每个 matmul 对象保留 flagId [0, 2N-1]，
+  SyncAll 占 11-13；冲突表现为间歇性 C/V 竞态（DumpTensor 插桩会掩盖）。竞态判据：
+  **stress ≥50 次零失败 + 全量 PASS**，单次 PASS 不算数。
+- **Matmul<> 别名 + 异步三件套**（SetSysWorkspaceForce + AIC clearWorkspace +
+  REGIST_MATMUL_OBJ）；硬编码 MatmulImpl 造成"IterateAll 恒同步"假象。
+  **裸 SyncAll()（AIV-only）**；SyncAll<false>（MIX 变体）在 client-server 下死锁。
+- **跨 tile 累加** `IterateAll<false>(ws, enAtomic=true) + End()` 原子加 fp32 ws；
+  GM 可见性 = 写流与发 mma 消息流同一；双 AIV 半区写须先会合再单流发射。
+- **507033 三种实证形态**：① 宽签名（32 参数）×完整类触发 MPU crash（保持 ~13 参数
+  窄签名 + 单 user workspace + Init 内 512B 对齐切分）；② 双 CO1 队列；③ **910B2C
+  不支持 FIX pipe 读 L0C 与 M pipe 写 L0C 并发**——任何 L0C Mad/Fix 重叠（含单 CO1
+  队列深度 2 的规避方案）不可行，生产前瞻深度 2 方案在本平台实测证伪。507033 后设备 retain
+  ~20s，复验前须先探活（否则误判修复失败）。
+- **CO1 TQue 双未决 EnQue 时 DeQue 呈 LIFO**（S/dP 交换）——fixpipe 批处理路径
+  不可行，保持串行 Mad→Fix。
+- **守卫链精细化方法**：SetWaitFlag 前向保护语义逐站点推导最小集（本算子分为
+  Stats{MTE2_V,V_MTE2} / Load{+MTE3_V,MTE3_MTE2} / Store{+PipeBarrier 归约} 三级）；
+  收益 ~20us 级（AIV scalar 主体是 ping-pong 等待停顿而非守卫开销，预期管理）。
+- **UB buffer 写宽复核**：列索引 Cast 写 256B 到 128B buffer 溢出覆盖相邻 sfmg
+  （原操作顺序下无害，sfmg 提升后暴露）——改 buffer 布局/生命周期时复核所有相邻
+  buffer 写宽。
+- **Nd2NzParams stride 字段全部 uint16_t**：BSHD 大行距（H*D=9216）下 16*ld 溢出
+  → Zz 路径逐组单发规避。
+- **fp32 attention_in 是无操作视图**（transpose+to(fp32)，BNSD 内存）：eval clone
+  输入会掩盖，kernel 需双布局步长兼容。
+
+### 7.5 测量口径（性能结论的前置条件）
+
+- **quick 批量模式含输入构造**（rand/cast/H2D 与 forward 同 stream 计量），小 shape
+  被放大 20-200x（~17ms 地板），比值压缩到 ~1.0x 失真，偶发 ref 侧 31x 异常产生
+  虚假高加速比；其 per-case 绝对值不可横向分析，geomean 仅作"不劣于"门禁。
+  （forward-only 修复曾实施验证，后按需求回退；当前仍为旧口径。）
+- **稳态 event（输入外置、warmup 3+、10 次平均）才是真实水位**；DVFS run 间波动
+  ±25%，所有对比必须同次背靠背。
+- 三方对账法（torch / 本实现 / 生产算子 两两比值应互洽，误差 <1%）是发现口径错误
+  与基准错误的有效手段。
+- **对比基准的有效性边界**：参照基准在其已验证 case 包络外的 shape 上可能静默
+  出错（实测：g=4 GQA + 非 64 对齐 seq 尾块组合下基准实质性错误而本实现逐位一致）
+  ——任何对比结论必须先做 golden 抽查，仅限基准已验证包络内有效。

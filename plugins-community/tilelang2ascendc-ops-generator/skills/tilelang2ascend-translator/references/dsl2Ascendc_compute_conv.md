@@ -42,6 +42,9 @@ direct 1x1 的关键认知：1x1 卷积的 im2col 是恒等变换，NCHW 原始�
 `[K=Ci, M=H*W]` 的 GEMM B 操作数，权重做 A 即可，acc = [Co, H*W]，epilogue 按
 通道行加 bias 直接写出 NCHW，全程零 transpose。
 
+> **fp32 输入**：上表三种模式针对 fp16/bf16 输入；fp32 输入走第 4 种模式（hi/lo
+> fp16 拆分 + 3-chain GEMM），见第九章。
+
 ---
 
 ## 第三章：数据通路 API 选型
@@ -121,8 +124,8 @@ kH*kW==1 时恰好重合——如果第一个验证 case 恰好是 Ci=16，会"�
 8. **MTE3 store 与同 buffer 后续 V 计算**：store 读 trans buffer，下一轮转置覆写它，
    MTE3 必须 drain 后 V 才能继续。
 9. **img2col LoadData3D 通道块索引 C1 ≥ 15（Ci ≥ 240）产生垃圾** → gate C1 ≤ 14，
-   Ci=256/512 回退 normal 路径（archive 因 L1 gate 从未探测该域，勿凭"archive 同
-   结构"推断安全）。
+   Ci=256/512 回退 normal 路径（fused 路径历史上受 L1 预算 gate 限制从未探测过
+   Ci≥240 区域，勿凭"fused 结构在别的通道数验证过"推断该区域安全）。
 10. **AIV 侧无 `HardEvent::MTE2_MTE3`**（AIC-only），误用 → 507014 死锁；AIV 等价
     保护用 SetFlag/WaitFlag 旗标对。
 11. **aicore timeout 的 kernel 会使该 NPU 进入持久坏状态**（同设备 torch_npu 原生
@@ -165,7 +168,7 @@ kH*kW==1 时恰好重合——如果第一个验证 case 恰好是 Ci=16，会"�
 |:---|:---|:---|
 | L1 预算 | 384 KB（L1=512KB 留余量） | A1+B1 双面板 + fused 模式 xNz + 常驻 B 面板 |
 | baseM / baseN / baseK | 128 / 128 / 64 | L0C 单 tile = 128×128×4B = 64KB，占 L0C(128KB) 一半 |
-| C0 | 16 | fp16/bf16 分形 C0 = 32B/2B |
+| C0 | 16 | fp16/bf16 分形 C0 = 32B/2B；**fp32 为 C0=8（禁止，见第九章）** |
 | UB 预算 | 192 KB 总量留 headroom | im2col slab / epilogue acc tile 按此反推行数 |
 | epilogue acc tile | ~16K fp32 元素/tile（64KB UB） | rowsPerTile = 8192/CoPad 反推 |
 
@@ -268,3 +271,73 @@ case9（[1,16,28,28] k5 s2，M=196/N=16/K=400，2.5 MFLOP）走完整 im2col+cub
 6. **tiling 参数单点计算、显式下发**：host 与 kernel 各自推导同一 tiling 参数是
    高危模式，任一侧引入新候选都会静默破坏另一侧 buffer 预算（曾致 242KB>192KB
    UB 崩溃）。
+
+---
+
+## 第九章：fp32 输入 —— hi/lo fp16 拆分 + 3-chain GEMM
+
+本章补充 fp32 输入的处理路径。第一~八章默认 fp16/bf16 输入（fp32 累加器）；**当输入
+dtype == fp32 且主计算走 cube 时，禁止直接切 fp32 cube，改用 hi/lo fp16 拆分 + 3-chain
+GEMM**，把 fp32 卷积降级到成熟的 fp16 cube（C0=16）路径。fp32 cube 底层陷阱细节见
+`@references/fp32-cube-path.md`。
+
+### 为什么禁止 fp32 cube
+
+910B 的 NZ/ZN 分形 `[16 行, C0 列]`：fp16/bf16 时 `C0=16`，**fp32 时 `C0=8`**。这个
+差异带来两类致命问题（实测曾挂死把设备 14 污染为 Alarm）：
+
+| 问题 | 现象 | 根因 |
+|:---|:---|:---|
+| 分形对齐陷阱 | `fixp_error0 0x60000db / UB address not aligned` | 凡从 C0 推出行数/`srcStride`/`mSize` 的代码 fp16 全对、fp32 全错；Mmad M/N/K 需 `AlignUp(·,16)` + `kDirectionAlign=true` + `SetFmatrix` 每次重设 |
+| M-pipe 同步死锁 | kernel 挂死，AICore 100% | fp32 绕开 TQue 自动同步后须手动补 M-pipe→Fixpipe 屏障，漏补即 Cube 与 Fixpipe 竞态死锁 |
+
+结论：fp32 cube 的收益被对齐/同步陷阱与挂死风险抵消，**实现层直接禁止**。
+
+### hi/lo 拆分算法
+
+把每个 fp32 值拆成两半 fp16（主值 + 残差），`x ≈ hi + lo`，err ≤ 2^-22：
+
+```cpp
+Cast(hi,  x,   RoundMode::CAST_RINT, n);   // hi = round(x)    主值
+Cast(back, hi,  RoundMode::CAST_NONE, n);  // back = fp32(hi)   精确还原
+Sub(x, x, back, n);                        // x = x - back      残差
+Cast(lo,  x,   RoundMode::CAST_RINT, n);   // lo = round(残差)
+```
+
+### 3-chain GEMM（fp32 的第 4 种 GEMM 模式）
+
+乘积展开 `(A_hi+A_lo)@(B_hi+B_lo)`，丢量级 2^-44 的 `A_lo@B_lo`，得 **3-chain**：
+
+```
+acc = A_hi@B_hi + A_hi@B_lo + A_lo@B_hi     （fp32 L0C 累加）
+```
+
+- 三条共享同一 `c1Local`（L0C）：仅第一条 `cmatrixInitVal=true`，后两条 `false` 累加。
+- k-panel 线性化 `j = combo*kPanels + kp`，`combo ∈ {0:A_hi@B_hi, 1:A_hi@B_lo, 2:A_lo@B_hi}`，深度 2 预取连发。
+- 全程 fp16，**不要**设 `kDirectionAlign`/`SetFmatrix`/5 参 Mmad 这些 fp32 特有项；M-pipe→Fixpipe 靠 `TQue<CO1>` EnQue/DeQue 自动串行（fp16 C0=16 下可靠）。
+
+### 与现有流水集成
+
+| kernel | 变化 |
+|:---|:---|
+| 新增 `hilo`（AIV） | fp32 → hi/lo fp16 拆分（对 x / im2col / 权重任意连续张量通用，`HILO_SEG=16384` 分段） |
+| `wrepack`（AIV） | 额外产出 `ws_hi/ws_lo` 两套 K-major |
+| `im2col`（AIV） | 额外产出 `im2col_hi/im2col_lo` 两套 |
+| `conv`（AIC） | 单条 `Mmad` 改 3-chain（操作数翻倍） |
+| `epilogue` | 不变 |
+
+### 精度与性能
+
+| 指标 | hi/lo fp16 3-chain GEMM |
+|:---|:---|
+| 精度 | MERE ~1e-6~2e-5（fp32 阈值 1.22e-4），err ≤ 2^-22 |
+| geomean 加速比 | **0.76x** |
+
+关键收益：groups==1 大通道小空间 case（直卷积瓶颈，逐 co 重读窗口 + 单元素 gather）从
+结构性慢变为 im2col+GEMM 正常水平；depthwise 0.95~1.76x。
+
+### 何时用
+
+- **输入 fp32 且走 cube** → 必须 hi/lo fp16 3-chain（禁止 fp32 cube）。
+- **输入 fp16/bf16** → 维持第一~八章原样（单条 GEMM，无 hi/lo）。
+- depthwise / 1x1 等纯 AIV 直接路径无 cube，可保持 fp32 Axpy。

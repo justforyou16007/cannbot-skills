@@ -376,7 +376,7 @@ P1：可能导致边界问题或实现意图不可追溯
 - **禁止**：手写 kernel 入口省略 task type 宏（TileLang 生成代码自带，手写易漏）
 - **要求**：每个 `__global__` 入口首行写
   `KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);`
-  （archive avg_pool3_d/conv2d_base 均有此宏惯例；rms_norm 没有是因为它对 subBlockNum=1
+  （多数多核 MIX 实现均有此宏惯例；个别没有的是因为其 subBlockNum=1
   也正确，不构成反例）
 - **来源**：61_SequentialPolarizedSelfAttention（2026-08-19）A 类修复——3 个手写 kernel
   全部漏写，case 2-9 大偏差，补宏后恢复

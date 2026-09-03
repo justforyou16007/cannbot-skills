@@ -72,6 +72,6 @@ per row m:
 
 ## 7. 参考实现
 
-- `output/4_GroupedMatmulSwigluQuant/` — 完整 fused 产物（dequant+swiglu+quant）。
+- GroupedMatmul+SwiGLU+Quant 完整 fused（dequant+swiglu+quant）已有验证产物。
 - `ops/tilelang-perf-optimization/references/best-practices/gmm_cv_fusion_optimize.md` — 性能优化。
 - `gmm/grouped_matmul_swiglu_quant/` — a8w4 融合版本。

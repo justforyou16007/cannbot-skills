@@ -276,13 +276,13 @@ per-token quant 的 reduce + 单值 scale 写出场景，`KERNEL_TYPE_MIX_AIC_1_
 
 ---
 
-## 10. 参考实现位置
+## 10. 可复用模式
 
-| 算子 | 可复用模式 |
+| 场景 | 可复用模式 |
 |---|---|
-| `archive_tasks/rms_norm/` | per-row reduce + 标量写 scale 的 `vector_tile.h` / `_kernel.h` 模板 |
-| `archive_tasks/reshape_matmul_rowwise_quant_int8/` | fp32 → fp16 → int8 cast 链（`quant_kernel.h`） |
-| `archive_tasks/quant_matmul/` | int8 输出的 host pybind / tiling 模式 |
+| per-row reduce + 标量写 scale | rms_norm 类算子的 `vector_tile.h` / `_kernel.h` 模板 |
+| fp32 → fp16 → int8 cast 链 | rowwise quant 类算子的 quant_kernel 模式 |
+| int8 输出的 host pybind / tiling | quant matmul 类算子的 host 写法 |
 
 ---
 

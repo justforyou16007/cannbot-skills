@@ -661,15 +661,48 @@ class ModelNew(nn.Module):
 
 ## 精度验证标准
 
-**五类决策矩阵**（由 `verification_ascendc.py` 自动判定）：
+`verification_ascendc.py` 同时挂两套精度标准，按「输出 dtype + 是否浮点」路由（阈值表内联在 `verification_ascendc.py` 中，是其唯一权威来源）：
 
-| 类别 | 触发条件 | 判定标准 |
+| 输出情况 | 走哪套标准 | 判据 |
 |---|---|---|
-| 非计算类 | `ASCENDC_NON_COMPUTE=1` | view-as-int 二进制完全一致（含 NaN bit pattern） |
-| bool 输出 | 输出 dtype 为 bool | `torch.equal` 严格相等 |
-| 整数计算类 | 输入最高精度为 int 且输出为 int | `|actual − golden| == 0` |
-| 量化计算类 | 输入最高精度为 float 且输出为 int | `|actual − golden| <= 1` |
-| 浮点计算类 | 输出为 float 类型 | 三项 AND 判定（max_error_cap + matched_ratio ≥ 0.9 + MERE < rel_threshold） |
+| 浮点输出，dtype 在生态阈值表内 | **生态开源精度标准（第一标准）** | 两项 AND，见 §1 |
+| 浮点输出，dtype 不在生态阈值表内 | NPU Benchmark（fallback） | 三项 AND，见 §2 |
+| 整型输出，输入最高精度为 float | NPU Benchmark（fallback） | 量化计算类 `|actual − golden| <= 1` |
+| 整型输出，输入最高精度为 int / 无 tensor | NPU Benchmark（fallback） | 整数计算类 `|actual − golden| == 0` |
+| bool 输出 | NPU Benchmark（fallback） | `torch.equal` 严格相等 |
+| 非计算类（`ASCENDC_NON_COMPUTE=1`） | NPU Benchmark（fallback） | view-as-int 二进制完全一致（含 NaN bit pattern） |
 
+### §1 生态开源精度标准（第一标准）
+
+只覆盖**浮点计算类**输出，且输出 dtype 在生态阈值表内。两项判定（AND，全部满足才算通过）：
+
+1. **混合容差通过率**：逐元素 `|actual − golden| <= atol + rtol * |golden|`，
+   要求 `matched_ratio = 通过元素数 / 总元素数 >= 0.99`；
+2. **逐元素绝对上限**：每个元素满足 `|actual − golden| <= max(max_abs_error_limit, 32 * ULP(|golden|))`，
+   ULP 按逐元素取（即取常数上限与 32×ULP 两者的较大值）。
+
+**阈值表**（内联定义于 `verification_ascendc.py`，是唯一权威来源）：
+
+| 数据类型 | rtol | atol | max_abs_error_limit |
+|---|---|---|---|
+| `float16` | 2⁻⁹ ≈ 1.95e-3 | 2⁻⁹ ≈ 1.95e-3 | 1e-1 |
+| `bfloat16` | 2⁻⁶ ≈ 1.56e-2 | 2⁻⁶ ≈ 1.56e-2 | 1e-0 |
+| `float32` | 2⁻¹⁰ ≈ 9.77e-4 | 2⁻¹⁶ ≈ 1.53e-5 | 1e-2 |
+| `hifloat32` | 2⁻⁹ ≈ 1.95e-3 | 2⁻¹⁰ ≈ 9.77e-4 | 1e-1 |
+| `float8_e4m3` | 2⁻² = 0.25 | 2⁻⁴ = 0.0625 | 1e-0 |
+| `float8_e5m2` | 2⁻¹ = 0.5 | 2⁻³ = 0.125 | 1e-1 |
+
+`required_matched_ratio = 0.99`；表内没有的 dtype **不套默认值**，直接回退 §2。
+两条判据（混合容差 / 绝对上限）相互独立、互不兜底，按 AND 处理。
+
+### §2 NPU Benchmark 精度标准（fallback）
+
+承接生态标准覆盖不到的数据格式：整型输出、bool 输出、非计算类，以及 dtype 不在生态阈值表内的浮点输出。
+
+浮点计算类三项 AND 判定（max_error_cap + matched_ratio + MERE）：
+1. **max_error_cap**：100% 元素满足 `|diff| <= atol + rtol * |golden|`；
+2. **matched_ratio**：分桶匹配率 ≥ 0.9（小值域 `|golden| < sv_thr` 用绝对误差，正常域用相对误差）；
+3. **MERE**：均值相对误差 < rel_threshold。
+
+- **golden 方向约定**：golden = reference（`model.py` 输出），actual = candidate（`model_new_ascendc.py` 输出），相对误差分母取 reference 幅度。
 - **输入类型自动推断**：从实际输入 tensor 中取最高精度 dtype 分类为 float / int / no_tensor。
-- **浮点三项判定**：① 100% 元素满足 `|diff| <= atol + rtol * |golden|`；② 分桶 matched_ratio ≥ 0.9（小值域绝对误差 / 正常域相对误差）；③ MERE（均值相对误差）< 阈值。三项全部通过才算通过。

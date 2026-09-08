@@ -443,12 +443,13 @@ AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(notifyId);
      双 MMA 通路隔离实验（第二次 Mmad 改用 P_hi，ratio=2.0）是正确的，极易误判方向。
   3. fp32 路径无此问题（无 Cast 截断），保持单 MMA。
   来源：ScaledDotProductAttention case[7] bf16 [2,8,577,128→136] 及全量 case[17]/[44] fp16。
-- 💡 **fp32 matmul 的正确前提与已验证路径**：注意区分两层限制——**TileLang 框架**的
-  mma_macro_generator 仅支持 16/8bit 输入（probe 实证），故 TileLang 阶段 fp32 只能表达为
-  Vector；但 **910B2C（Atlas A2）Cube 硬件支持 float×float→float Mmad**（Mmad.md 表7），
-  吞吐为 fp16 的 1/4（cube_k=4，见 cube_instruction_theoretical_perf_summary.md 表1），
-  开 HF32 模式为 1/2（尾数截断、精度有损）。⚠️ 不要写成"平台不支持 fp32 MMA"（SDPA 任务
-  kernel 注释曾误写）。
+- 💡 **fp32 matmul 的正确前提与已验证路径**：**910B2C（Atlas A2）Cube 硬件支持
+  float×float→float Mmad**（Mmad.md 表7），吞吐为 fp16 的 1/4（cube_k=4，见
+  cube_instruction_theoretical_perf_summary.md 表1），开 HF32 模式为 1/2（尾数截断、
+  精度有损）。**TileLang 层 `T.mma`/`gemm_v0` fp32 已支持**（框架已修复：catlass v2.0.0
+  + ascendc fp32 后端，实测无 NaN、与 torch_npu fp32 matmul / CPU
+  fp32 一致，全精度 fp32 舍入量级），fp32 GEMM 直接 cube 表达，**不再需要表达为 Vector**。
+  ⚠️ 不要写成"平台不支持 fp32 MMA"（SDPA 任务 kernel 注释曾误写）。
   **路径 ① fp32 直接 Cube Mmad 已实证**（SDPA 2026-08-12，`SdpaKernel<float>` 复用 fp16/bf16
   CV 融合结构，fp32 全程无 Cast 无 hi/lo）：case [2,15,239,192]×Skv=275 从 2307us→185us
   （12.5x，0.042x→0.522x），MERE 2.6e-7，fp32 谱 geomean 0.32→0.78。实现要点：

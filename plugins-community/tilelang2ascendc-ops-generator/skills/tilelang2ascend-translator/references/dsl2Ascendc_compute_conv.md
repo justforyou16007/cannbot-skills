@@ -42,8 +42,8 @@ direct 1x1 的关键认知：1x1 卷积的 im2col 是恒等变换，NCHW 原始�
 `[K=Ci, M=H*W]` 的 GEMM B 操作数，权重做 A 即可，acc = [Co, H*W]，epilogue 按
 通道行加 bias 直接写出 NCHW，全程零 transpose。
 
-> **fp32 输入**：上表三种模式针对 fp16/bf16 输入；fp32 输入走第 4 种模式（hi/lo
-> fp16 拆分 + 3-chain GEMM），见第九章。
+> **fp32 输入**：上表三种模式针对 fp16/bf16 输入；fp32 输入走**原生 fp32 cube**
+> （C0=8，强制处理项见第九章）。
 
 ---
 
@@ -102,6 +102,37 @@ kH*kW==1 时恰好重合——如果第一个验证 case 恰好是 Ci=16，会"�
 | 7 | depth-2 A1/B1 跨 (blk,panel) 预取 | case 0 conv 13.7→10.4us | 当前块计算时发射下一块的 GM→L1；B 槽只分配实际列数（≤baseN）使两块面板能同时放进 L1 |
 | 8 | stagger-aware 核数调优 | case 0 conv 12.5→10.9us | MIX kernel 发射 stagger ~0.2us/核，**满 wave 的少核 > 带残尾 wave 的最大核数**：waves=ceil(blocks/aic)，dim=ceil(blocks/waves)；小 grid 按 ~2 tile/核封项 |
 | 9 | n 自适应 L0B/Mmad | Co=64 时 cube 工作量减半 | nActual≥64 时按 nActual 加载；**nActual<64 保持满 baseN**（nActual=16 在 dav-c220 触发 L0C 读写冲突，实测） |
+| 10 | **stride==2 GatherMask 去交织向量化** | case[24] 0.32→1.20（kernel 侧 ~3.9x） | 每 task 2 次 GatherMask（pattern 1/2，Normal 模式）把整行拆 even/odd 子平面，ki 窗口变为子平面连续切片；UB src 32B 对齐铁律拆 head(≤7 标量)+main(对齐 bulk 直接 DataCopyPad)+tail(≤7 标量)，标量量 255/ki→≤14/ki；stride≥3 保留标量回退 |
+| 11 | **发射链合并（跨步切分）** | 4→3 发射，小 case 普升 | pad_w / im2col 等轻 kernel 并入单发射；**两个任务空间必须各自按核跨步 `for(t=coreIdx; t<n; t+=numCores)` 切分**——拼接+连续切分会把重任务塌到少数核（实测 case[33] 0.76→0.48，改跨步后 0.90） |
+| 12 | **输出 ws zeros→empty + kernel 零区覆盖写** | 省 1 次发射 + 大 case 省 MB 级 memset | kernel 写三段**两两不相交**零区（K-tail 整行 / M-tail 列条 / pad 空洞），零源 kernel 起始 Duplicate 一次全程只读（V_MTE3 一次同步）；无竞态前提 = 区域不相交 |
+| 13 | **epilogue 直写最终布局** | 全 case 普升，省 ~19us/call host | epilogue kernel 按目标布局（如 (N,Cout,Lout)）分段 store，wrapper 直接返回——布局转换必须在 kernel 内消化，**禁止留 reshape+permute+contiguous 给 wrapper**（aclnnInplaceCopy 全量往返 + host 固定开销） |
+| 14 | **host pad/copy 消除（LoadRowSafe 末行钳制）** | 省 ~4.3us/call + 流量 | 仅末行（xBase+count+8>numel）拆 安全主段 DataCopyPad + 尾部 <8 元素（floor8-8 对齐装载 scratch → SetValue 回填，MTE2_S 同步）；替代 host 侧 at::pad/copy_ |
+| 15 | 零 bias 张量缓存 | bias=False case 省 1 次 memset 发射 | wrapper 层按 key 缓存零 bias 张量，消除每 forward 一次 memset |
+
+#### #10 stride==2 GatherMask 去交织实现要点（conv1d 实证，conv2d/3d 同构适用）
+
+- **适用性**：最内维 stride==2 时行内去交织（`o = ki*dilation - pad` 的奇偶选子平面，
+  base=⌊o/2⌋）；2D/3D 外侧维 stride>1 是行级跳取、天然向量友好，无需去交织；
+  stride≥3 保留标量回退（占比小）。
+- **参数**：`GatherMaskParams(1, ceil(L/64), 8, 0)`，pattern 1=even / 2=odd，Normal
+  模式；fp32 每 repeat 读满 256B（64 元素）→ 取 32；xUb 装载须 64 元素对齐。
+- **标量头尾**：每 ki 两个 16 元素 scratch 槽位，pass1 全部标量填充 → 一次
+  `S_MTE3` 同步 → pass2 背靠背发射全部 store（MTE3 同 pipe 保序、dst 两两不相交）。
+- **同步序列**（每 task）：`MTE3_V`（子平面 WAR，前一 task store 读子平面）→
+  `V_MTE2`（xUb WAR，前一 task GatherMask 读 xUb）→ 装载 xUb → `MTE2_V + S_V`
+  （装载 RAW，含尾段 SetValue 回填）→ 2 次 GatherMask → `V_S + V_MTE3`（子平面
+  就绪）→ `MTE3_S`（scratch WAR）→（标量填充后）`S_MTE3`。
+- **对齐铁律**：UB src 必须 32B 对齐 → 有效段拆 head(≤7 标量)+main（alignUp8~
+  alignDown8，直接 DataCopyPad 自子平面，GM dst 非对齐由 pad 吸收）+tail(≤7 标量)。
+
+### 走偏点（conv1d 实证，勿重复）
+
+1. **constant_pad_nd 替代 host copy_**：aclnn 包装算子 host 固定开销 +33us/call，
+   "少一次 launch"账面逻辑不成立——pad/拷贝必须在 kernel 内消化（#14），不要换成
+   另一个 aclnn 算子。
+2. **合并发射用"拼接任务空间 + 连续切分"**：见 #11（并行度塌陷）。
+3. **workspace 三合一 alloc + narrow 视图**：变长大块分配绕过 caching allocator 尺寸桶
+   + narrow TensorImpl 开销，实测净 -2.4us/call——workspace 保持独立 alloc。
 
 ---
 
@@ -143,7 +174,7 @@ kH*kW==1 时恰好重合——如果第一个验证 case 恰好是 Ci=16，会"�
     2.5x）——默认选最窄旗标对（V_S/S_V），PIPE_ALL 仅在确需跨多管道时使用。
 16. **TransDataTo5HD per-call 成本 ≈ 140/coC us 固定值**（与 rows、stride 几何无关）
     ——小 co 转置存在 ~23.5us/tile 结构地板，只能靠减少调用次数（coC 最大化、
-    hi/lo 打包单次调用）或更换转置机制突破。
+    多段打包单次调用）或更换转置机制突破。
 17. **一个 .cpp 只能有一个 `extern "C"` kernel**：双 kernel 单文件在
     rtRegisterAllKernel 阶段报 107000（binary parse failed）——aclrtlaunch 打包
     按文件组织，多 kernel 必须拆文件。
@@ -168,7 +199,7 @@ kH*kW==1 时恰好重合——如果第一个验证 case 恰好是 Ci=16，会"�
 |:---|:---|:---|
 | L1 预算 | 384 KB（L1=512KB 留余量） | A1+B1 双面板 + fused 模式 xNz + 常驻 B 面板 |
 | baseM / baseN / baseK | 128 / 128 / 64 | L0C 单 tile = 128×128×4B = 64KB，占 L0C(128KB) 一半 |
-| C0 | 16 | fp16/bf16 分形 C0 = 32B/2B；**fp32 为 C0=8（禁止，见第九章）** |
+| C0 | 16 | fp16/bf16 分形 C0 = 32B/2B；**fp32 为 C0=8（默认路径，强制处理项见第九章）** |
 | UB 预算 | 192 KB 总量留 headroom | im2col slab / epilogue acc tile 按此反推行数 |
 | epilogue acc tile | ~16K fp32 元素/tile（64KB UB） | rowsPerTile = 8192/CoPad 反推 |
 
@@ -216,7 +247,7 @@ fp32 Conv2d 全参数（groups/dilation/stride/bias）vs torch_npu 融合 conv�
 - split-K 收益有限：gemm per-block 固定成本 ~20us（strip+B 面板+启动+fixpipe）
   主导而非 kt 循环——**先探针量化固定成本再决定是否拆 K**。
 - im2col 8 行成批门槛 ln%8==0（第六章 #13）。
-- k1-direct 初版（hilo 纯拆分 kernel 走 normal flip GEMM）已证 1x1 免转置可行，
+- k1-direct 初版（纯 AIV kernel 走 normal flip GEMM）已证 1x1 免转置可行，
   R5 Opt-D 将其推到单 kernel 形态。
 
 ### R4 测量口径（方法论铁律）
@@ -231,7 +262,7 @@ fp32 Conv2d 全参数（groups/dilation/stride/bias）vs torch_npu 融合 conv�
 
 | 优化 | 机制 | 实测收益 |
 |:---|:---|:---|
-| Opt-A epilogue 合并转置 | hi/lo 打包单次 TransDataTo5HD（repeatCount=2*nb 连续两段）+ 跨步 Cast/Add 重组 + host R=256 候选（UB 门限） | case7 epi 42→15us（0.53→0.68）；case5 0.55→0.65 |
+| Opt-A epilogue 合并转置 | 双段打包单次 TransDataTo5HD（repeatCount=2*nb 连续两段）+ 跨步 Cast/Add 重组 + host R=256 候选（UB 门限） | case7 epi 42→15us（0.53→0.68）；case5 0.55→0.65 |
 | Opt-B im2col oh-band 拆分 | 任务粒度 (n,g,ci,kh)→(…,oh-band)，band 数按 2×aicNum 自适应 | case0 im2col 29.6→11.3us（0.44→0.50）；case4→0.85 |
 | Opt-C flat-span 小空间路径 | W==Wo 时 col 行 = 平面连续平移拷贝，1 次装载 + 边缘 kw mask（Duplicate+标量置零）+ 成对存储；同步用最窄 V_S/S_V 旗标（#15） | case1 im2col 227→55us（**0.46→0.92**） |
 | Opt-D k1direct 单 kernel | 1x1/s1/p0 新增纯 AIV Axpy kernel：免 GEMM/免 wrepack/免 hi-lo/免转置，3-launch→1-launch | case3 **0.35→0.84**（33.4us+2launch→13.0us） |
@@ -272,72 +303,77 @@ case9（[1,16,28,28] k5 s2，M=196/N=16/K=400，2.5 MFLOP）走完整 im2col+cub
    高危模式，任一侧引入新候选都会静默破坏另一侧 buffer 预算（曾致 242KB>192KB
    UB 崩溃）。
 
+### 附：ConvStandard1d 发射链瘦身专项（fp32 cube 基线 0.738x → 1.253x）
+
+fp32 Conv1d 全参数（groups/dilation/stride/padding/bias）50 case，`--quick` per_case
+官方口径。fp32 cube 落地（第九章）后遗留两大瓶颈：case[24] stride=2 im2col 标量
+gather（0.32x）与小 case 4-kernel 发射 + host 固定开销（0.44~0.46x）。本轮逐项击破
+（每项后 evaluate 50/50 PASS + batch 复测，batch geomean 轨迹）：
+
+| # | 改动 | batch geomean | 关键 case |
+|:--|:-----|:--------------|:----------|
+| 基线 | fp32 cube 版（第九章） | 0.635 | case[24] 0.356 (233us) |
+| A | stride==2 GatherMask 去交织（第五章 #10） | 0.664 | case[24] 233→98us |
+| B1 | pad_w 并入 im2col 单发射 + 跨步切分修复（#11） | 0.690→0.79 | case[33] 0.51→0.90 |
+| B3 | x_col zeros→empty + kernel 三段零区覆盖写（#12） | 0.84 | case[24] →0.94 |
+| C1 | epilogue 直写最终布局，wrapper 去 permute+contiguous（#13） | 0.90 | 全 case 普升 |
+| C2 | bias=False 零 bias 张量缓存（#15） | 0.90 | bias=False case |
+| C3 | x_padded copy_ 消除，kernel 内 LoadRowSafe 末行钳制（#14） | **1.05** | case[24] →1.22~1.28 |
+| C4 | workspace 三合一 alloc + narrow | 1.02（**回退**） | 见第五章走偏点 3 |
+
 ---
 
-## 第九章：fp32 输入 —— hi/lo fp16 拆分 + 3-chain GEMM
+## 第九章：fp32 输入 —— 原生 fp32 cube
 
-本章补充 fp32 输入的处理路径。第一~八章默认 fp16/bf16 输入（fp32 累加器）；**当输入
-dtype == fp32 且主计算走 cube 时，禁止直接切 fp32 cube，改用 hi/lo fp16 拆分 + 3-chain
-GEMM**，把 fp32 卷积降级到成熟的 fp16 cube（C0=16）路径。fp32 cube 底层陷阱细节见
-`@references/fp32-cube-path.md`。
+本章补充 fp32 输入的处理路径。第一~八章默认 fp16/bf16 输入（fp32 累加器）。
 
-### 为什么禁止 fp32 cube
+> **conv1d 实证**：fp32 cube 为 fp32 输入的**唯一路径**——
+> 前提：必须满足下方「fp32 cube 强制处理项」。
+> fp32 cube 底层陷阱细节见 `@references/fp32-cube-path.md`。
+
+### TileLang 设计表达层对接（原生 fp32 cube）
+
+fp32 conv 的 TileLang 设计表达层直接是 **原生 fp32 cube**（`T.mma`/`gemm_v0`，
+框架已修复：catlass v2.0.0 + ascendc fp32 后端，2026-09-08 device 15 实测无 NaN、
+与 torch_npu fp32 matmul / CPU fp32 一致，全精度 fp32 舍入量级）——转译时收到的设计输入为：
+
+- **数据布局与原生 fp32 cube 转译目标 1:1 同构**：`W(CoutP,Kp) fp32`、
+  `X_col(g,Kp,Mp) fp32 K-major`、`acc(CoutP,Mp) fp32`，操作数单份——
+  转译时 GEMM 直接按本章强制处理项落 fp32 cube 即可，无需任何拆分/重组。
+- **表达形式**：复用 Expert 结构（`T.alloc_L1/L0A/L0B/L0C` + `T.mma`），与
+  fp16/bf16 唯一差异是 fp32 分形 C0=8（block_N 按 8 对齐即可；block_M/block_K 仍 16 对齐）。
+- **禁止再用 fp32 单链 AIV FMA**（`T.tile.mul_add_dst` rank-1 累加）表达 fp32 GEMM——
+  该形式仅曾因旧框架 fp32 cube 缺陷作为功能验证占位（AIV FMA 结构性慢，~0.10x 量级），
+  现框架已修复，直接 cube 表达。
+- **验证基线**（conv1d AscendC 实测 MERE 9.7e-8 ~ 1.27e-5，全部 ≤2x CPU 同精度参考）。
+
+### fp32 cube 强制处理项（缺一项即错/挂死）
 
 910B 的 NZ/ZN 分形 `[16 行, C0 列]`：fp16/bf16 时 `C0=16`，**fp32 时 `C0=8`**。这个
-差异带来两类致命问题（实测曾挂死把设备 14 污染为 Alarm）：
+差异带来两类致命问题（早期实测曾挂死把设备 14 污染为 Alarm）：
 
-| 问题 | 现象 | 根因 |
+| 问题 | 现象 | 强制处理 |
 |:---|:---|:---|
-| 分形对齐陷阱 | `fixp_error0 0x60000db / UB address not aligned` | 凡从 C0 推出行数/`srcStride`/`mSize` 的代码 fp16 全对、fp32 全错；Mmad M/N/K 需 `AlignUp(·,16)` + `kDirectionAlign=true` + `SetFmatrix` 每次重设 |
-| M-pipe 同步死锁 | kernel 挂死，AICore 100% | fp32 绕开 TQue 自动同步后须手动补 M-pipe→Fixpipe 屏障，漏补即 Cube 与 Fixpipe 竞态死锁 |
+| 分形对齐陷阱 | `fixp_error0 0x60000db / UB address not aligned` | 行数恒为 16（禁止从 C0 推导）；Mmad M/N/K 需 `AlignUp(·,16)` + `kDirectionAlign=true`；`SetFmatrix` 是粘性状态、每次 LoadData3D 前重设（A 用 `FMATRIX_LEFT`，B 转置用 `FMATRIX_RIGHT` + `fMatrixCtrl=true` + `kExtension=nAlign16/mExtension=kAlign16/channelSize=nAlign16`，对齐 MatmulImpl v220 fp32 路径） |
+| M-pipe 同步死锁 | kernel 挂死，AICore 100% | **优先保留 `TQue<CO1>` EnQue/DeQue 自动串行**（fp32 下可靠）；只有绕开 TQue 时才须手动补 M-pipe→Fixpipe 屏障 |
+| buffer 容量翻倍 | fp32 下 L0A/L0B/L1 占用 ×2 | K 向分块减半（如 CBASE_K 64→32）、L1 cap 相应下调，先算预算再写码 |
+| HF32 干扰 | 默认 HF32 模式会降精度 | 显式 `SetHF32Mode(false)` 锁严格 fp32（CANN 8.5.1 无 `HF32Mode` 枚举，仅 `SetHF32Mode(bool)` 重载） |
 
-结论：fp32 cube 的收益被对齐/同步陷阱与挂死风险抵消，**实现层直接禁止**。
-
-### hi/lo 拆分算法
-
-把每个 fp32 值拆成两半 fp16（主值 + 残差），`x ≈ hi + lo`，err ≤ 2^-22：
-
-```cpp
-Cast(hi,  x,   RoundMode::CAST_RINT, n);   // hi = round(x)    主值
-Cast(back, hi,  RoundMode::CAST_NONE, n);  // back = fp32(hi)   精确还原
-Sub(x, x, back, n);                        // x = x - back      残差
-Cast(lo,  x,   RoundMode::CAST_RINT, n);   // lo = round(残差)
-```
-
-### 3-chain GEMM（fp32 的第 4 种 GEMM 模式）
-
-乘积展开 `(A_hi+A_lo)@(B_hi+B_lo)`，丢量级 2^-44 的 `A_lo@B_lo`，得 **3-chain**：
-
-```
-acc = A_hi@B_hi + A_hi@B_lo + A_lo@B_hi     （fp32 L0C 累加）
-```
-
-- 三条共享同一 `c1Local`（L0C）：仅第一条 `cmatrixInitVal=true`，后两条 `false` 累加。
-- k-panel 线性化 `j = combo*kPanels + kp`，`combo ∈ {0:A_hi@B_hi, 1:A_hi@B_lo, 2:A_lo@B_hi}`，深度 2 预取连发。
-- 全程 fp16，**不要**设 `kDirectionAlign`/`SetFmatrix`/5 参 Mmad 这些 fp32 特有项；M-pipe→Fixpipe 靠 `TQue<CO1>` EnQue/DeQue 自动串行（fp16 C0=16 下可靠）。
-
-### 与现有流水集成
-
-| kernel | 变化 |
-|:---|:---|
-| 新增 `hilo`（AIV） | fp32 → hi/lo fp16 拆分（对 x / im2col / 权重任意连续张量通用，`HILO_SEG=16384` 分段） |
-| `wrepack`（AIV） | 额外产出 `ws_hi/ws_lo` 两套 K-major |
-| `im2col`（AIV） | 额外产出 `im2col_hi/im2col_lo` 两套 |
-| `conv`（AIC） | 单条 `Mmad` 改 3-chain（操作数翻倍） |
-| `epilogue` | 不变 |
+**调试纪律**：fp32 几何先用黑盒探针验证（W=I / X=I / 随机三组，max_abs 误差应 ≤1e-6 量级）
+再跑全量；kernel 挂死后先探活设备再继续（fp32 cube 有设备污染前科）。
 
 ### 精度与性能
 
-| 指标 | hi/lo fp16 3-chain GEMM |
+| 指标 | 原生 fp32 cube |
 |:---|:---|
-| 精度 | MERE ~1e-6~2e-5（fp32 阈值 1.22e-4），err ≤ 2^-22 |
-| geomean 加速比 | **0.76x** |
+| 精度 | conv1d 全量 50 case 通过（MERE 9.7e-8 ~ 1.27e-5，阈值 1.22e-4；相消点 cancel_err 全部 ≤2x CPU 同精度参考） |
+| geomean 加速比 | 基线 **0.738x**；叠加第五章 #10–#15 优化后 **1.253x / mean 1.284x**（per_case 官方口径，40/50 反超标杆） |
 
 关键收益：groups==1 大通道小空间 case（直卷积瓶颈，逐 co 重读窗口 + 单元素 gather）从
-结构性慢变为 im2col+GEMM 正常水平；depthwise 0.95~1.76x。
+结构性慢变为 im2col+GEMM 正常水平。
 
 ### 何时用
 
-- **输入 fp32 且走 cube** → 必须 hi/lo fp16 3-chain（禁止 fp32 cube）。
-- **输入 fp16/bf16** → 维持第一~八章原样（单条 GEMM，无 hi/lo）。
+- **输入 fp32 且走 cube** → **原生 fp32 cube**（满足本章强制处理项）。
+- **输入 fp16/bf16** → 维持第一~八章原样（单条 GEMM）。
 - depthwise / 1x1 等纯 AIV 直接路径无 cube，可保持 fp32 Axpy。

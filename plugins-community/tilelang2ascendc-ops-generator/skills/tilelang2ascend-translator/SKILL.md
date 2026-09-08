@@ -441,7 +441,7 @@ EXEC_KERNEL_CMD 正确传参模式（所有 tiling 参数为独立标量左值�
     - weight repack 结果是（weight 内容, shape, dtype）的确定函数，host 侧必须设计
       LRU 缓存（key = data_ptr + sizes + dtype + version，条目持有 weight 强引用），
       命中时跳过整个 wrepack 发射
-    - dtype 适配（fp32 hi/lo fp16 拆分、bf16 等）时必须声明「保留的优化结构清单」：
+    - dtype 适配（fp32 走原生 fp32 cube、bf16 等）时必须声明「保留的优化结构清单」：
       fused/normal 模式、零标量、TransDataTo5HD 批量转置、epilogue 跨行块处理
       逐项确认保留或说明丢弃理由
     - 声称"与已验证 conv 参考结构一致"时必须附证据（SetValue/GetValue grep

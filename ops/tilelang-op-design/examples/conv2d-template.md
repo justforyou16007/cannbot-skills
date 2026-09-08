@@ -8,7 +8,9 @@
 
 Conv 类算子（`nn.Conv*` / `F.conv*`）必须显式三选一，并记录结论：
 
-> ⚠️ **fp32 输入前置判断（先于三选一）**：输入 dtype == fp32 且主计算走 Cube 时，**强制走 hi/lo fp16 拆分 + 3-chain**（`hilo_3chain`），禁止 fp32 cube（C0=8 分形对齐 + M-pipe 同步死锁，实测挂死污染设备）。`hilo_3chain` 复用 normal 的 stage 链，额外插入 hi/lo 拆分 + 权重/特征双套 repack + 单条 `T.mma` 改 3-chain。详见下方 [§12](#12-fp32-输入专项hi-lo-fp16-拆分--3-chain)。
+> ⚠️ **fp32 输入前置判断（先于三选一）**：输入 dtype == fp32 且主计算走 Cube 时，**设计目标 = 原生 fp32 cube**（单 K 路径、fp32 操作数直进 cube；C0=8 分形 + 转译层强制处理项见 §12.2）。`T.mma`/`gemm_v0` fp32 **框架已修复**（catlass v2.0.0 + ascendc fp32 后端；实测：gemm_v0 fp32 非转置/transpose_B 与 mma fp32 均无 NaN、结果确定、与 torch_npu fp32 matmul / CPU fp32 一致，K=1024 时 max_abs ≤1.4e-4，全精度 fp32 舍入量级），**fp32 GEMM 直接用原生 fp32 cube 表达，禁止再走 AIV fp32 FMA 单链**。详见下方 §12。
+>
+> 📌 **AscendC 转译层注意**：原生 fp32 cube 在转译层已实证可行且更优（conv1d：50/50 过 cann-bench 新标准含相消点；叠加布局/发射链优化后 geomean 1.253x / mean 1.284x，40/50 case 反超标杆）——fp32 算子转译时按原生 fp32 cube 实现（强制处理 C0=8 分形/SetFmatrix/kDirectionAlign/SetHF32Mode(false)）。
 
 | 模式 | 适用条件 | 省去 |
 |------|---------|------|
@@ -196,7 +198,7 @@ normal:  GM[x] --software im2col--> GM[N,M,K] --T.copy--> L1 --T.copy--> L0A -->
 | BASE_M | 128 | L0C 单 tile `128×128×4B=64KB` 占 L0C 一半 |
 | BASE_N | 128 | 同上 |
 | BASE_K | 64 | L0 load 分块 |
-| C0 | 16 | fp16/bf16 分形 C0 = 32B/2B |
+| C0 | 16 | fp16/bf16 分形 C0 = 32B/2B；fp32 为 C0=8（fp32 输入见 §12 专项） |
 
 `block_num = batch × m_blocks × n_blocks`（`m_blocks=M_storage/BASE_M`，`n_blocks=Co_storage/BASE_N`）。
 
@@ -281,7 +283,7 @@ fp16: atol 2⁻¹⁴ / rtol 2⁻⁹；bf16: atol 2⁻¹⁰ / rtol 2⁻⁶；输�
 - **fused L1 预算用物理分配**：B 面板按 BASE_N 完整分配（非逻辑 Co），否则预算误判。
 - **满足 fused/direct 却回退 normal 必须写理由**（[decision-tree.md](../references/decision-tree.md) §5 强制）。
 - **禁止默认标量 gather im2col**：主数据路径必须向量化，标量豁免仅 <5% 尾块。
-- **fp32 输入禁止 fp32 cube**：C0=8 分形有对齐陷阱 + M-pipe 同步死锁，必须走 hi/lo fp16 拆分 + 3-chain（见下方 §12）。
+- **fp32 输入走原生 fp32 cube**（设计与转译目标均为 fp32 cube，`T.mma`/`gemm_v0` fp32 已支持，见 §0 前置判断与 §12；无需再走 AIV FMA 单链）。
 
 ---
 
@@ -306,252 +308,70 @@ design/
 
 ---
 
-## 12. fp32 输入专项：hi/lo fp16 拆分 + 3-chain
+## 12. fp32 输入专项：原生 fp32 cube（TileLang 直接表达）
 
-> 本节是 fp32 输入 conv 的专用设计结论（§0 已强制路由到 `hilo_3chain`）。禁止 fp32 cube 的原因见 §12.2；§12.5 含 ConvStandard1d 的 **TileLang 侧已验证完整实现**（2026-09-02，MERE ~1e-7）。
+> 本节是 fp32 输入 conv 的专用设计结论（§0 已路由：**设计/转译目标 = 原生 fp32 cube**）。
+> `T.mma`/`gemm_v0` fp32 **框架已修复**（catlass v2.0.0 + ascendc fp32 后端；实测：gemm_v0 fp32 非转置/transpose_B 与 mma fp32 均无 NaN、结果确定、与
+> torch_npu fp32 matmul / CPU fp32 一致，全精度 fp32 舍入量级）——fp32 GEMM 直接用原生
+> fp32 cube 表达，**禁止再走 AIV fp32 FMA 单链**。fp32 cube 的转译层陷阱与强制处理项见 §12.2。
 
 ### 12.1 设计决策（强制）
 
 | 输入 dtype | 主计算类型 | 设计决策 |
 |-----------|-----------|---------|
 | fp16 / bf16 | GEMM/Conv | 单条 `T.mma`，标准 fp16 cube（C0=16） |
-| **fp32** | GEMM/Conv | **hi/lo fp16 拆分 + 3-chain `T.mma`**（禁止 fp32 cube） |
+| **fp32** | GEMM/Conv | **原生 fp32 cube**（`T.mma`/`gemm_v0` 直接表达，C0=8 分形；转译层强制处理项见 §12.2） |
 | 任意 | 纯 Vector（无 `T.mma`） | 可直接 fp32 Axpy/向量化，无 cube 无此约束 |
 
-### 12.2 为什么禁止 fp32 cube
+### 12.2 fp32 cube 的陷阱与边界（AscendC 转译层强制处理项）
 
 Ascend 910B 的 NZ/ZN 分形 `[16 行, C0 列]`：fp16/bf16 时 `C0=16`，**fp32 时 `C0=8`**。这个分形差异引入两类致命问题：
 
 1. **分形对齐陷阱**：凡是从 `C0` 推出行数/`srcStride`/`mSize` 的代码，fp16 下恰好等于 `/16` 全对，fp32 下全错，报 `fixp_error0 0x60000db / UB address not aligned`。
 2. **M-pipe 同步死锁**：fp32 路径绕开 TQue 自动同步后需手动补 M-pipe→Fixpipe 屏障，漏补则 Cube 与 Fixpipe 竞态死锁，AICore 挂死并污染设备（实测曾把设备 14 污染为 Alarm）。
 
-结论：fp32 cube 的收益（少 3 倍算力）被对齐/同步陷阱与挂死风险抵消，**设计层直接禁止**。
+结论：**设计与转译目标均为原生 fp32 cube**（TileLang 表达层直接 `T.mma`/`gemm_v0` fp32，
+转译层逐项强制处理，conv1d 实证定稿）——转译层强制处理项：
+① 行数恒 16 不从 C0 推导 + Mmad `AlignUp(·,16)` + `kDirectionAlign=true`；
+② `SetFmatrix` 粘性状态每次重设（对齐 MatmulImpl v220 fp32 路径）；
+③ `SetHF32Mode(false)` 锁严格 fp32；④ 保留 `TQue<CO1>` 自动 M→FIX 串行，不绕开手写屏障；
+⑤ buffer 容量翻倍适配（K 分块减半）。缺一项即错/挂死。
 
-### 12.3 方案：hi/lo 拆分 + 3-chain
+### 12.3 TileLang 设计表达（原生 fp32 cube）
 
-把每个 fp32 值拆成两半 fp16（主值 + 残差）：
+fp32 GEMM 直接复用 §2/§3 的 Expert 结构（`T.alloc_L1/L0A/L0B/L0C` + `T.mma`），与
+fp16/bf16 唯一差异是 fp32 分形 C0=8。要点：
 
-```
-hi = CAST_ROUND(x)        # 主值：x 舍入到 fp16（~11 位尾数）
-lo = CAST_ROUND(x - hi)   # 残差：再舍入到 fp16（再 ~11 位）
-=> x ≈ hi + lo, err ≤ 2^-22   （≈ fp32 的 24 位尾数）
-```
+| 项 | fp32 cube 表达 |
+|----|---------------|
+| 操作数 dtype | `dtype="float32"`、累加器 `"float32"`；无 hi/lo 拆分、无 Cast 截断，单 MMA 路径 |
+| 分形 | C0=8（fp16/bf16 为 16）；block_M/block_K(kL0Size) 须 16 对齐，block_N 按 C0=8 对齐即可（实测 block_N=8/16/24 均通过） |
+| 内存 | L0A/L0B 容量按 fp32 翻倍预算（§12.2 强制处理项 ⑤），K 分块减半 |
+| 精度 | fp32 cube 结果与 torch_npu fp32 matmul / CPU fp32 一致（实测，全精度 fp32 舍入量级，K=1024 时 max_abs ≤1.4e-4） |
 
-> ⚠️ **RoundMode 实测修正（2026-09-02，ConvStandard1d 落地）**：fp32→fp16 必须用 `CAST_ROUND`（=torch `.half` 舍入，逐位一致、ties 偶发差 1 ULP）；`CAST_RINT` 隔离测试 bit-exact 但在完整拆分链中不稳定。fp16→fp32 回还用 `CAST_NONE`。完整实测坑位清单见下方 §12.6。
+通用 TileLang 坑位（同样适用于 fp32 cube）：
+- `@tilelang.jit(out_idx=[-1])` 下输出由框架自动分配，调用时**不要显式传入输出**（否则读回未写入的零缓冲）。
+- 纯向量辅助核（xtrans/wrepack/epilogue）必须挂 `TL_ASCEND_AUTO_SYNC`，否则 GM→UB→Vector→UB→GM 无同步 round-trip 即错。
+- Expert 模式 L0C **直接 `T.copy(C_L0, out[...])` 写回 GM**，避免 L0C→alloc_ub→GM 中转的 codegen 缺陷；bias 拆成独立向量核。
 
-乘积展开 `(A_hi+A_lo)@(B_hi+B_lo)`，丢量级 `2^-44` 的 `A_lo@B_lo`，得 **3-chain**：
+### 12.4 验证结论（实测910B2C）
 
-```
-acc = A_hi@B_hi + A_hi@B_lo + A_lo@B_hi   （fp32 L0C 累加）
-```
+| 验证项 | 结果 |
+|--------|------|
+| `T.gemm_v0` fp32（非转置，256³/512³/1024³） | 无 NaN、结果确定、与 torch_npu fp32 matmul / CPU fp32 一致（K=1024 时 max_abs 1.14e-4 vs fp64 参考，全精度 fp32 舍入量级） |
+| `T.mma` fp32（Expert L0A/L0B/L0C） | 同上 |
+| `T.gemm_v0` fp32 transpose_B（QK，128³） | 无 NaN、正确 |
 
-三条 GEMM 跑在**标准 fp16 cube（C0=16）**路径，M-pipe→Fixpipe 靠 `TQue<CO1>` 自动串行（可靠）。
+> 精度口径：TileLang fp32 cube 为**全精度 fp32**（与 CPU fp32/fp64 参考 max_abs ≤1.4e-4
+> @ K=1024，非 HF32/tf32 降精度），可直接作为 fp32 GEMM 的功能验证与精度口径。
 
-### 12.4 TileLang 设计表达
-
-**编程模式**：Expert（与 §2 一致），主计算 `T.mma` + 显式 `alloc_L1/L0A/L0B/L0C` + `T.Scope("C"/"V")` 核分离。
-
-**API 映射**：
-
-| 步骤 | 数学 | TileLang API | 模式 |
-|------|------|-------------|------|
-| hi/lo 拆分（producer） | `x → hi/lo` | `T.tile.cast(CAST_ROUND)` + `T.tile.sub` + `T.tile.cast`（AIV 辅助 kernel；hi 须在被覆写前立即写回 GM） | Expert(AIV) |
-| 操作数 hi/lo | A/B 各两套 | 权重 repack 产出 `ws_hi/ws_lo`；im2col 产出 `im2col_hi/im2col_lo` | Expert |
-| 3-chain GEMM | `acc += Σ A_c@B_c` | 三条 `T.mma(a_l0, b_l0, c_l0, init=(j==0))` 共享同一 `c_l0`，`j∈{0:A_hi@B_hi, 1:A_hi@B_lo, 2:A_lo@B_hi}` | Expert(Cube) |
-| L0C→acc | 写 fp32 累加 | `T.copy(c_l0, acc)`（**直接 L0C→GM**，经 UB 中转触发 codegen 缺陷，见 §12.6 坑 5） | Expert |
-| epilogue | `y = cast(acc + bias)` | `T.tile.add` + `T.tile.cast(CAST_RINT)` | Expert(AIV) |
-
-**内存规划**：
-
-- A/B 操作数各翻倍（hi/lo 两套），L0A/L0B/L1 面板数量 ×2（或按 combo 线性化 j 循环复用同一组 buffer，深度 2 预取）。
-- L0C 仍 `[BASE_M, BASE_N]` fp32，不变。
-- GM 侧新增 `ws_hi/ws_lo`、`im2col_hi/im2col_lo` workspace；host 侧可 LRU 缓存（拆分结果是 weight 内容的确定函数）。
-
-**3-chain 骨架**（block_level，替换 §3.3 单条 `T.mma`）：
-
-```python
-for j in T.Pipelined(3 * k_panels, num_stages=2):   # combo*kPanels + kp
-    combo = j // k_panels; kp = j % k_panels
-    T.copy(ws[combo][...], a_l1); T.copy(col[combo][...], b_l1)  # hi/lo 操作数
-    T.copy(a_l1, a_l0); T.copy(b_l1, b_l0)
-    T.mma(a_l0, b_l0, c_l0, init=(j == 0))           # 仅首 combo 清零
-T.copy(c_l0, acc[...])
-```
-
-> combo 的 k-panel 线性化让三条 GEMM 复用同一套 buffer 与流水，避免三份独立 kernel 的固定发射开销。
-
-### 12.5 已验证完整实现（ConvStandard1d tile_level，2026-09-02）
-
-> 发射链：`im2col (AIV) → hilo_split×2 (AIV) → conv_gemm_3chain (AIC) → bias_add (AIV)`，host 侧只做布局整理、无 torch 计算退化。
-
-**强制 pass_configs（所有 kernel 必挂）**——纯向量核缺 `TL_ASCEND_AUTO_SYNC` 时 GM→UB→Vector→UB→GM 无同步，round-trip 即错：
-
-```python
-_PASS_CONFIGS = {
-    tilelang.PassConfigKey.TL_ASCEND_AUTO_CV_COMBINE: True,
-    tilelang.PassConfigKey.TL_ASCEND_AUTO_CV_SYNC: True,
-    tilelang.PassConfigKey.TL_ASCEND_AUTO_SYNC: True,        # 纯向量核必须开
-    tilelang.PassConfigKey.TL_ASCEND_MEMORY_PLANNING: False,
-}
-```
-
-**hi/lo 拆分 kernel（完整实现）**：
-
-```python
-@tilelang.jit(out_idx=[-2, -1], pass_configs=_PASS_CONFIGS)
-def build_hilo_split(R, C, block_R=64, block_C=64,
-                     dtype="float32", half_dtype="float16"):
-    """fp32 (R,C) -> hi/lo 两套 fp16。要求 R/C 被 block 整除（调用方 zero-padding）。"""
-    r_num = R // block_R
-    c_num = C // block_C
-    tile_elems = block_R * block_C
-
-    @T.prim_func
-    def hilo_split(
-        x: T.Tensor((R, C), dtype),
-        hi: T.Tensor((R, C), half_dtype),
-        lo: T.Tensor((R, C), half_dtype),
-    ):
-        with T.Kernel(r_num * c_num, is_npu=True) as (cid, _):
-            r0 = (cid // c_num) * block_R
-            c0 = (cid % c_num) * block_C
-
-            x_ub = T.alloc_ub([block_R, block_C], dtype)
-            hi_ub = T.alloc_ub([block_R, block_C], half_dtype)
-            back_ub = T.alloc_ub([block_R, block_C], dtype)
-            lo_ub = T.alloc_ub([block_R, block_C], half_dtype)
-
-            T.copy(x[r0:r0 + block_R, c0:c0 + block_C], x_ub)
-            T.tile.cast(hi_ub, x_ub, "CAST_ROUND", tile_elems)
-            T.copy(hi_ub, hi[r0:r0 + block_R, c0:c0 + block_C])  # ★ hi 立即写回 GM
-            T.tile.cast(back_ub, hi_ub, "CAST_NONE", tile_elems)
-            T.tile.sub(x_ub, x_ub, back_ub)
-            T.tile.cast(lo_ub, x_ub, "CAST_ROUND", tile_elems)
-            T.copy(lo_ub, lo[r0:r0 + block_R, c0:c0 + block_C])
-
-    return hilo_split
-```
-
-**3-chain GEMM kernel（完整实现，gemm_v0 变体）**：
-
-```python
-_BLOCK_M = 64   # GEMM N 维分块
-_BLOCK_N = 64   # GEMM M 维分块
-_K_L1 = 64      # K 维 L1 分块
-
-@tilelang.jit(out_idx=[-1], pass_configs=_PASS_CONFIGS)
-def build_conv_gemm_3chain(groups, CoutG_padded, K_padded, M_padded,
-                           dtype="float16", accum_dtype="float32"):
-    """acc = W_hi@X_hi + W_hi@X_lo + W_lo@X_hi（fp32 L0C 累加）。
-    输入 X_hi/X_lo (groups,K_padded,M_padded)，W_hi/W_lo (Cout_padded,K_padded)。"""
-    Cout_padded = groups * CoutG_padded
-    m_num = M_padded // _BLOCK_M
-    n_num = CoutG_padded // _BLOCK_N
-
-    @T.prim_func
-    def conv_gemm_3chain(
-        X_hi: T.Tensor((groups, K_padded, M_padded), dtype),
-        X_lo: T.Tensor((groups, K_padded, M_padded), dtype),
-        W_hi: T.Tensor((Cout_padded, K_padded), dtype),
-        W_lo: T.Tensor((Cout_padded, K_padded), dtype),
-        out: T.Tensor((Cout_padded, M_padded), accum_dtype),
-    ):
-        with T.Kernel(groups * m_num * n_num, is_npu=True) as (cid, _):
-            g = cid // (m_num * n_num)
-            r = cid % (m_num * n_num)
-            by = r // n_num          # m tile
-            bx = r % n_num           # co tile
-
-            A_hi_L1 = T.alloc_L1([_BLOCK_N, _K_L1], dtype)   # W_hi tile
-            A_lo_L1 = T.alloc_L1([_BLOCK_N, _K_L1], dtype)   # W_lo tile
-            B_hi_L1 = T.alloc_L1([_K_L1, _BLOCK_M], dtype)   # X_hi tile
-            B_lo_L1 = T.alloc_L1([_K_L1, _BLOCK_M], dtype)   # X_lo tile
-            C_L0 = T.alloc_L0C([_BLOCK_N, _BLOCK_M], accum_dtype)
-
-            co0 = g * CoutG_padded + bx * _BLOCK_N
-            m0 = by * _BLOCK_M
-
-            with T.Scope("C"):
-                for kk in T.serial(K_padded // _K_L1):
-                    T.copy(W_hi[co0, kk * _K_L1], A_hi_L1)
-                    T.copy(W_lo[co0, kk * _K_L1], A_lo_L1)
-                    T.copy(X_hi[g, kk * _K_L1, m0], B_hi_L1)
-                    T.copy(X_lo[g, kk * _K_L1, m0], B_lo_L1)
-
-                    # ★ 3-chain：仅 chain-1 首 panel 清零，其余全部累加
-                    T.gemm_v0(A_hi_L1, B_hi_L1, C_L0, init=(kk == 0))
-                    T.gemm_v0(A_hi_L1, B_lo_L1, C_L0, init=False)
-                    T.gemm_v0(A_lo_L1, B_hi_L1, C_L0, init=False)
-
-                # ★ L0C 直接写回 GM（L0C→alloc_ub→GM 中转触发 codegen 缺陷）
-                T.copy(C_L0, out[co0, m0])
-
-    return conv_gemm_3chain
-```
-
-**3-chain 累加语义（核心不变式）**：
-
-| chain | 操作数 | init | 含义 |
-|-------|--------|------|------|
-| 1 | `W_hi @ X_hi` | `init=(kk==0)` — 仅首 panel 清零 | 主项 |
-| 2 | `W_hi @ X_lo` | `init=False` 恒累加 | hi×lo 交叉项 |
-| 3 | `W_lo @ X_hi` | `init=False` 恒累加 | lo×hi 交叉项 |
-
-三条 GEMM **共享同一 fp32 L0C**，单 tile 只在 chain-1 首 panel init 一次——这是 3-chain 的正确性不变式，任何等价改写都必须保持"同一累加器、全程只清零一次"。三种等价结构表达：
-
-| 表达 | 出处 | 结构 |
-|------|------|------|
-| combo 线性化 | §12.4 设计骨架 | `T.Pipelined(3*k_panels)` 单条 `T.mma`，combo 选 hi/lo 操作数 |
-| K-loop 内 3 条 gemm_v0 | 本节（TileLang 已验证实现） | 每 panel 4 次 L1 装载 + 3 条 gemm_v0 共享 C_L0 |
-| 虚拟 K'=3Kp | AscendC 转译落地（性能最好） | panel band 0/1/2 取 (hi,hi)/(lo,hi)/(hi,lo)，首 Mmad init、单 tile 一次 Fixpipe |
-
-### 12.6 实测坑位清单（逐项排查后的根因，勿重复踩）
-
-| # | 现象 | 根因 | 正确做法 |
-|---|------|------|---------|
-| 1 | 3-chain 结果 MERE≈1（读回全零） | `out_idx` 语义误解：`@tilelang.jit(out_idx=[-1])` 下输出由框架自动分配，调用时**显式传入输出**导致读回未写入的零缓冲 | 带 `out_idx` 的 kernel 调用时不传输出，用返回值 |
-| 2 | 向量核 round-trip 即错 | 缺 `TL_ASCEND_AUTO_SYNC` | 全部 kernel 挂 §12.5 的 pass_configs |
-| 3 | hi/lo 拆分后组合崩溃/被覆写 | fp32→fp16 用了 `CAST_RINT` | 用 `CAST_ROUND`；fp16→fp32 回还用 `CAST_NONE` |
-| 4 | lo 算错 | `hi_ub` 被后续 back/sub/lo 计算覆写 | hi 在被覆写前**立即写回 GM** |
-| 5 | Expert 模式 copy codegen 报 undefined Variable | L0C→alloc_ub→GM 中转触发 codegen 缺陷 | **L0C 直接 `T.copy(C_L0, out[...])` 写回 GM**；bias 拆成独立向量核 |
-| 6 | im2col 非 32B 对齐移位拷贝 ADDR_MISALIGN | stride>1 / ki·dilation 非 8 对齐 | TileLang 层按逐位置搬运表达即可；Phase 4 用 DataCopyPad/去交织处理（与 3-chain 精度无关） |
-
-> 坑 1/2/3/4/5 叠加曾表现为"3 次 gemm_v0 累加返回垃圾"，一度被误判为"框架不支持 fp32 3-chain"而合法跳过——逐项排查后全部为实现问题，框架路径可用。
-
-### 12.7 groups / 布局契约（host 侧配合）
-
-- **权重散播**：`weight.reshape(g, CoutG, K)` → 零填充到 `(g, CoutG_padded, K_padded)` → reshape `(Cout_padded, K_padded)`。group g 的权重落在行 `[g*CoutG_padded, g*CoutG_padded+CoutG)`，与 kernel 的 `co0 = g*CoutG_padded + bx*_BLOCK_N` 一致；bias 同样散播到 `(Cout_padded,)`。
-- **输入 GM 零填充**：`x_pad[:, :, p:p+L] = x`，padding 边界吸收进移位下标 `X_col[ci*k+ki, n*Lout+lout] = x_pad[lout*stride + ki*dilation]`。
-- **输出紧凑拼接**：GEMM 输出 `(g, CoutG_padded, M_padded)`，host 取每 group 有效行 `[:, :CoutG, :M]` 紧凑拼接成 `(Cout, M)` 再 reshape/permute 回 `(N, Cout, Lout)`。不能让 kernel 按 padded 布局直接输出（多 group 共享 buffer 尾块竞态）。
-- 拆分输入须整除：`R/C` 先 round_up 到 block 再进 `build_hilo_split`（调用方负责 zero-padding）。
-
-### 12.8 验证：torch_npu 符号冲突时的代理验证路径
-
-`evaluate_tilelang.sh` 被 torch_npu conv 与 tilelang 符号冲突阻塞（环境冲突，非实现问题）时，用**不依赖 torch_npu conv 的纯 torch 代理验证**：
-
-| 验证项 | 内容 | 结果（ConvStandard1d 实测） |
-|--------|------|------|
-| hi/lo 拆分正确性 | kernel 拆分 vs torch `.half()` | hi 逐位一致（ties 偶发差 1 ULP fp16）；重建 err ≤ 9.5e-7 |
-| 3-chain GEMM 精度 | vs torch fp32 matmul（fp64 参考），M/N/K 128~1024 | MERE 1.25e-7 ~ 2.41e-7（阈值 1.22e-4，余量 >400x） |
-| 全链 conv | host im2col + 拆分 + 3-chain + bias，覆盖 stride{1,2}/dilation{1,2}/padding{0,1,2}/groups{1,2,32 depthwise}/bias{T,F} | 6/6 通过，MERE 7e-8 ~ 2.9e-7 |
-
-> 教训：golden 被环境阻塞时，先构造绕过冲突源的纯 torch 参考对拍，不要轻易 SKIPPED（本路径的"合法跳过"结论曾被代理验证推翻）。
-
-### 12.9 精度
-
-- 拆分误差 `err ≤ 2^-22`；实测 MERE ~1e-7（ConvStandard1d 代理验证）~ 2e-5（conv2d_story），远低于 fp32 阈值 `rel_thr 1.22e-4`，50/50 case 全过。
-- 3-chain 丢 `A_lo@B_lo`（量级 2^-44），对 fp32 精度无影响。
-
-### 12.10 性能
+### 12.5 性能
 
 | 实现 | geomean 加速比 |
 |------|---------------|
-| **hi/lo fp16 3-chain GEMM**（conv2d_story） | **0.76x**（groups==1 大通道 0.69x，depthwise 0.95~1.76x） |
-| **hi/lo 3-chain**（ConvStandard1d，AscendC 虚拟 K'=3Kp 落地） | **0.69x**（AIV 手动 GEMM 对照 0.10x，~7x 提升） |
+| **原生 fp32 cube + 布局/发射层优化**（conv1d） | **1.253x geomean / 1.284x mean**（per_case 官方口径；0.738x fp32 cube 基线 → GatherMask 去交织 + 发射链 4→3 + epilogue 直写布局等 6 项优化） |
 
 关键收益：groups==1 大通道小空间 case（直卷积瓶颈，逐 co 重读窗口 + 单元素 gather）从结构性慢变为 im2col+GEMM 正常水平。
-
-**移交 Phase 4 注意**：stride>1 im2col 逐位置采样 → 去交织/GatherMask 向量化（最大单项剩余瓶颈）；DataCopyPad UB→GM 时 **UB 侧源地址必须 32B 对齐**（GM 侧非对齐由 pad 吸收，反之不行）。
 
 ---
 
@@ -561,7 +381,7 @@ def build_conv_gemm_3chain(groups, CoutG_padded, K_padded, M_padded,
 
 ```python
 BASE_M = 128; BASE_N = 128; BASE_K = 64   # L0C 单 tile 128×128×4B=64KB 占一半
-C0 = 16                                    # fp16/bf16 分形 C0 = 32B/2B
+C0 = 16                                    # fp16/bf16 分形 C0 = 32B/2B（fp32 为 C0=8，见 §12）
 FUSED_L1_BUDGET = 500 * 1024               # fused 的 L1 预算
 
 @dataclass(frozen=True)

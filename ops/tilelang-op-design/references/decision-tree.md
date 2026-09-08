@@ -32,6 +32,9 @@
 │   │   内存: GM→L1→L0A/L0B→L0C→GM
 │   │   pass_configs: 全开启（Developer）
 │   │   Kernel: T.Kernel(任务数, is_npu=True) as (cid, _)
+│   │   ⚠️ fp32 输入: T.mma/gemm_v0 fp32 已支持（实测通过）——
+│   │       直接原生 fp32 cube 表达（C0=8 分形见 §3 硬件约束），
+│   │       转译层强制处理项见 conv2d-template.md §12 与 fp32-cube-path.md
 │   │
 │   └─ matmul + element-wise 前处理/后处理 → CV 融合算子
 │       ├─ Developer 模式（推荐，默认消除 workspace/vid）
@@ -42,6 +45,7 @@
 │       │   同步: AUTO_SYNC + AUTO_CV_SYNC 自动处理
 │       │   V 核: threads=2 自动并行（消 vid）；复杂场景才回退 workspace+vid
 │       │   写法: 见 tilelang-programming-model-guide mode-examples.md §6
+│       │   ⚠️ fp32 输入: gemm_v0 fp32 已支持（原生 fp32 cube），Conv 类走 §5 强制分支
 │       │
 │       ├─ Expert 模式（极致性能）
 │       │   模式: Expert + T.Scope("C"/"V") + T.set_cross_flag
@@ -102,7 +106,7 @@
 
 | 类别 | Ascend 专用 API（推荐） | 通用 API（本项目不推荐/不支持） |
 |------|------------------------|-------------------------------|
-| GEMM | `T.gemm_v0` | `T.gemm`（可能不支持） |
+| GEMM | `T.gemm_v0` / `T.mma`（含 fp32 操作数——框架已修复，实测通过） | `T.gemm`（可能不支持） |
 | 内存分配（Expert）| `T.alloc_L1`, `T.alloc_L0C`, `T.alloc_ub` | - |
 | 内存分配（Developer）| `T.alloc_shared`, `T.alloc_fragment` | - |
 | Kernel | `T.Kernel(一维, is_npu=True)` | `T.Kernel(三维)` ❌ |
@@ -122,6 +126,6 @@ Conv 类算子（`nn.Conv*` / `F.conv*`）必须按以下三模式显式选型�
 约束：
 - 满足 fused/direct 条件却退回 normal 时，必须在设计文档「风险点」中写明理由
 - **禁止默认标量逐元素 gather** 的 im2col 设计；k'=(ci,kh,kw) 解码按段连续块/向量化表达；标量豁免仅限占比 <5% 的偶发小尾块（主数据路径不可豁免）
-- dtype 适配（fp32 走 hi/lo fp16 拆分、bf16 替代）时必须声明「保留的优化结构清单」：fused/normal 模式、零标量、批量转置、epilogue 跨行块处理逐项标注 保留/丢弃+理由
+- dtype 适配（fp32 走原生 fp32 cube——`T.mma`/`gemm_v0` fp32 已支持，直接 cube 表达；bf16 替代）时必须声明「保留的优化结构清单」：fused/normal 模式、零标量、批量转置、epilogue 跨行块处理逐项标注 保留/丢弃+理由
 - 权重 repack 结果是（weight 内容, shape, dtype）的确定函数，设计中标注可由 host 侧 LRU 缓存
 - **完整 conv2d 设计模板**（§0 三模式选型 + API 映射 + Tiling + K 顺序契约 + 风险点 + 交付清单）见 [`examples/conv2d-template.md`](../examples/conv2d-template.md)。生成 conv2d 类算子时先读本模板再走 `examples/design-template.md` 通用骨架。

@@ -54,7 +54,7 @@ def _get_device():
 
 
 # ---------------------------------------------------------------------------
-# 精度对比标准（参考 NPU Benchmark 精度对比方法，三项判定）
+# 精度对比标准（生态开源精度标准为浮点第一标准；NPU Benchmark 三项为 fallback）
 # ---------------------------------------------------------------------------
 
 REQUIRED_MATCHED_RATIO = 0.9
@@ -66,6 +66,77 @@ ALLCLOSE_TOLS_STR = {
     "bfloat16": (1e-1, 2**(-7)),   # 2**(-7)=7.8125e-3
 }
 ALLCLOSE_DEFAULT_TOLS = ALLCLOSE_TOLS_STR["float32"]
+
+
+# ---------------------------------------------------------------------------
+# 生态开源精度标准（第一标准；阈值表与限值计算内联本文件，不单独成模块）
+# 只覆盖浮点输出且 dtype 在阈值表内的用例，两项 AND 判定：
+#   ① 混合容差通过率：|actual-golden| <= atol + rtol*|golden|，matched_ratio >= 0.99
+#   ② 逐元素绝对上限：|actual-golden| <= max(max_abs_error_limit, 32*ULP(|golden|))，
+#      ULP 按逐元素取（= 32 * 2^(floor(log2|golden|) - 尾数位)）
+# 与下方 NPU Benchmark 的阈值表相互独立；未在表内覆盖的 dtype 回退到三项判定。
+# ---------------------------------------------------------------------------
+
+# (rtol, atol, max_abs_error_limit)
+_ECO_TOLS = {
+    "float16": (2 ** -9, 2 ** -9, 1e-1),
+    "bfloat16": (2 ** -6, 2 ** -6, 1e-0),
+    "float32": (2 ** -10, 2 ** -16, 1e-2),
+    "hifloat32": (2 ** -9, 2 ** -10, 1e-1),
+    "float8_e4m3": (2 ** -2, 2 ** -4, 1e-0),
+    "float8_e5m2": (2 ** -1, 2 ** -3, 1e-1),
+}
+_ECO_DEFAULT_TOLS = _ECO_TOLS["float32"]
+_ECO_MATCHED_RATIO = 0.99
+_ECO_ULP_FACTOR = 32.0
+
+# 各 dtype 尾数位数（用于 ULP 计算）
+_ECO_MANTISSA_BITS = {
+    "float16": 10,
+    "bfloat16": 7,
+    "float32": 23,
+    "float64": 52,
+    "hifloat32": 11,
+    "float8_e4m3": 3,
+    "float8_e5m2": 2,
+}
+_ECO_DEFAULT_MANTISSA_BITS = 23
+
+
+def _eco_normalize_dtype(data_type):
+    """把 torch.dtype 或字符串统一成生态阈值表的键名。"""
+    name = str(data_type).replace("torch.", "").lower()
+    if name.startswith("float8_e4m3"):
+        return "float8_e4m3"
+    if name.startswith("float8_e5m2"):
+        return "float8_e5m2"
+    return name
+
+
+def _eco_supports(data_type):
+    """dtype 是否在生态标准阈值表覆盖范围内（不在表内应回退，勿套 float32 默认）。"""
+    return _eco_normalize_dtype(data_type) in _ECO_TOLS
+
+
+def _get_eco_tols(data_type):
+    """返回生态标准 (rtol, atol, max_abs_error_limit)。"""
+    return _ECO_TOLS.get(_eco_normalize_dtype(data_type), _ECO_DEFAULT_TOLS)
+
+
+def _eco_elementwise_limit(abs_golden, data_type):
+    """逐元素绝对上限张量：max(常数上限, 32*ULP(|golden|), atol+rtol*|golden|)。
+
+    abs_golden 为 golden 的绝对值张量（float64），返回同形状的限值张量。
+    """
+    rtol, atol, lim_const = _get_eco_tols(data_type)
+    mantissa = _ECO_MANTISSA_BITS.get(
+        _eco_normalize_dtype(data_type), _ECO_DEFAULT_MANTISSA_BITS)
+    tiny = torch.finfo(torch.float64).tiny
+    exponent = torch.floor(torch.log2(abs_golden.clamp_min(tiny)))
+    ulp_limit = torch.pow(2.0, exponent - mantissa) * _ECO_ULP_FACTOR
+    limit = torch.clamp(ulp_limit, min=lim_const)
+    return torch.maximum(limit, atol + rtol * abs_golden)
+
 
 # 量化整数输出的 LSB tolerance：dynamic quant / smooth quant 等算子的
 # int8/int16 输出，在 NPU 实现侧通常经过 fp32→fp16→int 的中转 cast，
@@ -403,6 +474,80 @@ def _check_accuracy_npu_benchmark(golden, actual, data_type):
     metrics = _build_accuracy_metrics(acc)
     msg = _format_accuracy_message(acc)
     return is_pass, metrics, msg
+
+
+def _check_accuracy_eco(golden, actual, data_type):
+    """生态开源精度标准判定（两项 AND）。
+
+    ① 混合容差通过率：逐元素 |actual - golden| <= atol + rtol * |golden|，
+       要求 matched_ratio = 通过数 / 总元素数 >= 0.99；
+    ② 逐元素绝对上限：每个元素 |actual - golden| <= max(max_abs_error_limit, 32*ULP(|golden|))，
+       ULP 按逐元素取。
+
+    golden 为参考实现输出（本文件内即 lhs / 比较左侧），actual 为待评测实现输出，
+    两者均取 finite 切片。两条判据独立，按 AND 处理，任一不过即失败。
+
+    Returns:
+        (passed, metrics_dict, message)
+    """
+    rtol, atol, lim_const = _get_eco_tols(data_type)
+    golden_f = golden.to(torch.float64)
+    actual_f = actual.to(torch.float64)
+    abs_diff = (actual_f - golden_f).abs()
+    abs_golden = golden_f.abs()
+    mixed_bound = atol + rtol * abs_golden
+    matched_mask = abs_diff <= mixed_bound
+    total = matched_mask.numel()
+    matched_ratio = float(matched_mask.sum()) / total if total else 1.0
+    limit = _eco_elementwise_limit(abs_golden, data_type)
+    over_mask = abs_diff > limit
+    over_count = int(over_mask.sum()) if total else 0
+    ratio_ok = matched_ratio >= _ECO_MATCHED_RATIO
+    max_abs_error = float(abs_diff.max()) if total else 0.0
+    checks = {"matched_ratio": ratio_ok, "max_abs_error": over_count == 0}
+    passed = bool(ratio_ok and over_count == 0)
+
+    metrics = {
+        "standard": "eco-open-source",
+        "out_dtype": str(data_type),
+        "atol": atol,
+        "rtol": rtol,
+        "max_abs_error_limit": lim_const,
+        "ulp_factor": _ECO_ULP_FACTOR,
+        "matched_ratio": matched_ratio,
+        "required_matched_ratio": _ECO_MATCHED_RATIO,
+        "max_abs_error": max_abs_error,
+        "max_abs_golden": float(abs_golden.max()) if total else 0.0,
+        "max_abs_error_violation_count": over_count,
+        "total_finite": total,
+        "checks": checks,
+    }
+    if passed:
+        msg = (
+            f"生态开源精度标准 ok: matched_ratio={matched_ratio:.6f} "
+            f"(req>={_ECO_MATCHED_RATIO}), max_abs_error={max_abs_error:.3e} "
+            f"(绝对上限越限 {over_count}/{total})"
+        )
+        return passed, metrics, msg
+
+    over_idx = torch.where(over_mask)[0]
+    show = min(10, int(over_idx.numel())) if over_idx.numel() else 0
+    msg = (
+        f"生态开源精度标准失败: matched_ratio={matched_ratio:.6f} "
+        f"(req>={_ECO_MATCHED_RATIO}, ok={ratio_ok}), "
+        f"max_abs_error={max_abs_error:.3e} "
+        f"(逐元素上限=max(常数{lim_const:.3e}, {_ECO_ULP_FACTOR:.0f}*ULP(|golden|)), "
+        f"越限 {over_count}/{total}, ok={over_count == 0})"
+    )
+    for i in range(show):
+        idx = int(over_idx[i])
+        msg += (
+            f"; [{idx}]golden={float(golden_f[idx]):.3e}, "
+            f"actual={float(actual_f[idx]):.3e}, "
+            f"|diff|={float(abs_diff[idx]):.3e} "
+            f"(允许<={float(limit[idx]):.3e})"
+        )
+    return passed, metrics, msg
 
 
 # ---------------------------------------------------------------------------
@@ -760,13 +905,21 @@ def _compare_complex_tensors(lhs, rhs, path):
 
 
 def _compare_float_tensors(ctx: _TensorCmpCtx, lhs):
-    """Compare float tensors using NPU Benchmark 3 checks."""
+    """Compare float tensors：生态开源精度标准为第一标准，dtype 未覆盖时回退 NPU Benchmark 三项判定。"""
     lhs_finite, rhs_finite = ctx.lhs_finite, ctx.rhs_finite
     path = ctx.path
     finite_count, total_numel = ctx.finite_count, ctx.total_numel
     if rhs_finite.dtype != lhs_finite.dtype:
         rhs_finite = rhs_finite.to(lhs_finite.dtype)
-    passed, metrics, msg = _check_accuracy_npu_benchmark(rhs_finite, lhs_finite, lhs_finite.dtype)
+    data_type = lhs_finite.dtype
+    if _eco_supports(data_type):
+        # 生态开源精度标准（两项 AND）：输出 dtype 在阈值表内走此路径
+        passed, _metrics, msg = _check_accuracy_eco(lhs_finite, rhs_finite, data_type)
+        if passed:
+            return True, f"{path}: matched, {msg} ({finite_count}/{total_numel} finite)"
+        return False, f"{path}: {msg}"
+    # 输出 dtype 不在生态阈值表内 → 回退 NPU Benchmark 三项判定
+    passed, _metrics, msg = _check_accuracy_npu_benchmark(rhs_finite, lhs_finite, data_type)
     if passed:
         return True, f"{path}: matched, {msg} ({finite_count}/{total_numel} finite)"
     return False, f"{path}: {_tensor_diff_summary(lhs_finite, rhs_finite)}"

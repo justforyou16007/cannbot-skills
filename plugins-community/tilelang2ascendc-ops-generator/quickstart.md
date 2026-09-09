@@ -2,7 +2,7 @@
 
 ## 概述
 
-Ascend C 算子自动生成模式适用于**从 PyTorch Model 自动生成 Ascend C Kernel**场景，支持双路径：简单算子走 ops-direct-invoke 工作流（Architect 设计 → Developer 实现 → Reviewer 审查），复杂算子先走 TileLang 设计表达；验证通过后优先泛化为 AscendC，否则走既有转译，端到端完成算子开发。
+Ascend C 算子自动生成模式适用于**从 PyTorch Model 自动生成 Ascend C Kernel**场景，支持双路径：简单算子走 ops-direct-invoke 工作流（Architect 设计 → Developer 实现 → Reviewer 审查），复杂算子走 TileLang 设计表达 → AscendC 转译优化，端到端完成算子开发。
 
 ### 工作流
 
@@ -15,8 +15,7 @@ Phase 3: 设计表达            (分支)
   └─ 复杂算子: TileLang 设计  (tilelang2ascend-tilelang-designer + 退化检测 + 迭代)
 Phase 4: AscendC 生成与验证   (分支)
   ├─ 简单算子: 开发实现 + 代码审查 + 修复循环 (ops-direct-invoke: 渐进式开发 + REVIEW.md + 最多3轮修复)
-  └─ 复杂算子: TileLang 验证 PASS → 泛化 (tilelang2ascend-kernel-generalizer)
-              否则 → 转译 (tilelang2ascend-translator + 退化检测 + 迭代)
+  └─ 复杂算子: 转译          (tilelang2ascend-translator + 退化检测 + 迭代)
 Phase 5: 性能分析            (ops-profiling --compare 模式)
 Phase 6: 全量验证
 Phase 7: Trace 记录          (tilelang2ascend-trace-recorder)
@@ -27,7 +26,7 @@ Phase 7: Trace 记录          (tilelang2ascend-trace-recorder)
 | 路径 | 算子类型 | Skill 链 |
 |------|---------|---------|
 | 简单算子 | Index, IndexPut, Gather, Scatter, Nonzero, RepeatInterleave, EmbeddingDenseBackward | ops-direct-invoke（Architect → Developer → Reviewer） |
-| 复杂算子 | Attention, MatMul 变体, Norm 变体, Sort, TopK, 多输入融合 | TileLang 验证 PASS → tilelang2ascend-kernel-generalizer；否则 → tilelang2ascend-translator |
+| 复杂算子 | Attention, MatMul 变体, Norm 变体, Sort, TopK, 多输入融合 | tilelang2ascend-tilelang-designer → tilelang2ascend-translator |
 
 ## 一、环境搭建
 
@@ -171,8 +170,7 @@ bash .claude/skills/ops-profiling/scripts/msprof_profile_run.sh --batch \
 | `tilelang2ascend-case-simplifier` | 测试用例精简 | 所有 |
 | ops-direct-invoke (Architect + Developer + Reviewer) | 简单算子架构设计、开发实现、代码审查 | 简单算子 |
 | `tilelang2ascend-tilelang-designer` | TileLang kernel 设计表达 | 复杂算子 |
-| `tilelang2ascend-kernel-generalizer` | 将已验证 TileLang 输出泛化为标准 AscendC 工程 | TileLang 验证 PASS 的复杂算子 |
-| `tilelang2ascend-translator` | TileLang→AscendC 转译 | 未进入泛化分支的复杂算子 |
+| `tilelang2ascend-translator` | TileLang→AscendC 转译 | 复杂算子 |
 | `tilelang2ascend-operator-project-init` | Kernel 工程初始化 | 所有 |
 | `ops-profiling` | 性能测试分析（--compare 模式） | 所有 |
 | `tilelang2ascend-trace-recorder` | 执行记录生成 | 所有 |
@@ -192,11 +190,11 @@ bash init.sh --help
 
 ### Q: 简单算子和复杂算子有什么区别？
 
-简单算子（Index, Gather, Scatter 等）走 ops-direct-invoke 工作流：Architect 架构设计 → Developer 渐进式开发 → Reviewer 代码审查（100分制评分 + 修复循环）。复杂算子（Attention, MatMul, Norm, Sort 等）先做 TileLang 设计表达；当本轮验证通过时，基于已验证输出泛化为 AscendC 代码，否则沿用转译路径。
+简单算子（Index, Gather, Scatter 等）走 ops-direct-invoke 工作流：Architect 架构设计 → Developer 渐进式开发 → Reviewer 代码审查（100分制评分 + 修复循环）。复杂算子（Attention, MatMul, Norm, Sort 等）需要先做 TileLang 设计表达，再转译为 AscendC 代码。
 
 ### Q: TileLang 验证失败了怎么办？
 
-TileLang 验证通过是进入泛化分支的唯一条件；验证失败或框架不可用时不会要求用户修改 TileLang 编译器，而是直接进入既有 AscendC 转译阶段。在 trace.md 中记录路由原因。
+TileLang 当前主要用于设计表达，不是 correctness gate。若 TileLang 验证失败但设计意图正确，可跳过 TileLang 验证直接进入 AscendC 转译阶段。在 trace.md 中会记录跳过原因。
 
 ### Q: AscendC 验证迭代上限是多少？
 

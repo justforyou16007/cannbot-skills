@@ -1,6 +1,6 @@
 ---
 name: tilelang2ascendc-ops-generator
-description: Ascend C 算子自动生成工具 CANNBot，通过双路径（ops-direct-invoke / TileLang）设计表达，并在 TileLang 验证通过后优先泛化为 AscendC 算子。
+description: Ascend C 算子自动生成工具 CANNBot，通过双路径（ops-direct-invoke / TileLang）设计表达和 AscendC 转译实现算子端到端自动开发。
 mode: primary
 skills:
   - npu-arch
@@ -48,7 +48,7 @@ Ascend C Kernel 算子自动生成工具 CANNBot，通过双路径（ops-direct-
 - 接收用户需求并启动自动开发流程
 - 调用 Subagent 执行双路径开发：
   - 简单算子（Index/Gather/Scatter 等）→ ops-direct-invoke（Architect 设计 → Developer 实现 → Reviewer 审查）
-  - 复杂算子（Attention/MatMul/Norm/Sort 等）→ TileLang；验证通过后走 kernel-generalizer，否则走 translator
+  - 复杂算子（Attention/MatMul/Norm/Sort 等）→ TileLang → tilelang2ascend-translator
 - D 类精度修复调度：当 Subagent 返回 D 类失败时，重新调用 Subagent 按 4.5D 流程迭代修复
 - 读取文件状态判断工作流进度
 - 汇报最终开发结果给用户
@@ -117,9 +117,7 @@ Phase 3: 设计表达            (分支)
        Skill 依赖: tilelang-op-design + tilelang-op-develop + tilelang-perf-optimization
 Phase 4: AscendC 生成与验证   (分支)
   ├─ 简单算子: 开发实现 + 代码审查 + 修复循环 (ops-direct-invoke: 渐进式开发 + REVIEW.md + 最多3轮修复)
-  └─ 复杂算子:
-       ├─ TileLang 验证 PASS: 泛化 (tilelang2ascend-kernel-generalizer + 退化检测 + 迭代)
-       └─ 其他情况: 转译      (tilelang2ascend-translator + 退化检测 + 迭代)
+  └─ 复杂算子: 转译          (tilelang2ascend-translator + 退化检测 + 迭代)
 Phase 5: 性能分析            (ops-profiling --quick 模式; 只做测量归档, TileLang 调优已在 Phase 3 Step 4 完成)
 Phase 6: 全量验证            (恢复全量用例、验证、修复)
 Phase 7: Trace 记录          (tilelang2ascend-trace-recorder)
@@ -241,7 +239,6 @@ Subagent 返回
 - AscendC Phase 4 迭代: A 类（编译/运行时错误）上限 5 次（a_retry），D 类（精度不匹配）上限 D1 7 次 + D2 5 次 = 12 次（d_retry）。A/D 计数器相互独立，A 类用完后若转入 D 类则 D 类从 0 开始有完整 12 次机会。
 - 禁止修改 `{output_dir}/` 之外的任何文件
 - TileLang 功能验证（evaluate_tilelang.sh）默认必须执行且精度必须通过——精度通过是 Phase 3 Step 4 性能迭代的强制前置；仅当对照实验证明属 TileLang 编译器/框架底层不支持时才可跳过（需记录证据）并继续 Phase 4，其余失败必须迭代修复
-- 泛化分支只在本轮 `evaluate_tilelang.sh` 明确 PASS 后使用；不得修改、要求用户修改或通过补丁规避 TileLang 编译器问题
 - 禁止手动修改或删除 `.claude/hooks/state/precision_gate.json`（由 Hook 自动管理，绕过即违规）
 
 ---

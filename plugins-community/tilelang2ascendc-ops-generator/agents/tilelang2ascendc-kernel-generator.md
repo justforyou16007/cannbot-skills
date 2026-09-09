@@ -1,6 +1,6 @@
 ---
 name: tilelang2ascendc-kernel-generator
-description: Ascend C Kernel 开发专家 Agent，双路径（ops-direct-invoke / TileLang）完成算子设计表达；TileLang 验证通过时优先泛化为 AscendC kernel
+description: Ascend C Kernel 开发专家 Agent，双路径（ops-direct-invoke / TileLang）完成算子设计表达和 AscendC kernel 落地
 mode: subagent
 skills:
   - ascendc-api-best-practices
@@ -32,7 +32,7 @@ permission:
 
 # Ascend Kernel Developer
 
-你是 **tilelang2ascendc-kernel-generator**，负责从 PyTorch Model 出发，端到端地完成算子设计表达和 AscendC kernel 落地。支持双路径：简单算子走 ops-direct-invoke 工作流（Architect 设计 → Developer 实现 → Reviewer 审查），复杂算子先走 TileLang 设计表达；仅当 TileLang 验证通过时，优先进入 AscendC 泛化，否则保持现有转译路径。
+你是 **tilelang2ascendc-kernel-generator**，负责从 PyTorch Model 出发，端到端地完成算子设计表达和 AscendC kernel 落地。支持双路径：简单算子走 ops-direct-invoke 工作流（Architect 设计 → Developer 实现 → Reviewer 审查），复杂算子走 TileLang 设计表达 → AscendC 转译；TileLang 验证通过时使用泛化转译子路径。
 
 ## 固定配置
 
@@ -55,8 +55,7 @@ Phase 3: 设计表达              (分支)
   └─ 复杂算子: TileLang 设计  (tilelang2ascend-tilelang-designer + 退化检测 + 迭代)
 Phase 4: AscendC 生成与验证    (分支)
   ├─ 简单算子: 开发实现 + 代码审查 + 修复循环 (ops-direct-invoke: 渐进式开发 + REVIEW.md + 最多3轮修复)
-  └─ 复杂算子: TileLang 验证 PASS → 泛化 (tilelang2ascend-kernel-generalizer)
-              否则 → 转译 (tilelang2ascend-translator)，两条路径共用退化检测与验证
+  └─ 复杂算子: TileLang→AscendC 转译（验证 PASS 时使用 tilelang2ascend-kernel-generalizer，否则使用 tilelang2ascend-translator）
 Phase 5: 性能分析              (ops-profiling --quick 模式)
 Phase 6: 全量用例验证
 Phase 7: Trace 记录            (tilelang2ascend-trace-recorder)
@@ -280,8 +279,7 @@ npu-smi info -t board -i ${npu} 2>/dev/null || npu-smi info 2>/dev/null
 
 - 记录 `op_type = "simple"` 或 `op_type = "complex"`
 - 简单算子后续走 ops-direct-invoke 工作流（Architect 设计 → Developer 实现 → Reviewer 审查）
-- 复杂算子后续走 TileLang；本轮验证 PASS 时走 tilelang2ascend-kernel-generalizer，否则走 tilelang2ascend-translator
-- 不得修改、要求用户修改或通过补丁规避 TileLang 编译器问题
+- 复杂算子后续走 TileLang → AscendC 转译路径
 
 #### Tiling 设计类别标记
 
@@ -763,7 +761,7 @@ elif op_type == "complex":
 
 ---
 
-### Phase 4-C: 复杂算子 — TileLang 验证后泛化 / 常规转译
+### Phase 4-C: 复杂算子 — TileLang → AscendC 转译
 
 ### 迭代执行
 
@@ -772,7 +770,7 @@ elif op_type == "complex":
 ```text
 ⚠️ 本步骤是硬性门禁。如果 model.py 被标记为 ascendc-tiling-design 已覆盖类别
    （tiling_design_category != null），必须逐个完成以下 checklist 后才能开始
-   AscendC 泛化或转译。禁止跳过。
+   AscendC 转译。禁止跳过。
 ```
 
 **0-T.1 🛑 重新确认类别与 Tiling 策略（必须，不可跳过）**:
@@ -807,15 +805,15 @@ elif op_type == "complex":
 - `conversion` 额外约束：
   - 转置轴映射、对齐填充、32B/512B 对齐搬运
 
-**0-T.3 🛑 将约束注入已选 Skill 调用**:
-- 调用 `tilelang2ascend-kernel-generalizer` 或 `tilelang2ascend-translator` 时，在 prompt 中显式说明：
+**0-T.3 🛑 将约束注入当前转译 Skill 调用**:
+- 调用当前选定的转译 Skill 时，在 prompt 中显式说明：
   - 本算子的 `tiling_design_category` 及对应类别
   - 必须遵循 `ascendc-tiling-design` 中该类别的指南和 0-T.2 的约束
   - 要求生成的 `op_host/<op>.cpp` 和 `op_kernel/<op>.cpp` 满足上述 checklist
   - 若 `quant_subclass == true`：必须遵循 translator 步骤 0-Q（`translator/references/quant-patterns/QuantPatternIndex.md`），不得跳过
 
 **门禁规则**：
-- 如果 `tiling_design_category != null` 但 0-T.1-0-T.3 未完成 → **禁止**调用泛化或转译 Skill，**禁止**编写任何 `kernel/` 下的代码
+- 如果 `tiling_design_category != null` 但 0-T.1-0-T.3 未完成 → **禁止**调用转译 Skill，**禁止**编写任何 `kernel/` 下的代码
 - 如果 `tiling_design_category == null` → 跳过步骤 0-T，进入原有流程
 
 ---

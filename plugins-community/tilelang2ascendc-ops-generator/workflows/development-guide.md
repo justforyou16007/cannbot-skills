@@ -23,8 +23,7 @@ ascend-kernel-developer Subagent
     │     └─ 复杂: TileLang 设计 (tilelang2ascend-tilelang-designer) ← 迭代循环
     ├── Phase 4: AscendC 生成与验证（分支）
     │     ├─ 简单: ops-direct-invoke 开发实现 + 代码审查 + 修复循环（3轮上限）
-    │     └─ 复杂: TileLang 验证 PASS → AscendC 泛化 (tilelang2ascend-kernel-generalizer)
-    │                否则 → AscendC 转译 (tilelang2ascend-translator) ← 迭代循环（3轮上限）
+    │     └─ 复杂: AscendC 转译 (tilelang2ascend-translator) ← 迭代循环（3轮上限）
     │              [ascendc-tiling-design 已覆盖类别转译必须遵循对应类别 Tiling 策略，
     │               所有相关算子都要先阅读对应 Tiling 指南：MatMul 阅读 matmul_guide.md
     │               并关注 MatmulApiTiling、多核扩展、尾块处理；FlashAttention 阅读
@@ -56,7 +55,7 @@ generation → AST退化检测 → [通过] → 功能验证 → [通过] → �
 - Type3: 调用 kernel 但部分计算仍用 PyTorch
 - Type4: forward() 中存在逐元素 for 循环
 
-### Phase 4: AscendC 泛化 / 转译迭代
+### Phase 4: AscendC 转译迭代
 
 ```
 generation → AST退化检测 → [通过] → 功能验证 → [通过] → 完成
@@ -99,8 +98,7 @@ generation → AST退化检测 → [通过] → 功能验证 → [通过] → �
 
 ## 关键约束
 
-- TileLang 通过验证时可作为泛化输入；无法通过时不进入泛化分支，仍使用既有转译路径
-- 禁止修改、要求用户修改或通过补丁规避 TileLang 编译器问题
+- TileLang 仅用于设计表达，不作为 correctness/performance gate
 - model_new_*.py 中禁止使用 torch 算子
 - 必须将核心计算融合成单个算子
 - 文件操作范围限制在 {output_dir}/ 内

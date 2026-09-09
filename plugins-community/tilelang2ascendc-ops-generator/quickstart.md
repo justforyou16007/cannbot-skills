@@ -36,6 +36,24 @@ Phase 7: Trace 记录          (tilelang2ascend-trace-recorder)
 - 已配置 NPU 设备（支持 Ascend 910/950 PR 等芯片）
 - 已安装 OpenCode、Claude Code、TRAE、Cursor、Copilot、CodeArts 等受支持的 AI 编程工具
 
+### 安装 TileLang-Ascend 编译器（复杂算子路径）
+
+复杂算子需要使用 TileLang 完成设计表达；在安装本插件后，单独克隆并安装 TileLang-Ascend 编译器。简单算子的 `ops-direct-invoke` 路径不需要此步骤。
+
+```bash
+git clone --recursive https://github.com/tile-ai/tilelang-ascend.git
+cd tilelang-ascend
+bash install_ascend.sh
+```
+
+安装完成后，在同一 Python 环境中确认 TileLang、PyTorch 与 torch_npu 均可导入：
+
+```bash
+python -c 'import tilelang, torch, torch_npu; print(tilelang.__file__)'
+```
+
+若仓库已存在但子模块不完整，先执行 `git submodule update --init --recursive`，再运行 `bash install_ascend.sh`。CANN、PyTorch 与 torch_npu 的版本组合以 TileLang-Ascend 的安装输出和对应 CANN Release Notes 为准。
+
 ### OpenCode（推荐）
 
 ```bash

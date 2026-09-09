@@ -77,7 +77,10 @@ bash scripts/msprof_profile_run.sh --compare-batch --output-dir=./output/GELU --
 - 解析必须包含 `MIX_AIC/MIX_AIV/AI_CORE` 等计算 kernel 类型，否则 aicore 时长欠采集约 2.6-3x。
 
 ```bash
+# 逐 case（默认路径）
 bash scripts/msprof_profile_run.sh --quick --output-dir=./output/GELU --warm-up=1 --device=0
+# 单进程批量采全部 case（--quick-batch 可单独使用，等价 --quick --quick-batch）
+bash scripts/msprof_profile_run.sh --quick-batch --output-dir=./output/GELU --warm-up=1 --device=0
 ```
 
 输出：`performance.json`（含 `asc_mode: batch|per_case`）+ `performance.log` + `perf_report.md`

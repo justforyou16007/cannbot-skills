@@ -3587,7 +3587,8 @@ def main():
     parser.add_argument("--output-json", help="批量模式 JSON 输出路径")
 
     parser.add_argument("--quick-batch", action="store_true",
-                        help="启用 quick batch 模式：单进程一次 msprof 采集全部 case")
+                        help="启用 quick batch 模式：单进程一次 msprof 采集全部 case"
+                             "（可单独使用，等价 --quick --quick-batch；需配 --output-dir）")
     parser.add_argument("--per-case", action="store_true",
                         help="强制使用逐 case 测量（默认即逐 case，除非显式 --quick-batch）")
     parser.add_argument("--compare-batch", action="store_true",
@@ -3605,9 +3606,9 @@ def main():
             run_compare_batch_mode(args)
         else:
             run_compare_mode(args)
-    elif args.quick:
+    elif args.quick or args.quick_batch:
         if not args.output_dir:
-            parser.error("--quick 模式必须指定 --output-dir")
+            parser.error("--quick/--quick-batch 模式必须指定 --output-dir")
         run_quick_mode(args)
     elif args.batch:
         try:

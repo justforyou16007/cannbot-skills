@@ -105,7 +105,9 @@ usage() {
     cat <<'EOF'
 Usage: bash msprof_profile_run.sh [OPTIONS] -- <executable> [args...]
        bash msprof_profile_run.sh --compare --output-dir=<dir> [OPTIONS]
+       bash msprof_profile_run.sh --compare-batch --output-dir=<dir> [OPTIONS]
        bash msprof_profile_run.sh --quick --output-dir=<dir> [OPTIONS]
+       bash msprof_profile_run.sh --quick-batch --output-dir=<dir> [OPTIONS]
        bash msprof_profile_run.sh --batch --base-dir=<dir> [OPTIONS]
 
 通用选项:
@@ -134,7 +136,8 @@ Usage: bash msprof_profile_run.sh [OPTIONS] -- <executable> [args...]
   --device=N             指定 NPU 设备 ID；未指定时自动选择空闲卡
   --repeats=N            重复采集次数（默认 1）
   --retry=N              单 case 解析失败重试次数（默认 2）
-  --quick-batch          quick 模式内部使用一次 msprof 批量采集全部 case
+  --quick-batch          quick 单进程批量采集全部 case（可单独使用，等价 --quick --quick-batch；
+                         需配 --output-dir=<dir>）
   --per-case             quick 模式强制逐 case 测量（默认行为，用于覆盖 --quick-batch）
   --mfu                  追加官方 operator_mfu 等价口径 MFU 统计（需算子目录提供 flops.py）
   --mfu-top-k=N          按理论 FLOPs 选取 top-K 大 shape 测 MFU（默认 3，保留参数兼容）
@@ -166,7 +169,7 @@ while [[ $# -gt 0 ]]; do
         --repeats=*) REPEATS="${1#*=}"; shift ;;
         --retry=*)   RETRY="${1#*=}"; shift ;;
         --reference-cache=*) REFERENCE_CACHE="${1#*=}"; shift ;;
-        --quick-batch) QUICK_BATCH=1; shift ;;
+        --quick-batch) MODE="quick"; QUICK_BATCH=1; shift ;;
         --per-case)    PER_CASE=1; shift ;;
         --keep-prof) KEEP_PROF=1; shift ;;
         --max-cases=*) MAX_CASES="${1#*=}"; shift ;;

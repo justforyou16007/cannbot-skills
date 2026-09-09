@@ -1,0 +1,4 @@
+interface:
+  display_name: "TileLang Kernel Generalizer"
+  short_description: "Generalize validated TileLang output into AscendC."
+  default_prompt: "Generalize the validated TileLang kernel in this task directory into a standard AscendC operator project."

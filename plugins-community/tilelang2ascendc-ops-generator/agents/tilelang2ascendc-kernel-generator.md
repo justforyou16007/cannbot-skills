@@ -822,7 +822,7 @@ elif op_type == "complex":
 
 根据本轮 TileLang 验证结果选择唯一实现路径：
 
-- `tl_validation == PASS`：调用 `tilelang2ascend-kernel-generalizer`，从已验证的 TileLang 编译产物泛化出标准 `kernel/` 工程和 `model_new_ascendc.py`。只可消费现有 TileLang 输出，**禁止**修改、打补丁或要求用户修改 TileLang 编译器。
+- `tl_validation == PASS`：调用 `tilelang2ascend-kernel-generalizer`，从已验证的 TileLang 编译产物泛化出标准 `kernel/` 工程和 `model_new_ascendc.py`。
 - 其他结果（包括 `UNAVAILABLE`）：调用 `tilelang2ascend-translator`，基于 `design/tile_level/` 走既有转译路径。
 
 首次传入 `output_dir`；重试传入 `output_dir` 与本轮修复建议。两条路径均产出 `{output_dir}/kernel/*` 和 `{output_dir}/model_new_ascendc.py`。

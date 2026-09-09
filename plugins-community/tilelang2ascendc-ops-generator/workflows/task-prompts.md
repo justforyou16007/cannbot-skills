@@ -53,6 +53,5 @@ Phase 7: Trace 记录 — 调用 tilelang2ascend-trace-recorder 生成 trace.md
 - 简单算子 Phase 4 REVIEW.md 修复循环上限 3 轮
 - 复杂算子 Phase 4 AscendC 验证最多 3 轮迭代
 - 退化检测必须前置，通过后再执行功能验证
-- 泛化 Skill 只可读取并改写已通过验证的 TileLang 输出；禁止修改、要求用户修改或以补丁规避 TileLang 编译器问题
 - 语言：思考用中文，代码和路径用英文
 ```

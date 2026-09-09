@@ -1,11 +1,11 @@
 ---
 name: tilelang2ascend-kernel-generalizer
-description: 将本轮通过 evaluate_tilelang.sh 的 TileLang 编译输出转译为运行期参数化的标准 AscendC 算子工程。仅用于复杂算子的 TileLang 验证 PASS 路径；不修改或要求用户修改 TileLang 编译器。
+description: 将本轮通过 evaluate_tilelang.sh 的 TileLang 编译输出转译为运行期参数化的标准 AscendC 算子工程。仅用于复杂算子的 TileLang 验证 PASS 路径。
 ---
 
 # TileLang 编译输出泛化转译
 
-将已经通过 TileLang 验证的生成源码作为单 shape 语义基线，转译为可构建、可验证的 AscendC 标准算子工程。只泛化已定位的 shape 相关内容；不重新设计计算逻辑，也不处理 TileLang 编译器问题。
+将已经通过 TileLang 验证的生成源码作为单 shape 语义基线，转译为可构建、可验证的 AscendC 标准算子工程。只泛化已定位的 shape 相关内容，不重新设计计算逻辑。
 
 ## 路由与边界
 
@@ -19,7 +19,6 @@ description: 将本轮通过 evaluate_tilelang.sh 的 TileLang 编译输出转�
 
 禁止：
 
-- 修改、重编、打补丁或要求用户修改 TileLang 编译器、安装目录、缓存和评测脚本。
 - 读取任务目录外的编译缓存作为生成源码来源。
 - 用未验证的新算法、重排计算顺序或删除同步来“顺便优化”。
 
@@ -59,7 +58,7 @@ description: 将本轮通过 evaluate_tilelang.sh 的 TileLang 编译输出转�
 2. 先完成 host 侧 shape/stride/workspace 公式与范围检查，再修改 device 侧索引、buffer 和尾块逻辑。
 3. 保留生成源码中的计算顺序、dtype 分支、同步关系、核间协议和错误保护；这些不是清理目标。
 4. 使用 `tilelang2ascend-operator-project-init` 的既有结构产出 `kernel/op_host/`、`kernel/op_kernel/`、注册文件和 `model_new_ascendc.py`。
-5. 只修改 `{output_dir}/`。若发现必须改 TileLang 编译器才能继续，立即返回 `GENERALIZATION_NOT_AVAILABLE`。
+5. 只修改 `{output_dir}/`。若泛化所需输入缺失，立即返回 `GENERALIZATION_NOT_AVAILABLE`。
 
 ## 验证门禁
 

@@ -1,4 +1,0 @@
-interface:
-  display_name: "TileLang Kernel Generalizer"
-  short_description: "Generalize verified TileLang output into AscendC."
-  default_prompt: "Use $tilelang2ascend-kernel-generalizer to generalize this verified TileLang output into an AscendC operator project."

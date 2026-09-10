@@ -43,6 +43,28 @@ bash scripts/msprof_profile_run.sh --compare --output-dir=./output/GELU --warm-u
 
 输出：`performance.json` + `performance.log` + `perf_report.md`
 
+#### 2.1 对比模式批量加速（--compare-batch）
+
+与 `--compare` 同口径（8 轮：7 组 aic-metrics + sample，含 aic-metrics），但把 N 个 case
+合成**一次** msprof 采集（asc + ref 各一次批量），wall time 从 N×8 次降到 2×8 次：
+
+- 复用 quick-batch 的批量 wrapper：每 case 预建一个 `torch.npu.Stream()`，单进程顺序跑完全部 case。
+- 复用标准采集（`_run_msprof_standard`，8 轮）；解析 `op_summary_*.csv` 按 **Stream ID** 归组，
+  得到每 case 的耗时 + aic-metrics（`cube_utilization`/`aic_mac_ratio`/`aicore_time` 等）。
+- 进程内每 case 跑 `warmup+repeats` 次迭代，解析全量求和——与 `--compare` 的绝对 us 口径一致。
+- `--compare-batch` 可单独使用（等价 `--compare --compare-batch`）；`--compare` 单独用保持原逐 case 路径。
+
+```bash
+bash scripts/msprof_profile_run.sh --compare-batch --output-dir=./output/GELU --warm-up=1 --device=0
+# 冒烟：只测前 3 个 case
+bash scripts/msprof_profile_run.sh --compare-batch --output-dir=./output/GELU --warm-up=1 --device=0 --max-cases=3
+```
+
+输出：`performance.json`（per_case 含 `ref_metrics`/`asc_metrics`）+ `performance.log` + `perf_report.md`
+
+> 已知边界：批量依赖"每 case kernel 都落在自己的 stream"——若 PyTorch reference 内部起额外流
+> 导致 stream 数与 case 数不符，会整块回退逐 case（结果仍正确，只是更慢）。
+
 ### 3. 快速模式（单卡批量，一次 msprof 采全部 case）
 
 对算子目录做快速对比测试，不采集 7 个 aic-metrics，**单卡单进程批量**：
@@ -55,7 +77,10 @@ bash scripts/msprof_profile_run.sh --compare --output-dir=./output/GELU --warm-u
 - 解析必须包含 `MIX_AIC/MIX_AIV/AI_CORE` 等计算 kernel 类型，否则 aicore 时长欠采集约 2.6-3x。
 
 ```bash
+# 逐 case（默认路径）
 bash scripts/msprof_profile_run.sh --quick --output-dir=./output/GELU --warm-up=1 --device=0
+# 单进程批量采全部 case（--quick-batch 可单独使用，等价 --quick --quick-batch）
+bash scripts/msprof_profile_run.sh --quick-batch --output-dir=./output/GELU --warm-up=1 --device=0
 ```
 
 输出：`performance.json`（含 `asc_mode: batch|per_case`）+ `performance.log` + `perf_report.md`
@@ -180,6 +205,7 @@ Markdown 报告包含：
 | 场景 | 推荐命令 | 说明 |
 |------|----------|------|
 | 算子开发完成后的性能验收 | `msprof_profile_run.sh --compare` | 快速对比自定义算子 vs 标杆 |
+| 算子验收需批量拿 per-case aic-metrics | `msprof_profile_run.sh --compare-batch` | 一次 8 轮 msprof 采全部 case，按 stream 归组 |
 | 性能问题定位 | `msprof_profile_run.sh` + `msprof_perf_summary.py` | 深度瓶颈分析 |
 | 优化效果验证 | `msprof_profile_run.sh` + `msprof_perf_summary.py` | 对比优化前后的归档数据 |
 | 算子生成阶段快速测试 | `msprof_profile_run.sh --quick` | 快速对比测试（1 轮采集，只获取时间） |

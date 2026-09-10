@@ -55,6 +55,12 @@ from typing import Any, Dict, List, Optional, Tuple
 
 LOGGER = logging.getLogger(__name__)
 
+# msprof 临时目录唯一后缀：tmpdir 命名基于算子目录名（如 parallel_0），并发进化 lane
+# （不同 round 的 parallel_N、或不同进化会话）会撞出同名 /tmp 目录，导致并发 msprof
+# 输出互相踩踏（_cleanup_prof_dirs 把对方的 PROF 目录 rm 掉 → "msprof failed" /
+# "no task_time csv"）。pid + 随机字节保证每个 lane 进程的 tmpdir 全局唯一。
+_PROF_TMP_SUFFIX = f"{os.getpid()}x{os.urandom(3).hex()}"
+
 METRICS = [
     "PipeUtilization",
     "ArithmeticUtilization",
@@ -1484,7 +1490,7 @@ def _report_compare_to_markdown(report: Dict[str, Any]) -> str:
 def _report_compare_to_text(report: Dict[str, Any]) -> str:
     lines = []
     lines.append("=" * 100)
-    lines.append(f"Kernel-level Performance (msprof): {report['task']}  "
+    lines.append(f"Kernel-level Performance ({report.get('timing_method', 'msprof')}): {report['task']}  "
                  f"(warmup={report['warmup']}, repeats={report['repeats']}, seed={report['seed']})")
     lines.append("=" * 100)
     lines.append(f"{'Case':<5} {'Shape':<35} {'dtype':<10} {'Ref(us)':>12} {'Asc(us)':>12} {'Speedup':>10}")
@@ -1579,7 +1585,8 @@ def _measure_one_impl(mi: _MeasureInput):
         wrapper = _generate_wrapper_script(_WrapperConfig(
             mi.out_dir, mi.case_idx, mi.impl, mi.args.seed, mi.device_id,
             mi.args.warmup, mi.jsonl_case))
-        tmpdir = f"/tmp/msprof_{impl_abbr}_{mi.out_dir.name}_c{mi.case_idx}"
+        tmpdir = (f"/tmp/msprof_{impl_abbr}_{mi.out_dir.name}_c{mi.case_idx}"
+                  f"_{_PROF_TMP_SUFFIX}")
         prof_dir, err = _run_msprof_standard(wrapper, tmpdir, mi.device_id, mi.args.warmup)
         if prof_dir:
             duration, _op_name, parse_err = _parse_msprof_duration(prof_dir)
@@ -1617,7 +1624,7 @@ def _measure_one_impl_quick(mi: _MeasureInput):
             warmup, mi.jsonl_case, repeats))
         tag = getattr(mi.args, "prof_tag", None)
         tmpdir = (f"/tmp/msprof_quick_{impl_abbr}_{mi.out_dir.name}_c{mi.case_idx}"
-                  + (f"_{tag}" if tag else ""))
+                  + (f"_{tag}" if tag else "") + f"_{_PROF_TMP_SUFFIX}")
         _cleanup_prof_dirs(tmpdir)
         prof_dir, err = _run_msprof_quick(wrapper, tmpdir, mi.device_id, ext_warmup)
         if not prof_dir:
@@ -1796,7 +1803,7 @@ def _load_compare_cases(out_dir):
 def _log_compare_header(out_dir, args):
     """Log the compare mode header."""
     LOGGER.info("=" * 100)
-    LOGGER.info(f"Kernel-level Performance (msprof): {out_dir.name}  "
+    LOGGER.info(f"Kernel-level Performance: {out_dir.name}  "
           f"(warmup={args.warmup}, repeats={args.repeats}, seed={args.seed})")
     LOGGER.info("=" * 100)
     LOGGER.info(f"{'Case':<5} {'Shape':<35} {'dtype':<10} {'Ref(us)':>12} {'Asc(us)':>12} {'Speedup':>10}")
@@ -1897,14 +1904,142 @@ def _run_compare_loop(out_dir, cases, n_cases, args, device_id):
     return rows, speedups, ref_times, asc_times
 
 
+def _run_compare_loop_batch(out_dir, cases, n_cases, args, device_id):
+    """对比模式批量：单设备上 asc/ref 各一次 8 轮 msprof 采集全部 case。
+
+    - asc/ref 均优先批量（每 case 独占 stream，按 op_summary Stream ID 归组，含 aic-metrics）；
+      解析失败/结构校验不过时逐 case 回退 _measure_one_impl。
+    - 两段测量均持 _device_flock 与本卡其他进化 lane 串行协调。
+    - 收集所有 chunk 的 PROF_GROUP 目录，非 --keep-prof 时统一清理。
+
+    Returns (rows, speedups, ref_times, asc_times).
+    """
+    rows, speedups, ref_times, asc_times = [], [], [], []
+    skip = {idx for idx in range(n_cases) if _case_has_empty_tensor(cases[idx])}
+    meas_indices = [idx for idx in range(n_cases) if idx not in skip]
+    meas_cases = [cases[i] for i in meas_indices]
+
+    asc_batch = None
+    asc_prof_dirs = []
+    asc_results = {}
+    ref_batch = None
+    ref_prof_dirs = []
+    ref_results = {}
+
+    if meas_indices:
+        with _device_flock(device_id):
+            asc_batch, asc_prof_dirs, asc_batch_err = _measure_asc_batch_compare(
+                out_dir, meas_cases, meas_indices, args, device_id)
+        if asc_batch is None:
+            LOGGER.warning("[WARN] compare-batch asc failed (%s); falling back to per-case",
+                           asc_batch_err)
+            with _device_flock(device_id):
+                for idx in meas_indices:
+                    mi = _MeasureInput(out_dir, idx, "ascendc", args, device_id, cases[idx])
+                    asc_results[idx] = _measure_one_impl(mi)
+        else:
+            LOGGER.info("[INFO] compare-batch asc: %d cases in one 8-round msprof run (single process)",
+                        len(meas_indices))
+
+        with _device_flock(device_id):
+            ref_batch, ref_prof_dirs, ref_batch_err = _measure_batch_reference_compare(
+                out_dir, meas_cases, meas_indices, args, device_id)
+        if ref_batch is None:
+            LOGGER.warning("[WARN] compare-batch ref failed (%s); falling back to per-case",
+                           ref_batch_err)
+            with _device_flock(device_id):
+                for idx in meas_indices:
+                    mi = _MeasureInput(out_dir, idx, "reference", args, device_id, cases[idx])
+                    ref_results[idx] = _measure_one_impl(mi)
+        else:
+            LOGGER.info("[INFO] compare-batch ref: %d cases in one 8-round msprof run (single process)",
+                        len(meas_indices))
+
+    for idx in range(n_cases):
+        shape, dtype = _extract_shape_dtype_from_jsonl(cases[idx]) if cases else ("?", "?")
+        jsonl_case = cases[idx] if cases else None
+
+        if idx in skip:
+            LOGGER.info(f"{idx:<5} {shape:<35} {dtype:<10} "
+                        f"{'--':>12} {'--':>12} "
+                        f"{'skip':>10}  (empty tensor)")
+            rows.append({
+                "case": idx, "shape": shape, "dtype": dtype,
+                "ref_us": None, "asc_us": None, "speedup": None,
+                "ref_error": None, "asc_error": None,
+                "skipped": "empty_tensor",
+                "ref_metrics": {}, "asc_metrics": {},
+            })
+            continue
+
+        pos = meas_indices.index(idx)
+        if asc_batch is not None:
+            asc_us = asc_batch[pos]["us"]
+            asc_metrics = asc_batch[pos]["metrics"]
+            asc_err = None
+            asc_prof_dir = asc_prof_dirs[-1] if asc_prof_dirs else None
+        else:
+            asc_res = asc_results.get(idx)
+            if asc_res is None:
+                asc_us, asc_err, asc_prof_dir, asc_metrics = None, "asc measurement missing", None, {}
+            else:
+                asc_us, asc_err, asc_prof_dir = asc_res
+                asc_metrics = {}
+
+        if ref_batch is not None:
+            ref_us = ref_batch[pos]["us"]
+            ref_metrics = ref_batch[pos]["metrics"]
+            ref_err = None
+            ref_prof_dir = ref_prof_dirs[-1] if ref_prof_dirs else None
+        else:
+            ref_res = ref_results.get(idx)
+            if ref_res is None:
+                ref_us, ref_err, ref_prof_dir, ref_metrics = None, "ref measurement missing", None, {}
+            else:
+                ref_us, ref_err, ref_prof_dir = ref_res
+                ref_metrics = {}
+
+        if ref_us is not None and asc_us is not None and asc_us > 0:
+            sp = ref_us / asc_us
+            speedups.append(sp)
+            ref_times.append(ref_us)
+            asc_times.append(asc_us)
+            LOGGER.info(f"{idx:<5} {shape:<35} {dtype:<10} {ref_us:>12.2f} {asc_us:>12.2f} {sp:>9.3f}x")
+        else:
+            LOGGER.info(f"{idx:<5} {shape:<35} {dtype:<10} "
+                        f"{'N/A' if ref_us is None else f'{ref_us:.2f}':>12} "
+                        f"{'N/A' if asc_us is None else f'{asc_us:.2f}':>12} "
+                        f"{'N/A':>10}  (ref_err={ref_err}, asc_err={asc_err})")
+
+        rows.append({
+            "case": idx, "shape": shape, "dtype": dtype,
+            "ref_us": ref_us, "asc_us": asc_us,
+            "speedup": (ref_us / asc_us) if (ref_us and asc_us and asc_us > 0) else None,
+            "ref_error": ref_err,
+            "asc_error": asc_err,
+            "ref_prof_dir": ref_prof_dir,
+            "asc_prof_dir": asc_prof_dir,
+            "ref_metrics": ref_metrics,
+            "asc_metrics": asc_metrics,
+            "asc_device": device_id,
+            "ref_device": device_id,
+        })
+
+    if not args.keep_prof:
+        _cleanup_prof_dirs(*asc_prof_dirs, *ref_prof_dirs)
+
+    return rows, speedups, ref_times, asc_times
+
+
 def _run_quick_loop(out_dir, cases, n_cases, args, device_id):
     """快速模式：根据 --quick-batch/--per-case 选择测量方式。"""
     if getattr(args, "quick_batch", False) and not getattr(args, "per_case", False):
-        rows, speedups, ref_times, asc_times, _pool, _pool_source, asc_mode =             _run_quick_loop_batch(out_dir, cases, n_cases, args, device_id)
+        rows, speedups, ref_times, asc_times, _pool, _pool_source, asc_mode, tm =             _run_quick_loop_batch(out_dir, cases, n_cases, args, device_id)
     else:
         rows, speedups, ref_times, asc_times =             _run_quick_loop_per_case(out_dir, cases, n_cases, args, device_id)
         asc_mode = "per_case"
-    return rows, speedups, ref_times, asc_times, [], "none", asc_mode
+        tm = "msprof.quick.Task_Duration"
+    return rows, speedups, ref_times, asc_times, [], "none", asc_mode, tm
 
 
 
@@ -1937,7 +2072,8 @@ def _reference_cache_key(mi: _MeasureInput, method: str = "per_case") -> tuple[s
         "seed": int(mi.args.seed),
         "warmup": int(mi.args.warmup),
         "repeats": int(mi.args.repeats),
-        "timing_method": "msprof.quick.Task_Duration",
+        "timing_method": ("msprof.quick.Task_Duration.batch" if method == "batch"
+                          else "msprof.quick.Task_Duration"),
         "method": method,
     }
     encoded = json.dumps(
@@ -2059,6 +2195,18 @@ try:
 except Exception:
     _ref_for_init = None
 
+# 输入组只生成一次：get_input_groups() 会重建全部 case 的随机张量（大 shape 可达数百 MB），
+# 逐 case 调用会放大 ~50×（约 13s/case）。缓存后逐 case 直接按下标取用。
+_all_input_groups = None
+try:
+    _refm_inputs = _load(out_dir / "model.py", "ref_for_inputs_batch")
+    _gen_inputs = getattr(_refm_inputs, "get_input_groups",
+                          getattr(_refm_inputs, "get_inputs", None))
+    if _gen_inputs is not None:
+        _all_input_groups = _gen_inputs()
+except Exception:
+    _all_input_groups = None
+
 # 所有 case 的 stream 必须一次性预建并保持存活：
 # 若在循环里逐个创建 stream，上一把 stream 被 GC 释放后 torch 会复用其 ID，
 # 导致多个 case 共享同一 stream_id，task_time.csv 无法按 stream 归组到每个 case。
@@ -2068,14 +2216,22 @@ _batch_streams = [torch.npu.Stream() for _ in range({n_cases})]
 {case_blocks}
 """
 
-def _generate_batch_wrapper_script(out_dir, impl, cases, indices, args, device_id):
+def _generate_batch_wrapper_script(out_dir, impl, cases, indices, args, device_id,
+                                   in_process_iters=None):
     """生成批量 wrapper：每个 case 独占一个 stream，单进程内顺序跑完所有 case。
 
     cases 与 indices 一一对应；indices 为原始 case 编号（get_init_inputs 按它索引）。
+
+    in_process_iters 覆盖进程内每个 case 的迭代总数（compare-batch 传 warmup+repeats；
+    quick-batch 传 None = repeats），进程内全量迭代，msprof 解析按 stream 归组求和。
+
+    输入组（get_input_groups）已缓存为 _all_input_groups 只生成一次，逐 case 按下标取用，
+    避免每次重建全部随机张量（原实现 ~13s/case，是本 batch 模式慢的主因）。
     """
     model_file = "model.py" if impl == "reference" else "model_new_ascendc.py"
     cls_name = "Model" if impl == "reference" else "ModelNew"
     repeats = max(1, int(getattr(args, "repeats", 1)))
+    loop_iters = in_process_iters if in_process_iters is not None else repeats
     blocks = []
     for pos, (idx, case) in enumerate(zip(indices, cases)):
         inp = _serialize_jsonl_inputs(case)
@@ -2084,6 +2240,18 @@ def _generate_batch_wrapper_script(out_dir, impl, cases, indices, args, device_i
         # 若 randn 落在默认 stream，则这些 cast 不会被计入各 case 的 stream 归组，
         # 导致批量值与逐 case 值不一致。
         inp_indented = "\n".join("    " + line for line in inp.split("\n"))
+        loop_code = (
+            f"    for _ in range({loop_iters}):\n"
+            f"        with torch.no_grad():\n"
+            f"            try:\n"
+            f"                _ = model(**_inputs_dict)\n"
+            f"            except TypeError:\n"
+            f"                try:\n"
+            f"                    _ = model(*_inputs_list)\n"
+            f"                except TypeError:\n"
+            f"                    _ = model(tuple(_inputs_list))\n"
+            f"        torch.npu.synchronize()\n"
+        )
         blocks.append(
             f"# ---- case {idx} ----\n"
             f"_s = _batch_streams[{pos}]\n"
@@ -2091,19 +2259,9 @@ def _generate_batch_wrapper_script(out_dir, impl, cases, indices, args, device_i
             f"{inp_indented}\n"
             f"    _inputs_dict = {{_k: _move(_v) for _k, _v in _inputs_dict.items()}}\n"
             f"    _inputs_list = list(_inputs_dict.values())\n"
-            f"    _inputs_real = None\n"
-            f"    try:\n"
-            f"        _refm = _load(out_dir / 'model.py', 'ref_for_inputs_batch')\n"
-            f"        _gen = getattr(_refm, 'get_input_groups', getattr(_refm, 'get_inputs', None))\n"
-            f"        if _gen is not None:\n"
-            f"            _all_g = _gen()\n"
-            f"            if {idx} < len(_all_g):\n"
-            f"                _e = _all_g[{idx}]\n"
-            f"                _inputs_real = list(_e) if isinstance(_e, (list, tuple)) else [_e]\n"
-            f"    except Exception:\n"
-            f"        _inputs_real = None\n"
-            f"    if _inputs_real is not None:\n"
-            f"        _inputs_list = [_move(_v) for _v in _inputs_real]\n"
+            f"    if _all_input_groups is not None and {idx} < len(_all_input_groups):\n"
+            f"        _e = _all_input_groups[{idx}]\n"
+            f"        _inputs_list = [_move(_v) for _v in (_e if isinstance(_e, (list, tuple)) else [_e])]\n"
             f"        _inputs_dict = {{}}\n"
             f"    _init_args = []\n"
             f"    _init_kwargs = {{}}\n"
@@ -2119,22 +2277,50 @@ def _generate_batch_wrapper_script(out_dir, impl, cases, indices, args, device_i
             f"        except Exception:\n"
             f"            pass\n"
             f"    model = cls(*_init_args, **_init_kwargs).to(device).eval()\n"
-            f"    for _ in range({repeats}):\n"
-            f"        with torch.no_grad():\n"
-            f"            try:\n"
-            f"                _ = model(**_inputs_dict)\n"
-            f"            except TypeError:\n"
-            f"                try:\n"
-            f"                    _ = model(*_inputs_list)\n"
-            f"                except TypeError:\n"
-            f"                    _ = model(tuple(_inputs_list))\n"
-            f"        torch.npu.synchronize()\n"
+            + loop_code
         )
     return _BATCH_WRAPPER_SCRIPT_TEMPLATE.format(
-        out_dir=str(out_dir), device_id=device_id, model_file=model_file,
-        cls_name=cls_name, n_cases=len(cases), case_blocks="\n".join(blocks),
+        out_dir=str(out_dir), device_id=device_id,
+        model_file=model_file, cls_name=cls_name,
+        n_cases=len(cases), case_blocks="\n".join(blocks),
     )
 
+
+
+# msprof 导出产物缺失时的同步修复（quick-batch 依赖 task_time.csv）
+_TASK_TIME_CSV_PATTERNS = ("mindstudio_profiler_output/task_time_*.csv",
+                           "PROF_*/mindstudio_profiler_output/task_time_*.csv")
+
+
+def _ensure_msprof_export(prof_group_dir, patterns):
+    """确保 msprof 导出产物（task_time.csv / op_summary.csv）存在，缺失时同步重跑导出步骤。
+
+    msprof 的导出产物由独立的分析/导出子进程生成，偶尔被跳过或晚于主进程退出
+    （表现为 "no task_time csv found" / 空 op_summary 误判失败）。这里直接以子进程同步执行
+    `msprof --export=on --output=<PROF目录> --task-time=on` 强制重新导出——
+    原始设备数据在采集时已落盘，随时重跑导出都能确定性重建，无需轮询等待。
+
+    Returns True 表示至少一个指定产物已就绪。
+    """
+    for pattern in patterns:
+        if glob.glob(os.path.join(prof_group_dir, pattern), recursive=True):
+            return True
+    LOGGER.info("[INFO] msprof export artifact missing in %s; forcing synchronous export",
+                prof_group_dir)
+    try:
+        res = subprocess.run(
+            ["msprof", "--export=on", f"--output={prof_group_dir}", "--task-time=on"],
+            capture_output=True, text=True, timeout=300)
+        if res.returncode != 0:
+            LOGGER.warning("[WARN] msprof export-repair failed: %s", res.stderr[-300:])
+            return False
+    except Exception as e:  # noqa: BLE001
+        LOGGER.warning("[WARN] msprof export-repair raised: %s", e)
+        return False
+    for pattern in patterns:
+        if glob.glob(os.path.join(prof_group_dir, pattern), recursive=True):
+            return True
+    return False
 
 
 def _run_msprof_quick_batch(wrapper_script, output_dir, device_id, warmup):
@@ -2212,15 +2398,177 @@ def _parse_msprof_duration_quick_batch(prof_group_dir):
 
 
 
-def _measure_batch_quick(out_dir, cases, indices, args, device_id, impl):
-    """分批单次 msprof 采集指定 cases（cases/indices 一一对应）。
+# compare-batch 专用修正版计算行过滤。
+# 现有 _extract_compute_row 的判据（"AI_CORE" not in tt and "AIV" not in tt and
+# "MIX" not in tt）会丢弃 AI_VECTOR_CORE 行（该串不含 "AI_CORE"/"AIV" 子串），
+# 导致纯 vector 的 reference 被计成 ≈0。这里显式保留 AI_CORE/AI_VECTOR_CORE/MIX，
+# 丢弃 AI_CPU 与元数据行；不改动 --compare 原路径。
+_COMPARE_BATCH_TASK_TYPE_KEEP = ("AI_CORE", "AI_VECTOR_CORE", "MIX")
 
-    Returns (durations, prof_dir, err)；durations 对齐 cases，已除以 repeats。
+
+def _is_compute_row_compare_batch(r: dict) -> bool:
+    task_type = r.get("Task Type", "") or ""
+    return any(k in task_type for k in _COMPARE_BATCH_TASK_TYPE_KEEP)
+
+
+# op_summary 里非指标的列（身份/配置/输入输出描述等），解析 metrics 时跳过。
+_COMPARE_BATCH_METRIC_SKIP_COLS = {
+    "Device_id", "Model ID", "Task ID", "Stream ID", "Op Name", "OP Type",
+    "OP State", "Task Type", "Task Start Time(us)", "Task Duration(us)",
+    "Input Shapes", "Input Data Types", "Input Formats",
+    "Output Shapes", "Output Data Types", "Output Formats",
+    "Context ID", "Block Dim", "Mix Block Dim", "HF32 Eligible",
+}
+
+
+def _is_sum_metric_col(col: str) -> bool:
+    """时长/等待/cycle 类指标在 case 内跨 kernel 求和（其余比率/利用率取均值）。"""
+    return col.endswith("(us)") or col.endswith("cycles")
+
+
+def _parse_msprof_duration_batch(prof_group_dir: str, n_cases: int):
+    """批量解析 compare-batch：遍历 7 个 aic-metrics 轮次，按 op_summary 的 Stream ID 归组。
+
+    每 case 独占一条 stream（批量 wrapper 预建），按 Task Start Time 排序后 stream 首现
+    顺序即 case 顺序。各轮 op_summary 列集不同（Sample 轮无指标列，排除）；同一 kernel 在
+    7 个指标轮被重复测量，跨轮合并时取**中位数**而非求和（避免放大 7 倍）。
+
+    结构校验：某轮 stream 数 != n_cases（如 PyTorch reference 内部起额外流）则丢弃该轮；
+    没有任何一轮产出恰好 n_cases 个非零 stream 时返回失败，由上层整块回退逐 case。
+
+    Returns ([{"us": float, "metrics": {col: val}}] 对齐 cases, None) 或 (None, err)。
+    """
+    round_results = []  # 每轮 {"us": [...], "sums": {col:[...]}, "means": {col:[...]}}
+    for metric in METRICS:
+        metric_dir = os.path.join(prof_group_dir, f"PROF_{metric}")
+        csv_path = find_op_summary(metric_dir) if os.path.isdir(metric_dir) else None
+        if not csv_path:
+            continue
+        rows = read_csv_rows(csv_path)
+        if not rows:
+            continue
+        headers = set(rows[0].keys())
+        compute = [r for r in rows if _is_compute_row_compare_batch(r)]
+        if not compute:
+            continue
+        # 按 Task Start Time 排序（值带尾部 tab，safe_float 会 strip）；stream 首现即 case 序
+        compute.sort(key=lambda r: safe_float(r.get("Task Start Time(us)")))
+        stream_order, groups = [], {}
+        for r in compute:
+            sid = (r.get("Stream ID", "") or "").strip()
+            if not sid:
+                continue
+            if sid not in groups:
+                stream_order.append(sid)
+                groups[sid] = []
+            groups[sid].append(r)
+        if len(stream_order) != n_cases:
+            LOGGER.warning("[compare-batch] %s: stream count %d != cases %d; dropping round",
+                           metric, len(stream_order), n_cases)
+            continue
+
+        sum_cols = [c for c in headers
+                    if c not in _COMPARE_BATCH_METRIC_SKIP_COLS and _is_sum_metric_col(c)]
+        mean_cols = [c for c in headers
+                     if c not in _COMPARE_BATCH_METRIC_SKIP_COLS and not _is_sum_metric_col(c)]
+        per_case_us = [0.0] * n_cases
+        per_case_sums = {c: [0.0] * n_cases for c in sum_cols}
+        per_case_means = {c: [0.0] * n_cases for c in mean_cols}
+        ok = True
+        for pos, sid in enumerate(stream_order):
+            grp = groups[sid]
+            per_case_us[pos] = sum(safe_float(r.get("Task Duration(us)")) for r in grp)
+            if per_case_us[pos] <= 0:
+                ok = False
+                break
+            for c in sum_cols:
+                per_case_sums[c][pos] = sum(safe_float(r.get(c)) for r in grp)
+            for c in mean_cols:
+                vals = [safe_float(r.get(c)) for r in grp]
+                per_case_means[c][pos] = sum(vals) / len(vals) if vals else 0.0
+        if not ok:
+            continue
+        round_results.append({
+            "us": per_case_us,
+            "sums": per_case_sums,
+            "means": per_case_means,
+        })
+
+    if not round_results:
+        return None, "no valid metric round found (stream count mismatch or empty op_summary)"
+
+    # 跨轮合并：case 内已聚合，跨轮取中位数（同一 kernel 在 7 轮重复测量）
+    per_case = []
+    for pos in range(n_cases):
+        us_vals = sorted(r["us"][pos] for r in round_results if r["us"][pos] > 0)
+        metrics = {}
+        col_vals = {}
+        for r in round_results:
+            for c, arr in r["sums"].items():
+                col_vals.setdefault(c, []).append(arr[pos])
+            for c, arr in r["means"].items():
+                col_vals.setdefault(c, []).append(arr[pos])
+        for c, vals in col_vals.items():
+            valid = [v for v in vals if v > 0]
+            if valid:
+                metrics[c] = statistics.median(valid) if len(valid) > 1 else valid[0]
+        per_case.append({
+            "us": statistics.median(us_vals) if len(us_vals) > 1 else (us_vals[0] if us_vals else 0.0),
+            "metrics": metrics,
+        })
+    return per_case, None
+
+
+
+def _max_input_numel(case):
+    """从 jsonl case 提取最大输入张量元素数；无张量时返回 None。"""
+    try:
+        mx = 0
+        for inp in case.get("inputs", []):
+            if inp.get("type") == "tensor" and inp.get("shape"):
+                n = 1
+                for s in inp["shape"]:
+                    n *= int(s)
+                mx = max(mx, n)
+        return mx or None
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def _plausible_batch_durations(durations, cases):
+    """量纲 sanity（msprof 批量结果）：拒绝零/负/NaN，以及极小 shape 上荒谬的巨大耗时。
+
+    msprof 在并发争抢下偶发 stream 归组污染，会把小 case 的耗时放大 1000-10000×
+    （如 [1,196,96] 报成 150ms+）。按**输入张量元素量**判断：元素量 <= 100k 且耗时
+    > 100ms 判不可信；元素量大的 case 天然耗时高不做限制（4D shape 如 [8,512,33,41]
+    max 维小但元素量 5.5M，不应误杀——原 max-维判定对这类误判）。
+    """
+    if len(durations) != len(cases):
+        return False
+    for d, case in zip(durations, cases):
+        try:
+            v = float(d)
+        except (TypeError, ValueError):
+            return False
+        if math.isnan(v) or v <= 0 or v > 300_000_000.0:
+            return False
+        numel = _max_input_numel(case)
+        if numel is not None and numel <= 100_000 and v > 100_000.0:
+            return False
+    return True
+
+
+def _measure_batch_quick(out_dir, cases, indices, args, device_id, impl):
+    """分批单次 msprof 采集指定 cases（cases/indices 一一对应），纯 kernel 耗时。
+
+    msprof 的设备 profiling 通道会被并发会话瞬时争抢，对每个 chunk 重试 --retry 次；
+    导出竞态（task_time.csv 晚到/被跳过）由 _run_msprof_quick_batch 的同步导出修复解决。
+    结果做量纲 sanity 校验，拒绝 stream 污染导致的荒谬耗时。
+
+    Returns (durations, prof_dir, err, timing_method)；
+    durations 对齐 cases，已除以 repeats；timing_method 恒为 "msprof"。
     """
     repeats = max(1, int(getattr(args, "repeats", 1)))
-    # 共享机上 msprof 的设备 profiling 通道会被并发会话瞬时争抢（"Collect data failed" /
-    # "no task_time"），对每个 chunk 重试 --retry 次（与逐 case 的 _measure_one_impl_quick 一致），
-    # 避免瞬时通道失败直接回退到慢速逐 case。
     retry = max(0, int(getattr(args, "retry", 2)))
     impl_abbr = "ref" if impl == "reference" else "asc"
     all_durations = []
@@ -2228,14 +2576,14 @@ def _measure_batch_quick(out_dir, cases, indices, args, device_id, impl):
     for start in range(0, len(cases), _BATCH_CHUNK_SIZE):
         chunk_cases = cases[start:start + _BATCH_CHUNK_SIZE]
         chunk_indices = indices[start:start + _BATCH_CHUNK_SIZE]
+        tag = getattr(args, "prof_tag", None)
+        tmpdir = (f"/tmp/msprof_quick_{impl_abbr}_{out_dir.name}_batch_{start}"
+                  + (f"_{tag}" if tag else "") + f"_{_PROF_TMP_SUFFIX}")
         try:
             wrapper = _generate_batch_wrapper_script(
                 out_dir, impl, chunk_cases, chunk_indices, args, device_id)
-        except Exception as e:
-            return None, None, f"batch wrapper generation failed: {e}"
-        tag = getattr(args, "prof_tag", None)
-        tmpdir = (f"/tmp/msprof_quick_{impl_abbr}_{out_dir.name}_batch_{start}"
-                  + (f"_{tag}" if tag else ""))
+        except Exception as e:  # noqa: BLE001
+            return None, None, f"batch wrapper generation failed: {e}", "msprof"
         durations = None
         prof_dir = None
         last_err = None
@@ -2245,6 +2593,8 @@ def _measure_batch_quick(out_dir, cases, indices, args, device_id, impl):
             if not prof_dir:
                 last_err = err or "no prof dir"
             else:
+                # 导出竞态修复：task_time.csv 缺失时同步重跑 msprof export，确定性生成
+                _ensure_msprof_export(prof_dir, _TASK_TIME_CSV_PATTERNS)
                 durations, perr = _parse_msprof_duration_quick_batch(prof_dir)
                 if durations is None:
                     last_err = perr
@@ -2255,20 +2605,19 @@ def _measure_batch_quick(out_dir, cases, indices, args, device_id, impl):
                 elif len(durations) != len(chunk_cases):
                     last_err = (
                         f"chunk[{start}]: batch stream count {len(durations)} != cases {len(chunk_cases)}")
-                elif any(d <= 0 for d in durations):
-                    last_err = (
-                        f"chunk[{start}]: {sum(1 for d in durations if d <= 0)}/{len(durations)} "
-                        f"cases have zero/negative duration; stream grouping invalid")
-            if durations is not None:
-                break
+                elif not _plausible_batch_durations(durations, chunk_cases):
+                    last_err = (f"chunk[{start}]: durations failed magnitude sanity "
+                                f"(stream 污染/荒谬耗时)")
+                else:
+                    break
             LOGGER.warning("[WARN] batch chunk %s attempt %d/%d failed: %s",
                            start, attempt + 1, 1 + retry, last_err)
             time.sleep(0.5)
         if durations is None:
-            return None, prof_dir, last_err
+            return None, prof_dir, last_err, "msprof"
         all_durations.extend(d / repeats for d in durations)
         prof_dirs.append(prof_dir)
-    return all_durations, (prof_dirs[-1] if prof_dirs else None), None
+    return all_durations, (prof_dirs[-1] if prof_dirs else None), None, "msprof"
 
 
 
@@ -2278,11 +2627,10 @@ def _measure_asc_batch_quick(out_dir, cases, indices, args, device_id):
     原理：自定义 AscendC op 通过 TORCH_LIBRARY 注册，host 侧 EXEC_KERNEL_CMD 宏
     （kernel/utils/torch_kernel_helper.h）用 c10_npu::getCurrentNPUStream() 绑定启动流，
     因此在 `with torch.npu.stream(_s):` 内调用 op，其 kernel 会落到该 case 的 stream，
-    task_time.csv 可按 stream_id 精确归组。早期批量 asc 只测到逐 case 的 ~1/3，根因是
-    解析缺 MIX_AIC（欠采样 2.6-3x），现已在 _parse_msprof_duration_quick_batch 补齐
-    MIX_AIC/MIX_AIV/AI_CORE 等类型；结构校验不过时上层会回退逐 case。
+    task_time.csv 可按 stream_id 精确归组。导出竞态由 _ensure_task_time_csv 修复。
 
-    Returns (durations, prof_dir, err)；durations 对齐 cases，已除以 repeats。
+    Returns (durations, prof_dir, err, timing_method)；
+    durations 对齐 cases，已除以 repeats；timing_method 恒为 "msprof"。
     """
     return _measure_batch_quick(out_dir, cases, indices, args, device_id, "ascendc")
 
@@ -2323,7 +2671,7 @@ def _measure_batch_reference_quick_cached(out_dir, cases, indices, args, device_
     if miss_pos:
         miss_cases = [cases[p] for p in miss_pos]
         miss_indices = [indices[p] for p in miss_pos]
-        durations, prof_dir, err = _measure_batch_quick(
+        durations, prof_dir, err, _tm = _measure_batch_quick(
             out_dir, miss_cases, miss_indices, args, device_id, "reference")
         if durations is None:
             return None, prof_dir, err
@@ -2349,6 +2697,77 @@ def _measure_batch_reference_quick_cached(out_dir, cases, indices, args, device_
                 finally:
                     fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
     return results, None, None
+
+
+def _measure_batch_compare(out_dir, cases, indices, args, device_id, impl):
+    """分批单次 8 轮 msprof 采集指定 cases 的 compare 数据（含 aic-metrics）。
+
+    与 _measure_batch_quick 同构：每 case 独占一条 stream，一次标准采集（7 组 aic-metrics
+    + sample）覆盖全部 case，按 op_summary 的 Stream ID 归组出每 case 耗时 + aic-metrics。
+    进程内每 case 跑 warmup+repeats 次迭代（对齐逐 case compare 的「采集窗口内先预热再计时、
+    解析全量求和」口径），解析只求和不除。
+
+    Returns (per_case, prof_dirs, err)；per_case[pos]={"us": float, "metrics": {col: val}}
+    对齐 cases；prof_dirs 为全部 chunk 的 PROF_GROUP 目录（由调用方统一清理）。
+    """
+    retry = max(0, int(getattr(args, "retry", 2)))
+    impl_abbr = "ref" if impl == "reference" else "asc"
+    repeats = max(1, int(getattr(args, "repeats", 1)))
+    in_process_iters = max(1, int(getattr(args, "warmup", 0)) + repeats)
+    all_per_case = []
+    prof_dirs = []
+    for start in range(0, len(cases), _BATCH_CHUNK_SIZE):
+        chunk_cases = cases[start:start + _BATCH_CHUNK_SIZE]
+        chunk_indices = indices[start:start + _BATCH_CHUNK_SIZE]
+        tag = getattr(args, "prof_tag", None)
+        tmpdir = (f"/tmp/msprof_cmp_{impl_abbr}_{out_dir.name}_batch_{start}"
+                  + (f"_{tag}" if tag else "") + f"_{_PROF_TMP_SUFFIX}")
+        try:
+            wrapper = _generate_batch_wrapper_script(
+                out_dir, impl, chunk_cases, chunk_indices, args, device_id,
+                in_process_iters=in_process_iters)
+        except Exception as e:  # noqa: BLE001
+            return None, prof_dirs, f"batch wrapper generation failed: {e}"
+        chunk = None
+        prof_dir = None
+        last_err = None
+        for attempt in range(1 + retry):
+            _cleanup_prof_dirs(tmpdir)
+            prof_dir, err = _run_msprof_standard(wrapper, tmpdir, device_id, args.warmup)
+            if not prof_dir:
+                last_err = err or "no PROF_GROUP directory found"
+            else:
+                chunk, perr = _parse_msprof_duration_batch(prof_dir, len(chunk_cases))
+                if chunk is None:
+                    last_err = perr
+                elif len(chunk) != len(chunk_cases):
+                    last_err = (f"chunk[{start}]: per-case count {len(chunk)} "
+                                f"!= cases {len(chunk_cases)}")
+                elif any(c["us"] <= 0 for c in chunk):
+                    last_err = (f"chunk[{start}]: "
+                                f"{sum(1 for c in chunk if c['us'] <= 0)}/{len(chunk)} "
+                                f"cases have zero duration; stream grouping invalid")
+            if chunk is not None:
+                break
+            LOGGER.warning("[WARN] compare-batch chunk %s attempt %d/%d failed: %s",
+                           start, attempt + 1, 1 + retry, last_err)
+            time.sleep(0.5)
+        if chunk is None:
+            return None, prof_dirs, last_err
+        all_per_case.extend(chunk)
+        prof_dirs.append(prof_dir)
+    setattr(args, "compare_batch_timing", "msprof.op_summary.Task_Duration.batch")
+    return all_per_case, prof_dirs, None
+
+
+def _measure_asc_batch_compare(out_dir, cases, indices, args, device_id):
+    """compare-batch 的 asc 批量采集（每 case 独占 stream，一次 8 轮）。"""
+    return _measure_batch_compare(out_dir, cases, indices, args, device_id, "ascendc")
+
+
+def _measure_batch_reference_compare(out_dir, cases, indices, args, device_id):
+    """compare-batch 的 ref 批量采集（不复用 reference 缓存：缓存只有耗时、无 aic-metrics）。"""
+    return _measure_batch_compare(out_dir, cases, indices, args, device_id, "reference")
 
 
 def _run_quick_loop_per_case(out_dir, cases, n_cases, args, device_id):
@@ -2439,14 +2858,15 @@ def _run_quick_loop_batch(out_dir, cases, n_cases, args, device_id):
     asc_prof_batch = None
     asc_results = {}
     asc_mode = "per_case"
+    batch_timing_method = "msprof.quick.Task_Duration"
     ref_batch = None
     ref_prof_batch = None
     ref_results = {}
 
     if meas_indices:
-        # ---- asc: 单进程批量（每 case 一个 torch.npu.stream）；失败回退逐 case ----
+        # ---- asc: 单进程批量（每 case 一个 torch.npu.stream，Event 计时优先）；失败回退逐 case ----
         with _device_flock(device_id):
-            asc_batch, asc_prof_batch, asc_batch_err = _measure_asc_batch_quick(
+            asc_batch, asc_prof_batch, asc_batch_err, asc_tm = _measure_asc_batch_quick(
                 out_dir, meas_cases, meas_indices, args, device_id)
         if asc_batch is None:
             LOGGER.warning("[WARN] batch asc failed (%s); falling back to per-case", asc_batch_err)
@@ -2459,8 +2879,9 @@ def _run_quick_loop_batch(out_dir, cases, n_cases, args, device_id):
                                 idx, ("%.2fus" % us) if us is not None else "ERR")
         else:
             asc_mode = "batch"
-            LOGGER.info("[INFO] batch asc: %d cases in one msprof run (single process)",
-                        len(meas_indices))
+            batch_timing_method = "msprof.quick.Task_Duration.batch"
+            LOGGER.info("[INFO] batch asc: %d cases in one run (%s timing)",
+                        len(meas_indices), batch_timing_method)
 
         # ---- ref: 批量（含 cache）；失败回退逐 case ----
         with _device_flock(device_id):
@@ -2540,7 +2961,7 @@ def _run_quick_loop_batch(out_dir, cases, n_cases, args, device_id):
         if not args.keep_prof:
             _cleanup_prof_dirs(ref_prof_dir, asc_prof_dir)
 
-    return rows, speedups, ref_times, asc_times, [], "none", asc_mode
+    return rows, speedups, ref_times, asc_times, [], "none", asc_mode, batch_timing_method
 
 
 # ============================================================================
@@ -2782,6 +3203,42 @@ def run_compare_mode(args):
     _log_and_save_compare_reports(summary, out_dir, speedups, n_cases)
 
 
+def run_compare_batch_mode(args):
+    """执行对比模式（批量加速）：一次 8 轮 msprof 采集全部 case，按 stream 归组出每 case 耗时 + aic-metrics。
+
+    与 --compare 输出同口径（timing_method 一致、进程内 warmup+repeats 次迭代求和），
+    但 wall time 从 N×8 次 msprof 降到 2×8 次（asc + ref 各一轮批量）。
+    """
+    out_dir = Path(args.output_dir).resolve()
+
+    device_id, device_src = _select_device_id(args)
+    LOGGER.info(f"[INFO] Using NPU device {device_id} (source={device_src})")
+    LOGGER.info("[INFO] Compare-batch mode: one 8-round msprof run per impl covers all cases")
+
+    cases, case_source = _load_compare_cases(out_dir)
+    n_cases = len(cases)
+    if case_source:
+        LOGGER.info(f"[INFO] Loaded {n_cases} cases from {case_source}")
+
+    max_cases = getattr(args, "max_cases", 0)
+    if max_cases and max_cases < n_cases:
+        n_cases = max_cases
+        LOGGER.info(f"[INFO] --max-cases: limiting to first {n_cases} cases")
+
+    _log_compare_header(out_dir, args)
+    rows, speedups, ref_times, asc_times = _run_compare_loop_batch(
+        out_dir, cases, n_cases, args, device_id)
+
+    csi = _CompareSummaryInput(
+        out_dir, rows, speedups, ref_times, asc_times, n_cases, args, device_id, device_src)
+    summary = _compute_compare_summary(csi)
+    summary["timing_method"] = getattr(args, "compare_batch_timing",
+                                       "msprof.op_summary.Task_Duration")
+    summary["profiling_mode"] = "compare"
+    summary["asc_mode"] = "batch"
+    _log_and_save_compare_reports(summary, out_dir, speedups, n_cases)
+
+
 def run_quick_mode(args):
     """执行快速模式：model.py vs model_new_ascendc.py（只跑 1 轮 msprof，不采集 7 个 metrics）"""
     out_dir = Path(args.output_dir).resolve()
@@ -2827,7 +3284,7 @@ def run_quick_mode(args):
     LOGGER.info(f"[INFO] in-process warmup={args.warmup}, timed repeats={args.repeats}, "
                 f"ext-warmup={getattr(args, 'ext_warmup', 0)}, impl={getattr(args, 'impl', 'both')}")
     _log_compare_header(out_dir, args)
-    rows, speedups, ref_times, asc_times, _pool, _pool_source, asc_mode = _run_quick_loop(
+    rows, speedups, ref_times, asc_times, _pool, _pool_source, asc_mode, timing_method =             _run_quick_loop(
         out_dir, cases, n_cases, args, device_id)
 
     if flops_fn is not None and peak_tflops:
@@ -2843,7 +3300,7 @@ def run_quick_mode(args):
     csi = _CompareSummaryInput(
         out_dir, rows, speedups, ref_times, asc_times, n_cases, args, device_id, device_src)
     summary = _compute_compare_summary(csi)
-    summary["timing_method"] = "msprof.quick.Task_Duration"
+    summary["timing_method"] = timing_method
     summary["profiling_mode"] = "quick"
     summary["asc_mode"] = asc_mode
     if flops_fn is not None and peak_tflops:
@@ -3120,6 +3577,9 @@ def main():
     parser.add_argument("--retry", type=int, default=2, help="单 case 解析失败重试次数")
     parser.add_argument("--device", type=int, default=None, help="NPU 设备 id")
     parser.add_argument("--keep-prof", action="store_true", help="保留 msprof 原始 PROF 目录")
+    parser.add_argument("--reference-cache", dest="reference_cache", default=None,
+                        help="会话级 reference 计时缓存文件（跨 lane 共享；也读环境变量 "
+                             "LINGXI_REFERENCE_CACHE）")
 
     # 批量模式参数
     parser.add_argument("--batch", metavar="BASE_DIR", help="启用批量模式，指定根目录")
@@ -3127,20 +3587,28 @@ def main():
     parser.add_argument("--output-json", help="批量模式 JSON 输出路径")
 
     parser.add_argument("--quick-batch", action="store_true",
-                        help="启用 quick batch 模式：单进程一次 msprof 采集全部 case")
+                        help="启用 quick batch 模式：单进程一次 msprof 采集全部 case"
+                             "（可单独使用，等价 --quick --quick-batch；需配 --output-dir）")
     parser.add_argument("--per-case", action="store_true",
                         help="强制使用逐 case 测量（默认即逐 case，除非显式 --quick-batch）")
+    parser.add_argument("--compare-batch", action="store_true",
+                        help="对比模式改用单进程批量采集：每 case 独占一条 stream，"
+                             "一次 8 轮 msprof 采集全部 case，按 op_summary 的 Stream ID 归组"
+                             "得到每 case 耗时 + aic-metrics")
 
     args = parser.parse_args()
 
     # 模式路由
-    if args.compare:
+    if args.compare or args.compare_batch:
         if not args.output_dir:
             parser.error("--compare 模式必须指定 --output-dir")
-        run_compare_mode(args)
-    elif args.quick:
+        if args.compare_batch:
+            run_compare_batch_mode(args)
+        else:
+            run_compare_mode(args)
+    elif args.quick or args.quick_batch:
         if not args.output_dir:
-            parser.error("--quick 模式必须指定 --output-dir")
+            parser.error("--quick/--quick-batch 模式必须指定 --output-dir")
         run_quick_mode(args)
     elif args.batch:
         try:

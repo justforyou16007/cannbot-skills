@@ -98,12 +98,16 @@ DEVICE_START=1
 REFERENCE_CACHE="${LINGXI_REFERENCE_CACHE:-}"
 QUICK_BATCH=0
 PER_CASE=0
+COMPARE_BATCH=0
+MAX_CASES=""
 
 usage() {
     cat <<'EOF'
 Usage: bash msprof_profile_run.sh [OPTIONS] -- <executable> [args...]
        bash msprof_profile_run.sh --compare --output-dir=<dir> [OPTIONS]
+       bash msprof_profile_run.sh --compare-batch --output-dir=<dir> [OPTIONS]
        bash msprof_profile_run.sh --quick --output-dir=<dir> [OPTIONS]
+       bash msprof_profile_run.sh --quick-batch --output-dir=<dir> [OPTIONS]
        bash msprof_profile_run.sh --batch --base-dir=<dir> [OPTIONS]
 
 通用选项:
@@ -122,6 +126,9 @@ Usage: bash msprof_profile_run.sh [OPTIONS] -- <executable> [args...]
   --retry=N              单 case 解析失败重试次数（默认 2）
   --reference-cache=PATH 会话级 reference 计时缓存（quick 模式相同 model/case 只跑一次）
   --keep-prof            保留 msprof 原始 PROF 目录（用于深度分析）
+  --compare-batch        批量加速：每 case 独占一条 stream，一次 8 轮 msprof 采全部 case，
+                         按 op_summary Stream ID 归组出每 case 耗时 + aic-metrics（可单独使用）
+  --max-cases=N          只测前 N 个 case（冒烟用；compare/quick 均支持）
 
 快速模式 (--quick):
   --quick                启用快速模式：只采集 1 轮（只获取 kernel 时间，不采集 7 个 aic-metrics）
@@ -129,7 +136,8 @@ Usage: bash msprof_profile_run.sh [OPTIONS] -- <executable> [args...]
   --device=N             指定 NPU 设备 ID；未指定时自动选择空闲卡
   --repeats=N            重复采集次数（默认 1）
   --retry=N              单 case 解析失败重试次数（默认 2）
-  --quick-batch          quick 模式内部使用一次 msprof 批量采集全部 case
+  --quick-batch          quick 单进程批量采集全部 case（可单独使用，等价 --quick --quick-batch；
+                         需配 --output-dir=<dir>）
   --per-case             quick 模式强制逐 case 测量（默认行为，用于覆盖 --quick-batch）
   --mfu                  追加官方 operator_mfu 等价口径 MFU 统计（需算子目录提供 flops.py）
   --mfu-top-k=N          按理论 FLOPs 选取 top-K 大 shape 测 MFU（默认 3，保留参数兼容）
@@ -161,12 +169,14 @@ while [[ $# -gt 0 ]]; do
         --repeats=*) REPEATS="${1#*=}"; shift ;;
         --retry=*)   RETRY="${1#*=}"; shift ;;
         --reference-cache=*) REFERENCE_CACHE="${1#*=}"; shift ;;
-        --quick-batch) QUICK_BATCH=1; shift ;;
+        --quick-batch) MODE="quick"; QUICK_BATCH=1; shift ;;
         --per-case)    PER_CASE=1; shift ;;
         --keep-prof) KEEP_PROF=1; shift ;;
+        --max-cases=*) MAX_CASES="${1#*=}"; shift ;;
         --mfu)       MFU=1; shift ;;
         --mfu-top-k=*) MFU_TOP_K="${1#*=}"; shift ;;
         --mfu-peak=*) MFU_PEAK="${1#*=}"; shift ;;
+        --compare-batch) MODE="compare"; COMPARE_BATCH=1; shift ;;
         --compare)   MODE="compare"; shift ;;
         --quick)     MODE="quick"; shift ;;
         --batch)     MODE="batch"; shift ;;
@@ -275,6 +285,8 @@ run_compare() {
     [[ -n "${RETRY:-}" ]] && extra_args+=("--retry" "$RETRY")
     [[ "${KEEP_PROF:-0}" == "1" ]] && extra_args+=("--keep-prof")
     [[ -n "$REFERENCE_CACHE" ]] && extra_args+=("--reference-cache" "$REFERENCE_CACHE")
+    [[ "${COMPARE_BATCH:-0}" == "1" ]] && extra_args+=("--compare-batch")
+    [[ -n "${MAX_CASES:-}" ]] && extra_args+=("--max-cases" "$MAX_CASES")
 
     python3 "${SCRIPT_DIR}/msprof_perf_summary.py" --compare \
         --output-dir "$OUT_DIR" \

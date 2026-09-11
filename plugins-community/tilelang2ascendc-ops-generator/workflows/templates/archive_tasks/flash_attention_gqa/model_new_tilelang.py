@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 # ----------------------------------------------------------------------------------------------------------
 # Copyright (c) 2026 Huawei Technologies Co., Ltd.
-# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
-# CANN Open Software License Agreement Version 2.0 (the "License").
-# Please refer to the License for details. You may not use this file except in compliance with the License.
-# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
-# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
-# See LICENSE in the root of the software repository for the full text of the License.
 # ----------------------------------------------------------------------------------------------------------
+
+# TileLang GQA 入口（ascendc 后端，cann-bench level4/gqa，BSND 布局）。
+#
+# 设计：design/tile_level/gqa.py（per-shape 版；G 折叠进 M，ring 流水，
+#   causal diffS 裁剪 + UB 现算 mask）。per-shape 编译：dim/bs/bg/block_m 为
+#   编译期常量，buffer 精确分配；每个 distinct (shape, causal, dtype) 编译一次
+#   （进程级缓存）。最终交付物为手写泛化 AscendC kernel（ascendc/gqa.cpp，
+#   运行期 shape + 运行期 buffer）。
 
 import sys
 from pathlib import Path
@@ -15,61 +17,61 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-_TASK_DIR = Path(__file__).resolve().parent
-if str(_TASK_DIR) not in sys.path:
-    sys.path.insert(0, str(_TASK_DIR))
-if str(_TASK_DIR / "design") not in sys.path:
-    sys.path.insert(0, str(_TASK_DIR / "design"))
-
-from design.tile_level.flash_attention_gqa import (  # noqa: E402
-    flash_attention_gqa_fwd as tl_flash_attention_gqa_fwd,
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from design.tile_level.gqa import (  # noqa: E402
+    GQAConfig,
+    gqa_fwd as tl_gqa_fwd,
 )
+
+# (dtype, B, Nq, Nkv, S, Skv, D, causal) -> 已编译 kernel 的进程级缓存
+_KERNEL_CACHE: dict = {}
 
 
 class ModelNew(nn.Module):
     def __init__(self) -> None:
         super().__init__()
 
-    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
-        if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
-            raise ValueError("q/k/v must be 4D [B, Hnq, S, D]")
-        if q.shape[1] % k.shape[1] != 0:
-            raise ValueError("q heads must be a multiple of kv heads")
-        if not (q.dtype == k.dtype == v.dtype):
-            raise ValueError("q/k/v must have the same dtype")
-        dtype_map = {torch.float16: "float16", torch.bfloat16: "bfloat16"}
-        if q.dtype not in dtype_map:
-            raise ValueError(
-                f"tilelang GQA design supports float16/bfloat16 only, got {q.dtype}"
+    def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
+                scaleValue: float = -1.0, is_causal: bool = False):
+        if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
+            raise ValueError("Expected 4D BSND tensors")
+        if not (query.dtype == key.dtype == value.dtype):
+            raise ValueError("All input dtypes must match")
+
+        dtype_str = str(query.dtype).split(".")[-1]
+        if dtype_str not in ("float16", "bfloat16"):
+            raise ValueError(f"Unsupported dtype: {dtype_str}")
+
+        batch, q_seq_len, heads_q, dim = query.shape
+        kv_seq_len, heads_kv = key.shape[1], key.shape[2]
+
+        if heads_q % heads_kv != 0:
+            raise ValueError(f"N_q ({heads_q}) % N_kv ({heads_kv}) != 0")
+        if is_causal and q_seq_len > kv_seq_len:
+            raise ValueError("is_causal requires S <= S_kv")
+
+        ck = (dtype_str, batch, heads_q, heads_kv, q_seq_len, kv_seq_len, dim,
+              bool(is_causal))
+        kernel = _KERNEL_CACHE.get(ck)
+        if kernel is None:
+            cfg = GQAConfig(
+                batch=batch, heads_q=heads_q, heads_kv=heads_kv,
+                q_seq_len=q_seq_len, kv_seq_len=kv_seq_len, dim=dim,
+                causal=bool(is_causal), dtype=dtype_str,
             )
+            kernel = tl_gqa_fwd(cfg)
+            _KERNEL_CACHE[ck] = kernel
 
-        batch, n_heads, q_seq_len, dim = q.shape
-        kv_heads = k.shape[1]
-        kv_seq_len = int(k.shape[2])
-        dtype_str = dtype_map[q.dtype]
+            # 首调收敛校验（tilelang 首调暂态垃圾：多模块进程首次调用可能全错，
+            # 后续调用逐位一致）。新编译的 kernel 先用当前输入 warmup 一次并丢弃，
+            # 正式调用返回收敛后的结果。
+            sm_scale_w = float(scaleValue) if scaleValue > 0 else (1.0 / dim) ** 0.5
+            kernel(query, key, value, sm_scale_w)  # warmup, discard
+            torch.npu.synchronize()
 
-        if dim % 64 != 0:
-            raise ValueError("head dim (d_k) must be divisible by 64")
-
-        # ---- 原生 GQA 调用（host 零 pad）----
-        # kernel 直接用原始长度。q/k/v 不 pad，直接传原始 [B,nq,Sq,D] / [B,nkv,Skv,D]。
-        # 尾块（K/V 尾块、Q 尾块越界子块）由 kernel 内自动处理：
-        #   - K/V 尾块越界读靠 tilelang LegalizeSafeMemoryAccess 安全兜底（返回垃圾），
-        #     tail_valid mask 排除越界列（softmax 概率 0）；
-        #   - Q 尾块整块越界子块显式跳过，部分越界子块靠安全读 + 逐 half-row 行守卫。
-        # kernel 输出即为原始 q_seq_len 长度，无需切片回原长。
-        kernel = tl_flash_attention_gqa_fwd(
-            batch,
-            q_seq_len,
-            kv_seq_len,
-            n_heads,
-            kv_heads,
-            dim,
-            dtype=dtype_str,
-        )
-        out = kernel(q, k, v)
-        # 返回形状应为 [batch, n_heads, q_seq_len, dim]，与 ref 一致。
-        return out
+        # sm_scale 作为 prim_func 标量参数在运行时传入；<=0 自动 1/sqrt(D)
+        sm_scale = float(scaleValue) if scaleValue > 0 else (1.0 / dim) ** 0.5
+        return kernel(query, key, value, sm_scale)
 
 
 def get_init_inputs():

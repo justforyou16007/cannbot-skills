@@ -1,11 +1,5 @@
 /*
- * Copyright (c) 2026 Huawei Technologies Co., Ltd.
- * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
- * CANN Open Software License Agreement Version 2.0 (the "License").
- * Please refer to the License for details. You may not use this file except in compliance with the License.
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
- * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
- * See LICENSE in the root of the software repository for the full text of the License.
+ * gqa_gen 算子注册（Phase 5 工程化）
  */
 
 #include <torch/extension.h>
@@ -17,12 +11,14 @@ namespace {
 
 TORCH_LIBRARY_FRAGMENT(npu, m)
 {
-    m.def("flash_attention_gqa(Tensor q, Tensor k, Tensor v) -> Tensor");
+    m.def("gqa_gen_fp16(Tensor q, Tensor k, Tensor v, float scaleValue, bool isCausal) -> Tensor");
+    m.def("gqa_gen_bf16(Tensor q, Tensor k, Tensor v, float scaleValue, bool isCausal) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(npu, PrivateUse1, m)
 {
-    m.impl("flash_attention_gqa", TORCH_FN(ascend_kernel::flash_attention_gqa));
+    m.impl("gqa_gen_fp16", TORCH_FN(ascend_kernel::gqa_gen_fp16));
+    m.impl("gqa_gen_bf16", TORCH_FN(ascend_kernel::gqa_gen_bf16));
 }
 
 } // namespace

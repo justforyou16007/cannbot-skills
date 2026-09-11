@@ -1,227 +1,262 @@
-#ifndef KERNEL_COMMON_H
-#define KERNEL_COMMON_H
+// ----------------------------------------------------------------------------------------------------------
+// GQA forward (generalized) - 公共定义：常量 / tiling / dyn copy 包装
+//
+// 设备实现与 ascendc/gqa.cpp 同源（tilelang 编译产物的手工泛化，全量 20/20 验证）。
+// 同步结构（SetFlag/WaitFlag/PipeBarrier/CrossCoreFlag）与已验证的单文件版逐字节一致，
+// 禁止"顺手优化"。
+//
+// catlass v2.0.0 的 arch 特化头由 CATLASS_ARCH 门控；ascendc cmake 的 host_bisheng
+// 子构建不继承 ascendc_compile_definitions，因此在头文件内兜底定义（A2=2201）。
+// ----------------------------------------------------------------------------------------------------------
+#ifndef GQA_GEN_COMMON_H
+#define GQA_GEN_COMMON_H
 
-#include <type_traits>
+#ifndef CATLASS_ARCH
+#define CATLASS_ARCH 2201
+#endif
+#ifndef BACKEND_HYBM
+#define BACKEND_HYBM
+#endif
+#include "tl_templates/ascend/common.h"
+#include "acl/acl.h"
 
-constexpr uint32_t FP32_REPEAT_ELEMENT_NUM = 64;
-constexpr uint32_t FP32_BLOCK_ELEMENT_NUM = 8;
-constexpr uint32_t REPEATE_STRIDE_UP_BOUND = 256;
+using namespace Catlass;
+using uint = unsigned int;
 
-// Unified task context passed through the AIC/AIV pipeline.
-// Pure data carrier — packing only, no scheduling logic.
-struct TaskInfo {
-    bool valid = false;
-    uint32_t seq = 0;
-    uint32_t workspaceSlot = 0;
-    uint32_t bz = 0;
-    uint32_t kvHead = 0;
-    uint32_t qHead = 0;
-    uint32_t qRowStart = 0;
-    uint32_t qRows = 0;
-    uint32_t s2OuterIdx = 0;
-    uint32_t s2Start = 0;
-    uint32_t s2Rows = 0;
-    bool isFirstS2 = false;   // s2OuterIdx == 0
-    bool isLastS2 = false;    // s2OuterIdx + 1 == s2OuterBlocks
+__aicore__ __forceinline__ int64_t min64(int64_t a, int64_t b) {
+  return a < b ? a : b;
+}
+
+// ---- 编译期常量 -------------------------------------------------------------
+namespace gqa_gen {
+constexpr int64_t BLOCK_N_BASE = 128;  // L0B chunk width (rhs+v fill 64KB L0B)
+constexpr int64_t RING = 3;          // ring_slots = prelaunch + 1
+constexpr int64_t PRELAUNCH = 2;
+// Core count is queried at runtime (kernel: GetBlockNum(); host: GetCoreNumAic)
+// with a task_idx < block_num guard -- never hardcoded.
+constexpr float MASK_NEG = -1073741824;  // -2**30, softmax mask fill
+}  // namespace gqa_gen
+
+// Host 侧填入的 tiling 参数（GM 传入，kernel 启动时读取）。8B 对齐。
+struct GqaGenTiling {
+  int64_t batch;
+  int64_t heads_q;
+  int64_t heads_kv;
+  int64_t q_seq_len;
+  int64_t kv_seq_len;
+  int64_t dim;
+  int64_t causal;
+  float sm_scale;
+  int64_t pad;  // 8B 对齐占位
 };
 
-// Integer ceil division for tiling and block scheduling
-__aicore__ inline uint32_t CeilDiv(uint32_t a, uint32_t b)
-{
-    return (a + b - 1) / b;
+namespace gqa_dyn {
+
+using namespace AscendC;
+using namespace tla;
+using Catlass::Gemm::Tile::CopyL0CToGmTla;
+using Catlass::Gemm::Tile::TileCopyTla;
+using tl::ascend::ArchTag;
+using tl::ascend::LayoutGM;   // layout::RowMajor
+using tl::ascend::LayoutL0A;  // layout::zZ
+using tl::ascend::LayoutL0B;  // layout::nZ
+using tl::ascend::LayoutL1;   // layout::zN
+using tl::ascend::LayoutL1T;  // layout::nZ
+
+// ---- runtime-width variants of the tl::ascend wrappers ---------------------
+// Identical logic to tl::ascend::copy_* / mma / reduce_* but the tile extents
+// (which the generated code passes as template constants) are runtime values.
+
+template <typename T>
+CATLASS_DEVICE void copy_gm_to_l1_dyn(LocalTensor<T> dstTensor,
+                                      GlobalTensor<T> srcTensor, uint32_t dstM,
+                                      uint32_t dstN, uint32_t realSrcN,
+                                      uint32_t tailM, uint32_t tailN,
+                                      bool need_clear) {
+  if (need_clear && (tailM != dstM || tailN != dstN)) {
+    AscendC::InitConstValue(
+        dstTensor,
+        {1, static_cast<uint16_t>(dstM * dstN * sizeof(T) / 32), 0, 0});
+    AscendC::PipeBarrier<PIPE_MTE2>();
+  }
+  auto layout = MakeLayoutFromTag(LayoutGM{tailM, realSrcN});
+  auto src_LAYOUT = GetTileLayout(layout, tla::MakeShape(tailM, tailN),
+                                  tla::MakeShape(uint32_t(0), uint32_t(0)));
+  auto src = tla::MakeTensor(srcTensor, src_LAYOUT, Arch::PositionGM{});
+  auto layoutInL1 = tla::MakeLayout<T, LayoutL1>(dstM, dstN);
+  auto dst = tla::MakeTensor(dstTensor, layoutInL1, Arch::PositionL1{});
+  TileCopyTla<ArchTag, decltype(src), decltype(dst)> tileCopier;
+  tileCopier(dst, src);
 }
 
-__aicore__ inline uint32_t MinU32(uint32_t a, uint32_t b)
-{
-    return a < b ? a : b;
+template <typename T, bool transpose>
+CATLASS_DEVICE void copy_l1_to_l0a_dyn(LocalTensor<T> dstTensor,
+                                       LocalTensor<T> srcTensor, uint32_t srcM,
+                                       uint32_t srcN, uint32_t dstM,
+                                       uint32_t dstN) {
+  using LayoutL1Tag_ = std::conditional_t<transpose, LayoutL1T, LayoutL1>;
+  auto layout = transpose ? tla::MakeLayout<T, LayoutL1Tag_>(srcN, srcM)
+                          : tla::MakeLayout<T, LayoutL1Tag_>(srcM, srcN);
+  auto src_LAYOUT = GetTileLayout(layout, tla::MakeShape(dstM, dstN),
+                                  tla::MakeShape(uint32_t(0), uint32_t(0)));
+  auto src = tla::MakeTensor(srcTensor, src_LAYOUT, Arch::PositionL1{});
+  auto layoutAInL0 = tla::MakeLayout<T, LayoutL0A>(dstM, dstN);
+  auto dst = tla::MakeTensor(dstTensor, layoutAInL0, Arch::PositionL0A{});
+  TileCopyTla<ArchTag, decltype(src), decltype(dst)> tileCopier;
+  tileCopier(dst, src);
+}
+
+template <typename T, bool transpose>
+CATLASS_DEVICE void copy_l1_to_l0b_dyn(LocalTensor<T> dstTensor,
+                                       LocalTensor<T> srcTensor, uint32_t srcM,
+                                       uint32_t srcN, uint32_t dstM,
+                                       uint32_t dstN) {
+  using LayoutL1Tag_ = std::conditional_t<transpose, LayoutL1T, LayoutL1>;
+  auto layout = transpose ? tla::MakeLayout<T, LayoutL1Tag_>(srcN, srcM)
+                          : tla::MakeLayout<T, LayoutL1Tag_>(srcM, srcN);
+  auto src_LAYOUT = GetTileLayout(layout, tla::MakeShape(dstM, dstN),
+                                  tla::MakeShape(uint32_t(0), uint32_t(0)));
+  auto src = tla::MakeTensor(srcTensor, src_LAYOUT, Arch::PositionL1{});
+  auto layoutBInL0 = tla::MakeLayout<T, LayoutL0B>(dstM, dstN);
+  auto dst = tla::MakeTensor(dstTensor, layoutBInL0, Arch::PositionL0B{});
+  TileCopyTla<ArchTag, decltype(src), decltype(dst)> tileCopier;
+  tileCopier(dst, src);
+}
+
+template <typename T2>
+CATLASS_DEVICE void copy_l0c_to_gm_dyn(GlobalTensor<T2> dstTensor,
+                                       LocalTensor<float> srcTensor,
+                                       uint32_t srcM, uint32_t srcN,
+                                       uint32_t realDstN, uint32_t tailM,
+                                       uint32_t tailN) {
+  auto layoutInL0C = tla::MakeLayoutL0C(srcM, srcN);
+  auto src = tla::MakeTensor(srcTensor, layoutInL0C, Arch::PositionL0C{});
+  auto layout = MakeLayoutFromTag(LayoutGM{tailM, realDstN});
+  auto dst_LAYOUT = GetTileLayout(layout, tla::MakeShape(tailM, tailN),
+                                  tla::MakeShape(uint32_t(0), uint32_t(0)));
+  auto dst = tla::MakeTensor(dstTensor, dst_LAYOUT, Arch::PositionGM{});
+  CopyL0CToGmTla<ArchTag, decltype(src), decltype(dst),
+                 tl::ascend::ScaleGranularity::NO_QUANT, false>
+      tileCopier;
+  tileCopier(dst, src, 0);
 }
 
 template <typename T>
-__aicore__ inline uint32_t GetTaskS2Start(const T &tiling, uint32_t s2OuterIdx)
-{
-    return s2OuterIdx * tiling.s2BaseSize;
+CATLASS_DEVICE void copy_gm_to_ub_dyn(LocalTensor<T> dstTensor,
+                                      GlobalTensor<T> srcTensor,
+                                      uint32_t dstPitch, uint32_t realSrcN,
+                                      uint32_t maskShapeM, uint32_t maskShapeN,
+                                      T padValue) {
+  bool isPad = true;
+  uint32_t rightPadding = 1;
+  if (maskShapeN == dstPitch || (maskShapeN * sizeof(T)) % 32 == 0) {
+    isPad = false;
+    rightPadding = 0;
+  }
+  if (maskShapeM * dstPitch != maskShapeM * maskShapeN) {
+    AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(0);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(0);
+    AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(0);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(0);
+    AscendC::Duplicate<T>(dstTensor, padValue, maskShapeM * dstPitch);
+    AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(0);
+    AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(0);
+  }
+  AscendC::DataCopyExtParams dataCopyParams(
+      maskShapeM, maskShapeN * sizeof(T), (realSrcN - maskShapeN) * sizeof(T),
+      (dstPitch - maskShapeN) * sizeof(T) / 32, 0);
+  AscendC::DataCopyPadExtParams<T> padParams(isPad, 0, rightPadding, padValue);
+  AscendC::DataCopyPad(dstTensor, srcTensor, dataCopyParams, padParams);
 }
 
 template <typename T>
-__aicore__ inline uint32_t GetTaskS2Rows(const T &tiling, uint32_t s2OuterIdx)
-{
-    uint32_t s2Start = GetTaskS2Start(tiling, s2OuterIdx);
-    if (s2Start >= tiling.kvSeqLen) {
-        return 0;
-    }
-    return MinU32(tiling.s2BaseSize, tiling.kvSeqLen - s2Start);
+CATLASS_DEVICE void copy_ub_to_gm_dyn(GlobalTensor<T> dstTensor,
+                                      LocalTensor<T> srcTensor,
+                                      uint32_t srcPitch, uint32_t realDstN,
+                                      uint32_t maskShapeM,
+                                      uint32_t maskShapeN) {
+  AscendC::DataCopyExtParams dataCopyParams(
+      maskShapeM, maskShapeN * sizeof(T), (srcPitch - maskShapeN) * sizeof(T) / 32,
+      (realDstN - maskShapeN) * sizeof(T), 0);
+  AscendC::DataCopyPad(dstTensor, srcTensor, dataCopyParams);
 }
 
-template <typename T>
-__aicore__ inline uint32_t GetTileKvRows(const T &tiling, uint32_t s2Start, uint32_t localTileIdx)
-{
-    uint32_t rowStart = s2Start + localTileIdx * BLOCK_N;
-    if (rowStart >= tiling.kvSeqLen) {
-        return 0;
-    }
-    return MinU32(BLOCK_N, tiling.kvSeqLen - rowStart);
-}
-
-// Issue a same-core hard-event SetFlag/WaitFlag pair
-template <AscendC::HardEvent evt>
-__aicore__ inline void SetWaitFlag() {
-    event_t eventId = static_cast<event_t>(GetTPipePtr()->FetchEventID(evt));
-    AscendC::SetFlag<evt>(eventId);
-    AscendC::WaitFlag<evt>(eventId);
-}
-
-// Copy packed tiling data from GM into a local tiling struct
-template<typename T>
-__aicore__ inline void CopyTiling(T *tiling, GM_ADDR tilingGM)
-{
-    uint32_t *ptr = reinterpret_cast<uint32_t *>(tiling);
-    auto tiling32 = reinterpret_cast<__gm__ uint32_t *>(tilingGM);
-    for (size_t i = 0; i < sizeof(T) / sizeof(uint32_t); ++i, ++ptr) {
-        *ptr = *(tiling32 + i);
-    }
-}
-
-// Row-wise divide.
-// src0/dst are laid out as [dealRowCount, columnCount], and src1 is a Brcb-expanded
-// broadcast buffer laid out as [dealRowCount, FP32_BLOCK_ELEMENT_NUM].
-// Each row in src0 is divided by the corresponding per-row scalar block in src1,
-__aicore__ inline void RowDivs(AscendC::LocalTensor<float> dstUb,
-                               AscendC::LocalTensor<float> src0Ub,
-                               AscendC::LocalTensor<float> src1Ub,
-                               uint32_t dealRowCount,
-                               uint32_t columnCount,
-                               uint32_t actualColumnCount)
-{
-    uint32_t dtypeMask = FP32_REPEAT_ELEMENT_NUM;
-    uint32_t dLoop = actualColumnCount / dtypeMask;
-    uint32_t dRemain = actualColumnCount % dtypeMask;
-    AscendC::BinaryRepeatParams repeatParamsDiv;
-    repeatParamsDiv.src0BlkStride = 1;
-    repeatParamsDiv.src1BlkStride = 0;
-    repeatParamsDiv.dstBlkStride = 1;
-    repeatParamsDiv.src0RepStride = columnCount / FP32_BLOCK_ELEMENT_NUM;
-    repeatParamsDiv.src1RepStride = 1;
-    repeatParamsDiv.dstRepStride = columnCount / FP32_BLOCK_ELEMENT_NUM;
-    uint32_t columnRepeatCount = dLoop;
-
-    if (columnRepeatCount <= dealRowCount) {
-        uint32_t offset = 0;
-        for (uint32_t i = 0; i < dLoop; i++) {
-            AscendC::Div(dstUb[offset], src0Ub[offset], src1Ub, dtypeMask, dealRowCount, repeatParamsDiv);
-            offset += dtypeMask;
-        }
+// UB->UB cast/copy with runtime row pitch. RoundMode follows the tl::ascend
+// source per-dtype: widening casts use CAST_NONE, everything else CAST_RINT.
+// GQA only ever uses the narrowing float->half/bf16 path (CAST_RINT) and the
+// float->float flat copy, but the per-dtype dispatch keeps the helper correct.
+template <typename T1, typename T2>
+CATLASS_DEVICE void copy_ub_to_ub_dyn(LocalTensor<T1> dstTensor,
+                                      LocalTensor<T2> srcTensor, uint32_t len,
+                                      uint32_t rows, uint32_t cols,
+                                      uint32_t src_stride, uint32_t dst_stride) {
+  constexpr bool kWiden =
+      (std::is_same_v<T1, float> &&
+       (std::is_same_v<T2, half> || std::is_same_v<T2, bfloat16_t> ||
+        std::is_same_v<T2, int16_t>)) ||
+      (std::is_same_v<T1, half> && std::is_same_v<T2, int8_t>) ||
+      (std::is_same_v<T1, int16_t> && std::is_same_v<T2, int32_t>);
+  constexpr AscendC::RoundMode kMode =
+      kWiden ? AscendC::RoundMode::CAST_NONE : AscendC::RoundMode::CAST_RINT;
+  if (cols == src_stride && cols == dst_stride) {
+    if constexpr (std::is_same_v<T1, T2>) {
+      AscendC::DataCopy(dstTensor, srcTensor, len);
     } else {
-        AscendC::BinaryRepeatParams columnRepeatParams;
-        columnRepeatParams.src0BlkStride = 1;
-        columnRepeatParams.src1BlkStride = 0;
-        columnRepeatParams.dstBlkStride = 1;
-        columnRepeatParams.src0RepStride = 8;
-        columnRepeatParams.src1RepStride = 0;
-        columnRepeatParams.dstRepStride = 8;
-        uint32_t offset = 0;
-        for (uint32_t i = 0; i < dealRowCount; i++) {
-            AscendC::Div(dstUb[offset],
-                src0Ub[offset],
-                src1Ub[i * FP32_BLOCK_ELEMENT_NUM],
-                dtypeMask,
-                columnRepeatCount,
-                columnRepeatParams);
-            offset += columnCount;
-        }
+      AscendC::Cast(dstTensor, srcTensor, kMode, len);
     }
-    if (dRemain > 0) {
-        AscendC::Div(dstUb[dLoop * dtypeMask], src0Ub[dLoop * dtypeMask], src1Ub, dRemain, dealRowCount, repeatParamsDiv);
+  } else {
+    for (uint32_t i = 0; i < rows; i++) {
+      if constexpr (std::is_same_v<T1, T2>) {
+        AscendC::DataCopy(dstTensor[i * dst_stride], srcTensor[i * src_stride],
+                          cols);
+      } else {
+        AscendC::Cast(dstTensor[i * dst_stride], srcTensor[i * src_stride],
+                      kMode, cols);
+      }
     }
+  }
 }
 
-// Row-wise multiply.
-// src0/dst are laid out as [dealRowCount, columnCount], and src1 is a Brcb-expanded
-// broadcast buffer laid out as [dealRowCount, blockElementNum].
-// Each row in src0 is multiplied by the corresponding per-row scalar block in src1,
+// Runtime-M/N/K mma: tl::ascend::mma takes M/N as template constants;
+// MmadParams .m/.n/.k are runtime fields, so call Mmad directly. GQA always
+// uses init=True (each d_chunks chunk accumulates independently).
+template <typename T1, typename T2>
+CATLASS_DEVICE void mma_dyn(LocalTensor<T1> const A, LocalTensor<T1> const B,
+                            LocalTensor<T2> const C, bool init, uint32_t M,
+                            uint32_t N, uint32_t K) {
+  MmadParams mmadParams;
+  mmadParams.m = M;
+  mmadParams.n = N;
+  mmadParams.k = K;
+  mmadParams.cmatrixInitVal = init;
+  mmadParams.cmatrixSource = false;
+  mmadParams.unitFlag = 0;
+  Mmad(C, A, B, mmadParams);
+}
+
+// Runtime-shape reduce (dim=-1, AR pattern, clear=true).
 template <typename T>
-__aicore__ inline void RowMuls(AscendC::LocalTensor<T> dstUb,
-                               AscendC::LocalTensor<T> src0Ub,
-                               AscendC::LocalTensor<T> src1Ub,
-                               uint32_t dealRowCount,
-                               uint32_t columnCount,
-                               uint32_t actualColumnCount)
-{
-    uint32_t repeatElementNum = FP32_REPEAT_ELEMENT_NUM;
-    uint32_t blockElementNum = FP32_BLOCK_ELEMENT_NUM;
-
-    if constexpr (std::is_same<T, half>::value) {
-        repeatElementNum = FP32_REPEAT_ELEMENT_NUM * 2;
-        blockElementNum = FP32_BLOCK_ELEMENT_NUM * 2;
-    }
-
-    uint32_t dLoop = actualColumnCount / repeatElementNum;
-    uint32_t dRemain = actualColumnCount % repeatElementNum;
-    if (columnCount < REPEATE_STRIDE_UP_BOUND * blockElementNum) {
-        AscendC::BinaryRepeatParams repeatParams;
-        repeatParams.src0BlkStride = 1;
-        repeatParams.src1BlkStride = 0;
-        repeatParams.dstBlkStride = 1;
-        repeatParams.src0RepStride = columnCount / blockElementNum;
-        repeatParams.src1RepStride = 1;
-        repeatParams.dstRepStride = columnCount / blockElementNum;
-
-        if (dLoop <= dealRowCount) {
-            uint32_t offset = 0;
-            for (uint32_t i = 0; i < dLoop; i++) {
-                AscendC::Mul(dstUb[offset], src0Ub[offset], src1Ub, repeatElementNum, dealRowCount, repeatParams);
-                offset += repeatElementNum;
-            }
-        } else {
-            AscendC::BinaryRepeatParams columnRepeatParams;
-            columnRepeatParams.src0BlkStride = 1;
-            columnRepeatParams.src1BlkStride = 0;
-            columnRepeatParams.dstBlkStride = 1;
-            columnRepeatParams.src0RepStride = 8;
-            columnRepeatParams.src1RepStride = 0;
-            columnRepeatParams.dstRepStride = 8;
-            for (uint32_t i = 0; i < dealRowCount; i++) {
-                AscendC::Mul(dstUb[i * columnCount],
-                    src0Ub[i * columnCount],
-                    src1Ub[i * blockElementNum],
-                    repeatElementNum,
-                    dLoop,
-                    columnRepeatParams);
-            }
-        }
-
-        if (dRemain > 0) {
-            AscendC::Mul(dstUb[dLoop * repeatElementNum],
-                src0Ub[dLoop * repeatElementNum],
-                src1Ub,
-                dRemain,
-                dealRowCount,
-                repeatParams);
-        }
-    } else {
-        AscendC::BinaryRepeatParams repeatParams;
-        repeatParams.src0RepStride = 8;
-        repeatParams.src0BlkStride = 1;
-        repeatParams.src1RepStride = 0;
-        repeatParams.src1BlkStride = 0;
-        repeatParams.dstRepStride = 8;
-        repeatParams.dstBlkStride = 1;
-        for (uint32_t i = 0; i < dealRowCount; i++) {
-            AscendC::Mul(dstUb[i * columnCount],
-                src0Ub[i * columnCount],
-                src1Ub[i * blockElementNum],
-                repeatElementNum,
-                dLoop,
-                repeatParams);
-            if (dRemain > 0) {
-                AscendC::Mul(dstUb[i * columnCount + dLoop * repeatElementNum],
-                    src0Ub[i * columnCount + dLoop * repeatElementNum],
-                    src1Ub[i * blockElementNum],
-                    dRemain,
-                    1,
-                    repeatParams);
-            }
-        }
-    }
+CATLASS_DEVICE void reduce_max_dyn(LocalTensor<T> const &dstTensor,
+                                   LocalTensor<T> const &srcTensor,
+                                   LocalTensor<uint8_t> const &sharedTmpBuffer,
+                                   uint32_t M, uint32_t N) {
+  uint32_t shape[] = {M, N};
+  AscendC::ReduceMax<T, AscendC::Pattern::Reduce::AR>(dstTensor, srcTensor,
+                                                      sharedTmpBuffer, shape,
+                                                      true);
 }
 
-#endif // KERNEL_COMMON_H
+template <typename T>
+CATLASS_DEVICE void reduce_sum_dyn(LocalTensor<T> const &dstTensor,
+                                   LocalTensor<T> const &srcTensor,
+                                   LocalTensor<uint8_t> const &sharedTmpBuffer,
+                                   uint32_t M, uint32_t N) {
+  uint32_t shape[] = {M, N};
+  AscendC::ReduceSum<T, AscendC::Pattern::Reduce::AR>(dstTensor, srcTensor,
+                                                      sharedTmpBuffer, shape,
+                                                      true);
+}
+
+}  // namespace gqa_dyn
+
+#endif  // GQA_GEN_COMMON_H

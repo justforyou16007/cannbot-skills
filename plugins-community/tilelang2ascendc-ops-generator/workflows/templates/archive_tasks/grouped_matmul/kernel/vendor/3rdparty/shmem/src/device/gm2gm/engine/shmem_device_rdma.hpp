@@ -323,7 +323,7 @@ ACLSHMEM_DEVICE void aclshmemi_roce_pollcq_test(__gm__ T* srcDmaAddr, __gm__ T* 
     *(__gm__ uint64_t*)(gva + 40) = (uint64_t)curTail;
 
     AscendC::DataCopyExtParams copyParamsTail{1, 1 * sizeof(uint32_t), 0, 0, 0};
-
+    
     __gm__ ACLSHMEMcqeCtx* cqeAddr = (__gm__ ACLSHMEMcqeCtx*)(cqBaseAddr + cqeSize * (curTail & (depth - 1)));
     uint32_t cqeByte4 = *(__gm__ uint32_t*)cqeAddr;
     while (!(cqeByte4 & (1 << 7))) {
@@ -352,7 +352,7 @@ ACLSHMEM_DEVICE void aclshmemi_roce_pollcq_test(__gm__ T* srcDmaAddr, __gm__ T* 
     AscendC::DataCopyPad(WQTailGlobalTensor, ubLocal32, copyParamsTail);
     AscendC::PipeBarrier<PIPE_ALL>();
     dcci_cachelines((__gm__ uint8_t*)curWQTailAddr, 8);
-
+    
     // Check CQE status
     uint32_t status = (cqeAddr->byte4 >> 8) & 0xFF;
     *(__gm__ uint64_t*)(gva + 112) = status;

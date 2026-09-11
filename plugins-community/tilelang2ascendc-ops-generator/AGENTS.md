@@ -13,6 +13,7 @@ skills:
   - ascendc-precision-debug
   - tilelang2ascend-precision-tuning
   - tilelang2ascend-tilelang-designer
+  - tilelang2ascend-kernel-generalizer
   - tilelang2ascend-translator
   - tilelang2ascend-trace-recorder
   - tilelang-op-design

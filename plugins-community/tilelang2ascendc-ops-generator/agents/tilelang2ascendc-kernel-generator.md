@@ -12,6 +12,7 @@ skills:
   - tilelang-op-design
   - tilelang-op-develop
   - tilelang2ascend-operator-project-init
+  - tilelang2ascend-kernel-generalizer
   - tilelang2ascend-translator
   - tilelang2ascend-case-simplifier
   - ops-profiling
@@ -54,7 +55,7 @@ Phase 3: 设计表达              (分支)
   └─ 复杂算子: TileLang 设计  (tilelang2ascend-tilelang-designer + 退化检测 + 迭代)
 Phase 4: AscendC 生成与验证    (分支)
   ├─ 简单算子: 开发实现 + 代码审查 + 修复循环 (ops-direct-invoke: 渐进式开发 + REVIEW.md + 最多3轮修复)
-  └─ 复杂算子: TileLang→AscendC 转译 (tilelang2ascend-translator + 退化检测 + 迭代)
+  └─ 复杂算子: TileLang→AscendC 转译（验证 PASS 时使用 tilelang2ascend-kernel-generalizer，否则使用 tilelang2ascend-translator）
 Phase 5: 性能分析              (ops-profiling --quick 模式)
 Phase 6: 全量用例验证
 Phase 7: Trace 记录            (tilelang2ascend-trace-recorder)
@@ -278,7 +279,7 @@ npu-smi info -t board -i ${npu} 2>/dev/null || npu-smi info 2>/dev/null
 
 - 记录 `op_type = "simple"` 或 `op_type = "complex"`
 - 简单算子后续走 ops-direct-invoke 工作流（Architect 设计 → Developer 实现 → Reviewer 审查）
-- 复杂算子后续走 TileLang → tilelang2ascend-translator 路径
+- 复杂算子后续走 TileLang → AscendC 转译路径
 
 #### Tiling 设计类别标记
 
@@ -609,6 +610,7 @@ while tl_iteration < max_tl_iterations:
         {output_dir}
 
     验证通过:
+      tl_validation = PASS，并记录到 trace.md
       → 进入 3.5 性能迭代（强制，禁止直接 break）
 
     验证失败:
@@ -627,7 +629,7 @@ while tl_iteration < max_tl_iterations:
         无对照实验证据不得归入本类，按 A 类继续修复
 
     决策:
-      F 类 → 保留设计表达，跳出循环，进入 3.5（走 4a 合法
+      F 类 → tl_validation = UNAVAILABLE，并记录到 trace.md；保留设计表达，跳出循环，进入 3.5（走 4a 合法
              跳过分支，产出 perf_tuning/SKIPPED.md）
       B 类 → 终止，任务失败
       C 类 → 终止，任务失败
@@ -803,26 +805,27 @@ elif op_type == "complex":
 - `conversion` 额外约束：
   - 转置轴映射、对齐填充、32B/512B 对齐搬运
 
-**0-T.3 🛑 将约束注入 translator 调用**:
-- 调用 `tilelang2ascend-translator` skill 时，在 prompt 中显式说明：
+**0-T.3 🛑 将约束注入当前转译 Skill 调用**:
+- 调用当前选定的转译 Skill 时，在 prompt 中显式说明：
   - 本算子的 `tiling_design_category` 及对应类别
   - 必须遵循 `ascendc-tiling-design` 中该类别的指南和 0-T.2 的约束
   - 要求生成的 `op_host/<op>.cpp` 和 `op_kernel/<op>.cpp` 满足上述 checklist
   - 若 `quant_subclass == true`：必须遵循 translator 步骤 0-Q（`translator/references/quant-patterns/QuantPatternIndex.md`），不得跳过
 
 **门禁规则**：
-- 如果 `tiling_design_category != null` 但 0-T.1-0-T.3 未完成 → **禁止**调用 `tilelang2ascend-translator`，**禁止**编写任何 `kernel/` 下的代码
+- 如果 `tiling_design_category != null` 但 0-T.1-0-T.3 未完成 → **禁止**调用转译 Skill，**禁止**编写任何 `kernel/` 下的代码
 - 如果 `tiling_design_category == null` → 跳过步骤 0-T，进入原有流程
 
 ---
 
 #### 4-C.1 代码生成
 
-调用 tilelang2ascend-translator skill 生成 kernel/ 文件和 model_new_ascendc.py
-  首次: 传入 output_dir，基于 design/tile_level/ 转译
-  重试: 传入 output_dir + 本轮修复建议
+根据本轮 TileLang 验证结果选择唯一实现路径：
 
-产物 → {output_dir}/kernel/* + {output_dir}/model_new_ascendc.py
+- `tl_validation == PASS`：调用 `tilelang2ascend-kernel-generalizer`，从已验证的 TileLang 编译产物泛化出标准 `kernel/` 工程和 `model_new_ascendc.py`。
+- 其他结果（包括 `UNAVAILABLE`）：调用 `tilelang2ascend-translator`，基于 `design/tile_level/` 走既有转译路径。
+
+首次传入 `output_dir`；重试传入 `output_dir` 与本轮修复建议。两条路径均产出 `{output_dir}/kernel/*` 和 `{output_dir}/model_new_ascendc.py`。
 
 ---
 
@@ -900,7 +903,7 @@ D 类 → 进入 4.5D (D 类精度修复清单, 最多 12 次)
      如果是运行时崩溃/segfault：查阅 asc-devkit/examples/ 中对应模式的官方示例，确认正确的 API 使用模式。
      必须有明确的文档/示例查阅记录，记录查阅了哪个文件、确认了什么信息。
 
-[A2] 🛑 调用对应的 Skill 获取修复方案（复杂算子路径调用 tilelang2ascend-translator，简单算子路径调用 ops-direct-invoke），
+[A2] 🛑 调用对应的 Skill 获取修复方案（复杂算子按 4-C.1 保持已选的泛化或转译 Skill，简单算子调用 ops-direct-invoke），
      传入 output_dir + evaluate_ascendc.sh 错误输出 + [A1] 查阅结论。
      等待 Skill 返回修复方案。禁止跳过 Skill 直接修改代码。
 

@@ -33,7 +33,9 @@ Phase 3: 设计表达（分支）
   └─ 复杂算子: TileLang 设计 — 调用 tilelang2ascend-tilelang-designer，迭代验证
 Phase 4: AscendC 生成与验证（分支）
   ├─ 简单算子: ops-direct-invoke 开发实现 + 代码审查 + 修复循环（REVIEW.md + 最多3轮修复）
-  └─ 复杂算子: AscendC 转译 — 调用 tilelang2ascend-translator，迭代验证（最多 3 轮）
+  └─ 复杂算子:
+       ├─ 本轮 evaluate_tilelang.sh PASS: 调用 tilelang2ascend-kernel-generalizer，从已验证的 TileLang 输出泛化为 AscendC
+       └─ 其他情况: 调用 tilelang2ascend-translator，按既有路径转译并迭代验证（最多 3 轮）
               （ascendc-tiling-design 已覆盖类别的算子转译必须遵循对应类别的 Tiling 策略，
                所有相关算子都要先阅读对应 Tiling 指南：MatMul 阅读 matmul_guide.md 并关注
                MatmulApiTiling::GetTiling、多核扩展、尾块处理；FlashAttention 阅读

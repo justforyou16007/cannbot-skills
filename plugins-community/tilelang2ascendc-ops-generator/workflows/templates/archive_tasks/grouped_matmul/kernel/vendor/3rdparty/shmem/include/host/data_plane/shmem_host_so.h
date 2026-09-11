@@ -33,7 +33,7 @@ extern "C" {
     */                                                                                                                \
     ACLSHMEM_HOST_API void aclshmem_##NAME##_put_signal(TYPE* dst, TYPE* src, size_t elem_size,                       \
                                                         uint8_t *sig_addr, int32_t signal, int sig_op, int pe)
-    
+
 
 ACLSHMEM_TYPE_FUNC(ACLSHMEM_PUT_TYPENAME_MEM_SIGNAL);
 #define shmem_put_float_mem_signal aclshmem_float_put_signal
@@ -64,7 +64,7 @@ ACLSHMEM_TYPE_FUNC(ACLSHMEM_PUT_TYPENAME_MEM_SIGNAL);
     */                                                                                                                \
     ACLSHMEM_HOST_API void aclshmem_##NAME##_put_signal_nbi(TYPE* dst, TYPE* src, size_t elem_size,                   \
                                                         uint8_t *sig_addr, int32_t signal, int sig_op, int pe)
-    
+
 
 ACLSHMEM_TYPE_FUNC(ACLSHMEM_PUT_TYPENAME_MEM_SIGNAL_NBI);
 #define shmem_put_float_mem_signal_nbi aclshmem_float_put_signal_nbi
@@ -114,7 +114,7 @@ ACLSHMEM_HOST_API void aclshmemx_putmem_signal(void* dst, void* src, size_t elem
 #define shmem_putmem_signal aclshmemx_putmem_signal
 
 /**
- * @brief This routine performs an atomic operation on a remote signal variable at the specified PE, with the operation 
+ * @brief This routine performs an atomic operation on a remote signal variable at the specified PE, with the operation
  *        executed on the given stream. It is used to modify a remote signal and is typically paired with wait routines
  *        like aclshmemx_signal_wait_until_on_stream.
  *

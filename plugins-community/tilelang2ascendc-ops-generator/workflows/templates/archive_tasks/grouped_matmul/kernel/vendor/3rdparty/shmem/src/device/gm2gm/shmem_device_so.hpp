@@ -271,7 +271,7 @@ ACLSHMEM_DEVICE void aclshmemi_signal_add(__gm__ int32_t *addr, int pe, int32_t 
         if (ptr == nullptr) return;
         AscendC::SetAtomicNone();
         __gm__ int32_t* remote_ptr = reinterpret_cast<__gm__ int32_t*>(ptr);
-        
+
         __ubuf__ int32_t* buf =(__ubuf__ int32_t*)(ACLSHMEM_INTERNAL_UB_BUF_START_ADDR);
         *buf = val;
 

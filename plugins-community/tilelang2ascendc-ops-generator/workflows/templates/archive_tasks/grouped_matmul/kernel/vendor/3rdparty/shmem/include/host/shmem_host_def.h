@@ -25,7 +25,7 @@ extern "C" {
  * @defgroup group_constants Constants
  * @{
  */
- 
+
 /// \brief Inner length of the unique ID buffer for ACLSHMEM
 constexpr uint16_t ACLSHMEM_UNIQUE_ID_INNER_LEN = 124;
 /// \brief Default timeout value (in seconds) for ACLSHMEM operations
@@ -101,7 +101,7 @@ enum aclshmemx_bootstrap_t : int {
     ACLSHMEMX_INIT_WITH_MPI = 1 << 1,
     ACLSHMEMX_INIT_WITH_UNIQUEID = 1 << 3,
     ACLSHMEMX_INIT_MAX = 1 << 31
-    
+
 };
 #define shmemx_bootstrap_t aclshmemx_bootstrap_t
 

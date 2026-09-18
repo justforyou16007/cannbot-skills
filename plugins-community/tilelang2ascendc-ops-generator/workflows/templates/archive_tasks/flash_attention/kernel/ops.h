@@ -1,5 +1,5 @@
 /*
- * mha_gen 算子声明（Phase 5 工程化）
+ * flash_attention_gen 算子声明（Phase 5 工程化）
  */
 #ifndef OPS_H
 #define OPS_H
@@ -8,10 +8,9 @@
 
 namespace ascend_kernel {
 
-at::Tensor mha_gen_fp16(const at::Tensor &q, const at::Tensor &k,
-                        const at::Tensor &v, double scaleValue, bool isCausal);
-at::Tensor mha_gen_bf16(const at::Tensor &q, const at::Tensor &k,
-                        const at::Tensor &v, double scaleValue, bool isCausal);
+at::Tensor flash_attention_gen_fp16(const at::Tensor &q, const at::Tensor &k, const at::Tensor &v, bool isCausal);
+at::Tensor flash_attention_gen_bf16(const at::Tensor &q, const at::Tensor &k, const at::Tensor &v, bool isCausal);
+at::Tensor flash_attention_gen_fp32(const at::Tensor &q, const at::Tensor &k, const at::Tensor &v, bool isCausal);
 
 } // namespace ascend_kernel
 

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16.0)
-project(mha_gen_kernel)
+project(flash_attention_gen_kernel)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -28,18 +28,16 @@ endif()
 # SOC -> npu-arch（910B 系列 = dav-2201）
 set(NPU_ARCH "dav-2201" CACHE STRING "bisheng --npu-arch")
 
-# vendored tilelang-ascend 头文件（scripts/vendor_deps.py 生成）；交付自包含，
-# 禁止回退 TL_ROOT
-set(VENDOR_DIR "${CMAKE_CURRENT_SOURCE_DIR}/vendor")
-if(EXISTS ${VENDOR_DIR}/src)
-    set(TL_INCLUDE_DIRS
-        ${VENDOR_DIR}/src
-        ${VENDOR_DIR}/3rdparty/catlass/include
-        ${VENDOR_DIR}/3rdparty/shmem/include
-        ${VENDOR_DIR}/3rdparty/shmem/src/device)
-else()
-    message(FATAL_ERROR "kernel/vendor/ 不存在——先用 scripts/vendor_deps.py 生成 vendor")
+# tilelang-ascend 头文件直链（去 vendor 化：不携带头文件拷贝）
+set(TL_ROOT "$ENV{TL_ROOT}" CACHE PATH "tilelang-ascend repository root")
+if(NOT TL_ROOT)
+    message(FATAL_ERROR "未设 TL_ROOT——请 export TL_ROOT=<tilelang-ascend 仓根>")
 endif()
+set(TL_INCLUDE_DIRS
+    ${TL_ROOT}/src
+    ${TL_ROOT}/3rdparty/catlass/include
+    ${TL_ROOT}/3rdparty/shmem/include
+    ${TL_ROOT}/3rdparty/shmem/src/device)
 
 # 与 legacy 构建逐项对齐的 include 集（asc/tikcfw 头 + CANN 公共头）
 set(KERNEL_INCLUDE_DIRS
@@ -92,15 +90,17 @@ if(EXISTS ${ASCEND_CANN_PACKAGE_PATH}/include/version/asc_devkit_version.h)
     -include ${ASCEND_CANN_PACKAGE_PATH}/include/version/asc_devkit_version.h)
 endif()
 
-set(KERNEL_SRC ${CMAKE_CURRENT_SOURCE_DIR}/op_kernel/mha_kernels.cpp)
-set(KERNEL_OBJ ${CMAKE_CURRENT_BINARY_DIR}/mha_kernels.o)
+set(KERNEL_SRC ${CMAKE_CURRENT_SOURCE_DIR}/op_kernel/flash_attention_kernels.cpp)
+set(KERNEL_OBJ ${CMAKE_CURRENT_BINARY_DIR}/flash_attention_kernels.o)
 add_custom_command(
   OUTPUT ${KERNEL_OBJ}
   COMMAND ${BISHENG} ${KERNEL_BISHENG_FLAGS} ${KERNEL_INCLUDE_OPTIONS}
           -c ${KERNEL_SRC} -o ${KERNEL_OBJ}
   DEPENDS ${KERNEL_SRC}
-          ${CMAKE_CURRENT_SOURCE_DIR}/op_kernel/mha_kernel.h
-          ${CMAKE_CURRENT_SOURCE_DIR}/op_kernel/mha_launch.h
+          ${CMAKE_CURRENT_SOURCE_DIR}/op_kernel/fa_gen_kernel.h
+          ${CMAKE_CURRENT_SOURCE_DIR}/op_kernel/flash_attention_cube.h
+          ${CMAKE_CURRENT_SOURCE_DIR}/op_kernel/flash_attention_launch.h
+          ${CMAKE_CURRENT_SOURCE_DIR}/op_kernel/flash_attention_vec.h
           ${CMAKE_CURRENT_SOURCE_DIR}/op_kernel/kernel_common.h
           ${CMAKE_CURRENT_SOURCE_DIR}/ops.h
   VERBATIM
@@ -108,12 +108,12 @@ add_custom_command(
 add_custom_target(kernels_obj DEPENDS ${KERNEL_OBJ})
 
 # torch extension library (op_host + register + kernel objects)
-add_library(mha_gen_ext SHARED
-    ${CMAKE_CURRENT_SOURCE_DIR}/op_host/mha_gen.cpp
+add_library(flash_attention_gen_ext SHARED
+    ${CMAKE_CURRENT_SOURCE_DIR}/op_host/flash_attention_gen.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/register.cpp
     ${KERNEL_OBJ}
 )
-add_dependencies(mha_gen_ext kernels_obj)
+add_dependencies(flash_attention_gen_ext kernels_obj)
 
 execute_process(COMMAND python3 -c "import os; import torch; print(os.path.dirname(torch.__file__))"
     OUTPUT_STRIP_TRAILING_WHITESPACE
@@ -127,13 +127,13 @@ execute_process(COMMAND python3 -c "import os; import torch_npu; print(os.path.d
 )
 message("TORCH_NPU_PATH is ${TORCH_NPU_PATH}")
 
-target_link_directories(mha_gen_ext PRIVATE
+target_link_directories(flash_attention_gen_ext PRIVATE
     ${TORCH_PATH}/lib
     ${TORCH_NPU_PATH}/lib
     ${ASCEND_CANN_PACKAGE_PATH}/${SYSTEM_PREFIX}/lib64
     ${ASCEND_CANN_PACKAGE_PATH}/lib64
 )
-target_include_directories(mha_gen_ext PRIVATE
+target_include_directories(flash_attention_gen_ext PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/utils
     ${TORCH_NPU_PATH}/include
@@ -143,7 +143,7 @@ target_include_directories(mha_gen_ext PRIVATE
     ${ASCEND_CANN_PACKAGE_PATH}/${SYSTEM_PREFIX}/asc/include
 )
 
-target_link_libraries(mha_gen_ext PRIVATE
+target_link_libraries(flash_attention_gen_ext PRIVATE
     torch
     torch_cpu
     torch_npu
@@ -163,7 +163,7 @@ execute_process(COMMAND python3 -m pybind11 --includes
     OUTPUT_VARIABLE PYBIND11_INC
 )
 string(REPLACE " " ";" PYBIND11_INC ${PYBIND11_INC})
-target_compile_options(mha_gen_ext PRIVATE
+target_compile_options(flash_attention_gen_ext PRIVATE
     ${PYBIND11_INC}
     -D_GLIBCXX_USE_CXX11_ABI=1
 )
@@ -172,8 +172,8 @@ execute_process(COMMAND python3 -c "import sysconfig; print(sysconfig.get_config
     OUTPUT_STRIP_TRAILING_WHITESPACE
     OUTPUT_VARIABLE PYTHON_EXTENSION_SUFFIX
 )
-set_target_properties(mha_gen_ext PROPERTIES
-    OUTPUT_NAME mha_gen_ext
+set_target_properties(flash_attention_gen_ext PROPERTIES
+    OUTPUT_NAME flash_attention_gen_ext
     PREFIX ""
     SUFFIX "${PYTHON_EXTENSION_SUFFIX}"
     BUILD_RPATH "${TORCH_PATH}/lib;${TORCH_NPU_PATH}/lib;${ASCEND_CANN_PACKAGE_PATH}/${SYSTEM_PREFIX}/lib64;${ASCEND_CANN_PACKAGE_PATH}/lib64"

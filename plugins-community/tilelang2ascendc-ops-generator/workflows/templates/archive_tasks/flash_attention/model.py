@@ -1,81 +1,81 @@
 #!/usr/bin/env python3
-"""MHA 参考模型（cann-bench level4/mha）。
+# ----------------------------------------------------------------------------------------------------------
+# Copyright (c) 2026 Huawei Technologies Co., Ltd.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# ----------------------------------------------------------------------------------------------------------
 
-golden 直调官方参考实现（task/golden.py 同构内联）：标准 MHA，BSND 布局，
-causal 右下角对齐，scaleValue<=0 时自动 1/sqrt(D)。
-用例来自 task/cases.csv。
-"""
-import csv
 import json
 import os
+from pathlib import Path
 
 import torch
 import torch.nn as nn
 
 
-def mha(query, key, value, scaleValue=-1.0, is_causal=False):
-    """官方 golden（task/golden.py 逐字内联）。"""
-    B, S, N, D = query.shape
-    S_kv = key.shape[1]
-
-    if scaleValue <= 0:
-        scaleValue = 1.0 / (D ** 0.5)
-
-    # BSND -> BNSD
-    q = query.permute(0, 2, 1, 3)  # [B, N, S, D]
-    k = key.permute(0, 2, 1, 3)    # [B, N, S_kv, D]
-    v = value.permute(0, 2, 1, 3)  # [B, N, S_kv, D]
-
-    scores = torch.matmul(q, k.transpose(-2, -1)) * scaleValue  # [B, N, S, S_kv]
-    if is_causal:
-        i = torch.arange(S, device=scores.device).unsqueeze(-1)
-        j = torch.arange(S_kv, device=scores.device).unsqueeze(0)
-        causal_mask = j > (i + (S_kv - S))
-        scores = scores.masked_fill(causal_mask, float('-inf'))
-    # F217 全 mask 行保护（golden.py L69-74 同构）：全 -inf 行 softmax 后置 0
-    scores_max = scores.max(dim=-1, keepdim=True).values
-    all_masked = torch.isinf(scores_max) & (scores_max < 0)
-    attn_weights = torch.nn.functional.softmax(scores, dim=-1)
-    attn_weights = torch.where(all_masked, torch.zeros_like(attn_weights), attn_weights)
-    attn_output = torch.matmul(attn_weights, v)  # [B, N, S, D]
-
-    return attn_output.permute(0, 2, 1, 3).contiguous()  # [B, S, N, D]
+def case_is_causal(case):
+    """用例的 is_causal：支持顶层键或 inputs 内 attr 项（GQA 约定）；缺省 False。"""
+    if case.get("is_causal") is not None:
+        return bool(case["is_causal"])
+    for inp in case.get("inputs", []):
+        if inp.get("type") == "attr" and inp.get("name") == "is_causal":
+            return bool(inp.get("value"))
+    return False
 
 
 class Model(nn.Module):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
 
-    def forward(self, query, key, value, scaleValue=-1.0, is_causal=False):
-        return mha(query, key, value, scaleValue=scaleValue, is_causal=is_causal)
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                is_causal: bool = False):
+        acc = torch.einsum("bhsd,bhkd->bhsk", q, k) * (1.0 / q.shape[-1])**0.5
+        if is_causal:
+            # 右下对齐 causal（GQA golden 同语义）：行 i 可见列 j <= i + diff
+            s_q, s_kv = q.shape[2], k.shape[2]
+            diff = s_kv - s_q
+            i = torch.arange(s_q, device=acc.device).view(s_q, 1)
+            j = torch.arange(s_kv, device=acc.device).view(1, s_kv)
+            acc = acc.masked_fill(j > (i + diff), float("-inf"))
+        acc = acc.softmax(dim=-1)
+        o = torch.einsum("bhsk,bhkd->bhsd", acc, v)
+        return o
 
 
 def get_input_groups():
-    torch.manual_seed(42)
-    csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            "task", "cases.csv")
-    dtype_map = {"float16": torch.float16, "bfloat16": torch.bfloat16,
-                 "float32": torch.float32}
+    # FA_CASE_FILE selects the case list; TileLang verification passes
+    # general_tilelang_case.jsonl (TileLang does not support float32).
+    # Case format matches the ops-profiling jsonl: {"inputs": [{type, shape, dtype}]}.
+    case_name = os.environ.get("FA_CASE_FILE", "general_case.jsonl")
+    case_path = Path(__file__).resolve().parent / case_name
     input_groups = []
-    with open(csv_path, newline="") as f:
-        for row in csv.DictReader(f):
-            shapes = json.loads(row["input_shape"])
-            dtypes = json.loads(row["dtype"])
-            attrs = json.loads(row["attrs"])
-            dt = dtype_map[dtypes[0]]
-            # value_range [-1, 1]：均匀分布
-            q = (torch.rand(shapes[0], dtype=torch.float32) * 2 - 1).to(dt)
-            k = (torch.rand(shapes[1], dtype=torch.float32) * 2 - 1).to(dt)
-            v = (torch.rand(shapes[2], dtype=torch.float32) * 2 - 1).to(dt)
-            scale = float(attrs.get("scaleValue", -1.0))
-            causal = bool(attrs.get("is_causal", False))
-            input_groups.append([q, k, v, scale, causal])
+    with case_path.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            case = json.loads(line)
+            inputs = case["inputs"]
+            batch_size, n_heads, seq_len_q, d_k = inputs[0]["shape"]
+            seq_len_kv = inputs[1]["shape"][2]
+            dtype = {
+                "float16": torch.float16,
+                "bfloat16": torch.bfloat16,
+                "float32": torch.float32,
+            }[inputs[0]["dtype"]]
+            q = torch.rand(batch_size, n_heads, seq_len_q, d_k, dtype=dtype)
+            k = torch.rand(batch_size, n_heads, seq_len_kv, d_k, dtype=dtype)
+            v = torch.rand(batch_size, n_heads, seq_len_kv, d_k, dtype=dtype)
+            group = [q, k, v]
+            if case_is_causal(case):
+                group.append(True)
+            input_groups.append(group)
     return input_groups
 
 
-if __name__ == "__main__":
-    groups = get_input_groups()
-    print(f"loaded {len(groups)} cases")
-    for i, g in enumerate(groups):
-        q, k, v, s, c = g
-        print(i, tuple(q.shape), tuple(k.shape), q.dtype, s, c)
+def get_init_inputs():
+    return []

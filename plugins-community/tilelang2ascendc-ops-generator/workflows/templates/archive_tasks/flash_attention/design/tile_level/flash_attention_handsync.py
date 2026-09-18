@@ -1,24 +1,17 @@
 #!/usr/bin/env python3
 # ----------------------------------------------------------------------------------------------------------
-# flash_attention 手写同步变体（Phase 2）：AUTO_SYNC 关闭，全部旗语显式。
+# flash_attention 手写同步变体：AUTO_SYNC 关闭，全部旗语显式。
 #
-# 与 flash_attention.py 同构（C1/V1 生产者 + C2/V2 消费者，prelaunch=2 /
-# ring=3 耦合环）。旗语清单来自严格模拟器审计（sync_only + flag_blocking +
+# 结构：C1/V1 生产者 + C2/V2 消费者，prelaunch=2 / ring=3 耦合环；
+# K 双槽预取；V2 压缩（免零初始化 + 整幅 broadcast-mul / 行循环分档）；
+# V1 brcb-sub（dim<=128 门控，brcb 物化 64x8 替代整幅 2D 广播物化）。
 #
+# 旗语清单（sync_only + flag_blocking 模拟审计导出）：
 #   RAW（同迭代）：
-#     V1: V->MTE2(1) acc_s_ub 下一载；MTE3->V(1) acc_s_half cast 前（HS19 位A）
+#     V1: V->MTE2(1) acc_s_ub 下一载；MTE3->V(1) acc_s_half cast 前
 #   跨核（设计原生）：SIG_S/P/O_READY 不变。
 #   同管 V 链（mul/sub/exp/reduce/broadcast/div）零屏障——in-order FIFO
-#   （CANN sample 裸链铁证 + sync pass Fix 1 同规则）。
-#
-# 2026-09-17 FA story 战役沉淀移植（证据见 fa_s10/fa_s14 提交）：
-#   ① V2 压缩（s10 同构，全战役最大单步）：免零初始化（j==0 直接建立
-#      acc_o/sumexp + 单元素活性锚点防 memplan 别名）+ 整幅 broadcast-mul
-#      替代 64 路行循环；
-#   ② V1 brcb-sub（s14a 同构，dim_align<=128 门控：大 dim 档 UB 满，
-#      brcb_tmp 仅 block_m//2*8 fp32 但 dim>128 时 acc_o/acc_o_ub 各 64KB
-#      已无空余；门控外回退 broadcast+sub；sim 构建 FA_SIM_NO_BRCB 回退
-#      行循环标量 sub——row_expand 切片过不了 sim bridge validator）。
+#   （CANN sample 裸链 + sync pass 同管免屏障规则）。
 # ----------------------------------------------------------------------------------------------------------
 from dataclasses import dataclass
 import os
@@ -44,7 +37,7 @@ SIG_P_READY = 1   # V1 -> C2: ws_p 槽就绪
 SIG_O_READY = 2   # C2 -> V2: ws_o 槽就绪
 
 MAX_CORES = 20
-# dim<=512（GQA 同档）：dim_align 分档定 block_m 保 L0C/UB 容量
+# dim<=512：dim_align 分档定 block_m 保 L0C/UB 容量
 MAX_DIM = 512
 
 
@@ -80,7 +73,7 @@ def flash_attention_handsync_fwd(cfg: FlashAttentionConfig):
         # 越界 48 列（case56 全行垃圾的根因）；填充区零值不参与计算。
         dim_align = ((dim + 127) // 128) * 128
 
-    # GQA 同档：dim_align 越大 block_m 越小，L0C(acc_o=bm*128*4B + acc_s=bm*128*4B)
+    # dim_align 越大 block_m 越小，L0C(acc_o=bm*128*4B + acc_s=bm*128*4B)
     # 与 UB 守恒
     if dtype == "float32":
         # fp32 元素 4B：L0A 放不下 128 行 lhs+p，block_m 减半避免别名
@@ -88,7 +81,7 @@ def flash_attention_handsync_fwd(cfg: FlashAttentionConfig):
     elif dim_align <= 128:
         block_m = 128
     else:
-        block_m = 64   # dim>128 也 64（官方 h32_d512 同款，不降到 32）
+        block_m = 64   # dim>128 也 64
     block_n = 128
     cube_k = dim_align if dim_align < 256 else 256
     prelaunch = 2
@@ -131,7 +124,7 @@ def flash_attention_handsync_fwd(cfg: FlashAttentionConfig):
     ):
         with T.Kernel(used_core_num, is_npu=True) as (cid, vid):
             q_l1 = T.alloc_L1([block_m, dim_pad], dtype)
-            k_l1 = T.alloc_L1([2, block_n, dim_pad], dtype)   # K 双槽（kv_slots=2，抄 GQA）
+            k_l1 = T.alloc_L1([2, block_n, dim_pad], dtype)   # K 双槽（kv_slots=2）
             v_l1 = T.alloc_L1([block_n, dim_pad], dtype)
             acc_s_l1 = T.alloc_L1([block_m, block_n], dtype)
             T.annotate_layout({
@@ -179,7 +172,7 @@ def flash_attention_handsync_fwd(cfg: FlashAttentionConfig):
 
                     with T.Scope("C"):
                         T.copy(q[bz, by, bx * block_m: (bx + 1) * block_m, 0:dim], q_l1)
-                        # K 槽信用预置 + 预加载 K(0) 到槽 0（抄 GQA P2 双缓冲）
+                        # K 槽信用预置 + 预加载 K(0) 到槽 0（K 双缓冲预取）
                         T.set_flag("mte1", "mte2", 0)   # K 槽 0 空闲
                         T.set_flag("mte1", "mte2", 1)   # K 槽 1 空闲
                         T.wait_flag("mte1", "mte2", 0)
@@ -187,10 +180,10 @@ def flash_attention_handsync_fwd(cfg: FlashAttentionConfig):
                         T.set_flag("mte2", "mte1", 0)   # K 槽 0 就绪
 
                     with T.Scope("V"):
-                        # 免零初始化（s10 同构）：acc_o/sumexp 由 V2(0) 直接
-                        # 建立；单元素填充只是活性锚点——免填后 planner 会把
-                        # acc_o 活区间收缩到首个 V2 之后并与 acc_s_ub 别名
-                        # （s10 causal 构建全 task NaN 实证），锚点拉回 task 首
+                        # 免零初始化：acc_o/sumexp 由 V2(0) 直接建立；
+                        # 单元素填充只是活性锚点——免填后 planner 会把 acc_o
+                        # 活区间收缩到首个 V2 之后并与 acc_s_ub 别名
+                        # （memplan 别名 WAR 缺口），锚点拉回 task 首
                         T.tile.fill(acc_o[0, :], 0.0)
                         T.tile.fill(sumexp[0, :], 0.0)
                         T.tile.fill(m_i, -2 ** 30)
@@ -224,7 +217,7 @@ def flash_attention_handsync_fwd(cfg: FlashAttentionConfig):
                                 T.copy(acc_s_l0c, workspace_s[task_idx, slot_prod, :, :])
                                 # 释放槽 t%2（供 C1(t+1) 预取复用）
                                 T.set_flag("mte1", "mte2", t % 2)
-                                # HS19 位置 B（C1 跨迭代消费者完成，供 ring 尾 drain）
+                                # C1 跨迭代消费者完成标记（供 ring 尾 drain）
                                 T.set_flag("m", "mte1", 3)
                                 T.set_flag("fix", "m", 3)
                                 T.set_cross_flag("FIX", SIG_S_READY)
@@ -255,7 +248,7 @@ def flash_attention_handsync_fwd(cfg: FlashAttentionConfig):
                                                        mask_col)
                                 # causal 对角块 mask：行 r 可见列 j <=
                                 # (s0 + h_start + r) + diff_s；仅块内末列超出
-                                # 首行可见界才需要（GQA sub_per_band 同构向量化）
+                                # 首行可见界才需要（向量化）
                                 if causal:
                                     if (t + 1) * block_n - 1 > bx * block_m + diff_s:
                                         # col_2d[r][c] = t*bn + c（m_i_2d 复用）；
@@ -278,9 +271,9 @@ def flash_attention_handsync_fwd(cfg: FlashAttentionConfig):
                                 T.tile.max(m_i, m_i, alpha_ring[slot_prod, :, :])
                                 T.tile.sub(alpha_ring[slot_prod, :, :], alpha_ring[slot_prod, :, :], m_i)
                                 T.tile.exp(alpha_ring[slot_prod, :, :], alpha_ring[slot_prod, :, :])
-                                # brcb 化（catlass CalcExp 同构，s14a 实证
-                                # case6 -2~4%）：brcb 物化 64x8 替代整幅 2D
-                                # 广播；dim>128/sim 构建回退（行循环免 scratch）
+                                # brcb 化（catlass CalcExp 同构）：brcb 物化
+                                # 64x8 替代整幅 2D 广播；dim>128/sim 构建回退
+                                # （行循环免 scratch）
                                 if use_brcb and not _SIM_NO_BRCB:
                                     T.tile.row_expand_sub_experiment(
                                         BufferRegion(acc_s_ub, [Range(0, block_m // 2),
@@ -323,7 +316,7 @@ def flash_attention_handsync_fwd(cfg: FlashAttentionConfig):
                             with T.Scope("C"):
                                 T.wait_cross_flag(SIG_P_READY)
                                 # C2 的 acc_s_l1/v_l1 WAR/RAW 让位给 K 槽信用（MTE1_MTE2
-                                # 0/1、MTE2_MTE1 0/1），改用 3/2（抄 GQA 的 id 让位思路）。
+                                # 0/1、MTE2_MTE1 0/1），改用 3/2（flag id 让位）。
                                 T.set_flag("mte1", "mte2", 3)
                                 T.wait_flag("mte1", "mte2", 3)
                                 T.copy(workspace_p[task_idx, slot_cons, :, :], acc_s_l1)
@@ -350,7 +343,7 @@ def flash_attention_handsync_fwd(cfg: FlashAttentionConfig):
                                         workspace_o[task_idx, slot_cons, :,
                                                     cc * cube_k: (cc + 1) * cube_k],
                                     )
-                                # HS19 位置 B（C2 跨迭代消费者完成，供 ring 尾 drain）
+                                # C2 跨迭代消费者完成标记（供 ring 尾 drain）
                                 T.set_flag("m", "mte1", 5)
                                 T.set_flag("fix", "m", 4)
                                 T.set_flag("mte1", "mte2", 4)
@@ -398,7 +391,7 @@ def flash_attention_handsync_fwd(cfg: FlashAttentionConfig):
                                     T.tile.add(sumexp, sumexp,
                                                sumexp_i_ring[slot_cons, :, :])
 
-                        # HS19 定向化（ring 尾去 PIPE_ALL）：5 定向跨迭代消费者
+                        # ring 尾定向 drain（去 PIPE_ALL）：5 个定向跨迭代消费者
                         with T.Scope("C"):
                             if t < kv_loops:  # 本迭代跑了 C1(t)
                                 T.wait_flag("m", "mte1", 3)   # mma 读 rhs_l0 完成
@@ -412,7 +405,7 @@ def flash_attention_handsync_fwd(cfg: FlashAttentionConfig):
 
                     # C 侧槽信用 drain：task 内预置的 K 槽空闲信用（MTE1_MTE2 0/1）
                     # 经预取/释放后每槽恒残留 1 个未消费 set，task 尾 wait 配对清零
-                    # （抄 GQA，防跨 task 电平残留累积死锁）。
+                    # （防跨 task 电平残留累积死锁）。
                     with T.Scope("C"):
                         T.wait_flag("mte1", "mte2", 0)   # K 槽 0 空闲信用清零
                         T.wait_flag("mte1", "mte2", 1)   # K 槽 1 空闲信用清零

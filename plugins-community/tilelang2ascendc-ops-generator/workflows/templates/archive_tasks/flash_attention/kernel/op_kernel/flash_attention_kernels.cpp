@@ -2,7 +2,7 @@
 
 /* ---- flash_attention_gen_bf16 ---- */
 /*
- * flash_attention_gen_bf16 — 标准算子工程入口（Phase 5）
+ * flash_attention_gen_bf16 — 标准算子工程入口
  * 设备实现见 fa_gen_kernel.h（与 ascendc/flash_attention.cpp 同源的泛化 kernel）
  */
 
@@ -20,7 +20,7 @@ extern "C" __global__ __aicore__ void flash_attention_gen_bf16(
 
 /* ---- flash_attention_gen_fp16 ---- */
 /*
- * flash_attention_gen_fp16 — 标准算子工程入口（Phase 5）
+ * flash_attention_gen_fp16 — 标准算子工程入口
  * 设备实现见 fa_gen_kernel.h（与 ascendc/flash_attention.cpp 同源的泛化 kernel）
  */
 
@@ -38,7 +38,7 @@ extern "C" __global__ __aicore__ void flash_attention_gen_fp16(
 
 /* ---- flash_attention_gen_fp32 ---- */
 /*
- * flash_attention_gen_fp32 — 标准算子工程入口（Phase 5）
+ * flash_attention_gen_fp32 — 标准算子工程入口
  * 设备实现见 fa_gen_kernel.h（与 ascendc/flash_attention.cpp 同源的泛化 kernel）
  */
 

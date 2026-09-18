@@ -1,5 +1,5 @@
 /*
- * flash_attention_gen 算子声明（Phase 5 工程化）
+ * flash_attention_gen 算子声明
  */
 #ifndef OPS_H
 #define OPS_H

@@ -1,5 +1,5 @@
 // ----------------------------------------------------------------------------------------------------------
-// FlashAttention forward (generalized, HS32 手写同步) - Cube 侧：C0 / C1 / C2
+// FlashAttention forward (generalized，手写同步) - Cube 侧：C0 / C1 / C2
 // 同步结构（flag 编号 / 顺序）与 tilelang 手写同步设计（design/tile_level/
 // flash_attention_handsync.py）的生成码逐字节一致，禁止改动。
 // ----------------------------------------------------------------------------------------------------------
@@ -19,7 +19,7 @@ CATLASS_DEVICE void FaGenC0LoadQ(FaGenContext<T> &ctx, int64_t q_base,
 }
 
 // C1(t)：S = Q @ K^T -> workspace_s[slot]（d_chunks 个 K 段累 L0C）
-// HS35：k_l1 双缓冲——QK 用槽 t&1，同时 MTE2 往槽 (t+1)&1 载入下一块 K，
+// k_l1 双缓冲——QK 用槽 t&1，同时 MTE2 往槽 (t+1)&1 载入下一块 K，
 // 载入与 QK 重叠（preload 槽 0 在主循环前）。
 template <typename T>
 CATLASS_DEVICE void FaGenC1(FaGenContext<T> &ctx, int64_t kv_base,
@@ -28,7 +28,7 @@ CATLASS_DEVICE void FaGenC1(FaGenContext<T> &ctx, int64_t kv_base,
   const int64_t nxt = (t + 1) & 1;
   auto k_cur = cur ? ctx.k_l1b : ctx.k_l1;
   auto k_nxt = nxt ? ctx.k_l1b : ctx.k_l1;
-  // HS35 预取 K(t+1) 到槽 nxt（QK 前，MTE2 预取与 Cube QK 重叠）
+  // 预取 K(t+1) 到槽 nxt（QK 前，MTE2 预取与 Cube QK 重叠）
   if (t + 1 < ctx.kv_loops) {
     const int64_t k_tail_next =
         min64(BLOCK_N, ctx.kv_seq_len - (t + 1) * BLOCK_N);
@@ -83,9 +83,9 @@ CATLASS_DEVICE void FaGenC1(FaGenContext<T> &ctx, int64_t kv_base,
   fa_dyn::copy_l0c_to_gm_dyn<float>(
       ctx.workspace_s[ws_s_base + slot * ctx.block_m * BLOCK_N],
       ctx.acc_s_l0c[0], ctx.block_m, BLOCK_N, BLOCK_N, ctx.block_m, BLOCK_N);
-  // HS35 释放槽 cur（供 C1(t+1) 预取复用）
+  // 释放槽 cur（供 C1(t+1) 预取复用）
   AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(cur);
-  // HS19 位置 B（C1 跨迭代消费者完成，供 ring 尾 drain）
+  // C1 跨迭代消费者完成标记（供 ring 尾 drain）
   AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(3);
   AscendC::SetFlag<AscendC::HardEvent::FIX_M>(3);
   AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(0);
@@ -98,7 +98,7 @@ CATLASS_DEVICE void FaGenC2(FaGenContext<T> &ctx, int64_t kv_base,
                             int64_t tc) {
   AscendC::CrossCoreWaitFlag(1);
   // WAR：上迭代 MTE1 读 acc_s_l1/v_l1 排干 -> MTE2 覆写
-  // HS35：flag 让位给 K 槽信用（MTE1_MTE2 0/1、MTE2_MTE1 0/1），改用 3/2。
+  // flag 让位给 K 槽信用（MTE1_MTE2 0/1、MTE2_MTE1 0/1），改用 3/2。
   AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(3);
   AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(3);
   fa_dyn::copy_gm_to_l1_dyn<T>(
@@ -143,7 +143,7 @@ CATLASS_DEVICE void FaGenC2(FaGenContext<T> &ctx, int64_t kv_base,
     v_off += v_step;
     wo_off += ctx.cube_k;
   }
-  // HS19 位置 B（C2 跨迭代消费者完成，供 ring 尾 drain）
+  // C2 跨迭代消费者完成标记（供 ring 尾 drain）
   AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(5);
   AscendC::SetFlag<AscendC::HardEvent::FIX_M>(4);
   AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(4);

@@ -1,5 +1,5 @@
 // ----------------------------------------------------------------------------------------------------------
-// FlashAttention forward (generalized, HS32 手写同步) - Vector 侧：
+// FlashAttention forward (generalized，手写同步) - Vector 侧：
 // V0(running 状态初始化) / V1(scale/mask/online softmax) / V2(merge) / epilogue
 // 同步结构（flag 编号 / 顺序）与 tilelang 手写同步设计生成码逐字节一致，禁止改动。
 // 同管 V 链（Muls/reduce/Max/Sub/Exp/Broadcast/Div）不插 PIPE_V——in-order FIFO
@@ -13,7 +13,7 @@
 namespace fa_gen {
 
 // V0：running 状态初始化（acc_o / sumexp / m_i 驻留 UB）
-// HS36 免零初始化：acc_o/sumexp 由 V2(0) 直接建立，单元素/单行填充只是
+// 免零初始化：acc_o/sumexp 由 V2(0) 直接建立，单元素/单行填充只是
 // 活性锚点（生成码逐字节：Fill(acc_o[0],0,dim_align) + Fill(sumexp[0],0,1)）
 template <typename T>
 CATLASS_DEVICE void FaGenV0Init(FaGenContext<T> &ctx) {
@@ -22,7 +22,7 @@ CATLASS_DEVICE void FaGenV0Init(FaGenContext<T> &ctx) {
   tl::ascend::Fill<float>(ctx.m_i[0], -1073741824, ctx.half_m);
 }
 
-// causal 对角块 mask（HS32 新增）：块内末列超出首行可见界才需要
+// causal 对角块 mask：块内末列超出首行可见界才需要
 template <typename T>
 CATLASS_DEVICE void FaGenCausalMask(FaGenContext<T> &ctx, int64_t bx, int64_t t,
                                     int64_t vid) {
@@ -97,7 +97,7 @@ CATLASS_DEVICE void FaGenV1(FaGenContext<T> &ctx, int64_t ws_s_base,
                ctx.m_i[0], ctx.half_m);
   AscendC::Exp(ctx.alpha_ring[slot * ctx.half_m], ctx.alpha_ring[slot * ctx.half_m],
                ctx.half_m);
-  // HS36 brcb-sub（catlass CalcExp 同构，dim_align<=128 门控）：brcb 物化
+  // brcb-sub（catlass CalcExp 同构，dim_align<=128 门控）：brcb 物化
   // half_m x 8（2KB）替代整幅 2D 广播（32KB）；acc_s_ub 按 [half_m,64] 两半
   // 各一次 sub_mask（行宽恒 64 与 dim_align 无关，故 da<128 同样正确）。
   // dim>128 档 UB 无余量，走原 broadcast+sub。
@@ -144,7 +144,7 @@ CATLASS_DEVICE void FaGenV1(FaGenContext<T> &ctx, int64_t ws_s_base,
 }
 
 // V2(tc)：UB ring 读 alpha/sumexp_i，merge 当前 O 贡献到 running 状态
-// HS36 压缩 Vector 三分支（与修复后设计/生成码逐字节一致）：
+// 压缩 Vector 三分支：
 //   now_k==0        —— 免零初始化直接建立（copy acc_o_ub->acc_o / sumexp_i->sumexp）
 //   dim_align==128  —— 整幅 broadcast-mul（平坦 Mul 要求 pitch(acc_o)==pitch(m_i_2d)
 //                      ==128；da<128 时逐元素错位，实测 dim=64/80/96/112 全错，

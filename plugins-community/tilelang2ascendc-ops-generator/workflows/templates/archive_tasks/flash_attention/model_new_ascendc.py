@@ -21,7 +21,7 @@ os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
 
 import sysconfig
 
-# Phase 5 工程化产物（deliverer 路线）：kernel/ 注册的
+# kernel/ 注册的
 # flash_attention_gen_{fp16,bf16,fp32}，设备代码与 ascendc/flash_attention.cpp
 # 同源（tilelang 编译产物的手工泛化，全量 50/50 验证）。
 # 早期参考实现已移至 kernel_reference/（保留可构建）。

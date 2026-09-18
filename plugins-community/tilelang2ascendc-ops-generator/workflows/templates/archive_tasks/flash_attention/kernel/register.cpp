@@ -1,5 +1,5 @@
 /*
- * flash_attention_gen 算子注册（Phase 5 工程化）
+ * flash_attention_gen 算子注册
  */
 
 #include <torch/extension.h>

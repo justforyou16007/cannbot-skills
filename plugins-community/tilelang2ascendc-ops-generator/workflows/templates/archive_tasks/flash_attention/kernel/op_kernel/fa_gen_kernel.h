@@ -2,7 +2,7 @@
 // FlashAttention forward - generalized standalone AscendC kernel (MHA, kv_heads == heads).
 //
 // Origin: tilelang 手写同步设计 design/tile_level/flash_attention_handsync.py 的编译产物，
-// generalized by hand（HS32）：dim 运行期 + block_m 按 dim_align 分档 + d_chunks K 累加
+// generalized：dim 运行期 + block_m 按 dim_align 分档 + d_chunks K 累加
 // + causal 右下对齐 + 全显式旗语（AUTO_SYNC 关闭）。同步结构（flag 编号 / 顺序）
 // 与生成码逐字节一致，禁止改动。
 // ----------------------------------------------------------------------------------------------------------
@@ -34,11 +34,11 @@ CATLASS_DEVICE void fa_fwd_run(
 
   constexpr uint32_t C0 = 32 / sizeof(T);   // 16: fp16/bf16, 8: fp32
   ctx.dim_align = (ctx.dim + C0 - 1) / C0 * C0;
-  // HS33：dim_align > 128 时按 128 整 chunk 取齐
+  // dim_align > 128 时按 128 整 chunk 取齐
   if (ctx.dim_align > 128) {
     ctx.dim_align = (ctx.dim + 127) / 128 * 128;
   }
-  // HS32/33：block_m 按 dim_align 分档（fp32 减半 + dim>128 也 64）
+  // block_m 按 dim_align 分档（fp32 减半 + dim>128 也 64）
   if constexpr (sizeof(T) == 4) {
     ctx.block_m = (ctx.dim_align <= 128) ? 64 : 32;
   } else if (ctx.dim_align <= 128) {
@@ -76,7 +76,7 @@ CATLASS_DEVICE void fa_fwd_run(
   const uint32_t k_sz = BLOCK_N * ctx.dim_align * sizeof(T);
   const uint32_t p_sz = ctx.block_m * BLOCK_N * sizeof(T);
   AscendC::TBuf<AscendC::TPosition::A1> ascend_l1;
-  pipe.InitBuffer(ascend_l1, q_sz + 2 * k_sz + p_sz + k_sz);  // HS35: k_l1 双槽
+  pipe.InitBuffer(ascend_l1, q_sz + 2 * k_sz + p_sz + k_sz);  // k_l1 双槽
   AscendC::TBuf<AscendC::TPosition::A2> ascend_l0a;
   pipe.InitBuffer(ascend_l0a, 65536);
   AscendC::TBuf<AscendC::TPosition::B2> ascend_l0b;
@@ -95,7 +95,7 @@ CATLASS_DEVICE void fa_fwd_run(
   const uint32_t ub_bound_vec = ub_col_idx + BLOCK_N * 4;
   const uint32_t ub_tmp = ub_bound_vec + ctx.half_m * 4;            // uint8[half_m*256]
   const uint32_t ub_m_i_2d = ub_tmp + ctx.half_m * 256;
-  // HS36 brcb_tmp：dim_align<=128 档 half_m*8 fp32，其余档 8 元素哑元
+  // brcb_tmp：dim_align<=128 档 half_m*8 fp32，其余档 8 元素哑元
   // （与设计 builder 常量三元同构；运行期 dim 故尺寸走运行期三元。
   //  生命周期仅限 V1 内部 brcb->sub_mask，不与任何 buffer 别名）
   const uint32_t brcb_elems = (ctx.dim_align <= 128) ? ctx.half_m * 8 : 8;
@@ -196,7 +196,7 @@ CATLASS_DEVICE void fa_fwd_run(
 
       if ASCEND_IS_AIC {
         FaGenC0LoadQ(ctx, q_base, q_tail_m);
-        // HS35 preload：K 槽信用预置 + 预加载 K(0) 到槽 0（抄 design/GQA）
+        // preload：K 槽信用预置 + 预加载 K(0) 到槽 0
         AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(0);   // K 槽 0 空闲
         AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(1);   // K 槽 1 空闲
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(0);
@@ -229,7 +229,7 @@ CATLASS_DEVICE void fa_fwd_run(
             FaGenV2(ctx, ws_o_base, slot_c, tc, vid);
           }
         }
-        // HS33：ring 尾定向 drain（替代哨兵 PIPE_ALL）
+        // ring 尾定向 drain（替代哨兵 PIPE_ALL）
         if ASCEND_IS_AIC {
           if (t < ctx.kv_loops) {
             AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(3);
@@ -245,7 +245,7 @@ CATLASS_DEVICE void fa_fwd_run(
           }
         }
       }
-      // HS35 task 尾 drain：K 槽 0/1 空闲信用清零（每槽残留 1 个 set，抄 GQA）
+      // task 尾 drain：K 槽 0/1 空闲信用清零（每槽残留 1 个 set）
       if ASCEND_IS_AIC {
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(0);
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(1);

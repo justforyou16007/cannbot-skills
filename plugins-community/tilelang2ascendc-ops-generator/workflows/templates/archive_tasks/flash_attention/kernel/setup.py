@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build flash_attention_gen AscendC kernel（Phase 5 工程化产物，deliverer 路线）。"""
+"""Build flash_attention_gen AscendC kernel."""
 import sys
 from pathlib import Path
 

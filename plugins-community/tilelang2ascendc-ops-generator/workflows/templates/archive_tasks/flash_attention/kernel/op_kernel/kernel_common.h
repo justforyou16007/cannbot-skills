@@ -56,7 +56,7 @@ struct FaGenContext {
   // runtime dims（Init 时从 tiling 计算）
   int64_t batch, heads, q_seq_len, kv_seq_len, dim;
   int64_t dim_align;        // AlignUp(dim, C0)，片上 buffer 宽度
-  // HS32：block_m 按 dim_align 分档（GQA 同档），cube_k 单 chunk=128，
+  // block_m 按 dim_align 分档，cube_k 单 chunk=128，
   // d_chunks 为 K 维 chunk 数
   int64_t block_m, half_m, cube_k, d_chunks;
   int64_t q_blocks, block_num, tasks_per_core, kv_loops, kv_tail;
@@ -77,11 +77,11 @@ struct FaGenContext {
   // UB 视图（alpha/sumexp_i 按 ring slot UB 驻留；m_i_2d/alpha_2d 为 broadcast 目标）
   AscendC::LocalTensor<float> acc_o, sumexp, m_i, acc_s_ub, mask_col;
   AscendC::LocalTensor<float> alpha_ring, sumexp_i_ring, m_i_2d, acc_o_ub;
-  // HS36 brcb-sub：m_i 的 8 路广播物化（dim_align<=128 档；其余档 8 元素哑元）
+  // brcb-sub：m_i 的 8 路广播物化（dim_align<=128 档；其余档 8 元素哑元）
   AscendC::LocalTensor<float> brcb_tmp;
   AscendC::LocalTensor<uint8_t> tmp_ub;
   AscendC::LocalTensor<T> acc_s_half, acc_o_half;
-  // causal mask 专用 UB（HS32 新增；仅 causal=True 且块内末列超界时使用）
+  // causal mask 专用 UB（仅 causal=True 且块内末列超界时使用）
   AscendC::LocalTensor<float> col_idx, bound_vec, bound_2d;
   AscendC::LocalTensor<uint8_t> causal_cmp;
 };
@@ -259,7 +259,7 @@ CATLASS_DEVICE void copy_ub_to_ub_dyn(LocalTensor<T1> dstTensor,
   }
 }
 
-// ---- 运行期 M/N/K 的 mma / reduce 包装（HS32 新增，block_m 分档后 M 运行期） ----
+// ---- 运行期 M/N/K 的 mma / reduce 包装（block_m 分档后 M 运行期） ----
 
 // 直接调 Mmad：MmadParams.m/n/k 本来就是运行期字段，M/N 模板常量只用来填它。
 template <typename T>

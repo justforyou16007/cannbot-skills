@@ -1,5 +1,5 @@
 /*
- * flash_attention_gen op_host — tiling 计算 + workspace 分配 + kernel 启动（Phase 5）
+ * flash_attention_gen op_host — tiling 计算 + workspace 分配 + kernel 启动
  * 设备实现：op_kernel/fa_gen_kernel.h（泛化 kernel，运行期 shape + 运行期 buffer）
  */
 
@@ -32,7 +32,7 @@ constexpr int64_t RING_SLOTS = 3;
 constexpr int64_t GRID = 20;  // kernel 内 task_idx < block_num 守卫，grid 固定
 constexpr int64_t MAX_DIM = 512;
 
-// HS32/33：block_m 按 dim_align 分档（与 kernel fa_gen_kernel.h 一致）
+// block_m 按 dim_align 分档（与 kernel fa_gen_kernel.h 一致）
 static int64_t DeriveBlockM(int64_t dimAlign, int64_t elemSize) {
     if (elemSize == 4) {  // fp32：block_m 减半避免 L0A 别名
         return (dimAlign <= 128) ? 64 : 32;
@@ -90,7 +90,7 @@ static void AllocateGenWorkspaces(const at::Tensor &q, int64_t batch, int64_t he
     const int64_t c0 = 32 / elemSize;
     int64_t dimAlign = (dim + c0 - 1) / c0 * c0;
     if (dimAlign > 128) {
-        dimAlign = (dim + 127) / 128 * 128;  // HS33：128 整 chunk 取齐
+        dimAlign = (dim + 127) / 128 * 128;  // 128 整 chunk 取齐
     }
     const int64_t blockM = DeriveBlockM(dimAlign, elemSize);
     const int64_t blockNum = ((qSeqLen + blockM - 1) / blockM) * heads * batch;

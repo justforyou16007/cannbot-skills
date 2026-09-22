@@ -92,6 +92,12 @@ EXEC_KERNEL_CMD 正确传参模式（所有 tiling 参数为独立标量左值�
 
 ---
 
+### C/V 与相关 V 链的合同核对（命中时）
+
+读取 `model.py` 后，若包含 Matmul 后处理、C/V 流水、纯 V gate、稀疏取数、在线归约或局部 epilogue，先读 `.claude/skills/tilelang-perf-optimization/references/cv-patterns/CvPatternIndex.md`，再只读命中卡片。仓库真源为 `ops/tilelang-perf-optimization/references/cv-patterns/`，不复制知识正文。
+
+对照原始合同与 tile-level 设计，记录 token/block 索引单位、layout/stride、scale/exp 域、cast 点、ready/reuse 与有效长度。A8W8/A8W4、softplus/bounded gate 不可按近名替换；本组 Triton/AscendC 案例仅提供机制，目标 API 和芯片支持仍按官方文档核对。继续执行下面已存在的 Attention/Quant 路由与验证流程。
+
 ### 🛑 步骤 0-A: Attention 算子模式路由（Attention / FlashAttention 类算子强制执行）
 
 🛑 **无论算子类型如何，第一步必须读取 model.py**：

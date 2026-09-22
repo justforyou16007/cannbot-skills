@@ -23,45 +23,42 @@
 
 ---
 
+新增算子先对照 [串行基线](../cv-patterns/serial-baseline.md) 与 [槽位生命周期](../cv-patterns/pipeline-lifetime.md)；下面是调优候选，不预设负载必然 Cube-bound。
+
 ## 1. 数据流形态与 FA 的对照
 
 | 维度 | Flash Attention | GMM + 融合 epilogue |
 |------|----------------|---------------------|
 | C/V 数据流方向 | 双向 3 通道（S/P/O） | 单向 1 通道（Cube 结果 → Vec epilogue） |
 | 同步协议核心 | 双向握手、状态携带（online softmax 的 max/sum） | 就绪信号 + **背压** |
-| 主要死锁模式 | 双向协议配错（见 [../cv_sync_debug.md](../cv_sync_debug.md)） | 无背压 → Cube 覆盖未消费数据；背压过紧 → 锁步 |
-| Cube/Vec 耗时比 | 接近（需要精细交错） | Cube 通常远重于 Vec（GEMM-bound） |
-| 流水目标 | C、V 都持续忙 | Cube 不等 Vec 即可（Vec 跟上就行） |
+| 主要死锁模式 | 双向协议配错（见 [../cv_sync_debug.md](../cv_sync_debug.md)） | 无背压 → Cube 覆盖未消费数据；复用等待过早 → 可能限制 overlap |
+| Cube/Vec 耗时比 | 随 shape、mask、tile 与平台变化，需测量 | 随 groupList、量化与激活变化，需测量 |
+| 流水目标 | C、V 都持续忙 | 按实测瓶颈提高整体吞吐，控制复用等待 |
 
-**推论**：GMM+epilogue 的性能天花板基本由 Cube 阶段决定（算术强度拆解见
-[../measurement_discipline.md](../measurement_discipline.md) §5），Vector epilogue
-优化的目标是"**不拖住 Cube**"，而不是"自身多快"。
+仅在测量确认 Cube-bound 时，以 Vector 跟上 Cube 为主要目标；Vector 或访存主导时要重新排序优化候选。分类方法见 [measurement_discipline.md](../measurement_discipline.md) §5。
 
 ## 2. 核心优化 1：背压深度调优（本族特有的杠杆）
 
 **机制**：单向数据流下，Cube 生产 workspace 块，Vector 消费。必须有一条
 **V→C 的"已消费"信号**（背压），否则流水加深后 Cube 会覆盖 Vector 还没读的
-workspace。背压按**每 N 块一次**（而不是每块一次）发出，N 即背压深度。
+workspace。释放粒度取决于槽位协议：可以逐槽释放，也可在明确整组槽位都已消费后成组释放。槽位数不等于每 N 块才发一次信号；先画 ready/reuse 依赖，再讨论同步频率。
 
 **背压深度的权衡**：
 
 | 深度 N | 效果 |
 |--------|------|
-| 太小（如 1~2） | 接近锁步：Cube 每写几块就等 Vector 确认，核间气泡大 |
-| 太大 | workspace 需求随 N 线性增长；且 Vector 掉队太多时背压失去意义 |
+| 太小 | 可能因槽位不足产生等待；两个槽位也可实现有效 overlap，取决于阶段时长与协议 |
+| 太大 | workspace 增长且可能降低缓存命中；更多槽位不能补足较慢阶段的吞吐 |
 | 合适 | Cube 几乎不等，Vector 稳定消费，workspace 不超预算 |
 
 **调优方法（扫描法）**：
 
-1. 从 N = workspace 预算允许的最大值开始（先保证正确性和最小 Cube 等待）
-2. 逐步减半 N，每档测性能
-3. 性能拐点（Cube 开始等待）的前一档为最优
-4. 同步-only 测试（[../cv_sync_debug.md](../cv_sync_debug.md) §1）确认同步开销占比
-   已 <10%
+1. 先以已验证的保守槽位协议跑通，再在内存预算内选择少量深度候选
+2. 每档保持数学路径不变，测设备时间线、整段时间和 workspace 峰值
+3. 按目标 case 的实测选择深度；存在缓存/带宽竞争时收益不一定单调
+4. 同步-only 仅用于隔离协议问题，不据此设定通用的 <10% 验收线
 
-**TileLang 表达**：就绪/背压两个 semaphore（C→V ready + V→C release）+ 计数条件
-（`if (i+1) % N == 0` 发背压）。ID 分配参照
-[flash_attn_optimize.md](flash_attn_optimize.md) 的分配指南，两个方向各一个 ID。
+**TileLang 表达**：显式区分 C→V ready 和 V→C release，ID 数量/复用时机依据槽位、参与核与目标 API 语义确定；不能只加入 `if (i+1) % N == 0` 就视为完整协议。ID 设计可参考 [flash_attn_optimize.md](flash_attn_optimize.md)，并检查实际生成代码。
 
 **正确性红线**：背压信号缺失或晚于 Cube 的下一轮写 → 间歇性错误（竞态，
 见 [../cv_sync_debug.md](../cv_sync_debug.md) §3 第 3 条）。**先对后快**：
@@ -111,9 +108,7 @@ GMM 族的变体空间典型为 `dequantDtype(3) × weightFormat(2) × transB(2)
   （[cube_optimization_path.md](cube_optimization_path.md) §2.3），GMM 无特殊；
   但**每组（group）的行数不同**，tiling 必须按"各组独立切分 + 全局块索引连续"
   组织，kernel 内通过每组的起始偏移定位自己的块
-- **workspace 公式**：`Σ_groups(M_g × N) × sizeof(accum) + 背压深度 × 块大小 +
-  对齐预留`。**不要用拍脑袋常数**（如 "+20MB"），按公式算——shape 变化时
-  拍脑袋常数要么浪费要么溢出
+- **workspace 预算**：列出实际活跃的全部 allocation（每槽尺寸 × 槽数 × 实例数 × dtype 字节，加对齐及 API scratch）。仅实现确实保留全量 accumulator 时计入 `Σ_groups(M_g × N) × sizeof(accum)`；流式槽位不能再无条件叠加一个全量矩阵。按 host tiling 与 kernel 地址一致核算
 - **host 预计算**：各组的行偏移前缀和（`cum_out[G+1]`）在 host 算好传入，
   kernel 内不做分组长度的串行扫描
 
@@ -137,18 +132,16 @@ GMM 特有的问题：各组行数差异大（MoE 专家负载不均），按组
 ## 7. 调优顺序与检查清单
 
 ```
-[ ] 1. bound 分类（measurement_discipline §4）——GMM 族通常是 Cube bound 或真 MTE2 bound
-[ ] 2. Cube 基线：pingpong + tiling 推导（cube_optimization_path §2.3）
-[ ] 3. C/V 单向流水 + 保守背压（每块一次）跑通正确性
-[ ] 4. 背压深度扫描（§2）——确认 Cube 等待已消除
-[ ] 5. epilogue 单 pass 融合 + 向量化（§3）——确认 Vector 不再拖住 Cube
-[ ] 6. 负载均衡（§6 全局块队列）——分组不均时必做
-[ ] 7. 上限分析（measurement_discipline §5）——Cube 阶段占比即天花板，到顶收手
+[ ] 1. 对齐完整合同，建立串行基线，测量 bound（measurement_discipline §4）
+[ ] 2. 核对 ready/reuse 与 workspace；融合候选先通过精度和重复复用检查
+[ ] 3. 依测量排序：Cube/tiling、槽位深度、epilogue 向量化、分组负载均衡
+[ ] 4. 每轮只改变一个优化点，对比设备时间、整段时间与 workspace
+[ ] 5. 上限分析（measurement_discipline §5）并记录实际收益与剩余瓶颈
 ```
 
 **常见误区**：
 
-- ❌ 先优化 epilogue 的向量指令，没做背压——Vector 再快，Cube 在等背压也白搭
+- ❌ 未测量瓶颈就固定先调背压或先调 epilogue——先保证协议正确，再按数据排序
 - ❌ 背压一次到位设很深——没有先验证保守背压的正确性，竞态 bug 混入性能调优轮
 - ❌ 变体复制 12 份分别调——一个 bug 修 11 遍漏 1 遍
 - ❌ workspace 用拍脑袋常数——shape 一变就溢出或浪费

@@ -79,6 +79,7 @@
       "case_name": "核内流水不能证明图级双流收益",
       "config": {
         "max_tokens": 16000,
+        "ascend_platforms": ["A2", "A3", "A5"],
         "eval_mode": "text"
       },
       "prompt": "GMSQ 源码有两个 workspace，是否能证明图级双流有九成融合收益？请据此决定我们下一步怎么优化。",
@@ -103,6 +104,7 @@
       "case_name": "GQA block 索引适配",
       "config": {
         "max_tokens": 16000,
+        "ascend_platforms": ["A2", "A3", "A5"],
         "eval_mode": "text"
       },
       "prompt": "GqaSparseFwd 的 topk 存的是逻辑 block ID，可以直接套 topk_kv_sparse_pattern 的 token 除 page size 公式吗？L4 cache 最后一维打包 K/V。",
@@ -127,6 +129,7 @@
       "case_name": "不同量化变体的流水迁移",
       "config": {
         "max_tokens": 16000,
+        "ascend_platforms": ["A2", "A3", "A5"],
         "eval_mode": "text"
       },
       "prompt": "我的 L4 GroupedMatmulSwigluQuant 是 int8×int8，想直接使用 A8W4 MSD 的 Pre/Mid/Post 流水，你来判断。",
@@ -151,6 +154,7 @@
       "case_name": "bounded gate 与 softplus",
       "config": {
         "max_tokens": 16000,
+        "ascend_platforms": ["A2", "A3", "A5"],
         "eval_mode": "text"
       },
       "prompt": "把 FusedKdaGate 的 lower_bound=-5 分支统一改成 -exp(A)*softplus(g+bias)，方便融合纯 V 链，可以吗？",
@@ -175,6 +179,7 @@
       "case_name": "在线 TopK 是否消除了 GM",
       "config": {
         "max_tokens": 16000,
+        "ascend_platforms": ["A2", "A3", "A5"],
         "eval_mode": "text"
       },
       "prompt": "LightningIndexer ProcessTopK 在线维护幸存者，所以现在可以宣称全量 scoreGm 已消除并获得确定加速吗？",

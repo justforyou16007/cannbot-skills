@@ -345,7 +345,7 @@ Read `ops/tilelang-perf-optimization/references/optimization-guide.md` §一（�
 1. 算子类型判定（纯 Cube / 纯 Vector / CV 融合）及 optimization-guide §一 对应的优化范围与优先级
 2. 上表中与本算子相关的检查项逐项结论（命中 / 未命中 / 不适用 + 一句理由）
 3. Cube / CV 融合型：cube_advanced_strategies.md 路由结论——选用的高级策略，或在 block 级设计中预留的扩展空间（如 Split-K 切分维度、pingpong/swat 适配点）
-4. CV 融合型：cv_sync_debug.md §4 锁步风险结论（流水结构如何避免 C/V 串行乒乓）
+4. CV 融合型：依据 cv_sync_debug.md §4，记录跨块数据依赖、锁步风险及串行/流水的选择依据；若评估流水候选，补充 ready/reuse 依赖、槽位预算和待验证项。不满足适用条件时允许保留串行，最终选择依据同合同实测结果确定。
 5. `## 性能迭代待验证清单` 章节（见下方格式；1e 阶段无待验证项时写"暂无"，章节本身不可缺）
 6. Conv 类：步骤 0.5 的三模式选型结论（含退回 normal 的理由）；dtype 适配时另含「保留的优化结构清单」（fused/normal 模式、零标量、批量转置、epilogue 跨行块处理逐项 保留/丢弃+理由）
 

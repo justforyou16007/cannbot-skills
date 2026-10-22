@@ -59,7 +59,7 @@ C/V kernel 的 hang 和间歇性错误，**直接读代码找 bug 的成功率�
 - 同步-only 版仍然 hang → 同步协议本身错误（分类树 2.1 / 2.4 / 2.5）
 - 同步-only 版正常 → 同步协议骨架正确，问题在数据通路（2.2 / 2.3）
 
-这个测试同时给出**同步开销占比**（见 §4）——一鱼两吃。
+这个测试用于隔离协议问题；去掉计算会改变等待时序，不能将其时间直接换算成原 kernel 的同步开销占比（见 §4）。
 
 ---
 
@@ -132,12 +132,9 @@ T.set_cross_flag("FIX", SEM_ID)  # 所有子块无条件到达
 
 **症状**：间歇性错误（时序敏感），且**同一二进制换台机器/换个时段结果不同**。
 
-**修复（二选一）**：
+**排查与修复**：先依据目标芯片/API 的内存语义检查实际数据通路。生产者写入完成之后才发布 ready，消费者等待后才读取；存在 cache 一致性要求时使用该 API 文档规定的机制，并检查生成代码，不能臆造通用 fence。
 
-1. **结果经 UB 路由**：消费者从 UB 拿数据（UB 访问天然在 flag 保护的 pipe 链上）
-2. **显式可见性 fence**：生产者在 set 前确保 GM 写完成（写 pipe 与 set pipe 一致，
-   见 2.2），必要时减小 workspace 使其命中 L2（A2/A3 L2 约 201MB，连续且按核复用的
-   workspace 交互更可靠也更快）
+UB 路由只有目标硬件和 API 明确支持相应生产者/消费者访问时才可使用，不能假定不同核共享 UB。缩小 GM workspace 以争取 L2 命中属于性能候选，**不是可见性修复**；L2 可容纳不等于实际命中，也不免除 ready/reuse 依赖。槽位不变量见 [pipeline-lifetime.md](cv-patterns/pipeline-lifetime.md)。
 
 ### 2.4 Flag / Semaphore ID 冲突
 
@@ -193,26 +190,13 @@ T.set_cross_flag("FIX", SEM_ID)  # 所有子块无条件到达
 
 ## 4. "正确但慢"：锁步调度诊断
 
-**机制**：C/V 融合算子精度正确但性能远低于预期，第一嫌疑不是 tile 参数，而是
-**流水线塌陷**——Cube 算完 → Vector 算 → 下一个 Cube……串行乒乓，两个引擎各闲一半。
+**机制**：Cube 算完 → Vector 算 → 下一个 Cube 的串行依赖可能阻碍跨块重叠。两侧空闲占比取决于实际 C/V 时长，不能固定为各一半；慢也可能来自搬运、tile 或负载不均。
 
-**量化确认**（两步）：
+**确认**：结合生成代码的数据依赖和设备时间线，检查有无可并行的独立块，以及 ready/reuse 是否把所有块串行化。源码中 AIC/AIV 的书写顺序或缺少 `T.Pipelined` 本身不足以证明没有 overlap。同步-only 测试可隔离协议开销，但移除计算改变了等待时序，不能直接把其耗时占比当原 kernel 的同步瓶颈占比。
 
-1. 用 §1 Step 3 的**同步-only 测试**测同步开销占比：注释全部计算后同步本身耗时
-   占比 >50% → 同步粒度过细（用 `cross_interval=2` 降频，见
-   `optimization-guide.md` §3.2）
-2. 用 `get_kernel_source()` 检查生成的主循环：如果 AIC 段和 AIV 段在同一迭代内
-   顺序出现、且没有 `T.Pipelined(num_stages≥2)` 的跨迭代交错 → 锁步确认
+**候选修复**：确认独立块、槽位容量及同步协议正确后，评估 `T.Pipelined`/num_stages 或显式流水；自动 CV combine/sync 的适用边界见 §2.5。与同数学、同 dtype 的串行基线比较，记录启动/排空和等待成本；不要仅以打开编译开关宣布修复。
 
-**修复**：`T.Pipelined` + `num_stages` 调优（`optimization-guide.md` §3.1）+
-开启自动 CV combine/sync（`performance-antipatterns.md` "AIC/AIV 混合算子未开启
-CV overlap"节）。
-
-**判定上限**：如果 Cube 阶段耗时占比 ~90%（GEMM-bound 融合算子常见），锁步的损失
-上限只有 ~10%，此时流水化收益有限，应把精力转回 Cube 侧
-（[cube_optimization_path.md](best-practices/cube_optimization_path.md) /
-[cube_advanced_strategies.md](cube_advanced_strategies.md)）——上限分析方法见
-[measurement_discipline.md](measurement_discipline.md) §5。
+**判定上限**：忽略全部额外成本时，长流水由较慢阶段约束。例如 C 占串行时间90%，理想耗时下降至90%、加速约1/0.9≈1.11x；实际还受启动/排空及搬运竞争约束。两阶段推导见 [pipeline-lifetime.md](cv-patterns/pipeline-lifetime.md)，测量方法见 [measurement_discipline.md](measurement_discipline.md) §5。
 
 ---
 
@@ -221,10 +205,10 @@ CV overlap"节）。
 | 手段 | 用途 | 注意 |
 |------|------|------|
 | `get_kernel_source()` | 检查生成的 set/wait pipe 参数、flag ID 分配、主循环是否锁步 | 每次改同步逻辑后必看 |
-| 同步-only 测试 | 隔离同步协议 vs 数据通路；测同步开销占比 | §1 Step 3 |
+| 同步-only 测试 | 隔离同步协议 vs 数据通路；不直接估算原 kernel 的占比 | §1 Step 3 |
 | 单核先行 | 砍半搜索空间 | §1 Step 1 |
 | `T.printf` | 观察执行顺序 | 本身是同步点，会掩盖竞态 |
-| 诊断值写 GM workspace | 观察中间状态（不改变时序） | 用真实输出 tensor 槽位带回，别用 raw-byte workspace 读回（host 侧可能读不到设备直写的数据） |
+| 诊断值写 GM workspace | 观察中间状态（额外写入可能扰动时序） | 用真实输出 tensor 槽位带回，别用 raw-byte workspace 读回（host 侧可能读不到设备直写的数据） |
 | 连跑 ≥20 次 | 统计间歇性问题的失败率 | 概率 <5% 的竞态几乎无法靠单次运行定位 |
 | `npu-smi info` | 排除环境争用导致的假性 hang/超时 | 共享机器必查，见 [measurement_discipline.md](measurement_discipline.md) |
 

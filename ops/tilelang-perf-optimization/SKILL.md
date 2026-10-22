@@ -27,6 +27,7 @@ Step 1: 基线采集（性能 + 精度）
 - **优化指南**：[optimization-guide.md](references/optimization-guide.md)
 - **反模式清单**：[performance-antipatterns.md](references/performance-antipatterns.md)
 - **测量纪律**：[measurement_discipline.md](references/measurement_discipline.md)（A/B 口径、环境排除、bound 分类、上限分析）
+- **C/V 场景卡片**：[CvPatternIndex.md](references/cv-patterns/CvPatternIndex.md)（串行基线、核内流水、纯 V gate、稀疏取数、在线归约、局部 epilogue；按触发条件选读，源码机制与性能证据分开）
 - **C/V 同步调试**：[cv_sync_debug.md](references/cv_sync_debug.md)（C/V 融合 kernel hang / 死锁 / 间歇性错误 / 锁步诊断）
 - **cube 高级策略**：[cube_advanced_strategies.md](references/cube_advanced_strategies.md)（pingpong/swat/streamk/fullload/scale_coalescing/mte2_preload 路由）
 - **API 用法**：[tilelang-api-best-practices](../tilelang-api-best-practices/SKILL.md)
@@ -73,9 +74,11 @@ print(func.get_kernel_source())
 
 根据算子类型阅读 `optimization-guide.md` 对应章节 + `performance-antipatterns.md`，如果是 cube 核额外参考最佳实践 `best-practices/cube_optimization_path.md`；基线优化已完成但仍不达标时按 [cube_advanced_strategies.md](references/cube_advanced_strategies.md) 的路由表选下一层策略（先做 bound 分类，[measurement_discipline.md](references/measurement_discipline.md) §4）。
 
-**C/V 融合算子的两个补充动作**：
+**C/V 候选与相关 V 链的补充动作**：
 
-- 优化前先确认不是锁步调度（Cube/Vector 串行乒乓各闲一半）——诊断方法见 [cv_sync_debug.md](references/cv_sync_debug.md) §4；锁步时第一优化是 C/V overlap，不是 tile 参数
+- 涉及 C 后处理、流水、gate、稀疏取数、在线归约或局部 epilogue 时，先读 [CvPatternIndex.md](references/cv-patterns/CvPatternIndex.md) 并只加载命中卡片；记录合同、实际 dispatch 和待验证项，不由源码形态推断 Tv/Tc 或收益
+
+- 优化前检查锁步调度——诊断方法见 [cv_sync_debug.md](references/cv_sync_debug.md) §4；确认存在可并行的独立块、槽位预算和正确同步后，把 overlap 列为候选，与串行基线实测比较。锁步不代表 C/V 耗时必然各占一半
 - 调优中如出现 hang / 间歇性错误结果，立即停止性能迭代，转 [cv_sync_debug.md](references/cv_sync_debug.md) 的诊断协议，排除同步 bug 后再回来
 
 在 `optimization_log.md` 中输出：

@@ -5,6 +5,7 @@ description: >
   完成 block-level 设计、tile-level 设计和 model_new_tilelang.py 生成，
   并通过步骤 4（tilelang-perf-optimization 本体）完成测量驱动的性能迭代。
   产物对接下游 AscendC translator 算子生成流程。
+  触发：需要将复杂算子的 PyTorch Model 设计为 TileLang kernel 并进行精度与性能验证时。
 argument-hint: >
   输入：output_dir 目录路径（包含 model.py）。
   输出：block_level/ 设计、tile_level/ 设计、model_new_tilelang.py 实现、perf_tuning/ 性能迭代记录。
@@ -106,12 +107,15 @@ argument-hint: >
 | `ops/tilelang-perf-optimization/references/performance-antipatterns.md` | 常见性能劣化模式清单：launch core 数不当、逐元素 for loop、冗余全局同步、指令未融合、tile size 过小、CV 未 overlap、AIV 未流水/双 buffer、多行 tile 循环内归约 | Step 1e, 2e, 4c |
 | `ops/tilelang-perf-optimization/references/optimization-guide.md` | 性能优化指南：Split-K、Double Buffer、Fixed Core、多行 Tile 粒度扩展、MTE2 预取、指令向量化/融合 | Step 1e（§一 算子类型对应）, 2e, 4c |
 | `ops/tilelang-perf-optimization/references/cube_advanced_strategies.md` | Cube 高级策略路由表：pingpong / swat / streamk / fullload / scale_coalescing / mte2_preload | Step 1e（仅 Cube/CV 融合型）, 4c |
+| `ops/tilelang-perf-optimization/references/cv-patterns/CvPatternIndex.md` | C/V 六场景卡片：串行/流水/纯 V/稀疏取数/online/epilogue，先核对合同与证据等级 | Step 1e, 2e, 4c（命中时） |
 | `ops/tilelang-perf-optimization/references/cv_sync_debug.md` | C/V 融合 lockstep 诊断与避免（设计期预防 hang/死锁） | Step 1e（仅 CV 融合型）, 4c |
 | `ops/tilelang-perf-optimization/references/measurement_discipline.md` | 测量纪律：A/B 口径、环境排除、bound 分类、上限分析 | Step 4b, 4c, 4d |
 
 ---
 
 ## 流程
+
+**融合候选路由（Step 1e/2e）**：计算含 Matmul 后处理、C/V 流水、纯 V gate、稀疏取数、在线归约或局部 epilogue 时，读取 `ops/tilelang-perf-optimization/references/cv-patterns/CvPatternIndex.md`（安装后 `.claude/skills/tilelang-perf-optimization/references/cv-patterns/CvPatternIndex.md`），只展开命中卡片。将合同差异、槽位/在线状态和未证实的 dispatch/收益写入 `design/PERF_DESIGN.md`，供步骤 4 实测；不能把研究案例当已板测模板。
 
 🛑 **执行以下各步骤前，必须先完成步骤 0（Attention 类）、步骤 0.5（Conv 类）与步骤 0-Q（Quant 类）的强制查阅（按算子类型各取其一）。未完成对应步骤全部 checklist 前，禁止 Edit/Write 任何 `{output_dir}/design/` 下的代码文件。**
 
@@ -326,7 +330,7 @@ Read `ops/tilelang-perf-optimization/references/performance-antipatterns.md`，�
 |--------|----------|---------------|
 | launch core 数 | `block_num` >> 24 物理核 → 按任务数 launch | 改用 Fixed Core 模式，按物理核数 launch，核内 `T.serial` 分配多任务 |
 | launch core 数 | `block_num` < 24 仍按 24 launch | 按 `min(block_num, 24)` launch |
-| CV 未 overlap | CV 融合型但主循环串行（Cube 写 workspace → Vector 读） | 改用 `T.Pipelined` + AUTO_CV_COMBINE/AUTO_CV_SYNC |
+| CV 未 overlap | 数据依赖及时间线表明可并行块被串行化 | 核对槽位与协议后评估 `T.Pipelined`/自动同步，按 cv-patterns 卡片保留实测验证项 |
 | tile size 过小 | L0C/UB 实际使用量远小于容量 | 在不超限前提下成倍扩大 block_M/block_N |
 | AIV 未流水 | 纯 AIV 算子 GM→UB→Vector→GM 串行 | 改用 `T.Pipelined` 或手动双 buffer |
 
@@ -334,14 +338,14 @@ Read `ops/tilelang-perf-optimization/references/optimization-guide.md` §一（�
 
 **Cube/CV 融合型补充**：Read `ops/tilelang-perf-optimization/references/cube_advanced_strategies.md` 的路由表，判断本算子是否需要预留 pingpong/swat/streamk 等高级策略的扩展空间（如在 block 级设计中预留 Split-K 切分维度）。
 
-**CV 融合型补充**：Read `ops/tilelang-perf-optimization/references/cv_sync_debug.md` §4（锁步诊断），确认设计的流水结构不会落入 Cube/Vector 串行乒乓（各闲一半）的 lockstep 调度。
+**CV 融合型补充**：Read `ops/tilelang-perf-optimization/references/cv_sync_debug.md` §4（锁步诊断），检查跨块数据依赖与 ready/reuse；若存在可并行块，将流水候选及槽位预算写入 PERF_DESIGN，实际收益留待测量，不预设两侧各闲一半。
 
 **🛑 PERF_DESIGN.md 必须包含以下内容（缺项视为未完成 1e）**：
 
 1. 算子类型判定（纯 Cube / 纯 Vector / CV 融合）及 optimization-guide §一 对应的优化范围与优先级
 2. 上表中与本算子相关的检查项逐项结论（命中 / 未命中 / 不适用 + 一句理由）
 3. Cube / CV 融合型：cube_advanced_strategies.md 路由结论——选用的高级策略，或在 block 级设计中预留的扩展空间（如 Split-K 切分维度、pingpong/swat 适配点）
-4. CV 融合型：cv_sync_debug.md §4 锁步风险结论（流水结构如何避免 C/V 串行乒乓）
+4. CV 融合型：依据 cv_sync_debug.md §4，记录跨块数据依赖、锁步风险及串行/流水的选择依据；若评估流水候选，补充 ready/reuse 依赖、槽位预算和待验证项。不满足适用条件时允许保留串行，最终选择依据同合同实测结果确定。
 5. `## 性能迭代待验证清单` 章节（见下方格式；1e 阶段无待验证项时写"暂无"，章节本身不可缺）
 6. Conv 类：步骤 0.5 的三模式选型结论（含退回 normal 的理由）；dtype 适配时另含「保留的优化结构清单」（fused/normal 模式、零标量、批量转置、epilogue 跨行块处理逐项 保留/丢弃+理由）
 

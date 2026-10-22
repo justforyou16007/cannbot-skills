@@ -4,6 +4,10 @@
 
 渐进式披露原则：不要一上来读完所有模式文档。先用本索引定位命中的模式，再只读对应文档顶部的 `先读这个`；只有实现细节不够时，再继续读该文档后面的 `核心规则 / 地址公式 / 边界`。
 
+## 稀疏索引与融合补充
+
+若 `indices/topk` 表示选中的 **block**，先读 `ops/tilelang-perf-optimization/references/cv-patterns/sparse-layout.md`（安装后 `.claude/skills/tilelang-perf-optimization/references/cv-patterns/sparse-layout.md`）；下表 `topk_kv_sparse_pattern.md` 默认逻辑 token，不能直接套其除 page-size 地址公式。先核对 block/page 对应、cache 布局与有效前缀，再进入 Tile 设计。Online 状态与全 mask 边界见同目录 `online-consumption.md`。
+
 ## 核心模式
 
 | 如果看到 | 读这个文档 |
@@ -27,8 +31,8 @@
 2. Head Sharing：确定 q_head -> kv_head。
 3. MLA：如果 Dqk 和 Dv 分离，确定 QK 路和 PV 路各自消费哪些维度。
 4. Sink：如果有 sink source，确定 sink/local 的 source dispatch。
-5. Sparse TopK：如果有 indices，确定要读哪些 logical token。
-6. Paged KV：如果是 paged cache，把 logical token 映射到 physical cache row。
+5. Sparse TopK：如果有 indices，先确定 logical token 或 block 单位，再确定有效范围。
+6. Paged KV：如果是 paged cache，按已确定的索引单位映射到 physical page/row。
 7. Mask/Causal：在 softmax 前处理可见性、padding、causal。
 8. Backward：若为反向（dy/softmax 统计量输入），上述模式只决定数据路径，计算图按 fa_backward_pattern 的三段式组织。
 ```

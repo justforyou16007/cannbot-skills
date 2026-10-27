@@ -20,6 +20,7 @@ skills:
   - tilelang2ascend-precision-tuning
   - tilelang2ascend-tilelang-designer
   - tilelang2ascend-trace-recorder
+  - tilelang2ascend-tiling-sink
   - npu-arch
 permission:
   edit: allow
@@ -196,6 +197,7 @@ Phase 7: Trace 记录            (tilelang2ascend-trace-recorder)
 - `tilelang2ascend-trace-recorder`：evaluate_tilelang.sh、evaluate_ascendc.sh
 - `ascendc-precision-debug`：SKILL.md（快速决策树 + 数据搬运排查 + 症状定位）、references/、scripts/
 - `tilelang2ascend-precision-tuning`：SKILL.md（构造式审计方法论 + 症状-原因速查表 + 常见陷阱速查 + 诊断模式）、references/(precision_knowledge_base.json, decomposition_examples/)、scripts/(precision_forensics.py, precision_gate.py, precision_knowledge.py)
+- `tilelang2ascend-tiling-sink`：SKILL.md + references/dynamic_seqlen_tiling_sink.md（动态 seq-len serving tiling 下沉部署形态：成本门、producer AIV/AICPU 选型、图重放三原则）。**触发规则：仅当用户显式要求「使用 tiling 下沉 / metadata 算子下沉 / device-side tiling」时才调用本 skill 执行 tiling 下沉分析；默认 7-Phase 工作流任何阶段都不自动触发，也不因检测到 varlen / 动态 seq-len 特征而触发**
 
 ---
 

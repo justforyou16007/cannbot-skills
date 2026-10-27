@@ -1,0 +1,61 @@
+{
+  "team_name": "tilelang2ascendc-ops-generator",
+  "eval_mode": "text",
+  "evals": [
+    {
+      "id": 1,
+      "title": "显式要求 tiling 下沉时执行",
+      "case_name": "显式要求 tiling 下沉时执行",
+      "config": {
+        "max_tokens": 16000,
+        "ascend_platforms": ["A3", "A5"],
+        "eval_mode": "text"
+      },
+      "prompt": "我想使用 tiling 下沉方案优化这个 varlen FlashAttention：TND 布局，actual_seq_qlen/actual_seq_kvlen 每步都在变，serving 部署每步都有 D2H 和 host tiling 重算，NPUGraph 图重放逐层重绑。请按 tiling 下沉方案分析该怎么做。",
+      "expected_output": "回复应基于用户显式提出的 tiling 下沉请求，调用 tilelang2ascend-tiling-sink skill（读取 references/dynamic_seqlen_tiling_sink.md 场景卡）后作答：先过成本门（AICPU producer 固定开销 130-317µs + 双 aclnn 串行 150-190µs，主 kernel ≳500µs 的 kernel-bound 负载才净赚）；形态为主算子 host tiling shape-only + 前置 metadata 算子读 device seq-len 写 GM 元数据 + kernel 直读 GM 分核；图重放按三原则（AICPU 算子不进图每步图外重算进稳定 buffer、值标量 -1 哨兵、每档位独立 buffer）；producer 与双 aclnn 属集成层，不在 TileLang 生成物内。",
+      "files": [],
+      "expectations": [
+        {
+          "type": "contains",
+          "pattern": "dynamic_seqlen_tiling_sink",
+          "description": "应定位并读取 tiling 下沉场景卡"
+        },
+        {
+          "type": "contains",
+          "pattern": "500",
+          "description": "应给出主 kernel ≳500µs 的成本门判据"
+        },
+        {
+          "type": "contains",
+          "pattern": "metadata",
+          "description": "应说明前置 metadata 算子 + GM 元数据形态"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "成本门不达标时如实拒绝",
+      "case_name": "成本门不达标时如实拒绝",
+      "config": {
+        "max_tokens": 16000,
+        "ascend_platforms": ["A3", "A5"],
+        "eval_mode": "text"
+      },
+      "prompt": "我的算子主 kernel 只有约 80µs，属 launch-bound 短负载，但我想用 tiling 下沉优化它。请评估是否可行。",
+      "expected_output": "回复应读取 tiling 下沉场景卡的成入门后如实拒绝：主 kernel ≳500µs 的 kernel-bound 负载才净平/微赚，80µs 属 launch-bound 短负载，AICPU producer 固定开销 130-317µs + 双 aclnn 串行 150-190µs 的固定成本主导，净亏（实测最差 0.12-0.7x），不建议套用此形态。",
+      "files": [],
+      "expectations": [
+        {
+          "type": "contains",
+          "pattern": "500",
+          "description": "应引用 ≳500µs 成本门判据"
+        },
+        {
+          "type": "contains",
+          "pattern": "净亏",
+          "description": "应明确 launch-bound 负载净亏、不建议套用"
+        }
+      ]
+    }
+  ]
+}

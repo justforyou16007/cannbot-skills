@@ -10,6 +10,7 @@ skills:
   - forge-milestone
   - forge-hwkb
   - forge-campaign
+  - forge-probes
   - npu-arch
   - ops-profiling
 ---
@@ -94,17 +95,56 @@ msprof 分辨不了 tile 形状、buffer 布局、double buffer 深度、同步�
 1. 封存参考        seal_reference.py seal
 2. 适配与预检      reference_adapter.py prepare / verify
 3. 量噪声底        noise_floor.py --from-results
-4. 采参考签名      ops-profiling 的 msprof（取 PipeUtilization / OpBasicInfo）
-5. 查知识库        hwkb.py query --symptom <观测到的症状>
+4. 采参考签名      ops-profiling 采 msprof
+                   → signature_probe.py 提成结构化签名
+5. 查知识库        hwkb.py query --symptom <签名里的症状>
 6. 查死路表        hwkb.py nogo check --symptom <同上>
 7. 写 milestone    照 example-milestone.json 的结构
 8. 校验            milestone_validate.py
 9. 交给 coding agent 逐行实现
-10. 停滞时回到第 4 步，做消融与定价，改课程表
+10. 停滞时回到第 4 步：lever_probe.py 做消融定价，再改课程表
 ```
 
 第 5、6 两步不要跳过。知识库是跨 campaign 存活的东西，
 前人踩过的坑没必要再踩一遍；死路表里的方向不要再试。
+
+## 用探针，不要手搓 CSV
+
+`signature_probe.py` 把七份 msprof CSV 归并成一份结构化签名，
+每个值带着它的来源通道 —— 那个通道字符串可以直接写进 milestone 的
+`trigger.channel`。
+
+它还做一件你手工容易漏的事：**把「没采到」和「是 0」分开**。
+停顿数据缺失时若按 0 读，就成了「完全没有停顿」，一个本该追查的信号
+被反转成健康信号。所以缺 `ResourceConflictRatio` 时探针会**扣留全部
+架构假设**，不要绕过这个判断自己去读 CSV。
+
+同理，降频（`Current Freq` < `Rated Freq`）时也会扣留。不可信数据推出的
+架构错得很有说服力 —— 数据看着正常，错误极难发现。
+
+## 停滞时先定价，再决定投哪个方向
+
+转入 `stalled` 后，第一件事不是找新优化点，而是用 `lever_probe.py`
+给现有手段定价：
+
+```bash
+lever_probe.py add --store ./forge_work/levers.json --baseline-us <基线> --noise-floor <实测>
+lever_probe.py add --store ./forge_work/levers.json --lever drop_output_store --time-us <耗时>
+lever_probe.py analyze --store ./forge_work/levers.json
+```
+
+把某环节整个删掉省下的时间，就是优化它的**收益上界**。论文 Appendix I
+的案例：单独去掉输出写回拿到 6.0%，据此判断瓶颈在 kernel 边界上，
+于是重开了 M0 的第一个决策。
+
+定价最有价值的产出是**「不要投哪里」**。收益落在噪声内的方向，
+再投三轮也出不来。
+
+**所有单项都没空间时，这本身就是结论**：当前架构下这层没有余量了，
+应当回 M0 改架构，而不是继续在这一层找。
+
+> 定价变体会产出错误结果（删掉输出写回的 kernel 算得不对）。
+> 它们是探针不是候选，不得上线。
 
 ## 知识沉淀
 

@@ -121,13 +121,15 @@
         "mechanism_lines": [
           {
             "id": "M1",
-            "statement": "行常驻确实落地：MTE2 占比相对参考下降，而非总时间碰巧变短",
+            "label": "SUPPLY_KEEPUP",
+            "statement": "行常驻确实落地：不再有单元在等 GM 搬运，而非总时间碰巧变短",
             "status": "PASS",
             "anchor": {
               "kind": "reference_measurement",
-              "expr": "msprof:PipeUtilization.csv:aiv_mte2_ratio < 61.2",
+              "expr": "msprof:ResourceConflictRatio.csv:aiv_mte2_wait_ratio < 4.2",
               "provenance": "[MEASURED, job 2]"
-            }
+            },
+            "ordering_evidence": "参考 job 1 的 aiv_mte2_wait_ratio 为 4.2，本实现 job 2 降至 0.9；两次采集除本决策外配置相同"
           }
         ]
       }
@@ -184,15 +186,17 @@
         "mechanism_lines": [
           {
             "id": "M1",
-            "statement": "重叠确实发生：VEC 占比上升到 50% 以上，搬运被藏到计算之后",
+            "label": "WRITEBACK_OVERLAP",
+            "statement": "重叠确实发生：写回不再阻塞下一轮搬入",
             "status": "DEFERRED",
-            "evidence": "job 3 实测 aiv_vec_ratio 升至 47.0，方向正确但未越过字段文档的 50% VEC Bound 判据",
-            "reference_achieves": "参考 job 1 的 aiv_vec_ratio 为 53.1，证明该水平可达",
+            "evidence": "job 3 实测 aiv_mte3_wait_ratio 由 2.0 降至 1.4，方向正确但降幅落在噪声底 2.3% 以内，无法与抖动区分",
+            "reference_achieves": "参考 job 1 的 aiv_mte3_wait_ratio 为 0.3，证明该水平可达",
             "current_levers_cannot": "double buffer 深度受 UB 容量限制，在 D0.1 行常驻的前提下深度 2 已是上限",
             "downstream_lever": "D2.1",
+            "ordering_evidence": "job 2 的 aiv_mte3_wait_ratio 为 2.0，job 3 为 1.4；两次采集除本决策外配置相同",
             "anchor": {
               "kind": "reference_measurement",
-              "expr": "msprof:PipeUtilization.csv:aiv_vec_ratio > 50",
+              "expr": "msprof:ResourceConflictRatio.csv:aiv_mte3_wait_ratio <= 0.3",
               "provenance": "[MEASURED, job 3]"
             }
           }

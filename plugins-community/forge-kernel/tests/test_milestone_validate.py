@@ -60,10 +60,88 @@ def test_example_is_valid(doc):
 
 
 def test_all_rules_registered():
-    """规则表与文档声明的十条保持一致。"""
+    """规则表与文档声明的保持一致。"""
     assert sorted(mv.RULES) == sorted(
-        ["V1", "V2", "V3", "V4", "V5", "V6", "V7", "V8", "V9", "V10"]
+        ["V1", "V2", "V3", "V4", "V5", "V6", "V7", "V8", "V9", "V10", "V11"]
     )
+
+
+# ---------------------------------------------------------------------------
+# V11 机制行须有标签与停顿锚点
+# ---------------------------------------------------------------------------
+
+def mechanism_line(doc, milestone=0):
+    return doc["milestones"][milestone]["gate"]["mechanism_lines"][0]
+
+
+def test_v11_missing_label(doc):
+    """没有标签的机制行无法被程序核验，等于换个说法说「变快了」。"""
+    del mechanism_line(doc)["label"]
+    assert "V11" in rules_hit(mv.validate(doc, ["V11"]))
+
+
+def test_v11_label_outside_vocabulary(doc):
+    """自造标签等于没有标签。"""
+    mechanism_line(doc)["label"] = "OVERLAP_IMPROVED"
+    violations = mv.validate(doc, ["V11"])
+    assert "V11" in rules_hit(violations)
+    assert any("闭合词汇表" in v.message for v in violations)
+
+
+def test_v11_ratio_anchor_rejected(doc):
+    """占比下降可能只是别的段变慢了，不能替代停顿指标。"""
+    line = mechanism_line(doc)
+    assert line["label"] == "SUPPLY_KEEPUP"
+    line["anchor"]["expr"] = "msprof:PipeUtilization.csv:aiv_mte2_ratio < 61.2"
+    violations = mv.validate(doc, ["V11"])
+    assert "V11" in rules_hit(violations)
+    assert any("停顿" in v.message for v in violations)
+
+
+def test_v11_correct_stall_anchor_accepted(doc):
+    assert "V11" not in rules_hit(mv.validate(doc, ["V11"]))
+
+
+def test_v11_missing_ordering_evidence(doc):
+    """单独一个数说明不了变化方向。"""
+    del mechanism_line(doc)["ordering_evidence"]
+    assert "V11" in rules_hit(mv.validate(doc, ["V11"]))
+
+
+@pytest.mark.parametrize("label,anchor_field", [
+    ("CV_HANDOFF", "aic_cube_wait_ratio"),
+    ("SUPPLY_KEEPUP", "mte2_wait_ratio"),
+    ("WRITEBACK_OVERLAP", "mte3_wait_ratio"),
+    ("BANK_LAYOUT", "aiv_vec_bank_cflt_ratio"),
+    ("L2_LOCALITY", "total_hit_rate"),
+    ("OUTPUT_ALIGNMENT", "aic_fixpipe_ratio"),
+])
+def test_v11_each_label_accepts_its_anchor(doc, label, anchor_field):
+    line = mechanism_line(doc)
+    line["label"] = label
+    line["anchor"]["expr"] = f"msprof:X.csv:{anchor_field} < 1.0"
+    assert "V11" not in rules_hit(mv.validate(doc, ["V11"]))
+
+
+def test_v11_label_rejects_wrong_anchor(doc):
+    """标签与锚点必须对应，不能张冠李戴。"""
+    line = mechanism_line(doc)
+    line["label"] = "BANK_LAYOUT"
+    line["anchor"]["expr"] = "msprof:X.csv:aiv_mte2_wait_ratio < 1.0"
+    assert "V11" in rules_hit(mv.validate(doc, ["V11"]))
+
+
+def test_v11_only_applies_to_mechanism_lines(doc):
+    """正确性行与性能行不需要机制标签。"""
+    doc["milestones"][0]["gate"]["correctness_lines"][0].pop("label", None)
+    doc["milestones"][0]["gate"]["performance_lines"][0].pop("label", None)
+    assert "V11" not in rules_hit(mv.validate(doc, ["V11"]))
+
+
+def test_v11_vocabulary_is_documented():
+    """词汇表每个标签都要有必需锚点，空列表等于没约束。"""
+    for label, anchors in mv.MECHANISM_LABELS.items():
+        assert anchors, f"{label} 没有指定必需锚点"
 
 
 # ---------------------------------------------------------------------------

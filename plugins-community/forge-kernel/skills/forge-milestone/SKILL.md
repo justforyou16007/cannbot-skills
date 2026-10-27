@@ -70,7 +70,7 @@ python3 scripts/milestone_validate.py --list-rules
 
 退出码 `0` 通过，`1` 有违规，`2` 文件无法解析。
 
-## 十条校验规则
+## 十一条校验规则
 
 | 规则 | 检查什么 | 为什么 |
 |---|---|---|
@@ -84,6 +84,27 @@ python3 scripts/milestone_validate.py --list-rules
 | V8 | M0 无绝对性能阈值 | 架构刚落地没调过，绝对阈值会误杀 |
 | V9 | 原子组同批落地 | 真子集单独落地会退化 |
 | V10 | 架构决策有验证通道 | 区分「真落地」与「声称落地」 |
+| V11 | 机制行有标签与停顿锚点 | 占比下降可能只是别的段变慢了 |
+
+## V11：机制行为什么要锚在「停顿」上
+
+论文 Appendix B 要求这类机制使用**闭合词汇表**标签，每个标签都要有
+**停顿锚定的验证**。
+
+不加这条约束时，机制行会退化成这样：
+
+> 「流水重叠已改善，总时间下降 8%」
+
+这句话读起来像验证，实际只说了结果变好。而机制行存在的唯一理由，
+就是区分「我设计的机制真的发生了」与「碰巧变快了」—— 两者在总时间上
+长得一模一样。
+
+**为什么锚点必须是停顿而不是占比**：占比下降有多种成因，包括别的段
+变慢了。停顿指标回答的是另一个问题 —— 这个单元**有没有在等**。
+机制生效的直接表现是等待减少。
+
+闭合词汇表与各标签必需的停顿字段见
+[`references/mechanism-labels.md`](references/mechanism-labels.md)。
 
 ## 销账的举证责任
 
@@ -114,3 +135,4 @@ python3 scripts/milestone_validate.py --list-rules
 
 - [`references/example-milestone.json`](references/example-milestone.json) — 可直接改的完整样例，本身通过全部十条规则
 - [`references/schema.md`](references/schema.md) — 字段逐项说明
+- [`references/mechanism-labels.md`](references/mechanism-labels.md) — 机制标签闭合词汇表与各自必需的停顿锚点

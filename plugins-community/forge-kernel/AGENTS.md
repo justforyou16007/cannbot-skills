@@ -7,6 +7,7 @@ skills:
   - forge-milestone
   - forge-hwkb
   - forge-campaign
+  - forge-probes
   - npu-arch
   - ops-profiling
   - ops-evaluation
@@ -154,6 +155,8 @@ campaign 在下列任一条件下结束，**不要越过它继续**：
 | 资源 | 路径 |
 |---|---|
 | 签名字典 | `skills/forge-reference-analysis/references/signature-dictionary.md` |
+| 仪器对照 | `skills/forge-probes/references/instrument-map.md` |
+| 机制标签词汇表 | `skills/forge-milestone/references/mechanism-labels.md` |
 | 开放问题清单 | `skills/forge-reference-analysis/references/open-questions.md` |
 | milestone 样例 | `skills/forge-milestone/references/example-milestone.json` |
 | 字段说明 | `skills/forge-milestone/references/schema.md` |

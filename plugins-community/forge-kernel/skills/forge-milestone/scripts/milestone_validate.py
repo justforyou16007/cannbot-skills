@@ -28,6 +28,7 @@ profiler 行为里反推出的架构决策写成有序的 M0 -> Mk，coding agen
   V8  M0 不设绝对性能阈值  该阶段只能用相对参考的比率
   V9  原子组同批落地    atomic_group 的成员不能跨 milestone
   V10 架构决策须命名验证通道  必须指出哪个机器可读字段能验证它真的执行了
+  V11 机制行须有标签与停顿锚点 闭合词汇表 + 停顿类指标 + 顺序证据
 
 用法:
     python3 milestone_validate.py milestone.json
@@ -71,6 +72,29 @@ RE_ESTIMATE = re.compile(r"^\[ESTIMATE\]")
 RE_ABSOLUTE_TIME = re.compile(
     r"\d+(?:\.\d+)?\s*(?:us|µs|ms|ns|us/iter|cycles?)\b", re.IGNORECASE
 )
+
+#: V11：机制标签的闭合词汇表，以及每个标签必需的停顿锚点字段。
+#:
+#: 论文 Appendix B 要求这类机制使用闭合词汇表，且每个标签都要有停顿锚定的
+#: 验证。锚点取停顿类字段而非占比类，是因为占比下降有多种成因（包括别的段
+#: 变慢），而停顿下降直接说明「不再有人在等」—— 那才是机制落地的证据。
+#:
+#: 字段定义见 ops/ops-profiling/references/csv_fields_reference.md；
+#: 词汇表的完整说明见 references/mechanism-labels.md。改这里要同步改那里。
+MECHANISM_LABELS: Dict[str, Tuple[str, ...]] = {
+    "CV_HANDOFF": ("aic_cube_wait_ratio", "aiv_vec_wait_ratio"),
+    "SUPPLY_KEEPUP": ("mte2_wait_ratio",),
+    "WRITEBACK_OVERLAP": ("mte3_wait_ratio",),
+    "CONSUMER_PHASING": ("aiv_vec_wait_ratio",),
+    "L1_RESIDENCY": ("mte1_wait_ratio", "aic_mte1_ratio"),
+    "BANK_LAYOUT": ("aiv_vec_bank_cflt_ratio",),
+    "BANKGROUP_STRIDE": ("aiv_vec_bankgroup_cflt_ratio",),
+    "RESOURCE_SERIALIZATION": ("aiv_vec_resc_cflt_ratio",),
+    "CUBE_SATURATION": ("aic_cube_wait_ratio",),
+    "L2_LOCALITY": ("total_hit_rate",),
+    "OUTPUT_ALIGNMENT": ("aic_fixpipe_ratio",),
+    "EXPOSURE_REDUCTION": ("exposed_pct",),
+}
 
 
 class Violation:
@@ -613,6 +637,69 @@ def check_verification_channel(doc: Dict[str, Any]) -> List[Violation]:
 
 
 # ---------------------------------------------------------------------------
+# V11 — 机制行须有闭合词汇表标签与停顿锚点
+# ---------------------------------------------------------------------------
+
+def check_mechanism_labels(doc: Dict[str, Any]) -> List[Violation]:
+    """论文 Appendix B：这类机制使用闭合词汇表标签，每个标签要求停顿锚定的
+    验证与记录在案的顺序证据。
+
+    不加这条约束时，机制行会退化成「变快了」的换一种说法 —— 而区分
+    「我设计的机制真的发生了」与「碰巧变快了」正是机制行唯一的用途。
+
+    锚点必须是停顿类字段。占比下降有多种成因（包括别的段变慢了），
+    停顿下降才直接说明「不再有人在等」。
+    """
+    out: List[Violation] = []
+    for mid, category, line in _iter_gate_lines(doc):
+        if category != "mechanism_lines":
+            continue
+        lid = line.get("id", "<无 id>")
+        base = f"{mid}.mechanism_lines.{lid}"
+
+        label = line.get("label")
+        if _is_blank(label):
+            out.append(Violation(
+                "V11", f"{base}.label",
+                "机制行缺少 label。没有闭合词汇表标签，这条行无法被程序核验，"
+                f"等于只是换个说法说「变快了」；可选标签: {sorted(MECHANISM_LABELS)}",
+            ))
+            continue
+
+        label = str(label).strip()
+        required = MECHANISM_LABELS.get(label)
+        if required is None:
+            out.append(Violation(
+                "V11", f"{base}.label",
+                f"'{label}' 不在闭合词汇表内。自造标签等于没有标签；"
+                f"可选: {sorted(MECHANISM_LABELS)}。"
+                "确需新增请先按 references/mechanism-labels.md 的条件评估",
+            ))
+            continue
+
+        anchor = line.get("anchor")
+        expr = anchor.get("expr") if isinstance(anchor, dict) else None
+        haystack = " ".join(str(x) for x in (expr, line.get("statement")) if x)
+        if not any(token in haystack for token in required):
+            out.append(Violation(
+                "V11", f"{base}.anchor.expr",
+                f"标签 '{label}' 要求锚定停顿指标 {list(required)}，"
+                "但锚点表达式里没有出现它们中的任何一个。"
+                "占比类指标不能替代：占比下降可能只是别的段变慢了，"
+                "停顿下降才说明机制真的生效",
+            ))
+
+        if _is_blank(line.get("ordering_evidence")):
+            out.append(Violation(
+                "V11", f"{base}.ordering_evidence",
+                "缺少顺序证据。单独一个数说明不了变化方向，"
+                "需记录改动前后两次读数及它们来自同配置的事实",
+            ))
+
+    return out
+
+
+# ---------------------------------------------------------------------------
 # 调度
 # ---------------------------------------------------------------------------
 
@@ -627,6 +714,7 @@ RULES = {
     "V8": ("M0 不设绝对性能阈值", check_m0_no_absolute_threshold),
     "V9": ("原子组同批落地", check_atomic_groups),
     "V10": ("架构决策须命名验证通道", check_verification_channel),
+    "V11": ("机制行须有标签与停顿锚点", check_mechanism_labels),
 }
 
 

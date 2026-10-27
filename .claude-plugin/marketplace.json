@@ -794,7 +794,7 @@
     },
     {
       "name": "forge-kernel-skills",
-      "description": "ForgeKernel 自有 Skills（4 个）。参考分析签名字典、milestone 决策图与门禁校验、硬件知识库准入与边界 lint、campaign 驱动与自我提升。",
+      "description": "ForgeKernel 自有 Skills（5 个）。参考分析签名字典、milestone 决策图与门禁校验、硬件知识库准入与边界 lint、campaign 驱动与自我提升、探针套件（架构签名提取、手段定价、转发围栏）。",
       "source": "./plugins-community/forge-kernel/skills",
       "strict": false,
       "version": "0.1.0",
@@ -813,7 +813,8 @@
         "./forge-reference-analysis",
         "./forge-milestone",
         "./forge-hwkb",
-        "./forge-campaign"
+        "./forge-campaign",
+        "./forge-probes"
       ]
     },
     {

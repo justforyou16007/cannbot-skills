@@ -22,10 +22,10 @@ CANN 算子库里的内置实现、别人写的自定义算子，或者你自己
 步骤 1  封存参考      产出禁读清单 + 专有名词清单
 步骤 2  适配与预检    三种参考来源归一化，环境预检
 步骤 3  量噪声底      这一步不能跳过，也不能抄论文的经验值
-步骤 4  采参考签名    msprof 取流水线占比与核数
+步骤 4  采参考签名    msprof → signature_probe.py 提结构化签名
 步骤 5  产出课程表    arch agent 反推架构，写 milestone
-步骤 6  逐行实现      coder agent 一次一行，一次一测
-步骤 7  停滞 → 重开架构
+步骤 6  逐行实现      coder agent 一次一行；计时前过转发围栏
+步骤 7  停滞 → lever_probe 定价 → 重开架构
 步骤 8  达标 → 封存为下一代参考，继续
 ```
 
@@ -127,7 +127,24 @@ python3 $SK/noise_floor.py --from-results evaluation_results.json
 > 噪声底远超 5% 时先查环境：是否有其他进程占同一张卡、是否 DVFS 降频
 > （对比 msprof 的 `Current Freq` 与 `Rated Freq`）。
 
-### 步骤 4：开 campaign
+### 步骤 4：采参考签名
+
+```bash
+PB=.claude/skills/forge-probes/scripts
+
+# 先用 ops-profiling 采 msprof，再提成结构化签名
+python3 $PB/signature_probe.py --archive-dir ./round_1 \
+    --op-name AddLayerNorm --min-gm-bytes 8388608
+```
+
+这一步对应论文的 NCU pass。探针把七份 msprof CSV 归并成一份签名：
+launch structure、流水占比、**停顿分解**、搬运量与复用倍数、暴露时间，
+每个值带着它的来源通道（可直接写进 milestone 的 `trigger.channel`）。
+
+> 它会先查测量可信度。降频、ICache 颠簸、停顿数据缺失任一成立，就
+> **扣留全部架构假设** —— 不可信数据推出的架构错得很有说服力。
+
+### 步骤 5：开 campaign
 
 ```bash
 python3 $SK/campaign.py init \
@@ -137,7 +154,7 @@ python3 $SK/campaign.py init \
     --state ./forge_work/campaign_state.json
 ```
 
-### 步骤 5：交给 Agent
+### 步骤 6：交给 Agent
 
 启动 CLI，输入：
 
@@ -148,7 +165,7 @@ python3 $SK/campaign.py init \
 ```
 
 Orchestrator 会调度 `forge-arch` 反推架构并写 milestone，
-再调度 `forge-coder` 逐行实现。
+再调度 `forge-coder` 逐行实现。每次计时前会先过转发围栏。
 
 ---
 
@@ -237,6 +254,25 @@ arch agent 此时该做的是消融、给手段定价、必要时**重开 M0 的
 那里列着 msprof 分辨不了、因而一直没被回答的问题，其中可能藏着
 下一个数量级。
 
+### Q：探针说「测量不可信，已扣留架构假设」，能不能忽略？
+
+不能。扣留的三种情形都会让架构推断系统性出错：
+
+- **降频**：各段被按不同比例拉长，一个计算受限的 kernel 会看起来像搬运受限
+- **ICache 缺失率高**：取指开销混进各段占比
+- **缺 `ResourceConflictRatio`**：停顿数据是架构判断的一半依据
+
+注意第三条：这份数据是**上板独有，仿真拿不到**。用仿真数据做参考分析，
+这一整段必然缺失。
+
+### Q：定价工具说某个方向「测不出来」，是不是该换个测法？
+
+不是，那就是结论。收益落在噪声底以内意味着这个方向**没有可测量的空间**。
+再投三轮也出不来 —— 定价的主要价值正是提前砍掉这类投入。
+
+**所有单项都测不出来时**，说明当前架构下这一层没有余量了，
+应当回 M0 改架构，而不是继续在这层找。
+
 ### Q：报 `from evaluate import AscendBackend` 失败
 
 你用成 `evaluate_ops.py` 了。它引用的 `AscendBackend`、
@@ -254,6 +290,7 @@ arch agent 此时该做的是消融、给手段定价、必要时**重开 M0 的
 | `forge-milestone` | 决策图 schema 与十条门禁校验 |
 | `forge-hwkb` | 硬件知识库：准入、检索、边界 lint、死路表 |
 | `forge-campaign` | 封存、预检、噪声底、状态机、自我提升 |
+| `forge-probes` | 探针套件：架构签名提取、手段定价、转发围栏 |
 | `npu-arch` | 芯片规格与架构差异（真源） |
 | `ops-profiling` | msprof 采集与解析 |
 | `ops-evaluation` | 配对评测（用 `evaluate_ops_direct.py`） |

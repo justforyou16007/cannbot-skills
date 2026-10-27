@@ -8,6 +8,7 @@ tools: Read, Write, Edit, Bash, Glob, Grep
 skills:
   - forge-milestone
   - forge-campaign
+  - forge-probes
   - forge-hwkb
   - ascendc-performance-best-practices
   - ascendc-api-best-practices
@@ -26,7 +27,7 @@ skills:
 ## 核心节奏
 
 ```
-取下一行决策 → 实现它 → 跑一次配对评测 → record 裁决 → 接受或回滚
+取下一行决策 → 实现它 → 过围栏 → 跑一次配对评测 → record 裁决 → 接受或回滚
 ```
 
 一次一行。不要一口气实现三条决策再一起测 —— 那样测出来的变化归因不到
@@ -34,6 +35,24 @@ skills:
 
 例外是标了 `atomic_group` 的决策组：它们必须同批落地，
 因为任何真子集单独落地都会退化。
+
+## 计时之前必须过围栏
+
+```bash
+python3 <forge-probes>/scripts/fence_check.py \
+    --candidate <你的实现目录> --spec ./forge_work/reference_spec.json \
+    --denylist ./forge_work/denylist.txt
+```
+
+论文把这道围栏放在**任何计时之前**，理由很实际：候选若转发给参考，
+测出来的是参考自己的性能。加速比 1.0、精度满分、所有门禁都过，
+但一行 kernel 都没写。
+
+自演进场景下更隐蔽 —— 第 n 代转发给第 n-1 代，链条可以空转很多轮，
+每轮都「没有退化」。
+
+围栏拦你时会给 `file:line`。确属误判（例如那是你自己的算子注册而非
+调用厂商实现）可以 `--exempt` 豁免，但要在 milestone 里记下豁免理由。
 
 ## 裁决不由你定
 
@@ -112,8 +131,18 @@ python3 <ops-evaluation>/scripts/evaluate_ops_direct.py {op_name} \
 > **不要用同目录的 `evaluate_ops.py`**。它执行 `from evaluate import AscendBackend`，
 > 而 `AscendBackend` 在仓内不存在，会直接失败。
 
-需要流水线占比（验证 mechanism 行）时另外走 `ops-profiling` 的 msprof ——
-配对评测有意不采 msprof，它输出的 `pipeline` 和 `bottleneck` 恒为空。
+需要流水线占比（验证 mechanism 行）时另外走 `ops-profiling` 的 msprof，
+再用 `signature_probe.py` 提取 —— 配对评测有意不采 msprof，
+它输出的 `pipeline` 和 `bottleneck` 恒为空。
+
+## 机制行要锚在停顿上，不是占比
+
+验证一条 mechanism 行时，不要拿占比下降当证据。占比下降有多种成因，
+包括别的段变慢了。要用 `ResourceConflictRatio.csv` 的停顿指标 ——
+它回答的是「这个单元还在不在等」，那才是机制落地的直接证据。
+
+每个机制标签要求哪个停顿字段，见 `forge-milestone` 的
+`references/mechanism-labels.md`。写错了 V11 规则会拒。
 
 ## 失败时怎么办
 

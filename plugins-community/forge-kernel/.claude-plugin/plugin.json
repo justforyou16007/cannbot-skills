@@ -1,0 +1,21 @@
+{
+  "name": "forge-kernel",
+  "description": "ForgeKernel - 参考驱动的自演进 Ascend C 算子优化 Agent Team。从一个只能测不能读的封闭参考实现反推架构决策，按 milestone 课程表逐行实现，把被接受的 kernel 封存为下一代的参考。含 1 个 Orchestrator 与 2 个 Agent（架构层 / 实现层）。当需要对标并超越某个已有算子实现（CANN 内置 aclnn、他人的自定义算子、或自己上一代产出）时使用。",
+  "version": "0.1.0",
+  "author": {
+    "name": "CANNBot"
+  },
+  "homepage": "https://gitcode.com/cann/cannbot-skills",
+  "repository": "https://gitcode.com/cann/cannbot-skills",
+  "license": "MIT",
+  "dependencies": [
+    "forge-kernel-skills",
+    "forge-kernel-shared-skills",
+    "forge-kernel-borrowed-skills"
+  ],
+  "agents": [
+    "./AGENTS.md",
+    "./agents/forge-arch.md",
+    "./agents/forge-coder.md"
+  ]
+}

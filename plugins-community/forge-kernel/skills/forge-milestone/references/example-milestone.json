@@ -1,0 +1,203 @@
+{
+  "schema_version": "1.0",
+  "campaign": {
+    "operator": "add_layer_norm",
+    "arch": "DAV_2201",
+    "soc": "ascend910b",
+    "generation": 0,
+    "reference": {
+      "kind": "builtin_aclnn",
+      "id": "aclnnAddLayerNorm",
+      "sealed": true
+    },
+    "target_gain": 1.05,
+    "noise_floor_pct": 2.3
+  },
+
+  "_channel_convention": [
+    "性能与精度类指标写评测产物: evaluation_results.json:<字段路径>",
+    "架构签名类指标写 msprof 产物: msprof:<CSV 文件>:<列名>",
+    "切勿把架构签名写成 evaluation_results.json:*.pipeline.* —— 配对评测",
+    "有意不采 msprof，那两个键恒为空，门禁会变成看起来在跑但什么都没验证"
+  ],
+
+  "resource_topology_contract": {
+    "block_dim": {
+      "value": 48,
+      "provenance": "[MEASURED, job 1]",
+      "channel": "msprof:OpBasicInfo.csv:Block Dim"
+    },
+    "mix_block_dim": {
+      "value": "N/A",
+      "provenance": "[MEASURED, job 1]",
+      "channel": "msprof:OpBasicInfo.csv:Mix Block Dim"
+    },
+    "ub_bytes_per_core": {
+      "value": 196608,
+      "provenance": "[ESTIMATE] npu-arch 记载 DAV_2201 的 UB 为 192KB，按 192*1024 折算；运行时须以 PlatformAscendC 取实际值，不同子型号有差异",
+      "channel": "GetCoreMemSize(UB)"
+    },
+    "baseline_time_us": {
+      "value": 456.5,
+      "provenance": "[MEASURED, job 1]",
+      "channel": "evaluation_results.json:baseline.time_us"
+    },
+    "baseline_mte2_ratio": {
+      "value": 61.2,
+      "provenance": "[MEASURED, job 1]",
+      "channel": "msprof:PipeUtilization.csv:aiv_mte2_ratio"
+    }
+  },
+
+  "milestones": [
+    {
+      "id": "M0",
+      "kind": "foundation",
+      "title": "算法契约与硬件架构",
+      "decisions": [
+        {
+          "id": "D0.1",
+          "layer": "architectural",
+          "atomic_group": "g1",
+          "action": "按 reduce 轴整行常驻 UB，单核一次处理一整行，不做行内二次切分",
+          "purpose": "消除 LayerNorm 两趟统计量计算导致的 GM 重复读",
+          "trigger": {
+            "symptom": "参考的 MTE2 占比超过 50%，判为 MTE2 Bound，说明数据复用不足",
+            "channel": "msprof:PipeUtilization.csv:aiv_mte2_ratio",
+            "observed": {
+              "value": 61.2,
+              "provenance": "[MEASURED, job 1]"
+            }
+          },
+          "cost": "UB 占用随行长线性增长；行长超出单核 UB 余量时该决策失效，需回退到行内切分",
+          "depends_on": [],
+          "verification_channel": "msprof:PipeUtilization.csv:aiv_mte2_ratio 应显著低于参考的 61.2"
+        },
+        {
+          "id": "D0.2",
+          "layer": "architectural",
+          "atomic_group": "g1",
+          "action": "统计量用 FP32 累加，输入 FP16 在搬入后立即 Cast",
+          "purpose": "保证均值方差在长行上的数值稳定性",
+          "trigger": {
+            "symptom": "参考在 FP16 长行用例上仍达到与 FP32 同级的精度，说明它没有用 FP16 直接累加",
+            "channel": "evaluation_results.json:baseline.precision_passed",
+            "observed": {
+              "value": true,
+              "provenance": "[MEASURED, job 1]"
+            }
+          },
+          "cost": "UB 中间缓冲翻倍，与 D0.1 的行常驻争用同一块 UB",
+          "depends_on": ["D0.1"],
+          "verification_channel": "evaluation_results.json:aggregate.target.precision_passed"
+        }
+      ],
+      "gate": {
+        "correctness_lines": [
+          {
+            "id": "C1",
+            "statement": "目标 shape 全部 dtype 精度达标",
+            "status": "PASS",
+            "anchor": {
+              "kind": "reference_measurement",
+              "expr": "evaluation_results.json:aggregate.target.precision_passed == true",
+              "provenance": "[MEASURED, job 2]"
+            }
+          }
+        ],
+        "performance_lines": [
+          {
+            "id": "P1",
+            "statement": "相对参考不出现退化，比率不低于 0.95",
+            "status": "PASS",
+            "anchor": {
+              "kind": "derived",
+              "expr": "evaluation_results.json:comparison.speedup >= 0.95",
+              "derived_from": "resource_topology_contract.baseline_time_us",
+              "provenance": "[MEASURED, job 2]"
+            }
+          }
+        ],
+        "mechanism_lines": [
+          {
+            "id": "M1",
+            "statement": "行常驻确实落地：MTE2 占比相对参考下降，而非总时间碰巧变短",
+            "status": "PASS",
+            "anchor": {
+              "kind": "reference_measurement",
+              "expr": "msprof:PipeUtilization.csv:aiv_mte2_ratio < 61.2",
+              "provenance": "[MEASURED, job 2]"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "M1",
+      "kind": "additive",
+      "title": "搬运与计算重叠",
+      "decisions": [
+        {
+          "id": "D1.1",
+          "layer": "tactical",
+          "action": "对行搬运开启 double buffer，深度 2",
+          "purpose": "用下一行的搬入掩盖当前行的向量计算",
+          "trigger": {
+            "symptom": "M0 落地后 MTE2 降至 31%、VEC 为 42%，两者都未饱和，说明存在串行等待",
+            "channel": "msprof:PipeUtilization.csv:aiv_mte2_ratio,aiv_vec_ratio",
+            "observed": {
+              "value": "aiv_mte2_ratio=31.0, aiv_vec_ratio=42.0",
+              "provenance": "[MEASURED, job 2]"
+            }
+          },
+          "cost": "UB 占用翻倍，可能迫使 D0.1 的行常驻退让",
+          "depends_on": ["D0.1"],
+          "verification_channel": "msprof:PipeUtilization.csv:aiv_vec_ratio 应上升，总时间下降"
+        }
+      ],
+      "gate": {
+        "correctness_lines": [
+          {
+            "id": "C1",
+            "statement": "精度不因 double buffer 改变",
+            "status": "PASS",
+            "anchor": {
+              "kind": "reference_measurement",
+              "expr": "evaluation_results.json:aggregate.target.precision_passed == true",
+              "provenance": "[MEASURED, job 3]"
+            }
+          }
+        ],
+        "performance_lines": [
+          {
+            "id": "P1",
+            "statement": "相对上一代的增益超过实测噪声底",
+            "status": "PASS",
+            "anchor": {
+              "kind": "derived",
+              "expr": "(evaluation_results.json:comparison.speedup - 1) * 100 > campaign.noise_floor_pct",
+              "derived_from": "campaign.noise_floor_pct（由 evaluation_results.json:cv_pct 实测而来）",
+              "provenance": "[MEASURED, job 3]"
+            }
+          }
+        ],
+        "mechanism_lines": [
+          {
+            "id": "M1",
+            "statement": "重叠确实发生：VEC 占比上升到 50% 以上，搬运被藏到计算之后",
+            "status": "DEFERRED",
+            "evidence": "job 3 实测 aiv_vec_ratio 升至 47.0，方向正确但未越过字段文档的 50% VEC Bound 判据",
+            "reference_achieves": "参考 job 1 的 aiv_vec_ratio 为 53.1，证明该水平可达",
+            "current_levers_cannot": "double buffer 深度受 UB 容量限制，在 D0.1 行常驻的前提下深度 2 已是上限",
+            "downstream_lever": "D2.1",
+            "anchor": {
+              "kind": "reference_measurement",
+              "expr": "msprof:PipeUtilization.csv:aiv_vec_ratio > 50",
+              "provenance": "[MEASURED, job 3]"
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

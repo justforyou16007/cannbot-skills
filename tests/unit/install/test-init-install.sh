@@ -172,6 +172,21 @@ for team_dir in $(get_all_plugin_dirs); do
             local_plugin_skill_dir="$team_dir/skills/$skill"
             workflow_dir="$team_dir/workflow"
 
+            # 跨插件复用：marketplace 的 dependencies 允许一个 plugin 依赖
+            # 另一个 plugin 的 skills 包（如 forge-kernel 复用
+            # ops-perf-evolution-skills 里的 ops-evaluation）。
+            # 这里只认该 team 的 init.sh 中**实际写明**的借用路径，
+            # 不泛化到「碰巧存在于别的插件里」—— 否则一个声明了自己装不了
+            # 的 skill 的 team 也会被判通过。
+            borrowed_hit=""
+            for borrowed_root in $(grep -oE '\$PLUGIN_ROOT/\.\./[A-Za-z0-9._-]+/skills' "$init_script" 2>/dev/null | sort -u); do
+                candidate="${borrowed_root/\$PLUGIN_ROOT/$team_dir}/$skill"
+                if [ -d "$candidate" ] && [ -f "$candidate/SKILL.md" ]; then
+                    borrowed_hit="$candidate"
+                    break
+                fi
+            done
+
             if [ -d "$ops_skill_dir" ] && [ -f "$ops_skill_dir/SKILL.md" ]; then
                 print_pass "[$team_name] skill '$skill' exists in ops/"
                 PASS_COUNT=$((PASS_COUNT + 1))
@@ -192,6 +207,9 @@ for team_dir in $(get_all_plugin_dirs); do
                 PASS_COUNT=$((PASS_COUNT + 1))
             elif [ -d "$workflow_dir" ] && [ -f "$workflow_dir/SKILL.md" ]; then
                 print_pass "[$team_name] skill '$skill' exists as team workflow skill"
+                PASS_COUNT=$((PASS_COUNT + 1))
+            elif [ -n "$borrowed_hit" ]; then
+                print_pass "[$team_name] skill '$skill' exists in borrowed skill root (${borrowed_hit#$SKILLS_DIR/})"
                 PASS_COUNT=$((PASS_COUNT + 1))
             else
                 print_fail "[$team_name] skill '$skill' NOT found in shared or local skill roots"

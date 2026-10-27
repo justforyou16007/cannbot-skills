@@ -717,7 +717,12 @@
       "author": {
         "name": "CANNBot"
       },
-      "keywords": ["ascendc", "skills", "evolution", "perf-optimize"],
+      "keywords": [
+        "ascendc",
+        "skills",
+        "evolution",
+        "perf-optimize"
+      ],
       "category": "skills",
       "skills": [
         "./evolution-knowledge",
@@ -736,7 +741,12 @@
       "author": {
         "name": "CANNBot"
       },
-      "keywords": ["ascendc", "skills", "npu-arch", "profiling"],
+      "keywords": [
+        "ascendc",
+        "skills",
+        "npu-arch",
+        "profiling"
+      ],
       "category": "skills",
       "skills": [
         "./npu-arch",
@@ -751,7 +761,13 @@
       "author": {
         "name": "CANNBot"
       },
-      "keywords": ["ascendc", "evolution", "perf-optimize", "kernel", "operator"],
+      "keywords": [
+        "ascendc",
+        "evolution",
+        "perf-optimize",
+        "kernel",
+        "operator"
+      ],
       "category": "development",
       "dependencies": [
         "ops-perf-evolution-skills",
@@ -775,6 +791,97 @@
       ],
       "category": "development",
       "dependencies": []
+    },
+    {
+      "name": "forge-kernel-skills",
+      "description": "ForgeKernel 自有 Skills（4 个）。参考分析签名字典、milestone 决策图与门禁校验、硬件知识库准入与边界 lint、campaign 驱动与自我提升。",
+      "source": "./plugins-community/forge-kernel/skills",
+      "strict": false,
+      "version": "0.1.0",
+      "author": {
+        "name": "CANNBot"
+      },
+      "keywords": [
+        "forge-kernel",
+        "skills",
+        "reference-analysis",
+        "milestone",
+        "knowledge-base"
+      ],
+      "category": "skills",
+      "skills": [
+        "./forge-reference-analysis",
+        "./forge-milestone",
+        "./forge-hwkb",
+        "./forge-campaign"
+      ]
+    },
+    {
+      "name": "forge-kernel-shared-skills",
+      "description": "ForgeKernel 复用的共享 Skills（4 个）。NPU 架构与芯片规格查询、msprof 性能采集与分析、算子族性能优化实践、Ascend C API 最佳实践。",
+      "source": "./ops",
+      "strict": false,
+      "version": "0.1.0",
+      "author": {
+        "name": "CANNBot"
+      },
+      "keywords": [
+        "forge-kernel",
+        "skills",
+        "npu-arch",
+        "profiling",
+        "best-practices"
+      ],
+      "category": "skills",
+      "skills": [
+        "./npu-arch",
+        "./ops-profiling",
+        "./ascendc-performance-best-practices",
+        "./ascendc-api-best-practices"
+      ]
+    },
+    {
+      "name": "forge-kernel-borrowed-skills",
+      "description": "ForgeKernel 跨插件借用的 Skill（1 个）。ops-evaluation 提供配对评测（evaluate_ops_direct.py），由 ops-perf-evolution 维护，此处只声明借用不复制代码。",
+      "source": "./plugins-community/ops-perf-evolution/skills",
+      "strict": false,
+      "version": "0.1.0",
+      "author": {
+        "name": "CANNBot"
+      },
+      "keywords": [
+        "forge-kernel",
+        "skills",
+        "evaluation",
+        "borrowed"
+      ],
+      "category": "skills",
+      "skills": [
+        "./ops-evaluation"
+      ]
+    },
+    {
+      "name": "forge-kernel",
+      "source": "./plugins-community/forge-kernel",
+      "description": "ForgeKernel - 参考驱动的自演进 Ascend C 算子优化 Agent Team。从一个只能测不能读的封闭参考实现反推架构决策，按 milestone 课程表逐行实现，把被接受的 kernel 封存为下一代的参考。含 1 个 Orchestrator 与 2 个 Agent（架构层 / 实现层）。当需要对标并超越某个已有算子实现（CANN 内置 aclnn、他人的自定义算子、或自己上一代产出）时使用。",
+      "version": "0.1.0",
+      "author": {
+        "name": "CANNBot"
+      },
+      "keywords": [
+        "forge-kernel",
+        "ascendc",
+        "self-evolving",
+        "reference-driven",
+        "kernel",
+        "operator"
+      ],
+      "category": "development",
+      "dependencies": [
+        "forge-kernel-skills",
+        "forge-kernel-shared-skills",
+        "forge-kernel-borrowed-skills"
+      ]
     }
   ]
 }

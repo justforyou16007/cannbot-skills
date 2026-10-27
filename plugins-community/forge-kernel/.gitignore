@@ -1,0 +1,25 @@
+# init.sh 在 project 级安装时生成的工具配置，不入库
+.claude/
+.opencode/
+.cursor/
+.trae/
+CLAUDE.md
+
+# campaign 运行产物：参考封存清单、状态机、评测结果
+forge_work/
+campaign_state.json
+campaign_state.json.tmp
+sealed_manifest.json
+sealed_paths.txt
+reference_spec.json
+
+# 参考实现专有名词清单由封存动作按机器生成，不同参考不同内容
+skills/forge-hwkb/references/denylist.txt
+
+# 死路表与经验卡片本地维护（框架与脚本入库，具体条目不入库）
+skills/forge-hwkb/references/nogo.json
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/

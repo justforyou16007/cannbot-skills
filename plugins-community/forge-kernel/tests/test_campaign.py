@@ -1185,7 +1185,8 @@ def init_argv(state_file, **kw):
             "--operator", "demo_op", "--input-shape", "B=8,S=4096",
             "--arch", "DAV_2201",
             "--reference-kind", "builtin_aclnn", "--reference-id", "aclnnDemo",
-            "--noise-floor", str(kw.get("noise", 2.0))]
+            "--noise-floor", str(kw.get("noise", 2.0)),
+            "--device-id", str(kw.get("device_id", 0))]
     if "target" in kw:
         argv += ["--target-gain", str(kw["target"])]
     if "budget" in kw:
@@ -1199,7 +1200,8 @@ def test_cli_init_requires_input_shape(tmp_path):
     code, _ = run(["--state", str(tmp_path / "s.json"), "init",
                    "--operator", "demo_op", "--arch", "DAV_2201",
                    "--reference-kind", "builtin_aclnn",
-                   "--reference-id", "aclnnDemo", "--noise-floor", "2.0"])
+                   "--reference-id", "aclnnDemo", "--noise-floor", "2.0",
+                   "--device-id", "0"])
     assert code == 2
 
 
@@ -1217,7 +1219,8 @@ def test_state_accepted_after_subcommand(tmp_path):
     code, _ = run(["init", "--state", str(state_file),
                    "--operator", "demo_op", "--input-shape", "B=8",
                    "--arch", "DAV_2201", "--reference-kind", "builtin_aclnn",
-                   "--reference-id", "aclnnDemo", "--noise-floor", "2.0"])
+                   "--reference-id", "aclnnDemo", "--noise-floor", "2.0",
+                   "--device-id", "0"])
     assert code == 0
     assert state_file.exists()
 

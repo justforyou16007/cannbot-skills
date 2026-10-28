@@ -154,6 +154,7 @@ python3 $SK/campaign.py init \
     --arch DAV_2201 \
     --reference-kind builtin_aclnn --reference-id aclnnAddLayerNorm \
     --noise-floor 2.3 --target-gain 1.05 --budget 40 \
+    --device-id 0 \
     --reference-signature ./forge_work/reference_signature.json \
     --state ./forge_work/campaign_state.json
 ```
@@ -182,45 +183,46 @@ Orchestrator 会调度 `forge-arch` 反推架构并写 milestone，
 
 ---
 
-## 二之二、多卡并行
+## 二之二、并行跑多个任务
 
-单机多卡环境下同时演进多个算子：
+插件不做调度。要并行就起多个任务，各自指定不同的卡：
 
 ```bash
-POOL=./device_pool
-DEV=.claude/skills/forge-campaign/scripts
+# 任务 A
+python3 $SK/campaign.py init --state ./work_a/state.json \
+    --operator add_layer_norm --device-id 0 ... &
 
-# 每个算子绑一张卡
-python3 $DEV/forge_devices.py bind --pool $POOL \
-    --operator add_layer_norm --session-id ln_b8 --concurrency 8
-
-# 等同批都绑完 —— 这一步不能省
-python3 $DEV/forge_devices.py wait-peers --pool $POOL --expected 8
-
-# 现在量噪声底才有效
-python3 $DEV/forge_devices.py run --pool $POOL -- <评测命令>
-python3 $DEV/noise_floor.py --from-results evaluation_results.json
-
-# 开 campaign 时把卡与并发数写进去
-python3 $DEV/campaign.py init ... --device-id 3 --device-pool $POOL \
-    --device-session ln_b8 --concurrency 8
+# 任务 B
+python3 $SK/campaign.py init --state ./work_b/state.json \
+    --operator matmul_nz --device-id 1 ... &
 ```
 
-三条规矩：**一卡一 campaign**（不够就排队）、**代际不换卡**、
-**满载后再量噪声底**。
+### 必须分开的三样
 
-### Q：为什么不能先量噪声底再起其他 campaign？
+| | 为什么 |
+|---|---|
+| `--device-id` | 同卡互相干扰计时 |
+| `--state` | 两个任务写同一份状态会互相覆盖 |
+| 工作目录 | 封存清单与评测产物会互踩 |
 
-因为噪声底在什么并发水平下量的，就只在那个水平下成立。
+### 可以共用的
 
-其余 campaign 还没压上卡时量出来偏低；之后满载运行，主机 CPU、PCIe、
-内存带宽都在争用，真实噪声更高。于是噪声里的「改进」被当成真的收下，
-还会写进知识库和产物库污染后续各代 —— **而整个过程没有任何报错**。
+产物库与知识库**可以也应该共用** —— 跨任务复用经验正是它们存在的理由。
+两者的写入都加了文件锁，并发安全。
 
-### Q：卡不够，能不能两个 campaign 挤一张？
+### Q：并行时噪声底怎么处理？
 
-不能。共享一张卡会互相干扰计时，而配对计时的全部意义就是两个 kernel
-处在相同条件下。卡不够时 `bind` 会等待，这是预期行为。
+噪声底在什么并发水平下量的，就只在那个水平下成立。
+
+所以**等所有任务都起来之后再量**。其余任务还没压上卡时量出来偏低；
+之后满载运行，主机 CPU、PCIe、内存带宽都在争用，真实噪声更高。于是噪声
+里的「改进」被当成真的收下，还会写进知识库和产物库污染后续各代 ——
+**而整个过程没有任何报错**。
+
+### Q：两个任务能不能共用一张卡？
+
+不能。共享会互相干扰计时，配对计时的全部意义就是两个 kernel 处在相同
+条件下。
 
 ### Q：promote 之后会换卡吗？
 

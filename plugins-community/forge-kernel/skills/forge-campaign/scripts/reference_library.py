@@ -65,12 +65,15 @@ bench 本地不提供「最优版本」的 kernel，论文里的 public best 是
 """
 
 import argparse
+import contextlib
+import fcntl
 import hashlib
 import json
 import os
 import re
 import shutil
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -95,6 +98,62 @@ _DRIFT_EPS = 1e-6
 
 class LibraryError(Exception):
     """库操作失败。"""
+
+
+# ---------------------------------------------------------------------------
+# 跨任务互斥
+# ---------------------------------------------------------------------------
+
+#: 取锁超时。入库要复制产物，大目录可能慢，所以给得比普通 IO 宽。
+DEFAULT_LOCK_TIMEOUT = 120.0
+
+
+@contextlib.contextmanager
+def exclusive(library: Path, timeout: float = DEFAULT_LOCK_TIMEOUT):
+    """对整个库加排他锁，覆盖「读索引 → 改 → 写回」的全过程。
+
+    为什么非锁不可：多个演进任务并行跑（各占一张卡）时，它们**共用同一个
+    产物库**。add_generation 的流程是
+
+        load_index  →  算出 gen 号  →  复制产物到 genNNN/  →  save_index
+
+    不加锁会出两种事，而且都不报错：
+
+      索引丢更新   A 读到索引、B 也读到，A 写回、B 再写回 —— A 这次入库
+                   在索引里消失了。产物还在磁盘上，但查不到。
+
+      产物被覆盖   同一算子+形状的两个任务同时提升时，双方算出同一个 gen
+                   号，后者 rmtree 掉前者刚复制进去的产物。前者的 manifest
+                   记着自己算的校验和，于是 verify 之后会报「内容已变更」——
+                   那时已经查不出到底发生过什么了。
+
+    锁文件放在库根目录，粒度是整库而不是单条目：入库不频繁（一次 campaign
+    才几次），而按条目分锁要先读索引才知道锁哪个，那又回到了竞争上。
+    """
+    library.mkdir(parents=True, exist_ok=True)
+    lock_path = library / ".lock"
+    deadline = time.time() + timeout
+    handle = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        while True:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.time() >= deadline:
+                    raise LibraryError(
+                        f"取库锁超时（{timeout:.0f}s）：{lock_path}\n"
+                        "  另一个任务正在写库。入库要复制产物，大目录会慢一些。\n"
+                        "  若确认没有别的任务在跑，删掉这个锁文件即可。"
+                    )
+                time.sleep(0.05)
+        yield
+    finally:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(handle)
 
 
 # ---------------------------------------------------------------------------
@@ -379,6 +438,34 @@ def add_generation(library: Path, *, operator: str, arch: str,
                    device_id: Optional[int] = None,
                    note: str = "") -> Dict[str, Any]:
     """登记一代。gen 0 是外来参考，之后是本系统的产出。"""
+    if kind not in ALL_KINDS:
+        raise LibraryError(f"未知来源 '{kind}'；可选: {list(ALL_KINDS)}")
+
+    # 整个读-改-写在锁内完成，包括 gen 号的计算与产物复制 ——
+    # 三者任何一步被另一个任务插进来都会出事，见 exclusive 的说明。
+    with exclusive(library):
+        return _add_generation_locked(
+            library, operator=operator, arch=arch, input_shape=input_shape,
+            kind=kind, identifier=identifier, artifact=artifact,
+            signature=signature, time_us=time_us, gain=gain,
+            mechanism_verified=mechanism_verified, bench_task=bench_task,
+            bench_baseline_us=bench_baseline_us, family=family,
+            device_id=device_id, note=note)
+
+
+def _add_generation_locked(library: Path, *, operator: str, arch: str,
+                           input_shape: str, kind: str, identifier: str,
+                           artifact: Optional[str] = None,
+                           signature: Optional[str] = None,
+                           time_us: Optional[float] = None,
+                           gain: Optional[float] = None,
+                           mechanism_verified: Optional[bool] = None,
+                           bench_task: Optional[str] = None,
+                           bench_baseline_us: Optional[float] = None,
+                           family: Optional[str] = None,
+                           device_id: Optional[int] = None,
+                           note: str = "") -> Dict[str, Any]:
+    """add_generation 的实体。调用方必须已持有库锁。"""
     if kind not in ALL_KINDS:
         raise LibraryError(f"未知来源 '{kind}'；可选: {list(ALL_KINDS)}")
 

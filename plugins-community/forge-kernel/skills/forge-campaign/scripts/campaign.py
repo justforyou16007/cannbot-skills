@@ -53,7 +53,8 @@ ForgeKernel 跑的是两层循环，这个脚本是两层的调度中枢。
         --operator add_layer_norm --input-shape "B=8,S=4096,H=1024,fp16" \\
         --arch DAV_2201 --reference-kind builtin_aclnn \\
         --reference-id aclnnAddLayerNorm \\
-        --noise-floor 2.3 --target-gain 1.05 --budget 40
+        --noise-floor 2.3 --target-gain 1.05 --budget 40 \\
+        --device-id 0
 
     campaign.py record --state campaign_state.json \\
         --result evaluation_results.json --decision D0.1 \\
@@ -768,8 +769,7 @@ def new_state(operator: str, input_shape: str, arch: str,
         "reference_snapshot": reference_snapshot or None,
         # 代际之间**不换卡**：换了之后参考签名、噪声底、绝对耗时全部
         # 不可比，而这些不可比是静默的 —— 数字照常产出，只是错了。
-        "device": device or {"device_id": None, "pool_dir": None,
-                             "session_id": None, "concurrency": None},
+        "device": device or {"device_id": None},
         "target_gain": target_gain,
         "budget": {"max_records": budget, "used": 0},
         "state": STATE_ANALYZE,
@@ -1139,6 +1139,19 @@ def write_nogo(nogo_path: Path, state: Dict[str, Any],
     格式由 forge-hwkb 的 hwkb.py 定义（`{"entries": [...]}`）；
     这里只追加，不做任何解释。改格式时两边要一起改。
     """
+    # 与 hwkb.py 写同一个文件，必须互斥：两个任务同时登记死路时，
+    # 后写的会把先写的覆盖掉，而双方都报「已登记」。死路表的价值在于
+    # 跨代存活，丢一条就意味着下一代把那个方向原封不动再试一遍。
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import reference_library as _lib  # noqa: PLC0415
+
+    with _lib.exclusive(nogo_path.parent):
+        return _write_nogo_locked(nogo_path, state, entry)
+
+
+def _write_nogo_locked(nogo_path: Path, state: Dict[str, Any],
+                       entry: Dict[str, Any]) -> int:
+    """write_nogo 的实体。调用方必须已持锁。"""
     entries: List[Dict[str, Any]] = []
     if nogo_path.exists():
         try:
@@ -1249,9 +1262,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         noise_floor_pct=args.noise_floor, target_gain=args.target_gain,
         stagnation_threshold=args.stagnation_threshold, budget=args.budget,
         reference_snapshot=reference_snapshot,
-        device={"device_id": args.device_id, "pool_dir": args.device_pool,
-                "session_id": args.device_session,
-                "concurrency": args.concurrency},
+        device={"device_id": args.device_id},
     )
     save_state(path, state)
     print(f"已创建 campaign: {args.operator} @ {args.arch}")
@@ -1261,14 +1272,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     print(f"  目标增益  {args.target_gain}")
     if args.budget:
         print(f"  预算      {args.budget} 次评测")
-    if args.device_id is not None:
-        print(f"  绑定设备  device {args.device_id}"
-              + (f"（同批并发 {args.concurrency}）" if args.concurrency else ""))
-    if args.concurrency and args.concurrency > 1:
-        print()
-        print("提醒: 噪声底必须在同批都绑完之后量 —— 此刻若还有 campaign 没起来，")
-        print("      量出的噪声会偏低，之后满载运行时噪声里的「改进」会被收下。")
-        print(f"      先跑 forge_devices.py wait-peers --expected {args.concurrency}")
+    print(f"  设备      device {args.device_id}")
     action = next_action(state)
     print(f"\n下一步: {action['action']} — {action['reason']}")
     return 0
@@ -1725,9 +1729,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"预算      {budget.get('used', 0)}/{cap if cap else '不限'}")
     device = state.get("device") or {}
     if device.get("device_id") is not None:
-        print(f"绑定设备  device {device['device_id']}"
-              + (f"，同批并发 {device['concurrency']}"
-                 if device.get("concurrency") else ""))
+        print(f"设备      device {device['device_id']}")
     print(f"台账条目  {len(state.get('ledger', []))}")
     print(f"\n下一步: {action['action']} — {action['reason']}")
     return 0
@@ -1875,16 +1877,10 @@ def build_parser() -> argparse.ArgumentParser:
                         default=DEFAULT_STAGNATION_THRESHOLD)
     p_init.add_argument("--budget", type=int, default=None,
                         help="评测次数上限；不给则不限")
-    p_init.add_argument("--device-id", type=int, default=None,
-                        help="本 campaign 绑定的卡号。代际之间不换卡 —— "
-                             "换了之后参考签名与绝对耗时都不可比")
-    p_init.add_argument("--device-pool", default=None,
-                        help="设备池目录（forge_devices.py bind 用的那个）")
-    p_init.add_argument("--device-session", default=None,
-                        help="设备租约的 session id")
-    p_init.add_argument("--concurrency", type=int, default=None,
-                        help="同批并发的 campaign 数。噪声底必须在这个并发"
-                             "水平下量出，否则偏低")
+    p_init.add_argument("--device-id", type=int, required=True,
+                        help="本 campaign 使用的卡号。一个任务一张卡；"
+                             "代际之间不换卡 —— 换了之后参考签名、噪声底、"
+                             "绝对耗时全部不可比，而这些不可比是静默的")
     p_init.add_argument("--reference-signature", default=None,
                         help="参考实现的 signature_probe 输出。机制行要靠它"
                              "做差（第 0 轮基线）；不给则首轮无法构成顺序证据")

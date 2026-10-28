@@ -79,6 +79,7 @@ python3 scripts/campaign.py init --operator add_layer_norm \
     --input-shape "B=8,S=4096,H=1024,fp16" --arch DAV_2201 \
     --reference-kind builtin_aclnn --reference-id aclnnAddLayerNorm \
     --noise-floor 2.3 --target-gain 1.05 --budget 40 \
+    --device-id 0 \
     --state ./forge_work/campaign_state.json
 
 python3 scripts/campaign.py record --state ./forge_work/campaign_state.json \
@@ -236,74 +237,42 @@ python3 scripts/campaign.py ledger --recipes
 经验」。这个比例是判断知识库值不值得继续投入的依据 —— 没有它，你无法
 回答「知识库到底有没有在帮忙」，也发现不了某张卡片其实一直在误导。
 
-## 多卡并行实验
+## 指定设备
 
-单机多卡环境下让多个算子同时演进，三条约束：
-
-| 约束 | 为什么 |
-|---|---|
-| **一卡一 campaign** | 共享一张卡会互相干扰计时，而配对计时的全部意义就是两个 kernel 处在相同条件下。卡不够时**排队**，不要塞 |
-| **代际不换卡** | 换了之后参考签名、噪声底、绝对耗时全部不可比，而这些不可比是**静默的** —— 数字照常产出，只是错了 |
-| **满载后再量噪声底** | 见下，这条最容易漏 |
-
-设备租约复用 `ops-evaluation` 的 `device_lease`（session 级租约 + eval 级
-排队锁，自动挑显存占用最低的空闲卡）。`forge_devices.py` 在它之上补了
-并发栅栏。
-
-### 流程
+一个演进任务用一张卡，卡号在 `init` 时必填：
 
 ```bash
-POOL=./device_pool
-DEV=.claude/skills/forge-campaign/scripts
-
-# 1. 每个算子绑一张卡（整个 campaign 生命周期占住它）
-python3 $DEV/forge_devices.py bind --pool $POOL \
-    --operator add_layer_norm --session-id ln_b8s4096 --concurrency 8
-
-# 2. 栅栏：等同批 8 个都绑完
-python3 $DEV/forge_devices.py wait-peers --pool $POOL --expected 8
-
-# 3. 此刻的并发水平就是运行时的水平 —— 现在量噪声底才有效
-python3 $DEV/forge_devices.py run --pool $POOL -- \
-    python3 <ops-evaluation>/scripts/evaluate_ops_direct.py ...
-python3 $DEV/noise_floor.py --from-results evaluation_results.json
-
-# 4. 开 campaign，把卡与并发数写进 state
-python3 $DEV/campaign.py init --state ./forge_work/campaign_state.json \
+python3 scripts/campaign.py init --state ./forge_work/campaign_state.json \
     --operator add_layer_norm --input-shape "B=8,S=4096,fp16" \
-    --arch DAV_2201 --reference-kind builtin_aclnn \
-    --reference-id aclnnAddLayerNorm --noise-floor 2.3 \
-    --device-id 3 --device-pool $POOL --device-session ln_b8s4096 \
-    --concurrency 8
-
-# 5. 之后每次评测都持 eval 锁（同卡上的评估串行）
-python3 $DEV/forge_devices.py run --pool $POOL -- <评测命令>
-
-# 6. 跑完释放
-python3 $DEV/forge_devices.py release --pool $POOL --session-id ln_b8s4096
+    --arch DAV_2201 --device-id 3 ...
 ```
 
-### 为什么要栅栏
+要并行就**在仓库外起多个任务**，各自指定不同的卡与不同的工作目录。
+插件不做调度。
 
-噪声底在**什么并发水平下量的**，就只在那个水平下成立。
+### 两条规矩
 
-N 个 campaign 同时启动时，第一个量噪声底的那一刻其余几个可能还在初始化、
-还没压上卡 —— 量出来偏低。之后满载运行，主机 CPU、PCIe、内存带宽都在
-争用，真实噪声更高。于是噪声里的「改进」被当成真的收下，还会写进知识库
-和产物库污染后续各代。
+**一个任务一张卡。** 两个任务共用一张卡会互相干扰计时，而配对计时的
+全部意义就是两个 kernel 处在相同条件下。
 
-**整个过程没有任何报错。** 这是这类问题最难办的地方，所以用栅栏在源头
-挡住，而不是事后去查。
+**代际之间不换卡。** `promote` 保留 `device`，不重新分配。换卡之后参考
+签名、噪声底、绝对耗时全部不可比，而这些不可比是**静默的** —— 数字照常
+产出，只是错了。
 
-栅栏会清理崩溃进程留下的残留记录 —— 残留会让它误判满员，那就白设了。
+### 并行跑多个任务时注意
 
-### 绝对耗时跨卡不可比
+| 要分开的 | 为什么 |
+|---|---|
+| `--device-id` | 同卡互相干扰计时 |
+| `--state` | 两个任务写同一份状态会互相覆盖 |
+| 工作目录（`forge_work/`） | 封存清单、评测产物会互踩 |
 
-多卡机器上卡与卡之间有系统性差异。所以产物库的 `best_gen` 按**累计增益**
-评选而不是绝对耗时：`gain_over_parent` 是同一次配对测量里的比值，
-在哪张卡上测都成立。
+**可以共用的**：产物库与知识库。它们的写入已加文件锁，并发安全 ——
+事实上共用才是对的，跨任务复用经验正是知识库存在的理由。
 
-每代的 `device_id` 记在 manifest 里，哪些绝对数字可比要看得出来。
+> 噪声底在什么并发水平下量的，就只在那个水平下成立。并行任务数固定时，
+> 应当在**所有任务都起来之后**再量噪声底；否则量出来偏低，之后满载运行
+> 时噪声里的「改进」会被收下，而整个过程没有任何报错。
 
 ## 封存产物库
 
@@ -482,7 +451,6 @@ python3 scripts/campaign.py set-noise-floor --state <state> --value <实测值>
 |---|---|
 | `scripts/campaign.py` | 状态机：init / record / reopen / set-reference-signature / set-noise-floor / set-budget / promote / status / ledger |
 | `scripts/reference_library.py` | 封存产物库：ingest / register / promote / resolve / find / lineage / list / verify / drift |
-| `scripts/forge_devices.py` | 多卡：bind / wait-peers / run / status / release |
 | `scripts/noise_floor.py` | 实测噪声底 |
 | `scripts/seal_reference.py` | 封存参考，产出禁读与禁词清单 |
 | `scripts/reference_adapter.py` | 三种参考来源归一化 + 环境预检 |

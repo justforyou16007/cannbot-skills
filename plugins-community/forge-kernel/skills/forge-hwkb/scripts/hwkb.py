@@ -41,10 +41,14 @@ set/wait 强配对经验搬到 DAV_3510 的 BufferID 同步上是错的。
 """
 
 import argparse
+import contextlib
+import fcntl
 import json
+import os
 import re
 import shutil
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -101,6 +105,55 @@ class Issue:
 
     def __str__(self) -> str:
         return f"[{self.code}] {self.message}"
+
+
+# ---------------------------------------------------------------------------
+# 跨任务互斥
+# ---------------------------------------------------------------------------
+
+#: 取锁超时。知识库的写操作都很短（追加一条 JSON、拷一个卡片），
+#: 等这么久还拿不到就说明有东西卡住了，该报出来而不是继续等。
+LOCK_TIMEOUT = 30.0
+
+
+@contextlib.contextmanager
+def exclusive(kb_root: Path, timeout: float = LOCK_TIMEOUT):
+    """对知识库加排他锁，覆盖「读 → 改 → 写回」的全过程。
+
+    多个演进任务并行跑时共用同一个知识库。死路表的写入是
+
+        load_nogo  →  append  →  write
+
+    不加锁时两个任务同时登记死路，后写的会把先写的那条覆盖掉 ——
+    **而且两边都报「已登记」**。死路表的全部价值在于跨代存活，
+    丢一条就意味着下一代会把那个方向原封不动再试一遍，
+    这正是它要消除的浪费。
+
+    卡片入库也在锁内：两个任务同时 add 同一个 id 时，没有锁的话
+    「已存在」检查和复制之间有窗口，双方都会判定不存在然后依次写入。
+    """
+    kb_root.mkdir(parents=True, exist_ok=True)
+    lock_path = kb_root / ".lock"
+    deadline = time.time() + timeout
+    handle = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        while True:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.time() >= deadline:
+                    raise TimeoutError(
+                        f"取知识库锁超时（{timeout:.0f}s）：{lock_path}。"
+                        "若确认没有别的任务在跑，删掉这个锁文件即可。")
+                time.sleep(0.05)
+        yield
+    finally:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(handle)
 
 
 # ---------------------------------------------------------------------------
@@ -375,12 +428,18 @@ def cmd_add(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print(f"错误: {exc}", file=sys.stderr)
         return 2
-    target_dir.mkdir(parents=True, exist_ok=True)
-    target = target_dir / f"{meta['id']}.md"
-    if target.exists() and not args.force:
-        print(f"错误: {target} 已存在；如确需覆盖请加 --force", file=sys.stderr)
+    try:
+        with exclusive(kb_root):
+            target_dir.mkdir(parents=True, exist_ok=True)
+            target = target_dir / f"{meta['id']}.md"
+            if target.exists() and not args.force:
+                print(f"错误: {target} 已存在；如确需覆盖请加 --force",
+                      file=sys.stderr)
+                return 2
+            shutil.copyfile(card_path, target)
+    except TimeoutError as exc:
+        print(f"错误: {exc}", file=sys.stderr)
         return 2
-    shutil.copyfile(card_path, target)
     print(f"已入库: {target}")
     return 0
 
@@ -486,19 +545,24 @@ def cmd_nogo_add(args: argparse.Namespace) -> int:
         print("错误: 死路同样需要证据；未经测量的放弃不构成死路", file=sys.stderr)
         return 2
 
-    entries = load_nogo(kb_root)
-    entries.append({
-        "symptom": args.symptom,
-        "tried": args.tried,
-        "evidence": args.evidence,
-        "arch": args.arch,
-        "operator": args.operator,
-    })
-    kb_root.mkdir(parents=True, exist_ok=True)
-    _nogo_path(kb_root).write_text(
-        json.dumps({"entries": entries}, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    try:
+        with exclusive(kb_root):
+            entries = load_nogo(kb_root)
+            entries.append({
+                "symptom": args.symptom,
+                "tried": args.tried,
+                "evidence": args.evidence,
+                "arch": args.arch,
+                "operator": args.operator,
+            })
+            _nogo_path(kb_root).write_text(
+                json.dumps({"entries": entries}, ensure_ascii=False,
+                           indent=2) + "\n",
+                encoding="utf-8",
+            )
+    except TimeoutError as exc:
+        print(f"错误: {exc}", file=sys.stderr)
+        return 2
     print(f"已登记死路（当前 {len(entries)} 条）: {args.tried}")
     return 0
 

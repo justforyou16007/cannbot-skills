@@ -280,18 +280,17 @@ def lookup_snapshot_value(snapshot: Optional[Dict[str, float]],
     return None
 
 
-def lookup_signature_value(signature: Dict[str, Any],
-                           needle: str) -> Tuple[Optional[float], Optional[str]]:
-    """在架构签名里按通道名找值。
+def lookup_signature_matches(signature: Dict[str, Any],
+                             needle: str) -> List[Tuple[float, str]]:
+    """在架构签名里找出所有通道名含该字段的读数。
 
-    signature_probe 给每个字段都带上了它的来源通道，所以这里递归找
-    「channel 里含有该字段名且 present 为真」的那一项即可，不需要在两边
-    维护一份字段名映射表 —— 那种表一定会漂移。
-
-    返回 (值, 实际命中的通道)。找不到返回 (None, None)；
-    **找不到与值为 0 必须分开**，理由同 signature_probe 的设计。
+    返回全部匹配而不是第一个，因为**匹配到多个本身就是个问题**：
+    msprof 的同名指标在 Cube 与 Vector 上各有一份（aic_ / aiv_ 前缀），
+    锚点若只写 `mte2_wait_ratio`，两边都能匹配上。随便挑一个意味着可能
+    拿 Cube 的读数去回答一个关于 Vector 的问题 —— 而两者毫不相干。
     """
     found: List[Tuple[float, str]] = []
+    seen: Set[str] = set()
 
     def walk(node: Any) -> None:
         if isinstance(node, dict):
@@ -299,7 +298,9 @@ def lookup_signature_value(signature: Dict[str, Any],
             value = node.get("value")
             if (isinstance(channel, str) and needle in channel
                     and node.get("present") is True
-                    and isinstance(value, (int, float))):
+                    and isinstance(value, (int, float))
+                    and channel not in seen):
+                seen.add(channel)
                 found.append((float(value), channel))
             for child in node.values():
                 walk(child)
@@ -308,16 +309,27 @@ def lookup_signature_value(signature: Dict[str, Any],
                 walk(child)
 
     walk(signature)
-    if found:
-        return found[0]
 
     # exposure 段是推导量，不走 field() 的形状，单独找一次
     exposure = signature.get("exposure")
     if isinstance(exposure, dict) and exposure.get("available"):
         value = exposure.get(needle)
         if isinstance(value, (int, float)):
-            return float(value), f"derived:exposure.{needle}"
-    return None, None
+            channel = f"derived:exposure.{needle}"
+            if channel not in seen:
+                found.append((float(value), channel))
+    return found
+
+
+def lookup_signature_value(signature: Dict[str, Any],
+                           needle: str) -> Tuple[Optional[float], Optional[str]]:
+    """取第一个匹配。歧义检测见 lookup_signature_matches。
+
+    返回 (值, 实际命中的通道)。找不到返回 (None, None)；
+    **找不到与值为 0 必须分开**，理由同 signature_probe 的设计。
+    """
+    matches = lookup_signature_matches(signature, needle)
+    return matches[0] if matches else (None, None)
 
 
 def _expected_direction(operator: str) -> Optional[int]:
@@ -376,13 +388,27 @@ def verify_mechanism_line(line: Dict[str, Any],
     threshold = float(match.group("value"))
     op = match.group("op")
 
-    actual, hit_channel = lookup_signature_value(signature, field)
-    if actual is None:
+    matches = lookup_signature_matches(signature, field)
+    if len(matches) > 1:
+        # 同名指标在 Cube 与 Vector 上各有一份。挑哪个都是蒙 ——
+        # 拿 Cube 的读数回答关于 Vector 的问题，两者毫不相干，
+        # 而算出来的百分比会显得很有说服力。
+        names = sorted(c.rsplit(":", 1)[-1] for _v, c in matches)
+        out.update(
+            verified=None,
+            reason=(f"字段 {field} 在签名里匹配到 {len(matches)} 个通道"
+                    f"（{names}）—— 同名指标在不同硬件单元上各有一份，"
+                    "无法判断这条机制行说的是哪一个。"
+                    "请把锚点写成带单元前缀的全名（如 aiv_ / aic_）"))
+        return out
+
+    if not matches:
         out.update(verified=None,
                    reason=(f"签名里没有 {field} 的有效读数。"
                            "缺失不等于不成立 —— 但也不构成验证"))
         return out
 
+    actual, hit_channel = matches[0]
     out.update(actual=actual, threshold=threshold, operator=op,
                channel=hit_channel)
 
@@ -392,13 +418,17 @@ def verify_mechanism_line(line: Dict[str, Any],
                    reason=f"{field} 实测 {actual} {op} {threshold} 不成立")
         return out
 
-    # 阈值成立，再看它是不是因本次改动而移动的
-    previous = lookup_snapshot_value(previous_snapshot, field)
+    # 阈值成立，再看它是不是因本次改动而移动的。
+    # 基线按**实际命中的那个通道**精确取，不再按字段名模糊匹配 ——
+    # 模糊匹配会把 Cube 的基线配给 Vector 的实测，算出一个看着很漂亮
+    # 但毫无意义的百分比。
+    previous = (previous_snapshot or {}).get(hit_channel)
     if previous is None:
         out.update(
             verified=None,
-            reason=(f"{field} 实测 {actual} {op} {threshold} 成立，但缺少上一轮"
-                    "（或参考）的同字段读数，无法判断它是否因本次改动而变化。"
+            reason=(f"{field} 实测 {actual} {op} {threshold} 成立，"
+                    f"但基线里没有同一通道（{hit_channel}）的读数，"
+                    "无法判断它是否因本次改动而变化。"
                     "阈值成立也可能只是它本来就在那个位置 —— "
                     "这不构成顺序证据"))
         return out
@@ -832,18 +862,33 @@ def _precision_passed(doc: Dict[str, Any]) -> Optional[bool]:
 # 裁决
 # ---------------------------------------------------------------------------
 
+#: 改动被保留下来的裁决。只有这些代表「当前代码的样子」。
+#:
+#: revert / regression 的代码已经撤回，它们的签名记录的是一个**不复存在**
+#: 的状态。拿它当基线，下一轮真正的改动会被算成「没动」—— 而那一轮
+#: 恰恰是有效的。
+KEPT_VERDICTS = frozenset({VERDICT_ACCEPT, VERDICT_ACCEPT_UNVERIFIED})
+
+
 def previous_snapshot(state: Dict[str, Any]) -> Tuple[Optional[Dict[str, float]], str]:
     """取做差用的「上一轮」快照，并说明它是哪一轮。
 
-    优先用最近一条**仍然有效**的台账快照；没有就退回参考自己的签名 ——
-    那就是第 0 轮。样例里写的「参考 job 1 为 4.2，本实现 job 2 降至 0.9」
-    正是这种比法。
+    「上一轮」指的是**当前代码所处的状态**，所以只有被保留下来的改动才算：
 
-    已作废的条目不能用作基线：它们建立在旧架构假设上，拿它做差得出的
-    「变化」归因到新实现头上是错的。
+      accept / accept_unverified   代码留下了，是当前状态的一部分
+      revert / regression          代码撤回了，那个签名对应的状态已不存在
+      invalidated（reopen 过）     建立在旧架构假设上
+
+    漏掉这个判断的后果很具体：某一轮因增益落在噪声里被回滚，但它碰巧把
+    某个停顿压到了低位；下一轮真的把那个停顿从高位压下来时，会拿已撤回
+    那轮的低位值当基线，算出「没动」，于是一个真实的机制被判成平凡通过。
+
+    都没有就退回参考自己的签名 —— 那就是第 0 轮。
     """
     for entry in reversed(state.get("ledger", [])):
         if entry.get("invalidated"):
+            continue
+        if entry.get("verdict") not in KEPT_VERDICTS:
             continue
         snapshot = entry.get("signature_snapshot")
         if snapshot:
@@ -1132,21 +1177,32 @@ def nogo_command(state: Dict[str, Any], entry: Dict[str, Any]) -> str:
     )
 
 
-def write_nogo(nogo_path: Path, state: Dict[str, Any],
+#: 死路表的文件名。由 forge-hwkb 的 hwkb.py 定义，两边必须一致。
+NOGO_FILENAME = "nogo.json"
+
+
+def write_nogo(kb_root: Path, state: Dict[str, Any],
                entry: Dict[str, Any]) -> int:
     """直接写入 hwkb 的死路表。
 
-    格式由 forge-hwkb 的 hwkb.py 定义（`{"entries": [...]}`）；
-    这里只追加，不做任何解释。改格式时两边要一起改。
+    参数是**知识库根目录**，不是文件路径。文件名与锁的位置都由程序拼，
+    这样互斥是结构性的，不依赖调用方传对路径 ——
+
+      hwkb.py   锁 <kb_root>/.lock，写 <kb_root>/nogo.json
+      这里      锁 <kb_root>/.lock，写 <kb_root>/nogo.json
+
+    若这里改成按任意文件路径取其父目录作锁，调用方把文件放到别处时，
+    两边锁的就是不同的文件，而加锁要防的正是这件事。
+
+    格式由 hwkb.py 定义（`{"entries": [...]}`），改格式时两边要一起改。
     """
-    # 与 hwkb.py 写同一个文件，必须互斥：两个任务同时登记死路时，
-    # 后写的会把先写的覆盖掉，而双方都报「已登记」。死路表的价值在于
-    # 跨代存活，丢一条就意味着下一代把那个方向原封不动再试一遍。
+    # exclusive 是「对一个目录加排他锁」的通用原语（约定 <dir>/.lock），
+    # 与 hwkb.exclusive 同一套约定，所以锁的是同一个文件。
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import reference_library as _lib  # noqa: PLC0415
 
-    with _lib.exclusive(nogo_path.parent):
-        return _write_nogo_locked(nogo_path, state, entry)
+    with _lib.exclusive(kb_root):
+        return _write_nogo_locked(kb_root / NOGO_FILENAME, state, entry)
 
 
 def _write_nogo_locked(nogo_path: Path, state: Dict[str, Any],
@@ -1349,9 +1405,10 @@ def cmd_record(args: argparse.Namespace) -> int:
         print("        要让它算数，补上 --signature 与 --milestone 重新核验机制。")
 
     if entry["verdict"] in (VERDICT_REVERT, VERDICT_REGRESSION):
-        if args.nogo_store:
-            count = write_nogo(Path(args.nogo_store), state, entry)
-            print(f"\n  已登记死路（当前 {count} 条）: {args.nogo_store}")
+        if args.nogo_kb_root:
+            count = write_nogo(Path(args.nogo_kb_root), state, entry)
+            print(f"\n  已登记死路（当前 {count} 条）: "
+                  f"{Path(args.nogo_kb_root) / NOGO_FILENAME}")
         else:
             print("\n  这个方向应登记进死路表，否则下一代会原封不动再试一遍：")
             print("  " + nogo_command(state, entry).replace("\n", "\n  "))
@@ -1905,8 +1962,11 @@ def build_parser() -> argparse.ArgumentParser:
                           help="本次新总结的经验卡片 id，可重复")
     p_record.add_argument("--symptom", default="",
                           help="本次的 profiler 症状，回滚时写进死路表")
-    p_record.add_argument("--nogo-store", default=None,
-                          help="死路表路径；给了就在回滚时直接写入")
+    p_record.add_argument("--nogo-kb-root", default=None,
+                          help="知识库根目录；给了就在回滚时直接写入其中的"
+                               "死路表。传目录而非文件路径，是为了让它与 "
+                               "hwkb.py 锁同一个文件 —— 互斥要靠结构保证，"
+                               "不能指望调用方传对路径")
     p_record.set_defaults(func=cmd_record)
 
     p_reopen = sub.add_parser("reopen", help="重开架构决策并作废下游实现",

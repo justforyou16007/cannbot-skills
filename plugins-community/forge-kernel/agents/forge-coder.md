@@ -68,7 +68,7 @@ python3 <forge-campaign>/scripts/campaign.py record \
     --milestone milestone.json \
     --recipe R-2201-001 \
     --symptom "MTE2 占比过高" \
-    --nogo-store <forge-hwkb>/references/nogo.json
+    --nogo-kb-root <forge-hwkb>/references
 ```
 
 ```
@@ -103,13 +103,13 @@ python3 <forge-campaign>/scripts/campaign.py record \
 （或参考）比根本没动 —— 所以不是你这次改动造成的，增益来自别处。
 同样向上反馈。
 
-### `--symptom` 和 `--nogo-store` 也要给
+### `--symptom` 和 `--nogo-kb-root` 也要给
 
 回滚时这两个参数会把该方向直接写进死路表。论文把「回滚」与「记死路」写成
 一件事 —— 死路表的全部价值在于跨代存活，漏记的那条，下一代会原封不动
 再试一遍。
 
-不给 `--nogo-store` 时 record 会打印一条可直接粘贴执行的命令，但那一步
+不给 `--nogo-kb-root` 时 record 会打印一条可直接粘贴执行的命令，但那一步
 很容易被跳过，尤其是在连续失败的时候。
 
 增益落在噪声底以内就是没有效果。边界上的判定取拒绝，因为收错一个噪声会

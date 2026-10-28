@@ -81,12 +81,16 @@ RE_ABSOLUTE_TIME = re.compile(
 #:
 #: 字段定义见 ops/ops-profiling/references/csv_fields_reference.md；
 #: 词汇表的完整说明见 references/mechanism-labels.md。改这里要同步改那里。
+#: MTE 类字段在 msprof 里写作 ai*_mte2_wait_ratio —— 星号是通配，
+#: Cube 与 Vector 各有一份。锚点只写 mte2_wait_ratio 会同时匹配到两个，
+#: campaign 的机制核验无法判断说的是哪个单元，会判为无法求值。
+#: 所以这里要求带前缀的全名，两种前缀都接受。
 MECHANISM_LABELS: Dict[str, Tuple[str, ...]] = {
     "CV_HANDOFF": ("aic_cube_wait_ratio", "aiv_vec_wait_ratio"),
-    "SUPPLY_KEEPUP": ("mte2_wait_ratio",),
-    "WRITEBACK_OVERLAP": ("mte3_wait_ratio",),
+    "SUPPLY_KEEPUP": ("aiv_mte2_wait_ratio", "aic_mte2_wait_ratio"),
+    "WRITEBACK_OVERLAP": ("aiv_mte3_wait_ratio", "aic_mte3_wait_ratio"),
     "CONSUMER_PHASING": ("aiv_vec_wait_ratio",),
-    "L1_RESIDENCY": ("mte1_wait_ratio", "aic_mte1_ratio"),
+    "L1_RESIDENCY": ("aic_mte1_wait_ratio", "aic_mte1_ratio"),
     "BANK_LAYOUT": ("aiv_vec_bank_cflt_ratio",),
     "BANKGROUP_STRIDE": ("aiv_vec_bankgroup_cflt_ratio",),
     "RESOURCE_SERIALIZATION": ("aiv_vec_resc_cflt_ratio",),

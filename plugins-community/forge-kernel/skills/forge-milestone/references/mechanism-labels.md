@@ -42,10 +42,10 @@
 | 标签 | 机制 | 必需停顿锚点 |
 |---|---|---|
 | `CV_HANDOFF` | Cube 与 Vector 的交接编排 | `aic_cube_wait_ratio` 或 `aiv_vec_wait_ratio` |
-| `SUPPLY_KEEPUP` | 搬运供给跟上计算（对应论文的 gather-supply discipline） | `mte2_wait_ratio` |
-| `WRITEBACK_OVERLAP` | 写回与下一轮计算重叠 | `mte3_wait_ratio` |
+| `SUPPLY_KEEPUP` | 搬运供给跟上计算（对应论文的 gather-supply discipline） | `aiv_mte2_wait_ratio` 或 `aic_mte2_wait_ratio` |
+| `WRITEBACK_OVERLAP` | 写回与下一轮计算重叠 | `aiv_mte3_wait_ratio` 或 `aic_mte3_wait_ratio` |
 | `CONSUMER_PHASING` | 消费侧分阶段，错开争用 | `aiv_vec_wait_ratio` |
-| `L1_RESIDENCY` | 用 L1 作中间驻留层，减少 GM 直达 | `mte1_wait_ratio` 或 `aic_mte1_ratio` |
+| `L1_RESIDENCY` | 用 L1 作中间驻留层，减少 GM 直达 | `aic_mte1_wait_ratio` 或 `aic_mte1_ratio` |
 
 ### 冲突与布局
 
@@ -125,13 +125,34 @@ field == 阈值  不蕴含方向          → 只要动过即可
 所以词汇表不需要再维护一列「该增还是该减」—— 那张表会和这里漂移。
 `L2_LOCALITY` 用 `>`（命中率要升），其余用 `<`（停顿要降），语义自洽。
 
+### 锚点必须点名硬件单元
+
+msprof 里 MTE 类指标写作 `ai*_mte2_wait_ratio` —— 星号是通配，
+**Cube 与 Vector 各有一份**。锚点只写 `mte2_wait_ratio` 会同时匹配到两个，
+机制核验无法判断说的是哪个单元，直接判为无法求值。
+
+这不是吹毛求疵：不拦的话，有可能拿 Cube 的基线去配 Vector 的实测，
+算出一个看着很漂亮、实际毫无意义的百分比 —— 而那种错误没法从结果上
+看出来。
+
+```
+写  msprof:ResourceConflictRatio.csv:aiv_mte2_wait_ratio < 4.2
+不写 msprof:ResourceConflictRatio.csv:mte2_wait_ratio < 4.2
+```
+
 ### 做差基线是谁
 
 | 情形 | 基线 |
 |---|---|
-| 有更近的有效台账快照 | 上一轮那条决策 |
+| 有更近的、**改动被保留下来**的台账快照 | 上一轮那条决策 |
 | 首轮 | **参考自己的签名**（第 0 轮） |
 | 都没有 | 判为无法核验，并说明缺的是什么 |
+
+被回滚的轮次（revert / regression）**不作基线**：那一轮的代码已经撤回，
+它的签名对应着一个不复存在的状态。拿它做差，下一轮真正的改动会被算成
+「没动」，于是一个有效的机制被判成平凡通过。
+
+基线按**实际命中的那个通道**精确取，不按字段名模糊匹配 —— 理由同上。
 
 所以 `campaign.py init` 要带 `--reference-signature`，或事后用
 `set-reference-signature` 补上。不给的话首轮必然构不成顺序证据。

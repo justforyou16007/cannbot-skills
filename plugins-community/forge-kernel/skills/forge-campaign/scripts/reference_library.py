@@ -246,21 +246,28 @@ def infer_family(operator: str) -> Optional[str]:
     return None
 
 
-def cumulative_gain(generations: List[Dict[str, Any]], upto: int) -> float:
-    """算到第 upto 代为止、相对 gen0 的累计增益。
+def cumulative_gain(generations: List[Dict[str, Any]],
+                    upto: int) -> Optional[float]:
+    """算到第 upto 代为止、相对 gen0 的累计增益。链断了返回 None。
 
     用累计增益而不是绝对耗时来评最优，因为**绝对耗时跨环境不可比**：
-    多卡机器上卡与卡之间有系统性差异，不同时段的并发水平也不同。
-    而 gain_over_parent 是同一次配对测量里得到的比值 —— 那个比值在哪张卡上
-    测都成立，这正是论文坚持同 job 配对计时的理由。
+    机器之间、时段之间都有系统性差异。而 gain_over_parent 是同一次配对
+    测量里得到的比值 —— 那个比值在哪台机器上测都成立，这正是论文坚持
+    同 job 配对计时的理由。
+
+    但连乘要求**每一代都有 gain**。中间缺一代就把它当 1.0，等于断言
+    那一代没有任何变化 —— 而真相是不知道。这个默认会让一个实际更快的
+    代次在评选中被悄悄跳过，所以这里如实返回 None。
     """
     total = 1.0
-    for record in generations:
-        if record["generation"] == 0 or record["generation"] > upto:
+    for record in sorted(generations, key=lambda g: g["generation"]):
+        gen = record["generation"]
+        if gen == 0 or gen > upto:
             continue
         gain = record.get("gain_over_parent")
-        if isinstance(gain, (int, float)) and gain > 0:
-            total *= gain
+        if not isinstance(gain, (int, float)) or gain <= 0:
+            return None   # 链断了，之后各代的累计增益都无从谈起
+        total *= gain
     return total
 
 
@@ -274,18 +281,24 @@ def pick_best(entry: Dict[str, Any]) -> Tuple[Optional[int], str]:
     if not generations:
         return None, "无代次"
 
-    has_gain = any(isinstance(g.get("gain_over_parent"), (int, float))
-                   for g in generations)
-    if has_gain:
-        best = max(generations,
-                   key=lambda g: cumulative_gain(generations, g["generation"]))
+    # 每一代的累计增益都算得出来，才能用这个口径评选
+    cumulative = {g["generation"]: cumulative_gain(generations, g["generation"])
+                  for g in generations}
+    broken = sorted(gen for gen, value in cumulative.items() if value is None)
+
+    if not broken:
+        best = max(generations, key=lambda g: cumulative[g["generation"]])
         return best["generation"], "累计增益（跨环境可比）"
 
     timed = [g for g in generations
              if isinstance(g.get("time_us"), (int, float)) and g["time_us"] > 0]
     if timed:
         best = min(timed, key=lambda g: g["time_us"])
-        return best["generation"], "绝对耗时（仅同一环境内可比）"
+        # 讲明为什么退回了较弱的口径，否则下次还会踩同一个坑
+        return best["generation"], (
+            f"绝对耗时（仅同一环境内可比）—— gen{broken} 缺 gain，"
+            "增益链不完整，无法按累计增益评选。"
+            "入库时带 --gain 可恢复跨环境可比")
 
     # 一个可比数字都没有时仍要给出一代，否则刚 ingest 完的参考会查不到 ——
     # 「还没测过」不等于「不存在」。取最新一代并讲明依据不足。
@@ -436,6 +449,7 @@ def add_generation(library: Path, *, operator: str, arch: str,
                    bench_baseline_us: Optional[float] = None,
                    family: Optional[str] = None,
                    device_id: Optional[int] = None,
+                   force: bool = False,
                    note: str = "") -> Dict[str, Any]:
     """登记一代。gen 0 是外来参考，之后是本系统的产出。"""
     if kind not in ALL_KINDS:
@@ -450,7 +464,7 @@ def add_generation(library: Path, *, operator: str, arch: str,
             signature=signature, time_us=time_us, gain=gain,
             mechanism_verified=mechanism_verified, bench_task=bench_task,
             bench_baseline_us=bench_baseline_us, family=family,
-            device_id=device_id, note=note)
+            device_id=device_id, force=force, note=note)
 
 
 def _add_generation_locked(library: Path, *, operator: str, arch: str,
@@ -464,6 +478,7 @@ def _add_generation_locked(library: Path, *, operator: str, arch: str,
                            bench_baseline_us: Optional[float] = None,
                            family: Optional[str] = None,
                            device_id: Optional[int] = None,
+                           force: bool = False,
                            note: str = "") -> Dict[str, Any]:
     """add_generation 的实体。调用方必须已持有库锁。"""
     if kind not in ALL_KINDS:
@@ -498,7 +513,7 @@ def _add_generation_locked(library: Path, *, operator: str, arch: str,
     gen = len(entry["generations"])
     parent = gen - 1 if gen else None
 
-    if gen > 0 and mechanism_verified is False:
+    if gen > 0 and mechanism_verified is False and not force:
         raise LibraryError(
             "机制未核实的产出不得入库作为参考。\n"
             "  封存一个解释不清的结果，会让后续所有代都建立在它之上，\n"
@@ -616,6 +631,10 @@ def verify(library: Path, operator: Optional[str] = None
     参考一变，之前所有相对它的加速比全部失效。这件事必须是**可发现的**，
     否则会带着一堆不可比的数字继续往下跑。
     """
+    if not library.exists():
+        return ([f"库不存在: {library}。「没有东西可查」不等于「查过且没问题」"],
+                0)
+
     index = load_index(library)
     problems: List[str] = []
     checked = 0
@@ -688,11 +707,14 @@ def signature_drift(library: Path, operator: str, arch: str,
             drifted.append({"channel": channel, "sealed": old,
                             "current": new, "drift_pct": pct})
 
+    # 比对 0 个字段证明不了任何事。说「参考没变」是把「没查」说成了
+    # 「查过且没问题」—— 而这正是漂移检测要防的那类误判。
     return {
         "key": key, "generation": generation,
         "compared_fields": compared,
         "drifted": drifted,
-        "stable": not drifted,
+        "stable": bool(compared) and not drifted,
+        "inconclusive": compared == 0,
         "threshold_pct": SIGNATURE_DRIFT_PCT,
     }
 
@@ -872,7 +894,7 @@ def cmd_promote(args: argparse.Namespace) -> int:
             identifier=args.id or f"{args.operator}_promoted",
             artifact=args.artifact, signature=args.signature,
             time_us=args.time_us, gain=args.gain,
-            device_id=args.device_id,
+            device_id=args.device_id, force=bool(args.force),
             mechanism_verified=bool(args.mechanism_verified),
             note=args.note,
         )
@@ -1095,6 +1117,12 @@ def cmd_drift(args: argparse.Namespace) -> int:
 
     print(f"{report['key']} gen{report['generation']}：比对 "
           f"{report['compared_fields']} 个字段")
+    if report.get("inconclusive"):
+        print("无法判断：封存签名与当前签名没有任何同名通道可比。\n"
+              "  两次采集的 metric 覆盖不同，或封存时就没采到有效读数。\n"
+              "  这不等于「参考没变」—— 它等于「什么都没查」。",
+              file=sys.stderr)
+        return 1
     if report["stable"]:
         print("签名稳定，参考没变。")
         return 0

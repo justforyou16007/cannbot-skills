@@ -86,7 +86,7 @@ python3 scripts/campaign.py record --state ./forge_work/campaign_state.json \
     --result evaluation_results.json --decision D0.1 \
     --signature architecture_signature.json --milestone milestone.json \
     --recipe R-2201-001 --symptom "MTE2 占比过高" \
-    --nogo-store <forge-hwkb>/references/nogo.json
+    --nogo-kb-root <forge-hwkb>/references
 ```
 
 **`--input-shape` 是必填的。** 论文 §3.1：一次 campaign 取一个算子、
@@ -215,7 +215,7 @@ python3 scripts/campaign.py reopen --state ./forge_work/campaign_state.json \
 
 `record` 判为回滚时：
 
-- 给了 `--nogo-store` → 直接写入死路表
+- 给了 `--nogo-kb-root` → 直接写入该知识库的死路表
 - 没给 → 打印一条可直接粘贴执行的 `hwkb.py nogo add` 命令
 
 论文把「回滚」与「记死路」写成一件事。靠 agent 自觉是不牢的：连续失败

@@ -110,8 +110,8 @@ def test_v11_missing_ordering_evidence(doc):
 
 @pytest.mark.parametrize("label,anchor_field", [
     ("CV_HANDOFF", "aic_cube_wait_ratio"),
-    ("SUPPLY_KEEPUP", "mte2_wait_ratio"),
-    ("WRITEBACK_OVERLAP", "mte3_wait_ratio"),
+    ("SUPPLY_KEEPUP", "aiv_mte2_wait_ratio"),
+    ("WRITEBACK_OVERLAP", "aiv_mte3_wait_ratio"),
     ("BANK_LAYOUT", "aiv_vec_bank_cflt_ratio"),
     ("L2_LOCALITY", "total_hit_rate"),
     ("OUTPUT_ALIGNMENT", "aic_fixpipe_ratio"),
@@ -121,6 +121,14 @@ def test_v11_each_label_accepts_its_anchor(doc, label, anchor_field):
     line["label"] = label
     line["anchor"]["expr"] = f"msprof:X.csv:{anchor_field} < 1.0"
     assert "V11" not in rules_hit(mv.validate(doc, ["V11"]))
+
+
+def test_v11_requires_unit_prefix_on_mte_fields(doc):
+    """不带 aic_/aiv_ 前缀的 MTE 字段会同时匹配两个单元，必须拒。"""
+    line = mechanism_line(doc)
+    line["label"] = "SUPPLY_KEEPUP"
+    line["anchor"]["expr"] = "msprof:X.csv:mte2_wait_ratio < 4.2"
+    assert "V11" in rules_hit(mv.validate(doc, ["V11"]))
 
 
 def test_v11_label_rejects_wrong_anchor(doc):

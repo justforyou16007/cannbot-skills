@@ -1051,22 +1051,34 @@ def test_nogo_written_directly(tmp_path):
     state = fresh_state()
     entry = campaign.apply_result(state, result(speedup=1.001), "D0.1",
                                   symptom="MTE2 占比过高")
-    nogo = tmp_path / "nogo.json"
-    assert campaign.write_nogo(nogo, state, entry) == 1
+    kb_root = tmp_path / "kb"
+    assert campaign.write_nogo(kb_root, state, entry) == 1
 
-    doc = json.loads(nogo.read_text(encoding="utf-8"))
+    doc = json.loads((kb_root / campaign.NOGO_FILENAME).read_text(
+        encoding="utf-8"))
     assert doc["entries"][0]["symptom"] == "MTE2 占比过高"
     assert doc["entries"][0]["tried"] == "D0.1"
     assert doc["entries"][0]["input_shape"] == "B=8,S=4096,fp16"
 
 
 def test_nogo_appends_to_existing(tmp_path):
-    nogo = tmp_path / "nogo.json"
-    nogo.write_text(json.dumps({"entries": [{"symptom": "旧的"}]}),
-                    encoding="utf-8")
+    kb_root = tmp_path / "kb"
+    kb_root.mkdir()
+    (kb_root / campaign.NOGO_FILENAME).write_text(
+        json.dumps({"entries": [{"symptom": "旧的"}]}), encoding="utf-8")
     state = fresh_state()
     entry = campaign.apply_result(state, result(speedup=1.001), "D0.1")
-    assert campaign.write_nogo(nogo, state, entry) == 2
+    assert campaign.write_nogo(kb_root, state, entry) == 2
+
+
+def test_nogo_locks_the_same_file_as_hwkb(tmp_path):
+    """互斥要靠结构保证：两边都锁 <kb_root>/.lock，不随调用方的路径漂。"""
+    kb_root = tmp_path / "kb"
+    state = fresh_state()
+    entry = campaign.apply_result(state, result(speedup=1.001), "D0.1")
+    campaign.write_nogo(kb_root, state, entry)
+    assert (kb_root / ".lock").exists()
+    assert (kb_root / campaign.NOGO_FILENAME).exists()
 
 
 # ---------------------------------------------------------------------------
@@ -1307,15 +1319,16 @@ def test_cli_record_prints_nogo_hint_on_revert(tmp_path):
     assert "hwkb.py nogo add" in out
 
 
-def test_cli_record_writes_nogo_when_store_given(tmp_path):
+def test_cli_record_writes_nogo_when_kb_root_given(tmp_path):
     state_file = tmp_path / "s.json"
-    nogo = tmp_path / "nogo.json"
+    kb_root = tmp_path / "kb"
     run(init_argv(state_file))
     res = tmp_path / "ev.json"
     res.write_text(json.dumps(result(speedup=1.001)), encoding="utf-8")
     run(["--state", str(state_file), "record", "--result", str(res),
          "--decision", "D0.1", "--symptom", "MTE2 高",
-         "--nogo-store", str(nogo)])
+         "--nogo-kb-root", str(kb_root)])
+    nogo = kb_root / campaign.NOGO_FILENAME
     assert json.loads(nogo.read_text(encoding="utf-8"))["entries"]
 
 
@@ -1562,3 +1575,110 @@ def test_measured_floor_drives_acceptance():
         1.0 + floor / 200.0, floor) != campaign.VERDICT_ACCEPT
     assert campaign.decide_candidate(
         1.0 + floor / 50.0, floor) == campaign.VERDICT_ACCEPT
+
+
+# ---------------------------------------------------------------------------
+# 回归：被回滚的轮次不作基线
+#
+# 某一轮因增益落在噪声里被回滚，但它碰巧把某个停顿压到了低位。下一轮真的
+# 把那个停顿从高位压下来时，若拿已撤回那轮的低位值当基线，会算出「没动」，
+# 于是一个真实的机制被判成平凡通过 —— 而结论看着完全合理。
+# ---------------------------------------------------------------------------
+
+def test_reverted_round_is_not_used_as_baseline():
+    doc = milestone({"D0.1": [], "D0.2": []})
+    state = fresh_state(ref_stall=10.0, target=99.0)
+    # 第一轮被回滚（增益在噪声内），但它的签名显示停顿已降到 2.0
+    campaign.apply_result(state, result(speedup=1.001), "D0.1",
+                          milestone_doc=doc, signature=signature(2.0))
+    assert state["ledger"][0]["verdict"] == campaign.VERDICT_REVERT
+
+    # 第二轮真的把 10.0 降到 2.0
+    entry = campaign.apply_result(state, result(speedup=1.50), "D0.2",
+                                  milestone_doc=doc,
+                                  signature=signature(2.0))
+    assert entry["mechanism"]["compared_against"] == "参考实现"
+    assert entry["verdict"] == campaign.VERDICT_ACCEPT
+
+
+def test_regression_round_is_not_used_as_baseline():
+    state = fresh_state(ref_stall=10.0, target=99.0)
+    campaign.apply_result(state, result(speedup=0.5), "D0.1",
+                          milestone_doc=milestone(), signature=signature(2.0))
+    assert state["ledger"][0]["verdict"] == campaign.VERDICT_REGRESSION
+    snapshot, label = campaign.previous_snapshot(state)
+    assert label == "参考实现"
+
+
+def test_kept_round_is_used_as_baseline():
+    """accept_unverified 的改动留在代码里，应当作基线。"""
+    state = fresh_state(ref_stall=10.0, target=99.0)
+    campaign.apply_result(state, result(speedup=1.50), "D0.1",
+                          signature=signature(5.0))   # 无 milestone → unverified
+    assert state["ledger"][0]["verdict"] == campaign.VERDICT_ACCEPT_UNVERIFIED
+    snapshot, label = campaign.previous_snapshot(state)
+    assert snapshot[CHANNEL] == 5.0
+    assert "上一轮" in label
+
+
+# ---------------------------------------------------------------------------
+# 回归：同名指标跨硬件单元不得混比
+#
+# msprof 的 ai*_mte2_wait_ratio 在 Cube 与 Vector 上各有一份。锚点只写
+# mte2_wait_ratio 时两边都匹配，挑错一个就会拿 Cube 的基线配 Vector 的
+# 实测 —— 算出的百分比看着很有说服力，实际毫无意义。
+# ---------------------------------------------------------------------------
+
+AIC = "msprof:ResourceConflictRatio.csv:aic_mte2_wait_ratio"
+AIV = "msprof:ResourceConflictRatio.csv:aiv_mte2_wait_ratio"
+
+
+def two_unit_signature(aic_value, aiv_value):
+    return {"trust": {"trustworthy": True}, "stalls": {"wait": {
+        "cube": {"value": aic_value, "channel": AIC, "present": True},
+        "vec": {"value": aiv_value, "channel": AIV, "present": True}}}}
+
+
+def test_ambiguous_field_is_refused():
+    line = {"id": "M1", "label": "SUPPLY_KEEPUP",
+            "anchor": {"expr": "msprof:X.csv:mte2_wait_ratio < 4.0"}}
+    out = campaign.verify_mechanism_line(
+        line, two_unit_signature(2.0, 9.0), {AIC: 10.0, AIV: 9.2})
+    assert out["verified"] is None
+    assert "匹配到 2 个通道" in out["reason"]
+    assert "单元前缀" in out["reason"]
+
+
+def test_qualified_field_picks_the_right_unit():
+    """写全名时取的就是那个单元：Vector 几乎没动，应判平凡通过。"""
+    line = {"id": "M1", "label": "SUPPLY_KEEPUP",
+            "anchor": {"expr": f"{AIV} < 9.5"}}
+    out = campaign.verify_mechanism_line(
+        line, two_unit_signature(2.0, 9.0), {AIC: 10.0, AIV: 9.2})
+    assert out["vacuous"] is True
+    assert out["actual"] == 9.0
+    assert out["previous"] == 9.2
+
+
+def test_baseline_matched_by_exact_channel():
+    """基线按命中的通道精确取，不按字段名模糊匹配。"""
+    line = {"id": "M1", "anchor": {"expr": f"{AIV} < 9.5"}}
+    out = campaign.verify_mechanism_line(
+        line, two_unit_signature(2.0, 9.0), {AIC: 10.0})   # 基线只有 Cube
+    assert out["verified"] is None
+    assert "同一通道" in out["reason"]
+
+
+def test_lookup_matches_returns_all_units():
+    matches = campaign.lookup_signature_matches(
+        two_unit_signature(2.0, 9.0), "mte2_wait_ratio")
+    assert len(matches) == 2
+    assert {c for _v, c in matches} == {AIC, AIV}
+
+
+def test_lookup_matches_dedupes_channels():
+    """同一通道在签名里出现多次（嵌套结构）只算一个。"""
+    sig = {"trust": {"trustworthy": True},
+           "a": {"value": 1.0, "channel": AIV, "present": True},
+           "b": {"nested": {"value": 1.0, "channel": AIV, "present": True}}}
+    assert len(campaign.lookup_signature_matches(sig, "aiv_mte2")) == 1

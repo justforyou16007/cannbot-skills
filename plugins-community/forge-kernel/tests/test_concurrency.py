@@ -265,3 +265,62 @@ def test_lock_timeout_message_is_actionable(tmp_path):
     message = str(exc.value)
     assert ".lock" in message
     assert "删掉" in message
+
+
+# ---------------------------------------------------------------------------
+# 死路表的两个写入者必须锁同一个文件
+#
+# hwkb.py 锁 <kb_root>/.lock，campaign.py 也必须锁同一个 —— 否则互斥只在
+# 「调用方碰巧传对路径」时成立，而加锁要防的正是这件事。
+# ---------------------------------------------------------------------------
+
+def _campaign_nogo(payload):
+    kb_root, idx = payload
+    sys.path.insert(0, str(SCRIPTS))
+    import campaign as c
+    state = {"arch": "DAV_2201", "operator": f"op{idx}",
+             "input_shape": "B=8", "noise_floor_pct": 2.0}
+    entry = {"decision": f"D{idx}", "gain": 1.001,
+             "symptom": f"症状{idx}", "reason": "噪声内"}
+    c.write_nogo(Path(kb_root), state, entry)
+    return True
+
+
+def test_both_writers_lock_the_same_file(tmp_path):
+    """campaign 与 hwkb 对同一个知识库根取锁，锁文件必须是同一个。"""
+    import campaign as c
+    kb_root = tmp_path / "kb"
+    state = {"arch": "DAV_2201", "operator": "op", "input_shape": "B=8",
+             "noise_floor_pct": 2.0}
+    c.write_nogo(kb_root, state,
+                 {"decision": "D1", "gain": 1.0, "symptom": "s",
+                  "reason": "r"})
+    campaign_lock = kb_root / ".lock"
+
+    with hwkb.exclusive(kb_root):
+        pass
+    hwkb_lock = kb_root / ".lock"
+
+    assert campaign_lock == hwkb_lock
+    assert campaign_lock.exists()
+
+
+def test_mixed_writers_do_not_lose_nogo_entries(tmp_path):
+    """两个写入者并发追加，一条都不能丢。"""
+    kb_root = tmp_path / "kb"
+    payloads = [(str(kb_root), idx) for idx in range(WORKERS)]
+    half = WORKERS // 2
+    ctx = mp.get_context("fork")
+    with ctx.Pool(WORKERS) as pool:
+        a = pool.map_async(_campaign_nogo, payloads[:half])
+        b = pool.map_async(_add_nogo, payloads[half:])
+        a.get(); b.get()
+
+    entries = hwkb.load_nogo(kb_root)
+    assert len(entries) == WORKERS, f"丢了 {WORKERS - len(entries)} 条死路"
+
+
+def test_campaign_nogo_filename_matches_hwkb(tmp_path):
+    """文件名也要一致，否则两边各写各的文件，互斥等于没有。"""
+    import campaign as c
+    assert c.NOGO_FILENAME == hwkb.NOGO_FILENAME

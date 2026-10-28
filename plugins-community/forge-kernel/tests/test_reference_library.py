@@ -384,12 +384,20 @@ def test_gen0_cumulative_gain_is_one(tmp_path):
 
 
 def test_basis_flags_when_only_absolute_time(tmp_path):
-    """退回绝对耗时时要讲明它只在同一环境内可比。"""
+    """退回绝对耗时时要讲明它只在同一环境内可比。
+
+    注意 gen0 本身没有 gain（它是参考，没有上一代），所以单代库算是
+    完整链 —— 这里用两代、其中一代缺 gain 来触发退回。
+    """
     library = tmp_path / "L"
     seed_reference(library, tmp_path, time_us=456.5)
+    rl.add_generation(library, kind="sealed_kernel", identifier="g1",
+                      artifact=str(make_artifact(tmp_path)), time_us=400.0,
+                      mechanism_verified=True, **IDENTITY)   # 缺 gain
     entry = rl.load_index(library)["entries"][rl.entry_key(**IDENTITY)]
     _, basis = rl.pick_best(entry)
     assert "仅同一环境内可比" in basis
+    assert "增益链不完整" in basis
 
 
 def test_device_id_recorded(tmp_path):
@@ -700,3 +708,140 @@ def test_signature_snapshot_skips_absent(tmp_path):
         "stalls": {"wait": {"w": {"value": None, "channel": CHANNEL,
                                   "present": False}}}}), encoding="utf-8")
     assert rl.load_signature_snapshot(str(path)) is None
+
+
+# ---------------------------------------------------------------------------
+# 回归：三条「把没查说成查过了」的缺陷
+# ---------------------------------------------------------------------------
+
+def test_drift_with_no_overlapping_fields_is_inconclusive(tmp_path):
+    """比对 0 个字段证明不了任何事，不能说「参考没变」。"""
+    library = tmp_path / "L"
+    seed_reference(library, tmp_path, stall=4.2)
+    other = tmp_path / "other.json"
+    other.write_text(json.dumps({
+        "trust": {"trustworthy": True},
+        "stalls": {"wait": {"x": {
+            "value": 1.0, "channel": "msprof:别的.csv:完全不同的字段",
+            "present": True}}}}), encoding="utf-8")
+
+    report = rl.signature_drift(library, generation=0,
+                                current_signature=str(other), **IDENTITY)
+    assert report["compared_fields"] == 0
+    assert report["stable"] is False
+    assert report["inconclusive"] is True
+
+
+def test_drift_cli_returns_nonzero_when_inconclusive(tmp_path, capsys):
+    import argparse
+    library = tmp_path / "L"
+    seed_reference(library, tmp_path, stall=4.2)
+    other = tmp_path / "other.json"
+    other.write_text(json.dumps({
+        "trust": {"trustworthy": True},
+        "stalls": {"wait": {"x": {"value": 1.0, "channel": "无关",
+                                  "present": True}}}}), encoding="utf-8")
+    code = rl.cmd_drift(argparse.Namespace(
+        library=str(library), generation=0, signature=str(other),
+        as_json=False, **IDENTITY))
+    assert code == 1
+    assert "什么都没查" in capsys.readouterr().err
+
+
+def test_verify_on_missing_library_is_not_a_pass(tmp_path):
+    """「没有东西可查」不等于「查过且没问题」。"""
+    problems, checked = rl.verify(tmp_path / "完全不存在")
+    assert problems
+    assert "库不存在" in problems[0]
+    assert checked == 0
+
+
+def test_verify_cli_returns_nonzero_on_missing_library(tmp_path):
+    import argparse
+    code = rl.cmd_verify(argparse.Namespace(
+        library=str(tmp_path / "nope"), operator=None, as_json=False))
+    assert code == 1
+
+
+def test_promote_force_actually_works(tmp_path, capsys):
+    """--force 要能真的绕过准入闸，而不是提示你加一个你已经加了的参数。"""
+    import argparse
+    library = tmp_path / "L"
+    seed_reference(library, tmp_path)
+    code = rl.cmd_promote(argparse.Namespace(
+        library=str(library), artifact=str(make_artifact(tmp_path)),
+        id="g1", signature=None, time_us=350.0, gain=1.2,
+        mechanism_verified=False, force=True, note="已评估风险",
+        device_id=None, as_json=False, **IDENTITY))
+    assert code == 0
+    assert rl.resolve(library, **IDENTITY)["generation"] == 1
+
+
+def test_promote_without_force_still_refused(tmp_path):
+    import argparse
+    library = tmp_path / "L"
+    seed_reference(library, tmp_path)
+    code = rl.cmd_promote(argparse.Namespace(
+        library=str(library), artifact=str(make_artifact(tmp_path)),
+        id="g1", signature=None, time_us=350.0, gain=1.2,
+        mechanism_verified=False, force=False, note="",
+        device_id=None, as_json=False, **IDENTITY))
+    assert code == 1
+
+
+# ---------------------------------------------------------------------------
+# 回归：缺 gain 会断链，不能当 1.0
+# ---------------------------------------------------------------------------
+
+def test_missing_gain_breaks_the_chain(tmp_path):
+    library = tmp_path / "L"
+    seed_reference(library, tmp_path, time_us=500.0)
+    rl.add_generation(library, kind="sealed_kernel", identifier="g1",
+                      artifact=str(make_artifact(tmp_path, "k1")),
+                      gain=1.2, time_us=400.0, mechanism_verified=True,
+                      **IDENTITY)
+    rl.add_generation(library, kind="sealed_kernel", identifier="g2",
+                      artifact=str(make_artifact(tmp_path, "k2")),
+                      time_us=200.0, mechanism_verified=True, **IDENTITY)
+    entry = rl.load_index(library)["entries"][rl.entry_key(**IDENTITY)]
+    assert rl.cumulative_gain(entry["generations"], 1) == pytest.approx(1.2)
+    assert rl.cumulative_gain(entry["generations"], 2) is None
+
+
+def test_faster_generation_without_gain_still_wins(tmp_path):
+    """gen2 更快却缺 gain 时不能被悄悄跳过。"""
+    library = tmp_path / "L"
+    seed_reference(library, tmp_path, time_us=500.0)
+    rl.add_generation(library, kind="sealed_kernel", identifier="g1",
+                      artifact=str(make_artifact(tmp_path, "k1")),
+                      gain=1.2, time_us=400.0, mechanism_verified=True,
+                      **IDENTITY)
+    rl.add_generation(library, kind="sealed_kernel", identifier="g2",
+                      artifact=str(make_artifact(tmp_path, "k2")),
+                      time_us=200.0, mechanism_verified=True, **IDENTITY)
+    assert rl.resolve(library, **IDENTITY)["generation"] == 2
+
+
+def test_broken_chain_is_named_in_the_basis(tmp_path):
+    """要讲明是哪一代缺 gain，否则下次还会踩同一个坑。"""
+    library = tmp_path / "L"
+    seed_reference(library, tmp_path, time_us=500.0)
+    rl.add_generation(library, kind="sealed_kernel", identifier="g1",
+                      artifact=str(make_artifact(tmp_path)), time_us=400.0,
+                      mechanism_verified=True, **IDENTITY)
+    entry = rl.load_index(library)["entries"][rl.entry_key(**IDENTITY)]
+    _, basis = rl.pick_best(entry)
+    assert "增益链不完整" in basis
+    assert "--gain" in basis
+
+
+def test_complete_chain_still_uses_cumulative(tmp_path):
+    library = tmp_path / "L"
+    seed_reference(library, tmp_path, time_us=500.0)
+    for idx, (gain, t) in enumerate(((1.2, 400.0), (1.1, 900.0)), start=1):
+        rl.add_generation(library, kind="sealed_kernel", identifier=f"g{idx}",
+                          artifact=str(make_artifact(tmp_path, f"k{idx}")),
+                          gain=gain, time_us=t, mechanism_verified=True,
+                          **IDENTITY)
+    # gen2 绝对耗时更大（慢机器上测的），但累计增益更高
+    assert rl.resolve(library, **IDENTITY)["generation"] == 2

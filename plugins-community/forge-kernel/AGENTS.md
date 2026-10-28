@@ -63,7 +63,7 @@ Campaign 编排者。你调度两个 Agent，监控状态机，汇总结果。
 
 ### 你做什么
 
-- 接收需求：算子、目标架构、参考来源、目标增益
+- 接收需求：算子、**输入形状**、目标架构、参考来源、目标增益、预算
 - 跑前置四步：封存参考 → 适配预检 → 量噪声底 → 采参考签名
 - 调度 `forge-arch` 产出 milestone 课程表
 - 调度 `forge-coder` 逐行实现
@@ -78,6 +78,8 @@ Campaign 编排者。你调度两个 Agent，监控状态机，汇总结果。
 - **禁止**读参考实现的源码（hook 会拦，别绕）
 - **禁止**在噪声底未实测的情况下开 campaign
 - **禁止**替 `campaign.py` 做裁决
+- **禁止**不带 `--signature` / `--milestone` 就把结果当成已核实
+- **禁止**一份 state 跨多个输入形状复用
 
 ---
 
@@ -94,12 +96,17 @@ Campaign 编排者。你调度两个 Agent，监控状态机，汇总结果。
                         这一步不能跳过，也不能抄论文的 1~5%
 步骤 4  采参考签名      ops-profiling 的 msprof
                         取 PipeUtilization.csv / OpBasicInfo.csv
-步骤 5  开 campaign     campaign.py init
+步骤 5  开 campaign     campaign.py init（含 --input-shape 与 --budget）
 步骤 6  产出课程表      调度 forge-arch
-步骤 7  逐行实现        调度 forge-coder，每行一次 record
-步骤 8  停滞处理        状态转 stalled → 交回 forge-arch 重开架构
-步骤 9  达标            状态转 shipped → 决定是否 promote
-步骤 10 知识沉淀        认证过的发现入库，证伪的方向进死路表
+步骤 7  逐行实现        调度 forge-coder
+                        每行：fence_check → 评测 → signature_probe
+                        → record（带 --signature --milestone --symptom）
+步骤 8  停滞处理        三个口子任一触发 → 交回 forge-arch
+                        必要时 campaign.py reopen 按依赖图作废下游
+步骤 9  达标            状态转 shipped → promote
+步骤 10 重测噪声底      新参考换了，set-noise-floor 之前不许 record
+步骤 11 知识沉淀        认证过的发现入库，证伪的方向进死路表
+                        ledger --recipes 看知识库有没有在帮忙
 ```
 
 ### 参考来源怎么选
@@ -130,7 +137,11 @@ campaign 在下列任一条件下结束，**不要越过它继续**：
 |---|---|
 | 达到目标增益 | 状态转 `shipped`，可以 promote |
 | 阶段增益跌破噪声底 | 状态转 `stopped`，自我提升收敛 |
-| 预算耗尽 | 用户设定的轮次上限 |
+| 预算耗尽 | `--budget` 设定的评测次数上限，可用 `set-budget` 提高 |
+
+> `best` 只计机制已核实的改动。`accept_unverified` 的改动保留但不抬高
+> `best`，因此也不会让 campaign 提前进入可提升状态 —— 否则 promote 会把
+> 一个解释不清的结果封成下一代的参考。
 
 > 收敛时的停点是对硬件上限的**估计，不是证明** —— 也可能只是这个循环
 > 找不到了。论文自己就是这么说的，汇报时不要把它说成「已达硬件上限」。
@@ -144,7 +155,9 @@ campaign 在下列任一条件下结束，**不要越过它继续**：
 | `reference_adapter.py verify` 不过 | 停止，把完整输出交给用户 |
 | 噪声底异常高（远超 5%） | 停止，先查环境：是否有其他进程占卡、是否降频 |
 | 构建连续失败 ≥ 3 次 | 暂停上报 |
-| 内层连续无进展 | 交回 `forge-arch`，**不要**自己调 |
+| 内层连续无进展 / 决策图走穷 / 门禁僵持 | 交回 `forge-arch`，**不要**自己调 |
+| 连续精度或编译失败 | 实现问题，不消耗架构重入机会；查实现 |
+| 噪声底待重测 | 先 `noise_floor.py` 再 `set-noise-floor`，之前 record 会被拒 |
 | hook 拦截了读参考 | 这是预期行为，改用测量方式 |
 | 环境问题 | 告知用户并停止，不要绕过 |
 

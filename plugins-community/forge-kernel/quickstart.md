@@ -24,9 +24,10 @@ CANN 算子库里的内置实现、别人写的自定义算子，或者你自己
 步骤 3  量噪声底      这一步不能跳过，也不能抄论文的经验值
 步骤 4  采参考签名    msprof → signature_probe.py 提结构化签名
 步骤 5  产出课程表    arch agent 反推架构，写 milestone
-步骤 6  逐行实现      coder agent 一次一行；计时前过转发围栏
-步骤 7  停滞 → lever_probe 定价 → 重开架构
-步骤 8  达标 → 封存为下一代参考，继续
+步骤 6  逐行实现      coder agent 一次一行
+                      围栏 → 评测 → 签名 → record（机制进裁决）
+步骤 7  停滞 → 定价 → reopen 重开架构（自动作废下游）
+步骤 8  达标 → 封存为下一代参考 → 重测噪声底 → 继续
 ```
 
 ---
@@ -148,11 +149,18 @@ launch structure、流水占比、**停顿分解**、搬运量与复用倍数、
 
 ```bash
 python3 $SK/campaign.py init \
-    --operator add_layer_norm --arch DAV_2201 \
+    --operator add_layer_norm \
+    --input-shape "B=8,S=4096,H=1024,fp16" \
+    --arch DAV_2201 \
     --reference-kind builtin_aclnn --reference-id aclnnAddLayerNorm \
-    --noise-floor 2.3 --target-gain 1.05 \
+    --noise-floor 2.3 --target-gain 1.05 --budget 40 \
     --state ./forge_work/campaign_state.json
 ```
+
+> **`--input-shape` 是必填的。** 噪声底、架构签名、门禁锚点全都与 shape
+> 绑定 —— 同一个 tiling 决策在不同 shape 下的 trigger 完全不同。一份
+> state 跨 shape 复用会把不同 shape 的结果混进同一个 `best`，promote 时
+> 封存的参考与锚定的目标就对不上了。每个 shape 开一份 state。
 
 ### 步骤 6：交给 Agent
 
@@ -189,6 +197,8 @@ forge_work/
 |---|---|
 | 现在到哪一步了 | `campaign.py status` |
 | 每次裁决和理由 | `campaign.py ledger` |
+| 知识库有没有在帮忙 | `campaign.py ledger --recipes` |
+| 哪些改动机制没核实 | `ledger` 里标注「机制未核实」的条目 |
 | 架构决策与门禁 | `milestone.json` |
 | 课程表合不合规 | `milestone_validate.py milestone.json` |
 | 为什么某个候选被拒 | ledger 里该条的 `reason` |
@@ -253,6 +263,52 @@ arch agent 此时该做的是消融、给手段定价、必要时**重开 M0 的
 确需继续可以加 `--force`，但更有价值的做法是回头看开放问题清单：
 那里列着 msprof 分辨不了、因而一直没被回答的问题，其中可能藏着
 下一个数量级。
+
+### Q：裁决为什么是 `accept_unverified`？改动不是明明更快了吗？
+
+更快是真的，但没能确认**是你设计的机制起的作用**。
+
+增益超过噪声底只说明总时间变短了。它可能来自你的机制，也可能来自别的
+什么——两者在总时间上长得一模一样，但后者无法复用、无法解释、换个算子
+就不灵。
+
+`accept_unverified` 的改动会保留，但不计入 `best`，也不得作为知识库入库
+依据。要让它算数，record 时补上 `--signature`（signature_probe 的输出）
+与 `--milestone`，让机制行的停顿锚点真正被求值一次。
+
+最常见的原因其实是**没传这两个参数** —— 工具不替你假设「没查就是通过」。
+
+### Q：为什么连续几个编译错误没有触发架构重入？
+
+因为那是实现问题，不是架构问题。编译失败、精度不达标、评测缺失都计在
+`implementation_failures` 里，不消耗架构重入机会。
+
+只有「有有效测量但增益不足」才计进 `stagnation` —— 那才是架构层该关心的
+停滞。混在一起算，连续三个编译 bug 就会白白浪费一次重开架构的机会。
+
+### Q：重开 M0 的某个决策后，之前的实现还算数吗？
+
+不算，而且**不要自己记哪些要作废**，用：
+
+```bash
+campaign.py reopen --state <state> --milestone milestone.json --decision D0.1
+```
+
+它按 `depends_on` 算反向闭包，把所有直接或间接依赖该决策的台账记录标为
+作废，并重算 `best`。
+
+漏掉一条的后果很严重：新架构上还挂着建立在旧假设上的实现，测出来的增益
+归因就是错的 —— 而这恰恰发生在整个流程最关键的那一步上。
+
+### Q：promote 之后为什么不让我 record 了？
+
+因为噪声底还是上一代的。新参考是另一个二进制，运行时特征不同，而噪声底
+论文定义的是**同 job 噪声底**、每次 campaign 实测。
+
+```bash
+noise_floor.py --from-results <新一代首次评测结果>
+campaign.py set-noise-floor --state <state> --value <实测值>
+```
 
 ### Q：探针说「测量不可信，已扣留架构假设」，能不能忽略？
 

@@ -13,14 +13,12 @@
     "target_gain": 1.05,
     "noise_floor_pct": 2.3
   },
-
   "_channel_convention": [
     "性能与精度类指标写评测产物: evaluation_results.json:<字段路径>",
     "架构签名类指标写 msprof 产物: msprof:<CSV 文件>:<列名>",
     "切勿把架构签名写成 evaluation_results.json:*.pipeline.* —— 配对评测",
     "有意不采 msprof，那两个键恒为空，门禁会变成看起来在跑但什么都没验证"
   ],
-
   "resource_topology_contract": {
     "block_dim": {
       "value": 48,
@@ -48,7 +46,6 @@
       "channel": "msprof:PipeUtilization.csv:aiv_mte2_ratio"
     }
   },
-
   "milestones": [
     {
       "id": "M0",
@@ -71,7 +68,10 @@
           },
           "cost": "UB 占用随行长线性增长；行长超出单核 UB 余量时该决策失效，需回退到行内切分",
           "depends_on": [],
-          "verification_channel": "msprof:PipeUtilization.csv:aiv_mte2_ratio 应显著低于参考的 61.2"
+          "verification_channel": "msprof:PipeUtilization.csv:aiv_mte2_ratio 应显著低于参考的 61.2",
+          "recipes": [
+            "R-2201-001"
+          ]
         },
         {
           "id": "D0.2",
@@ -88,7 +88,9 @@
             }
           },
           "cost": "UB 中间缓冲翻倍，与 D0.1 的行常驻争用同一块 UB",
-          "depends_on": ["D0.1"],
+          "depends_on": [
+            "D0.1"
+          ],
           "verification_channel": "evaluation_results.json:aggregate.target.precision_passed"
         }
       ],
@@ -153,7 +155,9 @@
             }
           },
           "cost": "UB 占用翻倍，可能迫使 D0.1 的行常驻退让",
-          "depends_on": ["D0.1"],
+          "depends_on": [
+            "D0.1"
+          ],
           "verification_channel": "msprof:PipeUtilization.csv:aiv_vec_ratio 应上升，总时间下降"
         }
       ],

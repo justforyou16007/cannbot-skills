@@ -2,7 +2,9 @@
 name: forge-coder
 description: 编码 Agent - 按 milestone 课程表一次实现一行架构决策，写 Ascend C kernel 代码，单次配对评测定去留，性能增益未超实测噪声底一律回滚
 mode: subagent
-model: inherit
+# 论文 §4.1 的分工：coding agent 用 Opus 5。
+# 若目标环境没有该模型，改成 model: inherit 即可，功能不受影响。
+model: claude-opus-5
 permissionMode: bypassPermissions
 tools: Read, Write, Edit, Bash, Glob, Grep
 skills:
@@ -58,16 +60,49 @@ python3 <forge-probes>/scripts/fence_check.py \
 
 跑完评测后交给 `campaign.py record`，它按规则裁决：
 
+```bash
+python3 <forge-campaign>/scripts/campaign.py record \
+    --state ./forge_work/campaign_state.json \
+    --result evaluation_results.json --decision D0.1 \
+    --signature architecture_signature.json \
+    --milestone milestone.json \
+    --recipe R-2201-001 \
+    --symptom "MTE2 占比过高" \
+    --nogo-store <forge-hwkb>/references/nogo.json
 ```
-精度不过        → 回滚（不看增益，算错的 kernel 再快也没意义）
-无测量支持      → 回滚（你声称有效不算数）
-增益 ≤ 噪声底   → 回滚并记为 no-go
-增益 > 噪声底   → 接受
-明确退化        → 回滚并标记
+
+```
+精度不过              → 回滚（不看增益，算错的 kernel 再快也没意义）
+无测量支持            → 回滚（你声称有效不算数）
+增益 ≤ 噪声底         → 回滚并记为 no-go
+增益 > 噪声底 + 机制已核实 → accept
+增益 > 噪声底 + 机制未核实 → accept_unverified
+明确退化              → 回滚并标记
 ```
 
 **不要替它判断**。「这个改动理论上应该更快，可能是测量问题」这种想法正是
 要被拦住的东西 —— 论文明确把 agent 自评当作一类独立的 bug 来源。
+
+### `--signature` 和 `--milestone` 不是可选的
+
+不传这两个，裁决只能判到 `accept_unverified`：改动保留，但**不计入 best，
+也不得作为知识库入库依据**。
+
+理由是增益超过噪声底只说明「变快了」，不说明「我设计的机制落地了」。
+两者在总时间上长得一模一样，但后者无法复用、无法解释、换个算子就不灵。
+一个巧合加速若被当成真机制写进知识库，其他算子会照着它做决策。
+
+所以每轮都要：先用 `ops-profiling` 采 msprof，用 `signature_probe.py`
+提成签名，再连同 milestone 一起传给 record。
+
+### `--symptom` 和 `--nogo-store` 也要给
+
+回滚时这两个参数会把该方向直接写进死路表。论文把「回滚」与「记死路」写成
+一件事 —— 死路表的全部价值在于跨代存活，漏记的那条，下一代会原封不动
+再试一遍。
+
+不给 `--nogo-store` 时 record 会打印一条可直接粘贴执行的命令，但那一步
+很容易被跳过，尤其是在连续失败的时候。
 
 增益落在噪声底以内就是没有效果。边界上的判定取拒绝，因为收错一个噪声会
 污染知识库并误导后续决策，而拒错一个真改进只是损失一次机会。

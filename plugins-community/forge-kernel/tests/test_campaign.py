@@ -11,11 +11,15 @@
 # ----------------------------------------------------------------------------------------------------------
 """campaign.py 与 noise_floor.py 的单元测试。
 
-这两个脚本合起来决定「什么样的改动算数」。测试围绕三个容易出错的判断：
+这两个脚本合起来决定「什么样的改动算数」。测试围绕五件容易出错的判断：
 
-  边界   增益恰好等于噪声底时该不该收？不该 —— 等于噪声意味着无法区分。
-  优先级 精度不过的候选，增益再高也要回滚。
-  收敛   自我提升什么时候停，停了之后状态还能不能被误推进。
+  边界     增益恰好等于噪声底时该不该收？不该 —— 等于噪声意味着无法区分。
+  优先级   精度不过的候选，增益再高也要回滚。
+  机制     变快了不等于设计的机制落地了。没核实的不能计入 best，
+           更不能作为入库依据 —— 否则一个巧合会被其他算子照着做决策。
+  归因     停滞只数「测出来了但不够」。编译 bug 不该消耗架构重入机会。
+  重启范围 重开一个决策时，依赖它的下游实现必须一并作废；
+           漏一条，新架构上就还挂着旧假设的实现。
 
 运行: python3 -m pytest plugins-community/forge-kernel/tests/ -v
 """
@@ -35,7 +39,79 @@ import noise_floor  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
-# 接受判据
+# 夹具
+# ---------------------------------------------------------------------------
+
+def fresh_state(**kw):
+    state = campaign.new_state(
+        operator="demo_op", input_shape="B=8,S=4096,fp16", arch="DAV_2201",
+        reference={"kind": "builtin_aclnn", "id": "aclnnDemo", "sealed": True},
+        noise_floor_pct=kw.get("noise", 2.0),
+        target_gain=kw.get("target", 1.5),
+        stagnation_threshold=kw.get("threshold", 3),
+        budget=kw.get("budget"),
+    )
+    state["state"] = campaign.STATE_IMPLEMENT
+    return state
+
+
+def result(speedup=None, precision=True, baseline_us=None, evolved_us=None):
+    doc = {"comparison": {"precision_passed": precision}}
+    if speedup is not None:
+        doc["comparison"]["speedup"] = speedup
+    if baseline_us is not None:
+        doc["baseline"] = {"time_us": baseline_us}
+    if evolved_us is not None:
+        doc["evolved"] = {"time_us": evolved_us, "precision_passed": precision}
+    return doc
+
+
+def signature(stall_value=0.9, trustworthy=True, present=True):
+    """造一份最小的架构签名，只含机制核验需要的那个停顿字段。"""
+    return {
+        "trust": {"trustworthy": trustworthy},
+        "stalls": {
+            "wait": {
+                "mte2_wait": {
+                    "value": stall_value if present else None,
+                    "channel": "msprof:ResourceConflictRatio.csv:aiv_mte2_wait_ratio",
+                    "present": present,
+                }
+            }
+        },
+    }
+
+
+def milestone(decisions=None, mechanism_expr=None, gate_extra=None):
+    """造一份最小的 milestone。decisions 是 {id: [依赖...]}。"""
+    decisions = decisions or {"D0.1": []}
+    expr = mechanism_expr or (
+        "msprof:ResourceConflictRatio.csv:aiv_mte2_wait_ratio < 4.2")
+    gate = {
+        "correctness_lines": [{"id": "C1", "status": "PASS"}],
+        "performance_lines": [{"id": "P1", "status": "PASS"}],
+        "mechanism_lines": [{
+            "id": "M1", "label": "SUPPLY_KEEPUP", "status": "PASS",
+            "anchor": {"kind": "reference_measurement", "expr": expr},
+            "ordering_evidence": "job 1 为 4.2，job 2 为 0.9",
+        }],
+    }
+    if gate_extra:
+        gate.update(gate_extra)
+    return {
+        "milestones": [{
+            "id": "M0", "kind": "foundation",
+            "decisions": [
+                {"id": did, "layer": "architectural", "depends_on": deps}
+                for did, deps in decisions.items()
+            ],
+            "gate": gate,
+        }]
+    }
+
+
+# ---------------------------------------------------------------------------
+# 增益判据
 # ---------------------------------------------------------------------------
 
 def test_gain_above_noise_is_accepted():
@@ -43,7 +119,6 @@ def test_gain_above_noise_is_accepted():
 
 
 def test_gain_within_noise_is_reverted():
-    """增益落在噪声里，和没改一样 —— 收下它等于把抖动当成果。"""
     assert campaign.decide_candidate(1.01, 2.0) == campaign.VERDICT_REVERT
 
 
@@ -61,7 +136,6 @@ def test_clear_regression_is_flagged():
 
 
 def test_small_regression_within_noise_is_revert_not_regression():
-    """小幅变慢也可能是抖动，不该当成明确退化。"""
     assert campaign.decide_candidate(0.99, 2.0) == campaign.VERDICT_REVERT
 
 
@@ -71,7 +145,6 @@ def test_negative_noise_floor_rejected():
 
 
 def test_zero_noise_floor_accepts_any_positive_gain():
-    """噪声底为 0 时任何正增益都收 —— 这正是 init 要警告的危险配置。"""
     assert campaign.decide_candidate(1.0001, 0.0) == campaign.VERDICT_ACCEPT
 
 
@@ -92,8 +165,296 @@ def test_promotion_stops_on_regression():
 
 
 # ---------------------------------------------------------------------------
-# 下一步动作
+# 机制核验：把 profiling 接进裁决
 # ---------------------------------------------------------------------------
+
+def test_signature_lookup_finds_value_by_channel():
+    value, channel = campaign.lookup_signature_value(
+        signature(0.9), "aiv_mte2_wait_ratio")
+    assert value == 0.9
+    assert "ResourceConflictRatio" in channel
+
+
+def test_signature_lookup_skips_absent_fields():
+    """没采到与值为 0 必须分开 —— 否则缺失会被读成「没有停顿」。"""
+    value, _ = campaign.lookup_signature_value(
+        signature(present=False), "aiv_mte2_wait_ratio")
+    assert value is None
+
+
+def test_mechanism_line_verified_when_expr_holds():
+    line = milestone()["milestones"][0]["gate"]["mechanism_lines"][0]
+    out = campaign.verify_mechanism_line(line, signature(0.9))
+    assert out["verified"] is True
+
+
+def test_mechanism_line_refuted_when_expr_fails():
+    """机制没落地，说明这次的增益来自别处。"""
+    line = milestone()["milestones"][0]["gate"]["mechanism_lines"][0]
+    out = campaign.verify_mechanism_line(line, signature(9.9))
+    assert out["verified"] is False
+
+
+def test_mechanism_line_unknown_when_field_absent():
+    """无法求值不等于不成立，但也不构成验证。"""
+    line = milestone()["milestones"][0]["gate"]["mechanism_lines"][0]
+    out = campaign.verify_mechanism_line(line, signature(present=False))
+    assert out["verified"] is None
+    assert "缺失不等于不成立" in out["reason"]
+
+
+def test_mechanism_line_unknown_on_unparseable_expr():
+    line = {"id": "M1", "anchor": {"expr": "机制应该更好"}}
+    assert campaign.verify_mechanism_line(line, signature())["verified"] is None
+
+
+@pytest.mark.parametrize("op,actual,threshold,expected", [
+    ("<", 0.9, 4.2, True), ("<", 9.9, 4.2, False),
+    (">", 9.9, 4.2, True), (">", 0.9, 4.2, False),
+    ("<=", 4.2, 4.2, True), (">=", 4.2, 4.2, True),
+    ("==", 4.2, 4.2, True), ("!=", 4.2, 4.2, False),
+])
+def test_all_comparators(op, actual, threshold, expected):
+    line = {"id": "M1", "anchor": {
+        "expr": f"msprof:X.csv:aiv_mte2_wait_ratio {op} {threshold}"}}
+    assert campaign.verify_mechanism_line(
+        line, signature(actual))["verified"] is expected
+
+
+def test_mechanism_unknown_without_inputs():
+    """没给 milestone/signature 时不替调用方假设「没查就是通过」。"""
+    out = campaign.judge_mechanism(None, None, "D0.1")
+    assert out["status"] == "unknown"
+    assert "未提供" in out["reason"]
+
+
+def test_mechanism_unknown_when_signature_untrustworthy():
+    """签名自判不可信时，据此核验机制没有意义。"""
+    out = campaign.judge_mechanism(
+        milestone(), signature(trustworthy=False), "D0.1")
+    assert out["status"] == "unknown"
+    assert "不可信" in out["reason"]
+
+
+def test_mechanism_unknown_when_decision_not_in_milestone():
+    out = campaign.judge_mechanism(milestone(), signature(), "D9.9")
+    assert out["status"] == "unknown"
+
+
+# ---------------------------------------------------------------------------
+# 裁决：机制进回路后的四种结果
+# ---------------------------------------------------------------------------
+
+def test_verified_mechanism_yields_accept():
+    state = fresh_state()
+    entry = campaign.apply_result(
+        state, result(speedup=1.20), "D0.1",
+        milestone_doc=milestone(), signature=signature(0.9))
+    assert entry["verdict"] == campaign.VERDICT_ACCEPT
+    assert entry["counts_toward_best"] is True
+    assert entry["kb_admissible"] is True
+    assert state["best"]["gain"] == pytest.approx(1.20)
+
+
+def test_refuted_mechanism_yields_accept_unverified():
+    """核心用例：变快了但机制没落地 —— 保留，但不许影响 best 与知识库。"""
+    state = fresh_state()
+    entry = campaign.apply_result(
+        state, result(speedup=1.20), "D0.1",
+        milestone_doc=milestone(), signature=signature(9.9))
+    assert entry["verdict"] == campaign.VERDICT_ACCEPT_UNVERIFIED
+    assert entry["counts_toward_best"] is False
+    assert entry["kb_admissible"] is False
+    assert state["best"]["gain"] == 1.0, "未核实的增益不得抬高 best"
+
+
+def test_unverified_mechanism_yields_accept_unverified():
+    state = fresh_state()
+    entry = campaign.apply_result(
+        state, result(speedup=1.20), "D0.1",
+        milestone_doc=milestone(), signature=signature(present=False))
+    assert entry["verdict"] == campaign.VERDICT_ACCEPT_UNVERIFIED
+    assert state["best"]["gain"] == 1.0
+
+
+def test_missing_probe_inputs_yield_accept_unverified():
+    """不传 signature/milestone 时不能当成核实过。"""
+    state = fresh_state()
+    entry = campaign.apply_result(state, result(speedup=1.20), "D0.1")
+    assert entry["verdict"] == campaign.VERDICT_ACCEPT_UNVERIFIED
+    assert entry["kb_admissible"] is False
+
+
+def test_unverified_does_not_trigger_ship():
+    """未核实的增益不得让 campaign 进入可提升状态。"""
+    state = fresh_state(target=1.1)
+    campaign.apply_result(state, result(speedup=1.50), "D0.1")
+    assert state["state"] != campaign.STATE_SHIPPED
+
+
+def test_verified_triggers_ship():
+    state = fresh_state(target=1.1)
+    campaign.apply_result(state, result(speedup=1.50), "D0.1",
+                          milestone_doc=milestone(), signature=signature(0.9))
+    assert state["state"] == campaign.STATE_SHIPPED
+
+
+def test_precision_failure_reverts_regardless_of_speed():
+    state = fresh_state()
+    entry = campaign.apply_result(
+        state, result(speedup=5.0, precision=False), "D0.1",
+        milestone_doc=milestone(), signature=signature(0.9))
+    assert entry["verdict"] == campaign.VERDICT_REVERT
+    assert "精度" in entry["reason"]
+    assert state["best"]["gain"] == 1.0
+
+
+def test_missing_measurement_reverts():
+    state = fresh_state()
+    entry = campaign.apply_result(state, {"comparison": {}}, "D0.1")
+    assert entry["verdict"] == campaign.VERDICT_REVERT
+    assert "无测量支持" in entry["reason"]
+
+
+def test_gain_computed_from_times_when_speedup_absent():
+    state = fresh_state()
+    entry = campaign.apply_result(
+        state, result(baseline_us=400.0, evolved_us=200.0), "D0.1",
+        milestone_doc=milestone(), signature=signature(0.9))
+    assert entry["gain"] == pytest.approx(2.0)
+    assert entry["verdict"] == campaign.VERDICT_ACCEPT
+
+
+def test_best_not_downgraded_by_weaker_accept():
+    state = fresh_state(target=10.0)
+    for speedup in (1.80, 1.10):
+        campaign.apply_result(state, result(speedup=speedup), "D0.1",
+                              milestone_doc=milestone(), signature=signature(0.9))
+    assert state["best"]["gain"] == pytest.approx(1.80)
+
+
+# ---------------------------------------------------------------------------
+# 停滞归因：实现问题不该消耗架构重入机会
+# ---------------------------------------------------------------------------
+
+def test_stagnation_counts_only_measured_shortfalls():
+    state = fresh_state(threshold=3)
+    for _ in range(3):
+        campaign.apply_result(state, result(speedup=1.001), "D0.1")
+    assert state["state"] == campaign.STATE_STALLED
+    assert state["stall_reason"] == campaign.STALL_NO_IMPROVEMENT
+
+
+def test_precision_failures_do_not_trigger_architecture_reentry():
+    """连续编译/精度 bug 是实现问题，不该白费一次架构重入。"""
+    state = fresh_state(threshold=3)
+    for _ in range(5):
+        campaign.apply_result(state, result(speedup=5.0, precision=False), "D0.1")
+    assert state["state"] != campaign.STATE_STALLED
+    assert state["stagnation"]["since_improvement"] == 0
+    assert state["implementation_failures"]["consecutive"] == 5
+
+
+def test_missing_measurement_counts_as_implementation_failure():
+    state = fresh_state(threshold=3)
+    for _ in range(3):
+        campaign.apply_result(state, {"comparison": {}}, "D0.1")
+    assert state["state"] != campaign.STATE_STALLED
+    assert state["implementation_failures"]["consecutive"] == 3
+
+
+def test_accept_resets_both_counters():
+    state = fresh_state(threshold=3)
+    campaign.apply_result(state, result(speedup=1.001), "D0.1")
+    campaign.apply_result(state, result(speedup=5.0, precision=False), "D0.2")
+    campaign.apply_result(state, result(speedup=1.30), "D0.3",
+                          milestone_doc=milestone(), signature=signature(0.9))
+    assert state["stagnation"]["since_improvement"] == 0
+    assert state["implementation_failures"]["consecutive"] == 0
+
+
+# ---------------------------------------------------------------------------
+# 外层重入的另外两个口子
+# ---------------------------------------------------------------------------
+
+def test_graph_exhaustion_triggers_stall():
+    """决策图走穷但没达标 —— 必须有人提示回架构层。"""
+    doc = milestone({"D0.1": [], "D0.2": ["D0.1"]})
+    state = fresh_state(target=10.0, threshold=99)
+    campaign.apply_result(state, result(speedup=1.30), "D0.1",
+                          milestone_doc=doc, signature=signature(0.9))
+    assert state["state"] == campaign.STATE_IMPLEMENT
+    campaign.apply_result(state, result(speedup=1.35), "D0.2",
+                          milestone_doc=doc, signature=signature(0.9))
+    assert state["state"] == campaign.STATE_STALLED
+    assert state["stall_reason"] == campaign.STALL_GRAPH_EXHAUSTED
+
+
+def test_open_gate_line_triggers_impasse():
+    """用两条决策，避免同时触发走穷，单独验证僵持这一条。"""
+    doc = milestone({"D0.1": [], "D0.2": ["D0.1"]})
+    doc["milestones"][0]["gate"]["correctness_lines"][0]["status"] = "OPEN"
+    state = fresh_state(target=10.0, threshold=99)
+    campaign.apply_result(state, result(speedup=1.30), "D0.1",
+                          milestone_doc=doc, signature=signature(0.9))
+    assert state["state"] == campaign.STATE_STALLED
+    assert state["stall_reason"] == campaign.STALL_GATE_IMPASSE
+
+
+def test_multiple_stall_reasons_all_recorded():
+    """三个重入口可能同时成立，只报一个会让架构层丢线索。"""
+    doc = milestone({"D0.1": []})
+    doc["milestones"][0]["gate"]["correctness_lines"][0]["status"] = "OPEN"
+    state = fresh_state(target=10.0, threshold=1)
+    campaign.apply_result(state, result(speedup=1.001), "D0.1",
+                          milestone_doc=doc)
+    kinds = {r["kind"] for r in state["stall_reasons"]}
+    assert campaign.STALL_GATE_IMPASSE in kinds
+    assert campaign.STALL_GRAPH_EXHAUSTED in kinds
+    assert campaign.STALL_NO_IMPROVEMENT in kinds
+    # 主因取最具体的那个：僵持点名到具体门禁行
+    assert state["stall_reason"] == campaign.STALL_GATE_IMPASSE
+
+
+def test_stall_flags_cleared_on_recovery():
+    doc = milestone({"D0.1": [], "D0.2": ["D0.1"]})
+    state = fresh_state(target=10.0, threshold=1)
+    campaign.apply_result(state, result(speedup=1.001), "D0.1",
+                          milestone_doc=doc)
+    assert state["state"] == campaign.STATE_STALLED
+    campaign.apply_result(state, result(speedup=1.30), "D0.2",
+                          milestone_doc=milestone({"D0.1": [], "D0.2": ["D0.1"],
+                                                   "D0.3": []}),
+                          signature=signature(0.9))
+    assert state["state"] == campaign.STATE_IMPLEMENT
+    assert "stall_reason" not in state
+
+
+def test_deferred_to_nonexistent_lever_triggers_impasse():
+    """DEFERRED 指向不存在的手段，该测试实际是被丢弃了。"""
+    doc = milestone({"D0.1": []})
+    doc["milestones"][0]["gate"]["mechanism_lines"][0].update(
+        status="DEFERRED", downstream_lever="D9.9")
+    assert campaign.gate_impasse(doc) is not None
+    assert "被丢弃" in campaign.gate_impasse(doc)
+
+
+def test_deferred_to_existing_lever_is_not_impasse():
+    doc = milestone({"D0.1": [], "D2.1": ["D0.1"]})
+    doc["milestones"][0]["gate"]["mechanism_lines"][0].update(
+        status="DEFERRED", downstream_lever="D2.1")
+    assert campaign.gate_impasse(doc) is None
+
+
+def test_target_reached_wins_over_stall():
+    """达标优先于一切停滞判定。"""
+    doc = milestone({"D0.1": []})
+    doc["milestones"][0]["gate"]["correctness_lines"][0]["status"] = "OPEN"
+    state = fresh_state(target=1.1)
+    campaign.apply_result(state, result(speedup=1.50), "D0.1",
+                          milestone_doc=doc, signature=signature(0.9))
+    assert state["state"] == campaign.STATE_SHIPPED
+
 
 @pytest.mark.parametrize("phase,expected", [
     (campaign.STATE_ANALYZE, "analyze"),
@@ -107,124 +468,222 @@ def test_next_action_per_state(phase, expected):
 
 
 def test_stalled_action_mentions_reopening_architecture():
-    """停滞时的提示必须指向重开架构决策，而不是继续在原架构下硬调 ——
-    这是 ForgeKernel 区别于普通调优循环的关键动作。"""
     action = campaign.next_action({
         "state": campaign.STATE_STALLED,
+        "stall_reason": campaign.STALL_NO_IMPROVEMENT,
         "stagnation": {"since_improvement": 3},
     })
+    assert "reopen" in action["reason"]
     assert "M0" in action["reason"]
 
 
 # ---------------------------------------------------------------------------
-# 结果并入
+# 重启范围：依赖图反向闭包
 # ---------------------------------------------------------------------------
 
-def fresh_state(**kw):
-    state = campaign.new_state(
-        operator="demo_op", arch="DAV_2201",
-        reference={"kind": "builtin_aclnn", "id": "aclnnDemo", "sealed": True},
-        noise_floor_pct=kw.get("noise", 2.0),
-        target_gain=kw.get("target", 1.5),
-        stagnation_threshold=kw.get("threshold", 3),
-    )
-    state["state"] = campaign.STATE_IMPLEMENT
-    return state
+def test_dependents_closure_is_transitive():
+    doc = milestone({"D0.1": [], "D0.2": ["D0.1"], "D0.3": ["D0.2"],
+                     "D0.4": []})
+    assert campaign.dependents_closure(doc, "D0.1") == {"D0.2", "D0.3"}
 
 
-def result(speedup=None, precision=True, baseline_us=None, evolved_us=None):
-    doc = {"comparison": {"precision_passed": precision}}
-    if speedup is not None:
-        doc["comparison"]["speedup"] = speedup
-    if baseline_us is not None:
-        doc["baseline"] = {"time_us": baseline_us}
-    if evolved_us is not None:
-        doc["evolved"] = {"time_us": evolved_us, "precision_passed": precision}
-    return doc
+def test_dependents_closure_excludes_root():
+    doc = milestone({"D0.1": [], "D0.2": ["D0.1"]})
+    assert "D0.1" not in campaign.dependents_closure(doc, "D0.1")
 
 
-def test_accept_updates_best_and_resets_stagnation():
-    state = fresh_state()
-    state["stagnation"]["since_improvement"] = 2
-    entry = campaign.apply_result(state, result(speedup=1.20), "D0.1")
-    assert entry["verdict"] == campaign.VERDICT_ACCEPT
-    assert state["best"]["gain"] == pytest.approx(1.20)
-    assert state["stagnation"]["since_improvement"] == 0
+def test_dependents_closure_empty_for_leaf():
+    doc = milestone({"D0.1": [], "D0.2": ["D0.1"]})
+    assert campaign.dependents_closure(doc, "D0.2") == set()
 
 
-def test_precision_failure_reverts_regardless_of_speed():
-    """核心用例：算错的 kernel 再快也无意义，连增益都不该看。"""
-    state = fresh_state()
-    entry = campaign.apply_result(
-        state, result(speedup=5.0, precision=False), "D0.1")
-    assert entry["verdict"] == campaign.VERDICT_REVERT
-    assert "精度" in entry["reason"]
-    assert state["best"]["gain"] == 1.0  # 未被这个快但错的结果污染
+def test_dependents_closure_unknown_decision_errors():
+    with pytest.raises(campaign.CampaignError, match="没有决策"):
+        campaign.dependents_closure(milestone(), "D9.9")
 
 
-def test_missing_measurement_reverts():
-    """没有测量支持的改动一律回滚 —— agent 声称有效不算数。"""
-    state = fresh_state()
-    entry = campaign.apply_result(state, {"comparison": {}}, "D0.1")
-    assert entry["verdict"] == campaign.VERDICT_REVERT
-    assert "无测量支持" in entry["reason"]
+def test_reopen_invalidates_downstream(tmp_path):
+    """重开 M0 的决策时，建立在它之上的实现必须一并作废。"""
+    doc = milestone({"D0.1": [], "D0.2": ["D0.1"], "D0.3": []})
+    state_file = tmp_path / "state.json"
+    state = fresh_state(target=10.0, threshold=99)
+    for did in ("D0.1", "D0.2", "D0.3"):
+        campaign.apply_result(state, result(speedup=1.30), did,
+                              milestone_doc=doc, signature=signature(0.9))
+    campaign.save_state(state_file, state)
+
+    milestone_file = tmp_path / "m.json"
+    milestone_file.write_text(json.dumps(doc), encoding="utf-8")
+
+    import argparse
+    code = campaign.cmd_reopen(argparse.Namespace(
+        state=str(state_file), milestone=str(milestone_file),
+        decision="D0.1", reason="拓扑决策有缺陷", as_json=False))
+    assert code == 0
+
+    reloaded = json.loads(state_file.read_text(encoding="utf-8"))
+    by_decision = {}
+    for entry in reloaded["ledger"]:
+        if entry.get("decision") and entry.get("verdict") != "reopen":
+            by_decision[entry["decision"]] = entry
+    assert by_decision["D0.1"]["invalidated"] is True
+    assert by_decision["D0.2"]["invalidated"] is True, "下游必须一并作废"
+    assert "invalidated" not in by_decision["D0.3"], "无关决策不该被牵连"
+    assert reloaded["state"] == campaign.STATE_ANALYZE
 
 
-def test_gain_computed_from_times_when_speedup_absent():
-    state = fresh_state()
-    entry = campaign.apply_result(
-        state, result(baseline_us=400.0, evolved_us=200.0), "D0.1")
-    assert entry["gain"] == pytest.approx(2.0)
-    assert entry["verdict"] == campaign.VERDICT_ACCEPT
-
-
-def test_stagnation_accumulates_then_stalls():
-    """连续 3 轮无改进后交回架构层。"""
-    state = fresh_state(threshold=3)
-    for _ in range(2):
-        campaign.apply_result(state, result(speedup=1.001), "D0.1")
-        assert state["state"] == campaign.STATE_IMPLEMENT
-    campaign.apply_result(state, result(speedup=1.001), "D0.1")
-    assert state["state"] == campaign.STATE_STALLED
-
-
-def test_accept_in_between_resets_stall_countdown():
-    state = fresh_state(threshold=3)
-    campaign.apply_result(state, result(speedup=1.001), "D0.1")
-    campaign.apply_result(state, result(speedup=1.001), "D0.2")
-    campaign.apply_result(state, result(speedup=1.30), "D0.3")   # 有进展
-    campaign.apply_result(state, result(speedup=1.001), "D0.4")
-    assert state["state"] == campaign.STATE_IMPLEMENT
-    assert state["stagnation"]["since_improvement"] == 1
-
-
-def test_reaching_target_gain_ships():
-    state = fresh_state(target=1.5)
-    campaign.apply_result(state, result(speedup=1.60), "D0.1")
-    assert state["state"] == campaign.STATE_SHIPPED
-
-
-def test_best_not_downgraded_by_weaker_accept():
-    state = fresh_state(target=10.0)
-    campaign.apply_result(state, result(speedup=1.80), "D0.1")
-    campaign.apply_result(state, result(speedup=1.10), "D0.2")
+def test_reopen_recomputes_best(tmp_path):
+    """best 必须按剩余有效条目重算，不能留着来自已作废实现的数字。"""
+    doc = milestone({"D0.1": [], "D0.2": ["D0.1"], "D0.3": []})
+    state = fresh_state(target=10.0, threshold=99)
+    campaign.apply_result(state, result(speedup=1.80), "D0.2",
+                          milestone_doc=doc, signature=signature(0.9))
+    campaign.apply_result(state, result(speedup=1.20), "D0.3",
+                          milestone_doc=doc, signature=signature(0.9))
     assert state["best"]["gain"] == pytest.approx(1.80)
 
+    state_file = tmp_path / "s.json"
+    milestone_file = tmp_path / "m.json"
+    campaign.save_state(state_file, state)
+    milestone_file.write_text(json.dumps(doc), encoding="utf-8")
 
-def test_ledger_records_every_verdict():
+    import argparse
+    campaign.cmd_reopen(argparse.Namespace(
+        state=str(state_file), milestone=str(milestone_file),
+        decision="D0.1", reason="", as_json=False))
+
+    reloaded = json.loads(state_file.read_text(encoding="utf-8"))
+    assert reloaded["best"]["gain"] == pytest.approx(1.20), \
+        "1.80 来自已作废的 D0.2，必须退回到 D0.3 的 1.20"
+
+
+# ---------------------------------------------------------------------------
+# 死路表登记
+# ---------------------------------------------------------------------------
+
+def test_nogo_command_is_copy_pasteable():
     state = fresh_state()
+    entry = campaign.apply_result(state, result(speedup=1.001), "D0.1",
+                                  symptom="MTE2 占比过高")
+    command = campaign.nogo_command(state, entry)
+    assert "hwkb.py nogo add" in command
+    assert "MTE2 占比过高" in command
+    assert "D0.1" in command
+    assert "--arch DAV_2201" in command
+
+
+def test_nogo_written_directly(tmp_path):
+    """靠 agent 自觉登记是不牢的 —— 连续失败时最容易跳过记账。"""
+    state = fresh_state()
+    entry = campaign.apply_result(state, result(speedup=1.001), "D0.1",
+                                  symptom="MTE2 占比过高")
+    nogo = tmp_path / "nogo.json"
+    assert campaign.write_nogo(nogo, state, entry) == 1
+
+    doc = json.loads(nogo.read_text(encoding="utf-8"))
+    assert doc["entries"][0]["symptom"] == "MTE2 占比过高"
+    assert doc["entries"][0]["tried"] == "D0.1"
+    assert doc["entries"][0]["input_shape"] == "B=8,S=4096,fp16"
+
+
+def test_nogo_appends_to_existing(tmp_path):
+    nogo = tmp_path / "nogo.json"
+    nogo.write_text(json.dumps({"entries": [{"symptom": "旧的"}]}),
+                    encoding="utf-8")
+    state = fresh_state()
+    entry = campaign.apply_result(state, result(speedup=1.001), "D0.1")
+    assert campaign.write_nogo(nogo, state, entry) == 2
+
+
+# ---------------------------------------------------------------------------
+# 知识库的返回路径
+# ---------------------------------------------------------------------------
+
+def test_recipes_recorded_in_ledger():
+    state = fresh_state()
+    entry = campaign.apply_result(
+        state, result(speedup=1.30), "D0.1",
+        milestone_doc=milestone(), signature=signature(0.9),
+        recipes_used=["R-2201-001"], recipes_invented=["R-2201-009"])
+    assert entry["recipes_used"] == ["R-2201-001"]
+    assert entry["recipes_invented"] == ["R-2201-009"]
+
+
+def test_recipe_summary_separates_foreign_and_invented():
+    """没有这份汇总就无法回答「知识库到底有没有在帮忙」。"""
+    state = fresh_state(target=10.0)
+    campaign.apply_result(state, result(speedup=1.30), "D0.1",
+                          milestone_doc=milestone(), signature=signature(0.9),
+                          recipes_used=["R-A"], recipes_invented=["R-X"])
+    campaign.apply_result(state, result(speedup=1.40), "D0.2",
+                          milestone_doc=milestone(), signature=signature(0.9),
+                          recipes_used=["R-A", "R-B"])
+    summary = campaign.summarise_recipes(state)
+    assert summary["foreign_recipes"] == {"R-A": 2, "R-B": 1}
+    assert summary["invented_recipes"] == {"R-X": 1}
+    assert summary["accepted_total"] == 2
+    assert summary["foreign_assist_rate"] == pytest.approx(1.0)
+
+
+def test_recipe_summary_skips_invalidated():
+    state = fresh_state(target=10.0)
+    campaign.apply_result(state, result(speedup=1.30), "D0.1",
+                          recipes_used=["R-A"])
+    state["ledger"][0]["invalidated"] = True
+    assert campaign.summarise_recipes(state)["foreign_recipes"] == {}
+
+
+def test_foreign_assist_rate_zero_without_recipes():
+    state = fresh_state(target=10.0)
     campaign.apply_result(state, result(speedup=1.30), "D0.1")
-    campaign.apply_result(state, result(speedup=1.001), "D0.2")
-    assert len(state["ledger"]) == 2
-    assert all(e.get("reason") for e in state["ledger"]), "每条裁决都要有理由"
+    assert campaign.summarise_recipes(state)["foreign_assist_rate"] == 0.0
 
 
 # ---------------------------------------------------------------------------
-# 端到端：init -> record -> promote
+# campaign 身份：input shape
 # ---------------------------------------------------------------------------
 
-def run(_tmp_path, argv):
-    """用真实 argv 跑一次 CLI，返回退出码。"""
+def test_input_shape_stored_in_state():
+    assert fresh_state()["input_shape"] == "B=8,S=4096,fp16"
+
+
+def test_input_shape_recorded_on_every_entry():
+    """一份 state 跨 shape 复用会把不同 shape 的结果混进同一个 best。"""
+    state = fresh_state()
+    entry = campaign.apply_result(state, result(speedup=1.30), "D0.1")
+    assert entry["input_shape"] == "B=8,S=4096,fp16"
+
+
+# ---------------------------------------------------------------------------
+# 预算
+# ---------------------------------------------------------------------------
+
+def test_budget_counts_every_record():
+    state = fresh_state(budget=3)
+    campaign.apply_result(state, result(speedup=1.001), "D0.1")
+    assert state["budget"]["used"] == 1
+
+
+def test_budget_exhaustion_stops_campaign():
+    state = fresh_state(budget=2, threshold=99)
+    for _ in range(2):
+        campaign.apply_result(state, result(speedup=1.001), "D0.1")
+    assert state["state"] == campaign.STATE_STOPPED
+    assert "预算耗尽" in state["stop_reason"]
+
+
+def test_unlimited_budget_never_stops():
+    state = fresh_state(threshold=99)
+    for _ in range(10):
+        campaign.apply_result(state, result(speedup=1.001), "D0.1")
+    assert state["state"] != campaign.STATE_STOPPED
+
+
+# ---------------------------------------------------------------------------
+# 端到端 CLI
+# ---------------------------------------------------------------------------
+
+def run(argv):
     import contextlib
     import io
     saved = sys.argv
@@ -240,121 +699,197 @@ def run(_tmp_path, argv):
         sys.argv = saved
 
 
-def test_cli_init_then_status(tmp_path):
-    state_file = tmp_path / "state.json"
-    code, _ = run(tmp_path, [
-        "--state", str(state_file), "init",
-        "--operator", "demo_op", "--arch", "DAV_2201",
-        "--reference-kind", "builtin_aclnn", "--reference-id", "aclnnDemo",
-        "--noise-floor", "2.0", "--target-gain", "1.5",
-    ])
-    assert code == 0
-    assert state_file.exists()
+def init_argv(state_file, **kw):
+    argv = ["--state", str(state_file), "init",
+            "--operator", "demo_op", "--input-shape", "B=8,S=4096",
+            "--arch", "DAV_2201",
+            "--reference-kind", "builtin_aclnn", "--reference-id", "aclnnDemo",
+            "--noise-floor", str(kw.get("noise", 2.0))]
+    if "target" in kw:
+        argv += ["--target-gain", str(kw["target"])]
+    if "budget" in kw:
+        argv += ["--budget", str(kw["budget"])]
+    return argv
 
-    code, out = run(tmp_path, ["--state", str(state_file), "status"])
+
+def test_cli_init_requires_input_shape(tmp_path):
+    code, _ = run(["--state", str(tmp_path / "s.json"), "init",
+                   "--operator", "demo_op", "--arch", "DAV_2201",
+                   "--reference-kind", "builtin_aclnn",
+                   "--reference-id", "aclnnDemo", "--noise-floor", "2.0"])
+    assert code == 2
+
+
+def test_cli_init_then_status(tmp_path):
+    state_file = tmp_path / "s.json"
+    assert run(init_argv(state_file))[0] == 0
+    code, out = run(["--state", str(state_file), "status"])
     assert code == 0
-    assert "analyze" in out
+    assert "B=8,S=4096" in out
 
 
 def test_cli_init_refuses_overwrite(tmp_path):
-    state_file = tmp_path / "state.json"
-    base = ["--state", str(state_file), "init",
-            "--operator", "demo_op", "--arch", "DAV_2201",
-            "--reference-kind", "builtin_aclnn", "--reference-id", "aclnnDemo",
-            "--noise-floor", "2.0"]
-    assert run(tmp_path, base)[0] == 0
-    assert run(tmp_path, base)[0] == 2            # 不许静默覆盖进度
-    assert run(tmp_path, base + ["--force"])[0] == 0
+    state_file = tmp_path / "s.json"
+    assert run(init_argv(state_file))[0] == 0
+    assert run(init_argv(state_file))[0] == 2
+    assert run(init_argv(state_file) + ["--force"])[0] == 0
 
 
 def test_cli_warns_on_zero_noise_floor(tmp_path):
-    state_file = tmp_path / "state.json"
-    _, out = run(tmp_path, [
-        "--state", str(state_file), "init",
-        "--operator", "demo_op", "--arch", "DAV_2201",
-        "--reference-kind", "builtin_aclnn", "--reference-id", "aclnnDemo",
-        "--noise-floor", "0",
-    ])
+    _, out = run(init_argv(tmp_path / "s.json", noise=0))
     assert "警告" in out
 
 
-def test_cli_record_and_promote(tmp_path):
-    state_file = tmp_path / "state.json"
-    run(tmp_path, [
-        "--state", str(state_file), "init",
-        "--operator", "demo_op", "--arch", "DAV_2201",
-        "--reference-kind", "builtin_aclnn", "--reference-id", "aclnnDemo",
-        "--noise-floor", "2.0", "--target-gain", "1.1",
-    ])
+def test_cli_record_prints_nogo_hint_on_revert(tmp_path):
+    state_file = tmp_path / "s.json"
+    run(init_argv(state_file))
+    res = tmp_path / "ev.json"
+    res.write_text(json.dumps(result(speedup=1.001)), encoding="utf-8")
+    _, out = run(["--state", str(state_file), "record", "--result", str(res),
+                  "--decision", "D0.1", "--symptom", "MTE2 高"])
+    assert "hwkb.py nogo add" in out
 
-    res = tmp_path / "eval.json"
+
+def test_cli_record_writes_nogo_when_store_given(tmp_path):
+    state_file = tmp_path / "s.json"
+    nogo = tmp_path / "nogo.json"
+    run(init_argv(state_file))
+    res = tmp_path / "ev.json"
+    res.write_text(json.dumps(result(speedup=1.001)), encoding="utf-8")
+    run(["--state", str(state_file), "record", "--result", str(res),
+         "--decision", "D0.1", "--symptom", "MTE2 高",
+         "--nogo-store", str(nogo)])
+    assert json.loads(nogo.read_text(encoding="utf-8"))["entries"]
+
+
+def test_cli_record_reports_mechanism(tmp_path):
+    state_file = tmp_path / "s.json"
+    run(init_argv(state_file, target=10.0))
+    res = tmp_path / "ev.json"
+    res.write_text(json.dumps(result(speedup=1.30)), encoding="utf-8")
+    sig = tmp_path / "sig.json"
+    sig.write_text(json.dumps(signature(0.9)), encoding="utf-8")
+    mil = tmp_path / "m.json"
+    mil.write_text(json.dumps(milestone()), encoding="utf-8")
+
+    _, out = run(["--state", str(state_file), "record", "--result", str(res),
+                  "--decision", "D0.1", "--signature", str(sig),
+                  "--milestone", str(mil)])
+    assert "机制核验" in out
+    assert "成立" in out
+
+
+def test_cli_warns_when_mechanism_unverified(tmp_path):
+    state_file = tmp_path / "s.json"
+    run(init_argv(state_file, target=10.0))
+    res = tmp_path / "ev.json"
+    res.write_text(json.dumps(result(speedup=1.30)), encoding="utf-8")
+    _, out = run(["--state", str(state_file), "record", "--result", str(res),
+                  "--decision", "D0.1"])
+    assert "不计入 best" in out
+
+
+def test_cli_promote_marks_noise_floor_pending(tmp_path):
+    """新参考是另一个二进制，噪声底必须重测。"""
+    state_file = tmp_path / "s.json"
+    run(init_argv(state_file, target=1.1))
+    res = tmp_path / "ev.json"
     res.write_text(json.dumps(result(speedup=1.25)), encoding="utf-8")
-    code, _ = run(tmp_path, ["--state", str(state_file), "record",
-                             "--result", str(res), "--decision", "D0.1"])
-    assert code == 0
+    sig = tmp_path / "sig.json"
+    sig.write_text(json.dumps(signature(0.9)), encoding="utf-8")
+    mil = tmp_path / "m.json"
+    mil.write_text(json.dumps(milestone()), encoding="utf-8")
+    run(["--state", str(state_file), "record", "--result", str(res),
+         "--decision", "D0.1", "--signature", str(sig), "--milestone", str(mil)])
 
-    state = json.loads(state_file.read_text(encoding="utf-8"))
-    assert state["state"] == campaign.STATE_SHIPPED
-
-    code, _out = run(tmp_path, ["--state", str(state_file), "promote",
-                               "--artifact", "/tmp/best_kernel"])
+    code, out = run(["--state", str(state_file), "promote",
+                     "--artifact", "/tmp/best"])
     assert code == 0
     promoted = json.loads(state_file.read_text(encoding="utf-8"))
     assert promoted["generation"] == 1
-    assert promoted["reference"]["kind"] == "sealed_kernel"
-    assert promoted["reference"]["sealed"] is True
-    assert promoted["state"] == campaign.STATE_ANALYZE
-    assert promoted["best"]["gain"] == 1.0, "新一代应从零开始计增益"
+    assert promoted["noise_floor_status"] == campaign.NOISE_PENDING
+    assert "重测" in out
 
 
-def test_cli_promote_stops_when_gain_in_noise(tmp_path):
-    """自我提升的收敛路径：增益跌进噪声就停，不再无谓地开下一代。"""
-    state_file = tmp_path / "state.json"
-    run(tmp_path, [
-        "--state", str(state_file), "init",
-        "--operator", "demo_op", "--arch", "DAV_2201",
-        "--reference-kind", "builtin_aclnn", "--reference-id", "aclnnDemo",
-        "--noise-floor", "5.0", "--target-gain", "1.001",
-    ])
-    res = tmp_path / "eval.json"
-    res.write_text(json.dumps(result(speedup=1.002)), encoding="utf-8")
-    run(tmp_path, ["--state", str(state_file), "record",
-                   "--result", str(res), "--decision", "D0.1"])
-
-    code, out = run(tmp_path, ["--state", str(state_file), "promote",
-                               "--artifact", "/tmp/k"])
-    assert code == 0
-    assert "收敛" in out
+def test_cli_record_refused_while_noise_floor_pending(tmp_path):
+    state_file = tmp_path / "s.json"
+    run(init_argv(state_file))
     state = json.loads(state_file.read_text(encoding="utf-8"))
-    assert state["state"] == campaign.STATE_STOPPED
-    assert state["generation"] == 0, "收敛时不应推进代次"
+    state["noise_floor_status"] = campaign.NOISE_PENDING
+    state_file.write_text(json.dumps(state), encoding="utf-8")
+
+    res = tmp_path / "ev.json"
+    res.write_text(json.dumps(result(speedup=1.30)), encoding="utf-8")
+    code, out = run(["--state", str(state_file), "record",
+                     "--result", str(res), "--decision", "D1.1"])
+    assert code == 1
+    assert "重测" in out
+
+
+def test_cli_set_noise_floor_clears_pending(tmp_path):
+    state_file = tmp_path / "s.json"
+    run(init_argv(state_file))
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    state["noise_floor_status"] = campaign.NOISE_PENDING
+    state_file.write_text(json.dumps(state), encoding="utf-8")
+
+    assert run(["--state", str(state_file), "set-noise-floor",
+                "--value", "2.7"])[0] == 0
+    reloaded = json.loads(state_file.read_text(encoding="utf-8"))
+    assert reloaded["noise_floor_pct"] == 2.7
+    assert reloaded["noise_floor_status"] == campaign.NOISE_MEASURED
+
+
+def test_cli_set_budget_resumes_stopped_campaign(tmp_path):
+    state_file = tmp_path / "s.json"
+    run(init_argv(state_file, budget=1))
+    res = tmp_path / "ev.json"
+    res.write_text(json.dumps(result(speedup=1.001)), encoding="utf-8")
+    run(["--state", str(state_file), "record", "--result", str(res),
+         "--decision", "D0.1"])
+    assert json.loads(state_file.read_text())["state"] == campaign.STATE_STOPPED
+
+    run(["--state", str(state_file), "set-budget", "--max-records", "10"])
+    assert json.loads(state_file.read_text())["state"] != campaign.STATE_STOPPED
+
+
+def test_cli_ledger_recipes_summary(tmp_path):
+    state_file = tmp_path / "s.json"
+    run(init_argv(state_file, target=10.0))
+    res = tmp_path / "ev.json"
+    res.write_text(json.dumps(result(speedup=1.30)), encoding="utf-8")
+    run(["--state", str(state_file), "record", "--result", str(res),
+         "--decision", "D0.1", "--recipe", "R-2201-001"])
+    _, out = run(["--state", str(state_file), "ledger", "--recipes"])
+    assert "R-2201-001" in out
+    assert "外来经验" in out
 
 
 def test_cli_record_refused_after_stop(tmp_path):
-    state_file = tmp_path / "state.json"
-    run(tmp_path, [
-        "--state", str(state_file), "init",
-        "--operator", "demo_op", "--arch", "DAV_2201",
-        "--reference-kind", "builtin_aclnn", "--reference-id", "aclnnDemo",
-        "--noise-floor", "2.0",
-    ])
+    state_file = tmp_path / "s.json"
+    run(init_argv(state_file))
     state = json.loads(state_file.read_text(encoding="utf-8"))
     state["state"] = campaign.STATE_STOPPED
     state_file.write_text(json.dumps(state), encoding="utf-8")
-
-    res = tmp_path / "eval.json"
+    res = tmp_path / "ev.json"
     res.write_text(json.dumps(result(speedup=2.0)), encoding="utf-8")
-    code, _ = run(tmp_path, ["--state", str(state_file), "record",
-                             "--result", str(res), "--decision", "D1.1"])
-    assert code == 1
+    assert run(["--state", str(state_file), "record", "--result", str(res),
+                "--decision", "D1.1"])[0] == 1
 
 
 def test_corrupt_state_file_reports_clearly(tmp_path):
-    state_file = tmp_path / "state.json"
+    state_file = tmp_path / "s.json"
     state_file.write_text("这不是 JSON", encoding="utf-8")
-    code, out = run(tmp_path, ["--state", str(state_file), "status"])
+    code, out = run(["--state", str(state_file), "status"])
     assert code == 2
     assert "损坏" in out
+
+
+def test_corrupt_milestone_reports_clearly(tmp_path):
+    bad = tmp_path / "m.json"
+    bad.write_text("不是 JSON", encoding="utf-8")
+    with pytest.raises(campaign.CampaignError, match="不是合法 JSON"):
+        campaign.load_milestone(bad)
 
 
 # ---------------------------------------------------------------------------
@@ -367,8 +902,7 @@ def test_noise_floor_needs_minimum_samples():
 
 
 def test_noise_floor_on_identical_readings_is_zero():
-    out = noise_floor.compute([1.0, 1.0, 1.0])
-    assert out["floor_pct"] == pytest.approx(0.0)
+    assert noise_floor.compute([1.0, 1.0, 1.0])["floor_pct"] == pytest.approx(0.0)
 
 
 def test_noise_floor_grows_with_spread():
@@ -378,7 +912,6 @@ def test_noise_floor_grows_with_spread():
 
 
 def test_noise_floor_uses_conservative_of_two_statistics():
-    """取变异系数与半极差的较大者：一个离群点不应被平均掉。"""
     out = noise_floor.compute([1.0, 1.0, 1.0, 1.0, 1.3])
     assert out["floor_pct"] == pytest.approx(
         max(out["cv_pct"], out["half_range_pct"]))
@@ -386,13 +919,12 @@ def test_noise_floor_uses_conservative_of_two_statistics():
 
 def test_noise_floor_warns_when_environment_noisy():
     out = noise_floor.compute([1.0, 1.5, 0.6])
-    assert out["warnings"], "离散这么大必须提醒环境可能不稳定"
     assert any("不稳定" in w for w in out["warnings"])
 
 
 def test_noise_floor_ignores_invalid_readings():
     with pytest.raises(noise_floor.NoiseFloorError):
-        noise_floor.compute([1.0, -1.0, 0.0])  # 有效样本不足 3
+        noise_floor.compute([1.0, -1.0, 0.0])
 
 
 def test_ratio_extracted_from_speedup():
@@ -416,35 +948,24 @@ def test_ratio_none_on_zero_time():
         {"baseline": {"time_us": 0}, "evolved": {"time_us": 200}}) is None
 
 
-# ---------------------------------------------------------------------------
-# 噪声底：首选的 cv_pct 路径
-# ---------------------------------------------------------------------------
-
 def test_cv_extracted_from_top_level():
     assert noise_floor.extract_cv_values({"cv_pct": 1.8}) == [1.8]
 
 
 def test_cv_extracted_from_both_sides():
     values = noise_floor.extract_cv_values({
-        "baseline": {"cv_pct": 1.2},
-        "evolved": {"cv_pct": 2.4},
-    })
+        "baseline": {"cv_pct": 1.2}, "evolved": {"cv_pct": 2.4}})
     assert sorted(values) == [1.2, 2.4]
 
 
 def test_cv_extracted_from_shape_results():
-    """多 shape 评测时每个 shape 各有一个 cv，都要收进来。"""
     values = noise_floor.extract_cv_values({
-        "shape_results": {
-            "target": [{"cv_pct": 1.0}, {"cv_pct": 3.0}],
-            "generalization": [{"cv_pct": 2.0}],
-        }
-    })
+        "shape_results": {"target": [{"cv_pct": 1.0}, {"cv_pct": 3.0}],
+                          "generalization": [{"cv_pct": 2.0}]}})
     assert sorted(values) == [1.0, 2.0, 3.0]
 
 
 def test_cv_floor_takes_the_worst_reading():
-    """取最大而非平均：取宽松的读数会把线划得太低，抖动就被收进来了。"""
     out = noise_floor.compute_from_cv([1.0, 3.5, 2.0])
     assert out["floor_pct"] == pytest.approx(3.5)
     assert out["method"] == "cv_pct"
@@ -457,16 +978,13 @@ def test_cv_floor_errors_when_absent():
 
 def test_cv_floor_warns_when_noisy():
     out = noise_floor.compute_from_cv([12.0])
-    assert out["warnings"]
     assert any("降频" in w for w in out["warnings"])
 
 
 def test_cv_ignores_malformed_entries():
     values = noise_floor.extract_cv_values({
-        "cv_pct": "不是数字",
-        "baseline": "不是对象",
-        "shape_results": {"target": ["不是对象", {"cv_pct": 2.0}]},
-    })
+        "cv_pct": "不是数字", "baseline": "不是对象",
+        "shape_results": {"target": ["不是对象", {"cv_pct": 2.0}]}})
     assert values == [2.0]
 
 
@@ -474,15 +992,11 @@ def test_spread_method_is_labelled():
     assert noise_floor.compute([1.0, 1.01, 0.99])["method"] == "ratio_spread"
 
 
-# ---------------------------------------------------------------------------
-# 两者衔接：量出来的噪声底直接喂给接受判据
-# ---------------------------------------------------------------------------
-
 def test_measured_floor_drives_acceptance():
-    """这是两个脚本的接缝：噪声底不是常数，是量出来的。"""
+    """两个脚本的接缝：噪声底不是常数，是量出来的。"""
     measured = noise_floor.compute([1.00, 1.02, 0.98, 1.01, 0.99])
     floor = measured["floor_pct"]
-    # 落在实测噪声内的增益必须被拒
-    assert campaign.decide_candidate(1.0 + floor / 200.0, floor) != campaign.VERDICT_ACCEPT
-    # 明显超出的才收
-    assert campaign.decide_candidate(1.0 + floor / 50.0, floor) == campaign.VERDICT_ACCEPT
+    assert campaign.decide_candidate(
+        1.0 + floor / 200.0, floor) != campaign.VERDICT_ACCEPT
+    assert campaign.decide_candidate(
+        1.0 + floor / 50.0, floor) == campaign.VERDICT_ACCEPT

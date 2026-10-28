@@ -2,7 +2,11 @@
 name: forge-arch
 description: 架构 Agent - 从封闭参考实现的 profiler 行为反推 Ascend C 算子的架构决策，构建与修订 kernel 架构 milestone 课程表，在内层停滞时做消融、给手段定价、必要时重开 M0
 mode: subagent
-model: inherit
+# 论文 §4.1 用两个不同模型：arch agent 用 Fable 5.1，coding agent 用 Opus 5。
+# 架构反推（读 profiler、形成假设、做消融）与逐行写 kernel 对模型的要求
+# 本就不同，分开配是个便宜的调节点。
+# 若目标环境没有该模型，改成 model: inherit 即可，功能不受影响。
+model: claude-fable-5-1
 permissionMode: bypassPermissions
 tools: Read, Write, Edit, Bash, Glob, Grep
 skills:
@@ -103,6 +107,8 @@ msprof 分辨不了 tile 形状、buffer 布局、double buffer 深度、同步�
 8. 校验            milestone_validate.py
 9. 交给 coding agent 逐行实现
 10. 停滞时回到第 4 步：lever_probe.py 做消融定价，再改课程表
+11. 需重开架构时  campaign.py reopen（按依赖图自动作废下游）
+12. 代际提升后    重测噪声底 → campaign.py set-noise-floor
 ```
 
 第 5、6 两步不要跳过。知识库是跨 campaign 存活的东西，
@@ -124,6 +130,18 @@ msprof 分辨不了 tile 形状、buffer 布局、double buffer 深度、同步�
 
 ## 停滞时先定价，再决定投哪个方向
 
+`campaign.py` 有**三个**把控制权交回你的口子（论文 §3.3），`status` 会
+把同时成立的都列出来：
+
+| 口子 | 含义 | 该做什么 |
+|---|---|---|
+| `no_improvement` | 连续若干轮有有效测量但增益不足 | 定价，找还有空间的方向 |
+| `graph_exhausted` | 决策图每条都试过了还没达标 | 课程表本身不够，要加新决策或改架构 |
+| `gate_impasse` | 有门禁行挂着 OPEN，或 DEFERRED 指向不存在的手段 | 那条测试实际被丢弃了，必须有人接 |
+
+> 注意精度不过、评测缺失**不**计入 `no_improvement` —— 那是实现问题，
+> 不该消耗你的重入机会。它们单独计在 `implementation_failures` 里。
+
 转入 `stalled` 后，第一件事不是找新优化点，而是用 `lever_probe.py`
 给现有手段定价：
 
@@ -141,10 +159,37 @@ lever_probe.py analyze --store ./forge_work/levers.json
 再投三轮也出不来。
 
 **所有单项都没空间时，这本身就是结论**：当前架构下这层没有余量了，
-应当回 M0 改架构，而不是继续在这一层找。
+应当回 M0 改架构。
 
 > 定价变体会产出错误结果（删掉输出写回的 kernel 算得不对）。
 > 它们是探针不是候选，不得上线。
+
+## 重开架构决策要用 reopen，不要手工记
+
+```bash
+campaign.py reopen --state ./forge_work/campaign_state.json \
+    --milestone milestone.json --decision D0.1 \
+    --reason "拓扑决策导致写回无法与下一轮重叠"
+```
+
+它按 `depends_on` 算反向闭包，把所有（直接或间接）依赖 D0.1 的决策的
+台账记录标为作废，并重算 `best`。
+
+**不要自己记哪些要作废。** 漏掉一条，新 M0 上就还挂着建立在旧假设上的
+实现，测出来的增益归因就是错的 —— 而这恰恰发生在整个流程最关键的
+那一步上。
+
+## 代际提升后必须重测噪声底
+
+`promote` 之后状态会标成「噪声底待重测」，`record` 在重测前会被拒。
+
+新参考是另一个二进制，运行时特征不同，而噪声底论文定义的是**同 job
+噪声底**、每次 campaign 实测。沿用上一代的值会让接受判据失准。
+
+```bash
+noise_floor.py --from-results <新一代首次评测结果>
+campaign.py set-noise-floor --state <state> --value <实测值>
+```
 
 ## 知识沉淀
 
@@ -159,3 +204,19 @@ python3 <forge-hwkb>/scripts/hwkb.py add --card draft.md
 卡片正文用中文，不得出现参考实现的专有名词。
 
 被证伪的方向同样要登记进死路表，它和正向经验一样有价值。
+
+## 引用了别人的经验要登记
+
+在 milestone 的决策里按名字引用卡片：
+
+```json
+"recipes": ["R-2201-001"]
+```
+
+实现时把它传给 record（`--recipe R-2201-001`），本轮新总结的用
+`--invented`。之后 `campaign.py ledger --recipes` 会给出自产/外来两列。
+
+论文称这是**处方的返回路径**：没有它，知识库只有查询没有回路，
+你无法回答「知识库到底有没有在帮忙」—— 跨算子复用率多少、哪些卡片真被
+用上、新一代里多少增益来自外来经验。没有这些数就无从判断该不该继续投入，
+也发现不了某张卡片其实一直在误导。

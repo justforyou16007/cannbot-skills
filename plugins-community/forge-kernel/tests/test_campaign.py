@@ -24,6 +24,7 @@
 运行: python3 -m pytest plugins-community/forge-kernel/tests/ -v
 """
 
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -416,6 +417,109 @@ def test_multiple_stall_reasons_all_recorded():
     assert state["stall_reason"] == campaign.STALL_GATE_IMPASSE
 
 
+# ---------------------------------------------------------------------------
+# 第四个重入口：机制从未核实
+#
+# 昇腾上计时与 profiling 必须分两次跑，于是多出一种论文里不存在的失效方式：
+# 一直不传 --signature，每轮判 accept_unverified —— 不计入 best 所以永远
+# 到不了 shipped，又清零停滞计数所以永远不转 stalled，循环一直空转。
+# ---------------------------------------------------------------------------
+
+def test_consecutive_unverified_eventually_stalls():
+    state = fresh_state(target=10.0, threshold=99)
+    for i in range(3):
+        campaign.apply_result(state, result(speedup=1.10), f"D0.{i}")
+    assert state["state"] == campaign.STATE_STALLED
+    assert state["stall_reason"] == campaign.STALL_MECHANISM_UNVERIFIED
+
+
+def test_unverified_stall_names_the_missing_flags():
+    """提示必须点名缺了什么，否则 agent 还是不知道该补哪一步。"""
+    state = fresh_state(target=10.0, threshold=99)
+    for i in range(3):
+        campaign.apply_result(state, result(speedup=1.10), f"D0.{i}")
+    detail = state["stall_reasons"][0]["detail"]
+    assert "--signature" in detail
+    assert "--milestone" in detail
+
+
+def test_verified_accept_resets_unverified_counter():
+    state = fresh_state(target=10.0, threshold=99)
+    campaign.apply_result(state, result(speedup=1.10), "D0.1")
+    campaign.apply_result(state, result(speedup=1.10), "D0.2")
+    assert state["mechanism_unverified"]["consecutive"] == 2
+    campaign.apply_result(state, result(speedup=1.20), "D0.1",
+                          milestone_doc=milestone(), signature=signature(0.9))
+    assert state["mechanism_unverified"]["consecutive"] == 0
+
+
+def test_unverified_stall_takes_priority():
+    """机制没核实时 best 卡在 1.0、其他信号都是降级的，应排最前。"""
+    doc = milestone({"D0.1": []})
+    doc["milestones"][0]["gate"]["correctness_lines"][0]["status"] = "OPEN"
+    state = fresh_state(target=10.0, threshold=1)
+    for _ in range(3):
+        campaign.apply_result(state, result(speedup=1.10), "D0.1",
+                              milestone_doc=doc)
+    assert state["stall_reason"] == campaign.STALL_MECHANISM_UNVERIFIED
+
+
+def test_reverts_do_not_reset_unverified_counter():
+    """回滚既不确认也不否认 profiling 是否接上，应保持中立。"""
+    state = fresh_state(target=10.0, threshold=99)
+    campaign.apply_result(state, result(speedup=1.10), "D0.1")
+    campaign.apply_result(state, result(speedup=1.001), "D0.2")
+    assert state["mechanism_unverified"]["consecutive"] == 1
+
+
+# ---------------------------------------------------------------------------
+# 走穷判定不能把管理条目算成「试过」
+# ---------------------------------------------------------------------------
+
+def test_reopen_entry_not_counted_as_tried(tmp_path):
+    """刚重开的叶子决策还没重做，不该立刻被判走穷。"""
+    doc = milestone({"D0.1": [], "D0.2": []})
+    state = fresh_state(target=10.0, threshold=99)
+    for did in ("D0.1", "D0.2"):
+        campaign.apply_result(state, result(speedup=1.10), did,
+                              milestone_doc=doc, signature=signature(0.9))
+
+    state_file = tmp_path / "s.json"
+    milestone_file = tmp_path / "m.json"
+    campaign.save_state(state_file, state)
+    milestone_file.write_text(json.dumps(doc), encoding="utf-8")
+
+    import argparse
+    campaign.cmd_reopen(argparse.Namespace(
+        state=str(state_file), milestone=str(milestone_file),
+        decision="D0.2", reason="", as_json=False))
+
+    reloaded = campaign.load_state(state_file)
+    campaign.apply_result(reloaded, result(speedup=1.10), "D0.1",
+                          milestone_doc=doc, signature=signature(0.9))
+    assert reloaded["state"] != campaign.STATE_STALLED, \
+        "D0.2 刚重开尚未重做，决策图没有走穷"
+
+
+@pytest.mark.parametrize("verdict", ["reopen", "promote", "stop", "noise_floor"])
+def test_management_entries_excluded_from_tried(verdict):
+    doc = milestone({"D0.1": [], "D0.2": []})
+    state = fresh_state(target=10.0, threshold=99)
+    campaign.apply_result(state, result(speedup=1.10), "D0.1",
+                          milestone_doc=doc, signature=signature(0.9))
+    state["ledger"].append({"decision": "D0.2", "verdict": verdict})
+    assert campaign.graph_exhausted(state, doc) is False
+
+
+def test_genuine_exhaustion_still_detected():
+    doc = milestone({"D0.1": [], "D0.2": []})
+    state = fresh_state(target=10.0, threshold=99)
+    for did in ("D0.1", "D0.2"):
+        campaign.apply_result(state, result(speedup=1.10), did,
+                              milestone_doc=doc, signature=signature(0.9))
+    assert campaign.graph_exhausted(state, doc) is True
+
+
 def test_stall_flags_cleared_on_recovery():
     doc = milestone({"D0.1": [], "D0.2": ["D0.1"]})
     state = fresh_state(target=10.0, threshold=1)
@@ -533,14 +637,17 @@ def test_reopen_invalidates_downstream(tmp_path):
 
 
 def test_reopen_recomputes_best(tmp_path):
-    """best 必须按剩余有效条目重算，不能留着来自已作废实现的数字。"""
+    """best 必须按剩余有效条目重算，gain 与 time_us 要一起取。"""
     doc = milestone({"D0.1": [], "D0.2": ["D0.1"], "D0.3": []})
     state = fresh_state(target=10.0, threshold=99)
-    campaign.apply_result(state, result(speedup=1.80), "D0.2",
-                          milestone_doc=doc, signature=signature(0.9))
-    campaign.apply_result(state, result(speedup=1.20), "D0.3",
-                          milestone_doc=doc, signature=signature(0.9))
+    campaign.apply_result(
+        state, result(speedup=1.80, evolved_us=250.0), "D0.2",
+        milestone_doc=doc, signature=signature(0.9))
+    campaign.apply_result(
+        state, result(speedup=1.20, evolved_us=380.0), "D0.3",
+        milestone_doc=doc, signature=signature(0.9))
     assert state["best"]["gain"] == pytest.approx(1.80)
+    assert state["best"]["time_us"] == pytest.approx(250.0)
 
     state_file = tmp_path / "s.json"
     milestone_file = tmp_path / "m.json"
@@ -555,6 +662,42 @@ def test_reopen_recomputes_best(tmp_path):
     reloaded = json.loads(state_file.read_text(encoding="utf-8"))
     assert reloaded["best"]["gain"] == pytest.approx(1.20), \
         "1.80 来自已作废的 D0.2，必须退回到 D0.3 的 1.20"
+    assert reloaded["best"]["time_us"] == pytest.approx(380.0), \
+        "time_us 要跟着 gain 一起重算，不能被抹成 None"
+
+
+def test_reopen_resets_all_counters(tmp_path):
+    """三个计数器一起归零，与 promote 的处理对齐。"""
+    doc = milestone({"D0.1": []})
+    state = fresh_state(target=10.0, threshold=99)
+    campaign.apply_result(state, result(speedup=1.10), "D0.1")          # unverified
+    campaign.apply_result(state, result(speedup=1.001), "D0.1")         # stagnation
+    campaign.apply_result(state, result(precision=False, speedup=2.0), "D0.1")
+    assert state["mechanism_unverified"]["consecutive"] > 0
+
+    state_file = tmp_path / "s.json"
+    milestone_file = tmp_path / "m.json"
+    campaign.save_state(state_file, state)
+    milestone_file.write_text(json.dumps(doc), encoding="utf-8")
+
+    import argparse
+    campaign.cmd_reopen(argparse.Namespace(
+        state=str(state_file), milestone=str(milestone_file),
+        decision="D0.1", reason="", as_json=False))
+
+    reloaded = json.loads(state_file.read_text(encoding="utf-8"))
+    assert reloaded["stagnation"]["since_improvement"] == 0
+    assert reloaded["implementation_failures"]["consecutive"] == 0
+    assert reloaded["mechanism_unverified"]["consecutive"] == 0
+
+
+def test_ledger_entry_carries_time_us():
+    """台账要能自给自足地重算 best，所以 time_us 必须落在条目里。"""
+    state = fresh_state()
+    entry = campaign.apply_result(
+        state, result(speedup=1.30, evolved_us=350.0), "D0.1",
+        milestone_doc=milestone(), signature=signature(0.9))
+    assert entry["time_us"] == pytest.approx(350.0)
 
 
 # ---------------------------------------------------------------------------
@@ -718,6 +861,77 @@ def test_cli_init_requires_input_shape(tmp_path):
                    "--reference-kind", "builtin_aclnn",
                    "--reference-id", "aclnnDemo", "--noise-floor", "2.0"])
     assert code == 2
+
+
+# ---------------------------------------------------------------------------
+# --state 的位置
+#
+# 只挂顶层时，argparse 要求全局参数写在子命令之前，而人和 agent 的直觉
+# 都是写在后面。写错只报「unrecognized arguments」，不说该放哪 ——
+# agent 拿到这个报错往往不去调位置，而是转而自己判断，可这套设计的要害
+# 恰恰是不让 agent 自己裁决。
+# ---------------------------------------------------------------------------
+
+def test_state_accepted_after_subcommand(tmp_path):
+    state_file = tmp_path / "s.json"
+    code, _ = run(["init", "--state", str(state_file),
+                   "--operator", "demo_op", "--input-shape", "B=8",
+                   "--arch", "DAV_2201", "--reference-kind", "builtin_aclnn",
+                   "--reference-id", "aclnnDemo", "--noise-floor", "2.0"])
+    assert code == 0
+    assert state_file.exists()
+
+
+def test_state_accepted_before_subcommand(tmp_path):
+    state_file = tmp_path / "s.json"
+    assert run(init_argv(state_file))[0] == 0
+    assert state_file.exists()
+
+
+def test_subcommand_state_wins_when_both_given(tmp_path):
+    """两处都给时以子命令那个为准，顶层默认值不得悄悄覆盖回去。"""
+    real = tmp_path / "real.json"
+    assert run(init_argv(real))[0] == 0
+    code, out = run(["--state", str(tmp_path / "wrong.json"),
+                     "status", "--state", str(real)])
+    assert code == 0
+    assert "demo_op" in out
+
+
+@pytest.mark.parametrize("command", [
+    "status", "record", "reopen", "set-noise-floor", "set-budget",
+    "promote", "ledger",
+])
+def test_every_subcommand_accepts_state(command):
+    """新增子命令时容易漏挂，这里逐个兜住。"""
+    parser = campaign.build_parser()
+    sub = [a for a in parser._actions
+           if isinstance(a, argparse._SubParsersAction)][0]
+    options = set()
+    for action in sub.choices[command]._actions:
+        options.update(action.option_strings)
+    assert "--state" in options, f"{command} 没有挂 --state"
+    assert "--json" in options, f"{command} 没有挂 --json"
+
+
+def test_recovery_hint_is_copy_pasteable(tmp_path):
+    """程序打印的恢复命令必须照抄就能跑，否则 agent 会开始猜。"""
+    state_file = tmp_path / "s.json"
+    run(init_argv(state_file))
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    state["noise_floor_status"] = campaign.NOISE_PENDING
+    state_file.write_text(json.dumps(state), encoding="utf-8")
+
+    res = tmp_path / "ev.json"
+    res.write_text(json.dumps(result(speedup=1.30)), encoding="utf-8")
+    _, out = run(["--state", str(state_file), "record",
+                  "--result", str(res), "--decision", "D1.1"])
+
+    hint = [ln for ln in out.splitlines() if "set-noise-floor" in ln][0]
+    argv = hint.strip().replace("campaign.py ", "", 1).split()
+    # 把 <实测值> 这个占位符换成真实数值，其余原样照抄
+    argv = ["2.7" if a.startswith("<") else a for a in argv]
+    assert run(argv)[0] == 0, f"恢复提示照抄跑不通: {hint}"
 
 
 def test_cli_init_then_status(tmp_path):

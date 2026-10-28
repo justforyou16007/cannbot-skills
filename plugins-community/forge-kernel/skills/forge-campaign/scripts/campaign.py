@@ -49,23 +49,25 @@ ForgeKernel 跑的是两层循环，这个脚本是两层的调度中枢。
 闭包，自动作废。
 
 用法:
-    python3 campaign.py init --operator add_layer_norm \\
-        --input-shape "B=8,S=4096,H=1024,fp16" --arch DAV_2201 \\
-        --reference-kind builtin_aclnn --reference-id aclnnAddLayerNorm \\
-        --noise-floor 2.3 --target-gain 1.05 --budget 40 \\
-        --state campaign_state.json
+    campaign.py init --state campaign_state.json \\
+        --operator add_layer_norm --input-shape "B=8,S=4096,H=1024,fp16" \\
+        --arch DAV_2201 --reference-kind builtin_aclnn \\
+        --reference-id aclnnAddLayerNorm \\
+        --noise-floor 2.3 --target-gain 1.05 --budget 40
 
-    python3 campaign.py record --state campaign_state.json \\
+    campaign.py record --state campaign_state.json \\
         --result evaluation_results.json --decision D0.1 \\
         --signature architecture_signature.json --milestone milestone.json \\
         --recipe R-2201-001 --symptom "MTE2 占比过高"
 
-    python3 campaign.py reopen --state campaign_state.json \\
+    campaign.py reopen --state campaign_state.json \\
         --milestone milestone.json --decision D0.1 --reason "拓扑决策有缺陷"
 
-    python3 campaign.py set-noise-floor --state campaign_state.json --value 2.7
-    python3 campaign.py promote --state campaign_state.json --artifact ./best
-    python3 campaign.py ledger --state campaign_state.json --recipes
+    campaign.py set-noise-floor --state campaign_state.json --value 2.7
+    campaign.py promote --state campaign_state.json --artifact ./best
+    campaign.py ledger --state campaign_state.json --recipes
+
+`--state` 与 `--json` 写在子命令前后都可以，两种形态都能跑。
 
 退出码: 0 = 正常; 1 = 状态不允许该操作; 2 = 用法或 IO 错误
 """
@@ -88,10 +90,24 @@ STATE_STALLED = "stalled"      # 需要架构层重新进入
 STATE_SHIPPED = "shipped"      # 本代达标，可提升为下一代参考
 STATE_STOPPED = "stopped"      # 自我提升收敛或预算耗尽
 
-#: 外层重入的三个口子（论文 §3.3）。只实现第一个等于少了两次重开架构的机会。
+#: 外层重入的口子（论文 §3.3 给了前三个；第四个是本实现补的，见下）。
 STALL_NO_IMPROVEMENT = "no_improvement"
 STALL_GRAPH_EXHAUSTED = "graph_exhausted"
 STALL_GATE_IMPASSE = "gate_impasse"
+
+#: 第四个口子：机制始终没被核验过。
+#:
+#: 论文没有这一条，因为在它的实现里计时与 profiling 在同一个 job 里完成，
+#: 不存在「忘了采 profiling」这种状态。昇腾上两者必须分两次跑
+#: （acl.prof.init 每进程只能调一次），于是多出一种失效方式：
+#: 一直不传 --signature，每轮都判 accept_unverified —— 它不计入 best
+#: 所以永远到不了 shipped，又会清零停滞计数所以永远不转 stalled，
+#: 循环就这么一直跑下去，而 status 每轮都说「继续实现」。
+#:
+#: 每轮确实打印了提示，但连跑的 agent 不会因为一行提示改变行为 ——
+#: 它看到的是「接受了，继续」。所以要让这件事走和另外三个口子同一条通路，
+#: 架构层才看得见。
+STALL_MECHANISM_UNVERIFIED = "mechanism_never_verified"
 
 #: 内层连续多少轮「测出来了但增益不够」才交回架构层。
 DEFAULT_STAGNATION_THRESHOLD = 3
@@ -100,6 +116,9 @@ DEFAULT_STAGNATION_THRESHOLD = 3
 #: 它**不**触发架构重入 —— 那是实现问题，不是架构问题。
 DEFAULT_IMPL_FAILURE_THRESHOLD = 3
 
+#: 连续多少次 accept_unverified 判定为「profiling 没接进回路」。
+DEFAULT_UNVERIFIED_THRESHOLD = 3
+
 #: 自我提升每阶段的目标增益（论文 §3.5：+5%）。
 DEFAULT_PHASE_TARGET_GAIN = 1.05
 
@@ -107,6 +126,13 @@ VERDICT_ACCEPT = "accept"
 VERDICT_ACCEPT_UNVERIFIED = "accept_unverified"
 VERDICT_REVERT = "revert"
 VERDICT_REGRESSION = "regression"
+
+#: 对候选的裁决。台账里还有 reopen / promote / stop / noise_floor 这类
+#: **管理条目**，它们不代表「某条决策被试过」，统计时必须排除。
+CANDIDATE_VERDICTS = frozenset({
+    VERDICT_ACCEPT, VERDICT_ACCEPT_UNVERIFIED,
+    VERDICT_REVERT, VERDICT_REGRESSION,
+})
 
 #: 噪声底状态。参考换了之后必须重测 —— 新参考是另一个二进制，
 #: 运行时特征不同，而噪声底论文定义的是「同 job 噪声底」。
@@ -404,14 +430,23 @@ def graph_exhausted(state: Dict[str, Any],
 
     这是论文给的第二个外层重入口。少了它，决策图走完而没达标时状态会
     停在 implement，没有人提示该回架构层。
+
+    「试过」只算对候选的裁决。台账里还有 reopen / promote / stop /
+    noise_floor 这类管理条目，其中 reopen 带着被重开那条决策的 id ——
+    若按 id 一概算作试过，刚重开一个叶子决策就会被立刻误判为走穷，
+    于是架构层刚做完重开，状态机又让它回去重新分析，空转一轮。
     """
     if milestone_doc is None:
         return False
     decisions = set(all_decisions(milestone_doc))
     if not decisions:
         return False
-    tried = {entry.get("decision") for entry in state.get("ledger", [])
-             if entry.get("decision") and not entry.get("invalidated")}
+    tried = {
+        entry.get("decision") for entry in state.get("ledger", [])
+        if entry.get("decision")
+        and not entry.get("invalidated")
+        and entry.get("verdict") in CANDIDATE_VERDICTS
+    }
     return decisions.issubset(tried)
 
 
@@ -483,6 +518,7 @@ def next_action(state: Dict[str, Any]) -> Dict[str, str]:
             STALL_NO_IMPROVEMENT: "内层无进展",
             STALL_GRAPH_EXHAUSTED: "决策图走穷",
             STALL_GATE_IMPASSE: "门禁僵持",
+            STALL_MECHANISM_UNVERIFIED: "机制从未核实",
         }
         listed = "；".join(
             f"{titles.get(r['kind'], r['kind'])}（{r['detail']}）"
@@ -559,6 +595,10 @@ def new_state(operator: str, input_shape: str, arch: str,
             "consecutive": 0,
             "threshold": DEFAULT_IMPL_FAILURE_THRESHOLD,
         },
+        "mechanism_unverified": {
+            "consecutive": 0,
+            "threshold": DEFAULT_UNVERIFIED_THRESHOLD,
+        },
         "best": {"gain": 1.0, "time_us": None, "artifact": None},
         "ledger": [],
         "created_at": _now(),
@@ -622,12 +662,18 @@ def apply_result(state: Dict[str, Any], doc: Dict[str, Any], decision: str,
     再被其他算子照着做决策。
     """
     noise = float(state.get("noise_floor_pct", 0.0))
+    evolved = doc.get("evolved") or {}
+    evolved_time = (evolved.get("time_us")
+                    if isinstance(evolved, dict) else None)
     entry: Dict[str, Any] = {
         "at": _now(),
         "generation": state.get("generation", 0),
         "input_shape": state.get("input_shape"),
         "decision": decision,
         "gain": None,
+        # 台账要能自给自足地重算 best —— reopen 作废若干条目之后，
+        # best 必须从剩下的条目里恢复，包括 time_us。
+        "time_us": evolved_time if isinstance(evolved_time, (int, float)) else None,
         "verdict": None,
         "reason": "",
         "mechanism": None,
@@ -698,19 +744,24 @@ def apply_result(state: Dict[str, Any], doc: Dict[str, Any], decision: str,
         "since_improvement": 0, "threshold": DEFAULT_STAGNATION_THRESHOLD})
     impl = state.setdefault("implementation_failures", {
         "consecutive": 0, "threshold": DEFAULT_IMPL_FAILURE_THRESHOLD})
+    unver = state.setdefault("mechanism_unverified", {
+        "consecutive": 0, "threshold": DEFAULT_UNVERIFIED_THRESHOLD})
 
     if entry["verdict"] in (VERDICT_ACCEPT, VERDICT_ACCEPT_UNVERIFIED):
         stag["since_improvement"] = 0
         impl["consecutive"] = 0
+        if entry["verdict"] == VERDICT_ACCEPT:
+            unver["consecutive"] = 0
+        else:
+            # 连续若干次「变快了但说不清为什么」= profiling 没接进回路
+            unver["consecutive"] = int(unver.get("consecutive", 0)) + 1
         # 只有机制核实过的改动才抬高 best。未核实的保留但不计入 ——
         # 否则 promote 时会把一个解释不清的结果封成下一代的参考。
         if entry["counts_toward_best"] and entry["gain"] is not None:
             best = state.setdefault("best", {})
             if entry["gain"] > float(best.get("gain", 1.0)):
                 best["gain"] = entry["gain"]
-                evolved = doc.get("evolved") or {}
-                if isinstance(evolved, dict):
-                    best["time_us"] = evolved.get("time_us")
+                best["time_us"] = entry.get("time_us")
     elif measured:
         # 测出来了但不够 —— 这才是架构层该关心的停滞
         stag["since_improvement"] = int(stag.get("since_improvement", 0)) + 1
@@ -754,6 +805,19 @@ def _advance_state(state: Dict[str, Any],
         return
 
     reasons: List[Dict[str, str]] = []
+
+    # 这一条排最前：机制一直没核验说明 profiling 根本没接进回路，
+    # 此时 best 卡在 1.0、另外几个信号也都是降级的，先修这个。
+    unver = state.get("mechanism_unverified", {})
+    if int(unver.get("consecutive", 0)) >= int(
+            unver.get("threshold", DEFAULT_UNVERIFIED_THRESHOLD)):
+        reasons.append({
+            "kind": STALL_MECHANISM_UNVERIFIED,
+            "detail": (f"连续 {unver.get('consecutive')} 次判为 "
+                       "accept_unverified —— 改动都更快了，但一次机制也没核实。"
+                       "通常是 record 没带 --signature / --milestone；"
+                       "best 会一直卡在 1.0，campaign 永远到不了 shipped"),
+        })
 
     impasse = gate_impasse(milestone_doc)
     if impasse:
@@ -906,7 +970,8 @@ def cmd_record(args: argparse.Namespace) -> int:
         print("错误: 参考已更换，噪声底尚未对新参考重测。\n"
               "  新参考是另一个二进制，运行时特征不同，沿用上一代的噪声底会让\n"
               "  接受判据失准。先跑 noise_floor.py，再用：\n"
-              f"    campaign.py set-noise-floor --state {path} --value <实测值>",
+              f"    campaign.py set-noise-floor --state {path} --value <实测值>\n"
+              "  （<实测值> 填 noise_floor.py 输出的「噪声底」那一行）",
               file=sys.stderr)
         return 1
 
@@ -994,7 +1059,9 @@ def cmd_reopen(args: argparse.Namespace) -> int:
             entry["kb_admissible"] = False
             count += 1
 
-    # best 要按剩余有效条目重算，否则会留着一个来自已作废实现的数字
+    # best 要按剩余有效条目重算，否则会留着一个来自已作废实现的数字。
+    # gain 与 time_us 必须一起取，不能只算 gain 而把 time_us 置空 ——
+    # 那样「重算」就只做了一半。
     best_gain = 1.0
     best_time = None
     for entry in state.get("ledger", []):
@@ -1003,13 +1070,18 @@ def cmd_reopen(args: argparse.Namespace) -> int:
         gain = entry.get("gain")
         if isinstance(gain, (int, float)) and gain > best_gain:
             best_gain = gain
+            best_time = entry.get("time_us")
     state["best"] = {"gain": best_gain, "time_us": best_time,
                      "artifact": state.get("best", {}).get("artifact")}
 
     state["state"] = STATE_ANALYZE
     state["cursor"] = {"milestone": None, "decision": None, "iteration": 0}
-    state["stagnation"]["since_improvement"] = 0
+    # 三个计数器一起归零，与 promote 的处理对齐
+    state.setdefault("stagnation", {})["since_improvement"] = 0
+    state.setdefault("implementation_failures", {})["consecutive"] = 0
+    state.setdefault("mechanism_unverified", {})["consecutive"] = 0
     state.pop("stall_reason", None)
+    state.pop("stall_reasons", None)
     state.pop("stall_detail", None)
     state.setdefault("ledger", []).append({
         "at": _now(),
@@ -1128,8 +1200,9 @@ def cmd_promote(args: argparse.Namespace) -> int:
     }
     state["state"] = STATE_ANALYZE
     state["cursor"] = {"milestone": None, "decision": None, "iteration": 0}
-    state["stagnation"]["since_improvement"] = 0
+    state.setdefault("stagnation", {})["since_improvement"] = 0
     state.setdefault("implementation_failures", {})["consecutive"] = 0
+    state.setdefault("mechanism_unverified", {})["consecutive"] = 0
     state["target_gain"] = args.phase_target_gain
     state["best"] = {"gain": 1.0, "time_us": None, "artifact": None}
     # 参考换了，噪声底必须重测
@@ -1191,6 +1264,9 @@ def cmd_status(args: argparse.Namespace) -> int:
           "（只数有有效测量但增益不足）")
     print(f"实现失败  {impl.get('consecutive')}/{impl.get('threshold')}"
           "（精度/评测问题，不触发架构重入）")
+    unver = state.get("mechanism_unverified", {})
+    print(f"机制未核实 {unver.get('consecutive')}/{unver.get('threshold')}"
+          "（连续多次即判 profiling 没接进回路）")
     cap = budget.get("max_records")
     print(f"预算      {budget.get('used', 0)}/{cap if cap else '不限'}")
     print(f"台账条目  {len(state.get('ledger', []))}")
@@ -1289,16 +1365,40 @@ def cmd_ledger(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """构造命令行。
+
+    `--state` 与 `--json` 同时挂在顶层和每个子命令上，两种写法都能跑：
+
+        campaign.py --state s.json record ...
+        campaign.py record --state s.json ...
+
+    只挂顶层是 argparse 的默认做法，但它要求全局参数出现在子命令**之前**，
+    而人和 agent 的直觉都是写在后面。写错时 argparse 只报
+    「unrecognized arguments」，不说该放哪里 —— agent 拿到这个报错往往不会
+    去调参数位置，而是转而自己判断，可这套设计的要害恰恰是不让 agent
+    自己裁决。两种写法都收下，这个口子就不存在了。
+
+    子命令那份用 SUPPRESS 作默认值：不传时不写入 namespace，顶层的取值
+    得以保留；传了才覆盖。若用普通默认值，`--state X record` 会被子命令的
+    默认值悄悄覆盖回去。
+    """
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--state", default=argparse.SUPPRESS,
+                        help="状态文件路径（默认 campaign_state.json）")
+    common.add_argument("--json", action="store_true", dest="as_json",
+                        default=argparse.SUPPRESS,
+                        help="以 JSON 输出，供脚本消费")
+
     parser = argparse.ArgumentParser(
         description="ForgeKernel campaign 状态机：嵌套双循环、机制裁决与自我提升",
     )
     parser.add_argument("--state", default="campaign_state.json",
-                        help="状态文件路径（默认 campaign_state.json）")
+                        help="状态文件路径（也可写在子命令后面）")
     parser.add_argument("--json", action="store_true", dest="as_json",
-                        help="以 JSON 输出，供脚本消费")
+                        help="以 JSON 输出（也可写在子命令后面）")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_init = sub.add_parser("init", help="创建 campaign")
+    p_init = sub.add_parser("init", help="创建 campaign", parents=[common])
     p_init.add_argument("--operator", required=True)
     p_init.add_argument("--input-shape", required=True,
                         help="本次 campaign 的输入形状。噪声底、签名、门禁锚点"
@@ -1319,10 +1419,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_init.add_argument("--force", action="store_true")
     p_init.set_defaults(func=cmd_init)
 
-    p_status = sub.add_parser("status", help="查看进度与下一步")
+    p_status = sub.add_parser("status", help="查看进度与下一步", parents=[common])
     p_status.set_defaults(func=cmd_status)
 
-    p_record = sub.add_parser("record", help="并入一次评测结果并裁决")
+    p_record = sub.add_parser("record", help="并入一次评测结果并裁决",
+                              parents=[common])
     p_record.add_argument("--result", required=True,
                           help="evaluation_results.json 路径")
     p_record.add_argument("--decision", required=True, help="本次实现的决策行 id")
@@ -1340,21 +1441,25 @@ def build_parser() -> argparse.ArgumentParser:
                           help="死路表路径；给了就在回滚时直接写入")
     p_record.set_defaults(func=cmd_record)
 
-    p_reopen = sub.add_parser("reopen", help="重开架构决策并作废下游实现")
+    p_reopen = sub.add_parser("reopen", help="重开架构决策并作废下游实现",
+                              parents=[common])
     p_reopen.add_argument("--milestone", required=True)
     p_reopen.add_argument("--decision", required=True, help="要重开的决策 id")
     p_reopen.add_argument("--reason", default="")
     p_reopen.set_defaults(func=cmd_reopen)
 
-    p_nf = sub.add_parser("set-noise-floor", help="更新实测噪声底")
+    p_nf = sub.add_parser("set-noise-floor", help="更新实测噪声底",
+                          parents=[common])
     p_nf.add_argument("--value", type=float, required=True)
     p_nf.set_defaults(func=cmd_set_noise_floor)
 
-    p_bg = sub.add_parser("set-budget", help="设置或提高评测次数上限")
+    p_bg = sub.add_parser("set-budget", help="设置或提高评测次数上限",
+                          parents=[common])
     p_bg.add_argument("--max-records", type=int, required=True)
     p_bg.set_defaults(func=cmd_set_budget)
 
-    p_promote = sub.add_parser("promote", help="封存本代产出为下一代参考")
+    p_promote = sub.add_parser("promote", help="封存本代产出为下一代参考",
+                               parents=[common])
     p_promote.add_argument("--artifact", required=True)
     p_promote.add_argument("--phase-target-gain", type=float,
                            default=DEFAULT_PHASE_TARGET_GAIN)
@@ -1362,7 +1467,7 @@ def build_parser() -> argparse.ArgumentParser:
                            help="即使增益未超噪声底也强行提升")
     p_promote.set_defaults(func=cmd_promote)
 
-    p_ledger = sub.add_parser("ledger", help="查看裁决台账")
+    p_ledger = sub.add_parser("ledger", help="查看裁决台账", parents=[common])
     p_ledger.add_argument("--recipes", action="store_true",
                           help="汇总知识库的使用与产出")
     p_ledger.set_defaults(func=cmd_ledger)

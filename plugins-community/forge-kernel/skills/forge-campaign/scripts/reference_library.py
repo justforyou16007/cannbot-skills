@@ -150,6 +150,89 @@ def detect_environment() -> Dict[str, Any]:
     return env
 
 
+#: 算子族推断规则，按顺序匹配，先命中先算。
+#:
+#: 族的划分沿用 ops/ascendc-performance-best-practices 的分类体系 ——
+#: 那边按族组织优化知识，这边按族找参考，两边对齐才查得通。
+#:
+#: 推断只是省事，**推错比没有更糟**，所以结果会标明是推断还是显式指定，
+#: 显式给的 --family 永远优先。
+FAMILY_RULES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    ("attention", ("attention", "flash", "_fa", "fa_", "mla", "gqa", "mha",
+                   "sdpa")),
+    ("matmul", ("matmul", "batch_matmul", "bmm", "gemm", "linear", "_mm_",
+                "grouped_mm")),
+    ("convolution", ("conv1d", "conv2d", "conv3d", "conv_", "depthwise")),
+    ("sort", ("topk", "sort", "argsort", "kthvalue", "argmax", "argmin")),
+    ("quantization", ("quant", "dequant", "fakequant")),
+    ("reduction", ("reduce", "softmax", "layernorm", "layer_norm", "rmsnorm",
+                   "rms_norm", "groupnorm", "group_norm", "batchnorm",
+                   "mean", "_sum", "logsumexp", "norm")),
+    ("conversion", ("transpose", "concat", "split", "cast", "permute",
+                    "reshape", "gather", "scatter")),
+    ("broadcast", ("broadcast",)),
+    ("random", ("random", "dropout", "uniform", "normal_")),
+    ("elementwise", ("add", "mul", "sub", "div", "sin", "cos", "abs", "exp",
+                     "relu", "gelu", "silu", "swish", "sigmoid", "tanh",
+                     "mish", "sqrt", "rsqrt", "pow", "clip")),
+)
+
+
+def infer_family(operator: str) -> Optional[str]:
+    """从算子名推断算子族。推不出来返回 None，不硬塞。"""
+    name = operator.lower()
+    for family, keywords in FAMILY_RULES:
+        if any(keyword in name for keyword in keywords):
+            return family
+    return None
+
+
+def cumulative_gain(generations: List[Dict[str, Any]], upto: int) -> float:
+    """算到第 upto 代为止、相对 gen0 的累计增益。
+
+    用累计增益而不是绝对耗时来评最优，因为**绝对耗时跨环境不可比**：
+    多卡机器上卡与卡之间有系统性差异，不同时段的并发水平也不同。
+    而 gain_over_parent 是同一次配对测量里得到的比值 —— 那个比值在哪张卡上
+    测都成立，这正是论文坚持同 job 配对计时的理由。
+    """
+    total = 1.0
+    for record in generations:
+        if record["generation"] == 0 or record["generation"] > upto:
+            continue
+        gain = record.get("gain_over_parent")
+        if isinstance(gain, (int, float)) and gain > 0:
+            total *= gain
+    return total
+
+
+def pick_best(entry: Dict[str, Any]) -> Tuple[Optional[int], str]:
+    """选出当前最优的一代，并说明依据。
+
+    优先按累计增益（跨环境可比）；整条链一个增益都没记时才退回绝对耗时，
+    并在依据里标明它只在同一环境内可比。
+    """
+    generations = entry.get("generations", [])
+    if not generations:
+        return None, "无代次"
+
+    has_gain = any(isinstance(g.get("gain_over_parent"), (int, float))
+                   for g in generations)
+    if has_gain:
+        best = max(generations,
+                   key=lambda g: cumulative_gain(generations, g["generation"]))
+        return best["generation"], "累计增益（跨环境可比）"
+
+    timed = [g for g in generations
+             if isinstance(g.get("time_us"), (int, float)) and g["time_us"] > 0]
+    if timed:
+        best = min(timed, key=lambda g: g["time_us"])
+        return best["generation"], "绝对耗时（仅同一环境内可比）"
+
+    # 一个可比数字都没有时仍要给出一代，否则刚 ingest 完的参考会查不到 ——
+    # 「还没测过」不等于「不存在」。取最新一代并讲明依据不足。
+    return generations[-1]["generation"], "无可比数据，取最新一代"
+
+
 # ---------------------------------------------------------------------------
 # 索引读写
 # ---------------------------------------------------------------------------
@@ -292,6 +375,8 @@ def add_generation(library: Path, *, operator: str, arch: str,
                    mechanism_verified: Optional[bool] = None,
                    bench_task: Optional[str] = None,
                    bench_baseline_us: Optional[float] = None,
+                   family: Optional[str] = None,
+                   device_id: Optional[int] = None,
                    note: str = "") -> Dict[str, Any]:
     """登记一代。gen 0 是外来参考，之后是本系统的产出。"""
     if kind not in ALL_KINDS:
@@ -304,6 +389,17 @@ def add_generation(library: Path, *, operator: str, arch: str,
         "input_shape": input_shape, "generations": [], "best_gen": None,
         "created_at": _now(),
     })
+
+    # 算子族用于按类型检索。显式给的优先；推断的标明来源，
+    # 因为推错比没有更糟 —— 查的人会以为这一族里没有参考。
+    if family:
+        entry["family"] = family
+        entry["family_source"] = "explicit"
+    elif "family" not in entry:
+        inferred = infer_family(operator)
+        if inferred:
+            entry["family"] = inferred
+            entry["family_source"] = "inferred"
 
     if bench_task:
         entry["bench_task"] = bench_task
@@ -347,6 +443,7 @@ def add_generation(library: Path, *, operator: str, arch: str,
         "key": key, "generation": gen, "kind": kind, "id": identifier,
         "sealed_at": _now(),
         "environment": detect_environment(),
+        "device_id": device_id,
         "time_us": time_us,
         "gain_over_parent": gain,
         "promoted_from": parent,
@@ -363,6 +460,7 @@ def add_generation(library: Path, *, operator: str, arch: str,
 
     entry["generations"].append({
         "generation": gen, "kind": kind, "id": identifier,
+        "device_id": device_id,
         "sealed_at": manifest["sealed_at"], "time_us": time_us,
         "gain_over_parent": gain, "promoted_from": parent,
         "mechanism_verified": mechanism_verified,
@@ -370,12 +468,9 @@ def add_generation(library: Path, *, operator: str, arch: str,
         "dir": str(gen_dir.relative_to(library)),
     })
 
-    # best 取实测最快的一代。没有实测时间的不参与评选 ——
-    # 不能拿「没测过」和「测过」放在一起比。
-    timed = [g for g in entry["generations"]
-             if isinstance(g.get("time_us"), (int, float)) and g["time_us"] > 0]
-    if timed:
-        entry["best_gen"] = min(timed, key=lambda g: g["time_us"])["generation"]
+    best_gen, basis = pick_best(entry)
+    entry["best_gen"] = best_gen
+    entry["best_basis"] = basis
     entry["updated_at"] = _now()
 
     save_index(library, index)
@@ -515,6 +610,130 @@ def signature_drift(library: Path, operator: str, arch: str,
     }
 
 
+def find(library: Path, *, family: Optional[str] = None,
+         operator: Optional[str] = None, arch: Optional[str] = None,
+         shape: Optional[str] = None,
+         require_artifact: bool = False) -> List[Dict[str, Any]]:
+    """按类型检索参考。
+
+    forge-kernel 要迭代某一类算子时，第一件事是「这一类有没有现成的参考
+    可以当起点」。精确键（架构/算子/形状）查不了这个 —— 它要求你已经知道
+    确切的形状。所以这里按族、按算子名子串、按架构筛，返回每个条目当前
+    最优的那一代。
+    """
+    index = load_index(library)
+    out: List[Dict[str, Any]] = []
+
+    for key, entry in sorted(index["entries"].items()):
+        if arch and entry.get("arch") != arch:
+            continue
+        if family and entry.get("family") != family:
+            continue
+        if operator and operator.lower() not in str(entry.get("operator", "")).lower():
+            continue
+        if shape and shape.lower() not in str(entry.get("input_shape", "")).lower():
+            continue
+
+        best_gen = entry.get("best_gen")
+        record = None
+        for candidate in entry.get("generations", []):
+            if candidate["generation"] == best_gen:
+                record = candidate
+                break
+        if record is None:
+            continue
+        if require_artifact and not record.get("artifact_present"):
+            continue
+
+        out.append({
+            "key": key,
+            "operator": entry.get("operator"),
+            "arch": entry.get("arch"),
+            "input_shape": entry.get("input_shape"),
+            "family": entry.get("family"),
+            "family_source": entry.get("family_source"),
+            "generations": len(entry.get("generations", [])),
+            "best_gen": best_gen,
+            "best_basis": entry.get("best_basis"),
+            "cumulative_gain": cumulative_gain(
+                entry.get("generations", []), best_gen or 0),
+            "kind": record.get("kind"),
+            "id": record.get("id"),
+            "time_us": record.get("time_us"),
+            "artifact_present": record.get("artifact_present"),
+            "artifact_dir": (str(library / record["dir"] / ARTIFACT_DIRNAME)
+                             if record.get("artifact_present") else None),
+            "bench_task": entry.get("bench_task"),
+        })
+    return out
+
+
+def ingest(library: Path, *, source: Path, operator: str, arch: str,
+           input_shape: str, identifier: Optional[str] = None,
+           family: Optional[str] = None,
+           signature: Optional[str] = None,
+           time_us: Optional[float] = None,
+           device_id: Optional[int] = None,
+           work_dir: Optional[Path] = None,
+           bench_task: Optional[str] = None,
+           bench_baseline_us: Optional[float] = None,
+           note: str = "") -> Dict[str, Any]:
+    """把本地一个算子目录纳入库，作为自定义参考（gen0）。
+
+    这条路径做三件事，少任何一件这个参考都不算「封好了」：
+
+      1. 校验目录确实像一个算子实现，不是随手指的路径
+      2. **封存**：产出禁读清单与专有名词清单。有源码的参考必须封，
+         否则 no-code 边界形同虚设 —— agent 可以随便读它，而读了之后
+         架构结论就是抄的
+      3. 登记进库作为 gen0
+
+    手工串这三步容易漏第 2 步，而漏了之后一切照常运转，只是方法失效了。
+    """
+    if not source.exists():
+        raise LibraryError(f"参考目录不存在: {source}")
+    if not source.is_dir():
+        raise LibraryError(f"参考必须是目录: {source}")
+
+    source_files = [p for p in source.rglob("*") if p.is_file()]
+    if not source_files:
+        raise LibraryError(f"参考目录下没有任何文件: {source}")
+
+    seal_report: Dict[str, Any] = {}
+    work = work_dir or (library / "_seals" / entry_key(
+        arch, operator, input_shape).replace("/", "_"))
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import seal_reference as sealer  # noqa: PLC0415
+
+        manifest = sealer.seal(source, operator, work)
+        seal_report = {
+            "work_dir": str(work),
+            "files": manifest["file_count"],
+            "source_files": manifest["source_file_count"],
+            "identifiers": manifest["identifier_count"],
+            "sealed_paths": str(work / sealer.SEALED_PATHS_FILENAME),
+            "denylist": str(work / sealer.DENYLIST_FILENAME),
+        }
+    except Exception as exc:  # noqa: BLE001 - 封存失败不能静默放行
+        raise LibraryError(
+            f"封存失败: {exc}\n"
+            "  有源码的参考必须先封存，否则 no-code 边界形同虚设 —— \n"
+            "  agent 可以随便读它，而读了之后架构结论就是抄来的。"
+        ) from exc
+
+    record = add_generation(
+        library, operator=operator, arch=arch, input_shape=input_shape,
+        kind="opp_install", identifier=identifier or operator,
+        artifact=str(source), signature=signature, time_us=time_us,
+        family=family, device_id=device_id, bench_task=bench_task,
+        bench_baseline_us=bench_baseline_us,
+        note=note or f"自定义参考，源自 {source}",
+    )
+    record["seal"] = seal_report
+    return record
+
+
 # ---------------------------------------------------------------------------
 # 命令
 # ---------------------------------------------------------------------------
@@ -526,6 +745,7 @@ def cmd_register(args: argparse.Namespace) -> int:
             input_shape=args.input_shape, kind=args.kind,
             identifier=args.id, artifact=args.artifact,
             signature=args.signature, time_us=args.time_us,
+            family=args.family, device_id=args.device_id,
             bench_task=args.bench_task,
             bench_baseline_us=args.bench_baseline_us,
             note=args.note,
@@ -565,6 +785,7 @@ def cmd_promote(args: argparse.Namespace) -> int:
             identifier=args.id or f"{args.operator}_promoted",
             artifact=args.artifact, signature=args.signature,
             time_us=args.time_us, gain=args.gain,
+            device_id=args.device_id,
             mechanism_verified=bool(args.mechanism_verified),
             note=args.note,
         )
@@ -611,6 +832,80 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     if record.get("bench_baseline_us"):
         print(f"\n  bench 基准线 {record['bench_baseline_us']} us"
               "（评分用，不是参考产物）")
+    return 0
+
+
+def cmd_ingest(args: argparse.Namespace) -> int:
+    """把本地某个目录下的算子纳入库作为自定义参考。"""
+    try:
+        record = ingest(
+            Path(args.library), source=Path(args.source),
+            operator=args.operator, arch=args.arch,
+            input_shape=args.input_shape, identifier=args.id,
+            family=args.family, signature=args.signature,
+            time_us=args.time_us, device_id=args.device_id,
+            work_dir=Path(args.work_dir) if args.work_dir else None,
+            bench_task=args.bench_task,
+            bench_baseline_us=args.bench_baseline_us, note=args.note,
+        )
+    except LibraryError as exc:
+        print(f"错误: {exc}", file=sys.stderr)
+        return 2
+
+    seal = record.get("seal", {})
+    print(f"已纳入自定义参考 gen{record['generation']}: {record['id']}")
+    print(f"  键        {record['key']}")
+    print(f"  产物      {len(record['artifact_files'])} 个文件已复制进库")
+    print(f"  封存      源码 {seal.get('source_files')} 个，"
+          f"抽出专有名词 {seal.get('identifiers')} 个")
+    print(f"  禁读清单  {seal.get('sealed_paths')}")
+    print(f"  名词清单  {seal.get('denylist')}")
+    print()
+    print("开 campaign 时把这两份清单接上，no-code 边界才真正生效：")
+    print(f"  export FORGE_SEALED_PATHS={seal.get('sealed_paths')}")
+    print(f"  fence_check.py --denylist {seal.get('denylist')} ...")
+    if record["environment"]["cann_version"] == "unknown":
+        print("\n提示: 没探到 CANN 版本。不同版本下的参考不是同一个东西，"
+              "建议 source set_env.sh 后重做，或在 --note 写明。",
+              file=sys.stderr)
+    return 0
+
+
+def cmd_find(args: argparse.Namespace) -> int:
+    """按类型检索：这一类算子有没有现成的参考可以当起点。"""
+    try:
+        hits = find(Path(args.library), family=args.family,
+                    operator=args.operator, arch=args.arch,
+                    shape=args.shape, require_artifact=args.with_artifact)
+    except LibraryError as exc:
+        print(f"错误: {exc}", file=sys.stderr)
+        return 2
+
+    if args.as_json:
+        print(json.dumps(hits, ensure_ascii=False, indent=2))
+        return 0 if hits else 1
+
+    if not hits:
+        print("没有命中。可用的族：")
+        index = load_index(Path(args.library))
+        families = sorted({e.get("family") for e in index["entries"].values()
+                           if e.get("family")})
+        print("  " + (", ".join(families) if families else "（库是空的）"))
+        return 1
+
+    print(f"命中 {len(hits)} 项\n")
+    for hit in hits:
+        mark = "" if hit["family_source"] == "explicit" else "（推断）"
+        print(f"{hit['operator']}  [{hit['arch']}]  族 {hit['family']}{mark}")
+        print(f"  形状     {hit['input_shape']}")
+        print(f"  最优     gen{hit['best_gen']} / 共 {hit['generations']} 代"
+              f"  累计 {(hit['cumulative_gain'] - 1) * 100:+.2f}%")
+        print(f"  依据     {hit['best_basis']}")
+        if hit["artifact_dir"]:
+            print(f"  产物     {hit['artifact_dir']}")
+        else:
+            print(f"  产物     无（{hit['kind']}，调用即可）")
+        print()
     return 0
 
 
@@ -763,6 +1058,9 @@ def build_parser() -> argparse.ArgumentParser:
                        help="挂到 cann-bench 任务，如 tasks/level2/add_layer_norm")
     p_reg.add_argument("--bench-baseline-us", type=float, default=None,
                        help="cases.yaml 的 baseline_perf_us；评分基准线，非参考产物")
+    p_reg.add_argument("--family", default=None,
+                       help="算子族；不给则从算子名推断")
+    p_reg.add_argument("--device-id", type=int, default=None)
     p_reg.add_argument("--note", default="")
     p_reg.set_defaults(func=cmd_register)
 
@@ -778,6 +1076,7 @@ def build_parser() -> argparse.ArgumentParser:
                        help="campaign 判为 accept（而非 accept_unverified）时才给")
     p_pro.add_argument("--force", action="store_true",
                        help="机制未核实也强行入库")
+    p_pro.add_argument("--device-id", type=int, default=None)
     p_pro.add_argument("--note", default="")
     p_pro.set_defaults(func=cmd_promote)
 
@@ -790,6 +1089,36 @@ def build_parser() -> argparse.ArgumentParser:
     p_lin = sub.add_parser("lineage", help="展示代际链条",
                            parents=[common, identity])
     p_lin.set_defaults(func=cmd_lineage)
+
+    p_ing = sub.add_parser(
+        "ingest", help="把本地算子目录纳入库作为自定义参考（含封存）",
+        parents=[common, identity])
+    p_ing.add_argument("--source", required=True, help="本地算子实现目录")
+    p_ing.add_argument("--id", default=None)
+    p_ing.add_argument("--family", default=None,
+                       help="算子族；不给则从算子名推断")
+    p_ing.add_argument("--signature", default=None)
+    p_ing.add_argument("--time-us", type=float, default=None)
+    p_ing.add_argument("--device-id", type=int, default=None,
+                       help="测这个时间用的是哪张卡。多卡机器上卡间有系统性"
+                            "差异，记下来才知道哪些数字可比")
+    p_ing.add_argument("--work-dir", default=None,
+                       help="封存清单的落地目录；默认放库内 _seals/")
+    p_ing.add_argument("--bench-task", default=None)
+    p_ing.add_argument("--bench-baseline-us", type=float, default=None)
+    p_ing.add_argument("--note", default="")
+    p_ing.set_defaults(func=cmd_ingest)
+
+    p_find = sub.add_parser(
+        "find", help="按算子族/名字/架构检索参考", parents=[common])
+    p_find.add_argument("--family", default=None,
+                        help="算子族，如 matmul / reduction / attention")
+    p_find.add_argument("--operator", default=None, help="算子名子串")
+    p_find.add_argument("--arch", default=None)
+    p_find.add_argument("--shape", default=None, help="形状子串")
+    p_find.add_argument("--with-artifact", action="store_true",
+                        help="只要有产物可取的（排除厂商实现）")
+    p_find.set_defaults(func=cmd_find)
 
     p_lst = sub.add_parser("list", help="列出库里有什么", parents=[common])
     p_lst.set_defaults(func=cmd_list)

@@ -64,7 +64,8 @@ ForgeKernel 跑的是两层循环，这个脚本是两层的调度中枢。
         --milestone milestone.json --decision D0.1 --reason "拓扑决策有缺陷"
 
     campaign.py set-noise-floor --state campaign_state.json --value 2.7
-    campaign.py promote --state campaign_state.json --artifact ./best
+    campaign.py promote --state campaign_state.json --artifact ./best \\
+        --library ~/.forge-kernel/lib --signature architecture_signature.json
     campaign.py ledger --state campaign_state.json --recipes
 
 `--state` 与 `--json` 写在子命令前后都可以，两种形态都能跑。
@@ -1576,7 +1577,7 @@ def cmd_promote(args: argparse.Namespace) -> int:
     # 第 n-1 代了，而且没有任何地方能看出参考变过。
     library_record = None
     library_seeded = None
-    if args.library:
+    if True:
         best_verified = any(
             e.get("counts_toward_best") and not e.get("invalidated")
             for e in state.get("ledger", []))
@@ -1653,9 +1654,6 @@ def cmd_promote(args: argparse.Namespace) -> int:
                   "（库里原本没有这个算子）")
         print(f"  已入库    {library_record['key']} gen{library_record['generation']}"
               f"（{len(library_record['artifact_files'])} 个文件）")
-    else:
-        print("  未入库    产物只在 state 里留了路径；该目录被清掉后，"
-              "下一代将拿不到它。建议加 --library")
     print(f"  新参考    {state['reference']['id']}（封闭）")
     print(f"  上代增益  {(gain - 1) * 100:+.2f}%")
     print(f"  新目标    {args.phase_target_gain}")
@@ -1911,10 +1909,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_promote.add_argument("--artifact", required=True)
     p_promote.add_argument("--phase-target-gain", type=float,
                            default=DEFAULT_PHASE_TARGET_GAIN)
-    p_promote.add_argument("--library", default=None,
-                           help="封存产物库根目录。给了就把产物复制进库并记"
-                                "校验和与血统 —— 不给的话只在 state 里留一个"
-                                "路径，那个目录被清掉下一代就拿不到它了")
+    p_promote.add_argument("--library", required=True,
+                           help="封存产物库根目录。产物会被复制进库并记校验和"
+                                "与血统。必填 —— 只留路径等于没留：那个目录"
+                                "被清掉之后下一代就拿不到上一代的产物，"
+                                "而自我提升的前提正是它还拿得到")
     p_promote.add_argument("--signature", default=None,
                            help="本代产物的架构签名，供日后检测漂移")
     p_promote.add_argument("--note", default="")

@@ -438,7 +438,11 @@ def test_promote_clears_reference_snapshot(tmp_path):
     mil.write_text(json.dumps(milestone()), encoding="utf-8")
     run(["--state", str(state_file), "record", "--result", str(res),
          "--decision", "D0.1", "--signature", str(sig), "--milestone", str(mil)])
-    run(["--state", str(state_file), "promote", "--artifact", "/tmp/b"])
+    artifact = tmp_path / "b"
+    (artifact / "op_kernel").mkdir(parents=True)
+    (artifact / "op_kernel" / "k.cpp").write_text("// k\n", encoding="utf-8")
+    run(["--state", str(state_file), "promote", "--artifact", str(artifact),
+         "--library", str(tmp_path / "lib")])
 
     promoted = json.loads(state_file.read_text(encoding="utf-8"))
     assert promoted["reference_snapshot"] is None
@@ -1353,8 +1357,12 @@ def test_cli_promote_marks_noise_floor_pending(tmp_path):
     run(["--state", str(state_file), "record", "--result", str(res),
          "--decision", "D0.1", "--signature", str(sig), "--milestone", str(mil)])
 
+    artifact = tmp_path / "best"
+    (artifact / "op_kernel").mkdir(parents=True)
+    (artifact / "op_kernel" / "k.cpp").write_text("// k\n", encoding="utf-8")
     code, out = run(["--state", str(state_file), "promote",
-                     "--artifact", "/tmp/best"])
+                     "--artifact", str(artifact),
+                     "--library", str(tmp_path / "lib")])
     assert code == 0
     promoted = json.loads(state_file.read_text(encoding="utf-8"))
     assert promoted["generation"] == 1

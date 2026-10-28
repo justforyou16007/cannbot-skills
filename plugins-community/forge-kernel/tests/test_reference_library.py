@@ -327,6 +327,7 @@ def test_lineage_records_parent_and_gain(tmp_path):
 
 
 def test_best_is_fastest_measured(tmp_path):
+    """整条链没有增益记录时，退回绝对耗时比较。"""
     library = tmp_path / "L"
     seed_reference(library, tmp_path, time_us=456.5)
     rl.add_generation(library, kind="sealed_kernel", identifier="g1",
@@ -335,7 +336,270 @@ def test_best_is_fastest_measured(tmp_path):
     rl.add_generation(library, kind="sealed_kernel", identifier="g2",
                       artifact=str(make_artifact(tmp_path, "k2")),
                       time_us=400.0, mechanism_verified=True, **IDENTITY)
-    assert rl.resolve(library, **IDENTITY)["generation"] == 1
+    record = rl.resolve(library, **IDENTITY)
+    assert record["generation"] == 1
+
+
+# ---------------------------------------------------------------------------
+# 最优的评选依据：累计增益跨环境可比，绝对耗时不可比
+#
+# 多卡机器上卡与卡之间有系统性差异，不同时段的并发水平也不同。
+# gain_over_parent 是同一次配对测量里的比值，哪张卡上测都成立 ——
+# 这正是论文坚持同 job 配对计时的理由。
+# ---------------------------------------------------------------------------
+
+def test_best_prefers_cumulative_gain(tmp_path):
+    """有增益记录时按累计增益选，不看绝对耗时。"""
+    library = tmp_path / "L"
+    seed_reference(library, tmp_path, time_us=456.5)
+    # gen1 在慢卡上测，绝对耗时更大，但增益更高
+    rl.add_generation(library, kind="sealed_kernel", identifier="g1",
+                      artifact=str(make_artifact(tmp_path, "k1")),
+                      time_us=900.0, gain=1.50, device_id=3,
+                      mechanism_verified=True, **IDENTITY)
+    record = rl.resolve(library, **IDENTITY)
+    assert record["generation"] == 1, "不该因为绝对耗时大就判它更差"
+
+    index = rl.load_index(library)
+    entry = index["entries"][rl.entry_key(**IDENTITY)]
+    assert "跨环境可比" in entry["best_basis"]
+
+
+def test_cumulative_gain_multiplies_along_chain(tmp_path):
+    library = tmp_path / "L"
+    seed_reference(library, tmp_path, time_us=100.0)
+    for idx, gain in enumerate((1.20, 1.10), start=1):
+        rl.add_generation(library, kind="sealed_kernel", identifier=f"g{idx}",
+                          artifact=str(make_artifact(tmp_path, f"k{idx}")),
+                          gain=gain, mechanism_verified=True, **IDENTITY)
+    entry = rl.load_index(library)["entries"][rl.entry_key(**IDENTITY)]
+    assert rl.cumulative_gain(entry["generations"], 2) == pytest.approx(1.32)
+
+
+def test_gen0_cumulative_gain_is_one(tmp_path):
+    library = tmp_path / "L"
+    seed_reference(library, tmp_path)
+    entry = rl.load_index(library)["entries"][rl.entry_key(**IDENTITY)]
+    assert rl.cumulative_gain(entry["generations"], 0) == 1.0
+
+
+def test_basis_flags_when_only_absolute_time(tmp_path):
+    """退回绝对耗时时要讲明它只在同一环境内可比。"""
+    library = tmp_path / "L"
+    seed_reference(library, tmp_path, time_us=456.5)
+    entry = rl.load_index(library)["entries"][rl.entry_key(**IDENTITY)]
+    _, basis = rl.pick_best(entry)
+    assert "仅同一环境内可比" in basis
+
+
+def test_device_id_recorded(tmp_path):
+    """多卡机器上卡间有系统性差异，记下来才知道哪些数字可比。"""
+    library = tmp_path / "L"
+    manifest = rl.add_generation(library, kind="builtin_aclnn", identifier="a",
+                                 device_id=3, **IDENTITY)
+    assert manifest["device_id"] == 3
+
+
+# ---------------------------------------------------------------------------
+# 算子族：按类型检索的基础
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("operator,expected", [
+    ("add_layer_norm", "reduction"),
+    ("softmax_v2", "reduction"),
+    ("matmul_nz", "matmul"),
+    ("batch_matmul", "matmul"),
+    ("flash_attn_fwd", "attention"),
+    ("mla_prefill", "attention"),
+    ("conv2d_fwd", "convolution"),
+    ("fast_gelu", "elementwise"),
+    ("topk_v2", "sort"),
+    # 量化变体归入主族：仓内分类体系把 matmul_mxfp4 这类归 matmul
+    ("fake_quant_matmul", "matmul"),
+    ("quantize_per_tensor", "quantization"),
+    ("transpose_nd", "conversion"),
+])
+def test_family_inference(operator, expected):
+    assert rl.infer_family(operator) == expected
+
+
+def test_family_inference_returns_none_when_unsure():
+    """推不出来就返回 None，不硬塞一个族 —— 塞错比没有更糟。"""
+    assert rl.infer_family("zzz_custom_thing") is None
+
+
+def test_explicit_family_overrides_inference(tmp_path):
+    library = tmp_path / "L"
+    rl.add_generation(library, kind="builtin_aclnn", identifier="a",
+                      family="custom_family", **IDENTITY)
+    entry = rl.load_index(library)["entries"][rl.entry_key(**IDENTITY)]
+    assert entry["family"] == "custom_family"
+    assert entry["family_source"] == "explicit"
+
+
+def test_inferred_family_is_labelled(tmp_path):
+    """推断的要标明来源，查的人才知道该不该信。"""
+    library = tmp_path / "L"
+    seed_reference(library, tmp_path)
+    entry = rl.load_index(library)["entries"][rl.entry_key(**IDENTITY)]
+    assert entry["family_source"] == "inferred"
+
+
+# ---------------------------------------------------------------------------
+# 按类型检索
+# ---------------------------------------------------------------------------
+
+def _populate(library, tmp_path):
+    specs = [
+        ("add_layer_norm", "DAV_2201", "B=8,S=4096"),
+        ("softmax_v2", "DAV_3510", "S=8192"),
+        ("matmul_nz", "DAV_2201", "M=4096,K=4096"),
+        ("flash_attn_fwd", "DAV_2201", "B=2,S=4096"),
+    ]
+    for operator, arch, shape in specs:
+        rl.add_generation(library, kind="builtin_aclnn",
+                          identifier=f"aclnn_{operator}", time_us=100.0,
+                          operator=operator, arch=arch, input_shape=shape)
+
+
+def test_find_by_family(tmp_path):
+    """forge-kernel 要迭代某类算子时，先问这一类有没有现成参考。"""
+    library = tmp_path / "L"
+    _populate(library, tmp_path)
+    hits = rl.find(library, family="reduction")
+    assert {h["operator"] for h in hits} == {"add_layer_norm", "softmax_v2"}
+
+
+def test_find_by_arch(tmp_path):
+    library = tmp_path / "L"
+    _populate(library, tmp_path)
+    hits = rl.find(library, arch="DAV_3510")
+    assert len(hits) == 1
+
+
+def test_find_combines_filters(tmp_path):
+    library = tmp_path / "L"
+    _populate(library, tmp_path)
+    hits = rl.find(library, family="reduction", arch="DAV_2201")
+    assert {h["operator"] for h in hits} == {"add_layer_norm"}
+
+
+def test_find_by_operator_substring(tmp_path):
+    library = tmp_path / "L"
+    _populate(library, tmp_path)
+    assert len(rl.find(library, operator="attn")) == 1
+
+
+def test_find_by_shape_substring(tmp_path):
+    library = tmp_path / "L"
+    _populate(library, tmp_path)
+    assert len(rl.find(library, shape="S=4096")) == 2
+
+
+def test_find_require_artifact_excludes_builtin(tmp_path):
+    """厂商实现没有产物可取，要拿来当起点改写时得排除掉。"""
+    library = tmp_path / "L"
+    _populate(library, tmp_path)
+    assert rl.find(library, require_artifact=True) == []
+
+
+def test_find_returns_best_generation(tmp_path):
+    library = tmp_path / "L"
+    seed_reference(library, tmp_path, time_us=456.5)
+    rl.add_generation(library, kind="sealed_kernel", identifier="g1",
+                      artifact=str(make_artifact(tmp_path)), gain=1.30,
+                      time_us=350.0, mechanism_verified=True, **IDENTITY)
+    hit = rl.find(library, family="reduction")[0]
+    assert hit["best_gen"] == 1
+    assert hit["cumulative_gain"] == pytest.approx(1.30)
+
+
+def test_find_empty_on_no_match(tmp_path):
+    library = tmp_path / "L"
+    _populate(library, tmp_path)
+    assert rl.find(library, family="nonexistent") == []
+
+
+# ---------------------------------------------------------------------------
+# 自定义参考入库
+# ---------------------------------------------------------------------------
+
+def custom_reference(tmp_path):
+    root = tmp_path / "myref"
+    (root / "op_kernel").mkdir(parents=True)
+    (root / "op_kernel" / "k.cpp").write_text(
+        "#include \"kernel_operator.h\"\n"
+        "#define MYREF_TILE_BYTES 16384\n"
+        "class MyProprietaryCore { };\n", encoding="utf-8")
+    (root / "op_host").mkdir()
+    (root / "op_host" / "tiling.cpp").write_text("// t\n", encoding="utf-8")
+    return root
+
+
+def test_ingest_registers_as_gen0(tmp_path):
+    library = tmp_path / "L"
+    record = rl.ingest(library, source=custom_reference(tmp_path),
+                       identifier="my_impl", **IDENTITY)
+    assert record["generation"] == 0
+    assert record["kind"] == "opp_install"
+
+
+def test_ingest_copies_artifact(tmp_path):
+    library = tmp_path / "L"
+    rl.ingest(library, source=custom_reference(tmp_path), **IDENTITY)
+    resolved = rl.resolve(library, **IDENTITY)
+    assert Path(resolved["artifact_dir"], "op_kernel", "k.cpp").is_file()
+
+
+def test_ingest_seals_the_reference(tmp_path):
+    """有源码的参考必须封存，否则 no-code 边界形同虚设。"""
+    library = tmp_path / "L"
+    record = rl.ingest(library, source=custom_reference(tmp_path), **IDENTITY)
+    seal = record["seal"]
+    assert Path(seal["sealed_paths"]).is_file()
+    assert Path(seal["denylist"]).is_file()
+    denylist = Path(seal["denylist"]).read_text(encoding="utf-8")
+    assert "MyProprietaryCore" in denylist
+    assert "MYREF_TILE_BYTES" in denylist
+
+
+def test_ingest_denylist_excludes_common_api(tmp_path):
+    library = tmp_path / "L"
+    record = rl.ingest(library, source=custom_reference(tmp_path), **IDENTITY)
+    denylist = Path(record["seal"]["denylist"]).read_text(encoding="utf-8")
+    assert "GlobalTensor" not in denylist
+
+
+def test_ingest_rejects_missing_dir(tmp_path):
+    with pytest.raises(rl.LibraryError, match="不存在"):
+        rl.ingest(tmp_path / "L", source=tmp_path / "nope", **IDENTITY)
+
+
+def test_ingest_rejects_file(tmp_path):
+    path = tmp_path / "a.cpp"
+    path.write_text("x", encoding="utf-8")
+    with pytest.raises(rl.LibraryError, match="必须是目录"):
+        rl.ingest(tmp_path / "L", source=path, **IDENTITY)
+
+
+def test_ingest_rejects_empty_dir(tmp_path):
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    with pytest.raises(rl.LibraryError, match="没有任何文件"):
+        rl.ingest(tmp_path / "L", source=empty, **IDENTITY)
+
+
+def test_ingest_infers_family(tmp_path):
+    library = tmp_path / "L"
+    rl.ingest(library, source=custom_reference(tmp_path), **IDENTITY)
+    assert rl.find(library, family="reduction")
+
+
+def test_ingest_accepts_explicit_family(tmp_path):
+    library = tmp_path / "L"
+    rl.ingest(library, source=custom_reference(tmp_path),
+              family="my_family", **IDENTITY)
+    assert rl.find(library, family="my_family")
 
 
 def test_untimed_generations_excluded_from_best(tmp_path):

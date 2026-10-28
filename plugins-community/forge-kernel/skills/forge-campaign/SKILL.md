@@ -297,6 +297,66 @@ python3 scripts/reference_library.py drift --library ~/.forge-kernel/lib \
 漂了就说明参考不是原来那个，之前的加速比不可比，应重新 register 一代
 并重测噪声底。
 
+### 自定义参考入库
+
+把本地某个目录下的算子纳入库作为参考，一条命令完成校验、封存、登记：
+
+```bash
+python3 scripts/reference_library.py ingest --library ~/.forge-kernel/lib \
+    --source /path/to/my_reference_op \
+    --operator add_layer_norm --arch DAV_2201 \
+    --input-shape "B=8,S=4096,fp16" --id my_layer_norm \
+    --signature reference_signature.json --time-us 420.0 --device-id 3
+```
+
+它做三件事，少任何一件这个参考都不算封好：
+
+1. 校验目录确实像一个算子实现
+2. **封存** —— 产出禁读清单与专有名词清单
+3. 登记为 gen0
+
+第 2 步最容易被漏。手工串 `seal_reference` + `register` 时漏掉它，
+一切照常运转，只是 no-code 边界形同虚设：agent 可以随便读这个参考，
+而读了之后架构结论就是抄的。
+
+`ingest` 会把两份清单的路径打出来，记得接上：
+
+```bash
+export FORGE_SEALED_PATHS=<ingest 输出的 sealed_paths.txt>
+fence_check.py --denylist <ingest 输出的 denylist.txt> ...
+```
+
+### 按类型检索
+
+要迭代某一类算子时，先问「这一类有没有现成参考可以当起点」：
+
+```bash
+# 按算子族
+python3 scripts/reference_library.py find --library ~/.forge-kernel/lib \
+    --family reduction --arch DAV_2201
+
+# 只要有产物可取的（排除厂商实现）
+python3 scripts/reference_library.py find --library ~/.forge-kernel/lib \
+    --family matmul --with-artifact
+```
+
+族的划分沿用 `ascendc-performance-best-practices` 的分类体系 —— 那边按族
+组织优化知识，这边按族找参考，两边对齐才查得通。族可以 `--family` 显式
+指定，不给则从算子名推断，推断结果会标明来源（推错比没有更糟：
+查的人会以为这一族里没有参考）。
+
+### 最优按累计增益选，不按绝对耗时
+
+多卡机器上卡与卡之间有系统性差异，不同时段的并发水平也不同 ——
+**绝对耗时跨环境不可比**。而 `gain_over_parent` 是同一次配对测量里得到的
+比值，在哪张卡上测都成立，这正是论文坚持同 job 配对计时的理由。
+
+所以 `best_gen` 按累计增益（各代增益连乘）评选。整条链一个增益都没记时
+才退回绝对耗时，并在 `best_basis` 里标明它只在同一环境内可比。
+
+每代的 `device_id` 也记在 manifest 里 —— 多卡实验时，哪些数字可比要看
+得出来。
+
 ### 挂到 cann-bench
 
 bench 的 `tasks/level*/<算子>/` 提供任务定义（`proto.yaml`、`cases.yaml`、
@@ -316,8 +376,12 @@ bench 的 `tasks/level*/<算子>/` 提供任务定义（`proto.yaml`、`cases.ya
 
 ```bash
 python3 scripts/campaign.py promote --state ./forge_work/campaign_state.json \
-    --artifact ./best_kernel
+    --artifact ./best_kernel --library ~/.forge-kernel/lib \
+    --signature architecture_signature.json
 ```
+
+> `--library` 是**必填**的。只在 state 里留一个路径等于没留：那个目录被
+> 清掉之后下一代就拿不到上一代的产物，而自我提升的前提正是它还拿得到。
 
 把本代产出封存成下一代的参考，重新分析、重新锚定目标。**源码不跨代边界，
 知识库跨** —— 这是两条不重复的反馈边：提升抬高性能锚点，知识库降低够到
@@ -348,7 +412,7 @@ python3 scripts/campaign.py set-noise-floor --state <state> --value <实测值>
 | 脚本 | 用途 |
 |---|---|
 | `scripts/campaign.py` | 状态机：init / record / reopen / set-reference-signature / set-noise-floor / set-budget / promote / status / ledger |
-| `scripts/reference_library.py` | 封存产物库：register / promote / resolve / lineage / list / verify / drift |
+| `scripts/reference_library.py` | 封存产物库：ingest / register / promote / resolve / find / lineage / list / verify / drift |
 | `scripts/noise_floor.py` | 实测噪声底 |
 | `scripts/seal_reference.py` | 封存参考，产出禁读与禁词清单 |
 | `scripts/reference_adapter.py` | 三种参考来源归一化 + 环境预检 |

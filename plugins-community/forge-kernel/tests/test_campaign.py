@@ -43,7 +43,15 @@ import noise_floor  # noqa: E402
 # 夹具
 # ---------------------------------------------------------------------------
 
+#: 参考实现的同字段读数。机制行要靠它做差 —— 没有基线就只是个阈值比较，
+#: 拦不住「这个 kernel 的停顿本来就低」。
+REFERENCE_STALL = 4.2
+
+CHANNEL = "msprof:ResourceConflictRatio.csv:aiv_mte2_wait_ratio"
+
+
 def fresh_state(**kw):
+    ref = kw.get("ref_stall", REFERENCE_STALL)
     state = campaign.new_state(
         operator="demo_op", input_shape="B=8,S=4096,fp16", arch="DAV_2201",
         reference={"kind": "builtin_aclnn", "id": "aclnnDemo", "sealed": True},
@@ -51,6 +59,7 @@ def fresh_state(**kw):
         target_gain=kw.get("target", 1.5),
         stagnation_threshold=kw.get("threshold", 3),
         budget=kw.get("budget"),
+        reference_snapshot=({CHANNEL: ref} if ref is not None else None),
     )
     state["state"] = campaign.STATE_IMPLEMENT
     return state
@@ -75,7 +84,7 @@ def signature(stall_value=0.9, trustworthy=True, present=True):
             "wait": {
                 "mte2_wait": {
                     "value": stall_value if present else None,
-                    "channel": "msprof:ResourceConflictRatio.csv:aiv_mte2_wait_ratio",
+                    "channel": CHANNEL,
                     "present": present,
                 }
             }
@@ -183,10 +192,16 @@ def test_signature_lookup_skips_absent_fields():
     assert value is None
 
 
+def baseline(value=REFERENCE_STALL):
+    return {CHANNEL: value}
+
+
 def test_mechanism_line_verified_when_expr_holds():
+    """阈值成立 + 字段朝声称方向移动过 = 机制确实落地。"""
     line = milestone()["milestones"][0]["gate"]["mechanism_lines"][0]
-    out = campaign.verify_mechanism_line(line, signature(0.9))
+    out = campaign.verify_mechanism_line(line, signature(0.9), baseline())
     assert out["verified"] is True
+    assert out["moved_pct"] < 0
 
 
 def test_mechanism_line_refuted_when_expr_fails():
@@ -209,17 +224,19 @@ def test_mechanism_line_unknown_on_unparseable_expr():
     assert campaign.verify_mechanism_line(line, signature())["verified"] is None
 
 
-@pytest.mark.parametrize("op,actual,threshold,expected", [
-    ("<", 0.9, 4.2, True), ("<", 9.9, 4.2, False),
-    (">", 9.9, 4.2, True), (">", 0.9, 4.2, False),
-    ("<=", 4.2, 4.2, True), (">=", 4.2, 4.2, True),
-    ("==", 4.2, 4.2, True), ("!=", 4.2, 4.2, False),
+@pytest.mark.parametrize("op,previous,actual,threshold,expected", [
+    # 基线都取得离 actual 足够远，把移动量这一项满足掉，单独验阈值逻辑
+    ("<", 9.9, 0.9, 4.2, True), ("<", 1.0, 9.9, 4.2, False),
+    (">", 1.0, 9.9, 4.2, True), (">", 9.9, 0.9, 4.2, False),
+    ("<=", 9.9, 4.2, 4.2, True), (">=", 1.0, 4.2, 4.2, True),
+    ("==", 1.0, 4.2, 4.2, True), ("!=", 1.0, 4.2, 4.2, False),
 ])
-def test_all_comparators(op, actual, threshold, expected):
+def test_all_comparators(op, previous, actual, threshold, expected):
     line = {"id": "M1", "anchor": {
-        "expr": f"msprof:X.csv:aiv_mte2_wait_ratio {op} {threshold}"}}
-    assert campaign.verify_mechanism_line(
-        line, signature(actual))["verified"] is expected
+        "expr": f"{CHANNEL} {op} {threshold}"}}
+    out = campaign.verify_mechanism_line(
+        line, signature(actual), baseline(previous))
+    assert out["verified"] is expected
 
 
 def test_mechanism_unknown_without_inputs():
@@ -240,6 +257,214 @@ def test_mechanism_unknown_when_signature_untrustworthy():
 def test_mechanism_unknown_when_decision_not_in_milestone():
     out = campaign.judge_mechanism(milestone(), signature(), "D9.9")
     assert out["status"] == "unknown"
+
+
+# ---------------------------------------------------------------------------
+# 顺序证据：阈值成立不够，字段还得确实动过
+#
+# 只查阈值的话，一个本来停顿就很低的 kernel 会让机制行平凡成立 ——
+# 门禁看起来过了，实际什么都没验证。论文要的是「改动前后两次读数」这个序对。
+# ---------------------------------------------------------------------------
+
+def test_vacuous_when_field_did_not_move():
+    """核心用例：这个 kernel 的停顿本来就是 0.9，改动做的是别的事。"""
+    line = milestone()["milestones"][0]["gate"]["mechanism_lines"][0]
+    out = campaign.verify_mechanism_line(line, signature(0.9), baseline(0.9))
+    assert out["verified"] is False
+    assert out["vacuous"] is True
+    assert "本来就是" in out["reason"]
+    assert "平凡通过" in out["reason"]
+
+
+def test_vacuous_when_movement_below_threshold():
+    """动了但幅度低于判据，同样算没动。"""
+    line = milestone()["milestones"][0]["gate"]["mechanism_lines"][0]
+    out = campaign.verify_mechanism_line(line, signature(0.98), baseline(1.0))
+    assert out["vacuous"] is True
+
+
+def test_movement_just_above_threshold_verifies():
+    line = milestone()["milestones"][0]["gate"]["mechanism_lines"][0]
+    out = campaign.verify_mechanism_line(line, signature(0.90), baseline(1.0))
+    assert out["verified"] is True
+
+
+def test_vacuous_when_direction_is_wrong():
+    """阈值仍成立，但字段朝反方向动了 —— 机制没朝声称的方向起作用。"""
+    line = milestone()["milestones"][0]["gate"]["mechanism_lines"][0]
+    out = campaign.verify_mechanism_line(line, signature(3.0), baseline(1.0))
+    assert out["verified"] is False
+    assert out["vacuous"] is True
+    assert "方向" in out["reason"]
+
+
+def test_direction_derived_from_operator():
+    """方向从比较符推出，不另立一张「每个标签该增该减」的表。"""
+    assert campaign._expected_direction("<") == -1
+    assert campaign._expected_direction("<=") == -1
+    assert campaign._expected_direction(">") == +1
+    assert campaign._expected_direction(">=") == +1
+    assert campaign._expected_direction("==") is None
+
+
+def test_increase_direction_verified():
+    """L2 命中率这类指标声称的是「升上去」，用 > 表达。"""
+    line = {"id": "M1", "label": "L2_LOCALITY", "anchor": {
+        "expr": "msprof:L2Cache.csv:total_hit_rate > 80"}}
+    sig = {"trust": {"trustworthy": True},
+           "cache": {"hit": {"value": 92.0, "present": True,
+                             "channel": "msprof:L2Cache.csv:total_hit_rate"}}}
+    out = campaign.verify_mechanism_line(
+        line, sig, {"msprof:L2Cache.csv:total_hit_rate": 45.0})
+    assert out["verified"] is True
+
+
+def test_unknown_without_any_baseline():
+    """没有上一轮也没有参考签名时，顺序证据无从谈起 —— 不能算核实。"""
+    line = milestone()["milestones"][0]["gate"]["mechanism_lines"][0]
+    out = campaign.verify_mechanism_line(line, signature(0.9), None)
+    assert out["verified"] is None
+    assert "不构成顺序证据" in out["reason"]
+
+
+def test_judge_reports_vacuous_status():
+    out = campaign.judge_mechanism(
+        milestone(), signature(0.9), "D0.1", baseline(0.9))
+    assert out["status"] == "vacuous"
+    assert "平凡通过" in out["reason"]
+
+
+def test_refuted_takes_priority_over_vacuous():
+    """阈值不成立比平凡通过更严重，状态要报前者。"""
+    doc = milestone()
+    doc["milestones"][0]["gate"]["mechanism_lines"].append({
+        "id": "M2", "label": "SUPPLY_KEEPUP", "status": "PASS",
+        "anchor": {"expr": f"{CHANNEL} < 0.1"},
+        "ordering_evidence": "x",
+    })
+    out = campaign.judge_mechanism(doc, signature(0.9), "D0.1", baseline(0.9))
+    assert out["status"] == "refuted"
+
+
+# ---------------------------------------------------------------------------
+# 做差基线从哪来
+# ---------------------------------------------------------------------------
+
+def test_baseline_falls_back_to_reference():
+    """首轮没有上一轮，参考自己的签名就是第 0 轮。"""
+    state = fresh_state()
+    snapshot, label = campaign.previous_snapshot(state)
+    assert snapshot[CHANNEL] == REFERENCE_STALL
+    assert label == "参考实现"
+
+
+def test_baseline_prefers_latest_ledger_entry():
+    state = fresh_state(target=10.0)
+    campaign.apply_result(state, result(speedup=1.30), "D0.1",
+                          milestone_doc=milestone(), signature=signature(2.0))
+    snapshot, label = campaign.previous_snapshot(state)
+    assert snapshot[CHANNEL] == 2.0
+    assert "上一轮" in label
+
+
+def test_invalidated_entries_not_used_as_baseline():
+    """已作废的条目建立在旧架构假设上，拿它做差会把变化归错因。"""
+    state = fresh_state(target=10.0)
+    campaign.apply_result(state, result(speedup=1.30), "D0.1",
+                          milestone_doc=milestone(), signature=signature(2.0))
+    state["ledger"][-1]["invalidated"] = True
+    snapshot, label = campaign.previous_snapshot(state)
+    assert snapshot[CHANNEL] == REFERENCE_STALL
+    assert label == "参考实现"
+
+
+def test_no_baseline_at_all():
+    state = fresh_state(ref_stall=None)
+    snapshot, label = campaign.previous_snapshot(state)
+    assert snapshot is None
+    assert label == "无"
+
+
+def test_snapshot_skips_absent_fields():
+    """缺失的字段不进快照，下一轮做差时如实报缺，而不是拿 0 去减。"""
+    snapshot = campaign.snapshot_signature(signature(present=False))
+    assert CHANNEL not in snapshot
+
+
+def test_snapshot_includes_derived_exposure():
+    sig = {"exposure": {"available": True, "exposed_pct": 14.1,
+                        "exposed_us": 64.4, "covered_us": 392.1}}
+    snapshot = campaign.snapshot_signature(sig)
+    assert snapshot["derived:exposure.exposed_pct"] == 14.1
+
+
+def test_ledger_carries_signature_snapshot():
+    state = fresh_state()
+    entry = campaign.apply_result(
+        state, result(speedup=1.30), "D0.1",
+        milestone_doc=milestone(), signature=signature(0.9))
+    assert entry["signature_snapshot"][CHANNEL] == 0.9
+
+
+def test_mechanism_records_which_baseline_was_used():
+    """台账要能回答「这次是跟谁比的」。"""
+    state = fresh_state()
+    entry = campaign.apply_result(
+        state, result(speedup=1.30), "D0.1",
+        milestone_doc=milestone(), signature=signature(0.9))
+    assert entry["mechanism"]["compared_against"] == "参考实现"
+
+
+def test_vacuous_counts_as_architectural_signal():
+    """平凡通过与被证伪同归一桶：两者都说明增益另有来源。"""
+    state = fresh_state(target=10.0, threshold=99)
+    campaign.apply_result(state, result(speedup=1.30), "D0.1",
+                          milestone_doc=milestone(),
+                          signature=signature(REFERENCE_STALL))
+    assert state["mechanism_unverified"]["streak_refuted"] == 1
+    assert state["mechanism_unverified"]["streak_unknown"] == 0
+
+
+def test_promote_clears_reference_snapshot(tmp_path):
+    """新参考是另一个二进制，拿旧签名做差会把两代差异算到本代头上。"""
+    state_file = tmp_path / "s.json"
+    run(init_argv(state_file, target=1.1,
+                  reference_signature=write_reference_signature(tmp_path)))
+    res = tmp_path / "ev.json"
+    res.write_text(json.dumps(result(speedup=1.25)), encoding="utf-8")
+    sig = tmp_path / "sig.json"
+    sig.write_text(json.dumps(signature(0.9)), encoding="utf-8")
+    mil = tmp_path / "m.json"
+    mil.write_text(json.dumps(milestone()), encoding="utf-8")
+    run(["--state", str(state_file), "record", "--result", str(res),
+         "--decision", "D0.1", "--signature", str(sig), "--milestone", str(mil)])
+    run(["--state", str(state_file), "promote", "--artifact", "/tmp/b"])
+
+    promoted = json.loads(state_file.read_text(encoding="utf-8"))
+    assert promoted["reference_snapshot"] is None
+
+
+def test_cli_set_reference_signature(tmp_path):
+    state_file = tmp_path / "s.json"
+    run(init_argv(state_file))
+    sig = write_reference_signature(tmp_path, 7.7)
+    code, _ = run(["--state", str(state_file), "set-reference-signature",
+                   "--signature", str(sig)])
+    assert code == 0
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    assert state["reference_snapshot"][CHANNEL] == 7.7
+
+
+def test_cli_set_reference_signature_rejects_empty(tmp_path):
+    """签名里一个有效读数都没有时，它不能充当做差基线。"""
+    state_file = tmp_path / "s.json"
+    run(init_argv(state_file))
+    empty = tmp_path / "empty.json"
+    empty.write_text(json.dumps(signature(present=False)), encoding="utf-8")
+    code, out = run(["--state", str(state_file), "set-reference-signature",
+                     "--signature", str(empty)])
+    assert code == 1
+    assert "无法作为做差基线" in out
 
 
 # ---------------------------------------------------------------------------
@@ -740,9 +965,11 @@ def test_reopen_recomputes_best(tmp_path):
     """best 必须按剩余有效条目重算，gain 与 time_us 要一起取。"""
     doc = milestone({"D0.1": [], "D0.2": ["D0.1"], "D0.3": []})
     state = fresh_state(target=10.0, threshold=99)
+    # 两条决策共用一条机制行，所以第二条要相对第一条继续下降；
+    # 停在原地就是平凡通过（阈值成立但不是它造成的）。
     campaign.apply_result(
         state, result(speedup=1.80, evolved_us=250.0), "D0.2",
-        milestone_doc=doc, signature=signature(0.9))
+        milestone_doc=doc, signature=signature(2.0))
     campaign.apply_result(
         state, result(speedup=1.20, evolved_us=380.0), "D0.3",
         milestone_doc=doc, signature=signature(0.9))
@@ -942,6 +1169,13 @@ def run(argv):
         sys.argv = saved
 
 
+def write_reference_signature(tmp_path, value=REFERENCE_STALL):
+    """参考自己的签名 = 机制做差的第 0 轮基线。"""
+    path = tmp_path / "ref_sig.json"
+    path.write_text(json.dumps(signature(value)), encoding="utf-8")
+    return path
+
+
 def init_argv(state_file, **kw):
     argv = ["--state", str(state_file), "init",
             "--operator", "demo_op", "--input-shape", "B=8,S=4096",
@@ -952,6 +1186,8 @@ def init_argv(state_file, **kw):
         argv += ["--target-gain", str(kw["target"])]
     if "budget" in kw:
         argv += ["--budget", str(kw["budget"])]
+    if kw.get("reference_signature"):
+        argv += ["--reference-signature", str(kw["reference_signature"])]
     return argv
 
 
@@ -1104,9 +1340,10 @@ def test_cli_warns_when_mechanism_unverified(tmp_path):
 
 
 def test_cli_promote_marks_noise_floor_pending(tmp_path):
-    """新参考是另一个二进制，噪声底必须重测。"""
+    """新参考是另一个二进制，噪声底与参考签名都必须重取。"""
     state_file = tmp_path / "s.json"
-    run(init_argv(state_file, target=1.1))
+    run(init_argv(state_file, target=1.1,
+                  reference_signature=write_reference_signature(tmp_path)))
     res = tmp_path / "ev.json"
     res.write_text(json.dumps(result(speedup=1.25)), encoding="utf-8")
     sig = tmp_path / "sig.json"

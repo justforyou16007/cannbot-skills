@@ -154,8 +154,13 @@ python3 $SK/campaign.py init \
     --arch DAV_2201 \
     --reference-kind builtin_aclnn --reference-id aclnnAddLayerNorm \
     --noise-floor 2.3 --target-gain 1.05 --budget 40 \
+    --reference-signature ./forge_work/reference_signature.json \
     --state ./forge_work/campaign_state.json
 ```
+
+> **`--reference-signature` 传步骤 4 对参考采的那份签名。** 机制行要拿它
+> 做差（第 0 轮基线）；不给的话首轮构不成顺序证据，机制一律判为无法核验。
+> 忘了可以事后补：`campaign.py set-reference-signature --signature <path>`。
 
 > **`--input-shape` 是必填的。** 噪声底、架构签名、门禁锚点全都与 shape
 > 绑定 —— 同一个 tiling 决策在不同 shape 下的 trigger 完全不同。一份
@@ -200,6 +205,7 @@ forge_work/
 | 知识库有没有在帮忙 | `campaign.py ledger --recipes` |
 | 哪些改动机制没核实 | `ledger` 里标注「机制未核实」的条目 |
 | 机制是没查还是查了不成立 | `status` 的「机制不算数」一行，分证伪/无法核验两列 |
+| 这次机制是跟谁比的 | `record` 输出的「做差基线」，或台账的 `compared_against` |
 | 架构决策与门禁 | `milestone.json` |
 | 课程表合不合规 | `milestone_validate.py milestone.json` |
 | 为什么某个候选被拒 | ledger 里该条的 `reason` |
@@ -278,6 +284,19 @@ arch agent 此时该做的是消融、给手段定价、必要时**重开 M0 的
 与 `--milestone`，让机制行的停顿锚点真正被求值一次。
 
 最常见的原因其实是**没传这两个参数** —— 工具不替你假设「没查就是通过」。
+
+### Q：机制行明明阈值成立，为什么判「平凡通过」？
+
+因为那个字段跟上一轮（或参考）比**根本没动**。
+
+阈值来自参考实测，所以「低于 4.2」的含义是「我比参考等得少」。但如果
+这个 kernel 的 MTE2 停顿本来就只有 0.9，那它天然满足阈值 —— 改动做的
+其实是别的事，机制行只是平凡地通过了。门禁看起来过了，实际什么都没验证。
+
+所以 record 会拿本轮签名和基线做差，要求字段确实朝声称的方向移动
+（默认至少 5% 相对变化）。方向从比较符推出：`<` 是要降，`>` 是要升。
+
+平凡通过和「阈值不成立」归在同一桶：都说明增益另有来源，都该交回架构层。
 
 ### Q：`status` 说 `mechanism_refuted`，和 `mechanism_never_verified` 有什么不同？
 

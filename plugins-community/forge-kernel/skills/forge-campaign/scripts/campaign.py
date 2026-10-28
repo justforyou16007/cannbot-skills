@@ -132,6 +132,21 @@ DEFAULT_UNVERIFIED_THRESHOLD = 3
 #: 自我提升每阶段的目标增益（论文 §3.5：+5%）。
 DEFAULT_PHASE_TARGET_GAIN = 1.05
 
+#: 机制行的锚点字段至少要移动这么多（相对上一轮的百分比）才算「动过」。
+#:
+#: 没有这条检查，机制行只是一个阈值比较，而阈值来自参考实测，所以
+#: 「低于 4.2」实际含义是「我比参考等得少」。它拦不住这种情形：
+#: 某个 kernel 的 MTE2 停顿本来就只有 0.9，改动做的是别的事，
+#: 机制行照样成立 —— 门禁看起来过了，实际什么都没验证。
+#:
+#: 这个 5% 是工程判断，**无文档出处**。停顿类指标的测量噪声没有像时延
+#: 那样被实测过（噪声底量的是时延），所以这里取一个保守的相对阈值，
+#: 并在输出里如实标注它是推导判据而非实测判据。
+MECHANISM_MOVE_MIN_PCT = 5.0
+
+#: 比较极小值时的分母保护。停顿占比可以真的是 0。
+_MOVE_EPS = 1e-6
+
 VERDICT_ACCEPT = "accept"
 VERDICT_ACCEPT_UNVERIFIED = "accept_unverified"
 VERDICT_REVERT = "revert"
@@ -215,6 +230,53 @@ _COMPARATORS = {
 }
 
 
+def snapshot_signature(signature: Dict[str, Any]) -> Dict[str, float]:
+    """把一份架构签名压成 {通道: 数值}，存进台账供下一轮做差。
+
+    存快照而不是存文件路径：路径会失效（目录被清、工作区换位置），
+    而顺序证据一旦丢了就补不回来 —— 那次测量已经过去了。快照是几十个
+    数字，代价可以忽略。
+
+    只收 present 为真的字段。缺失的不进快照，下一轮做差时就会如实报告
+    「上一轮没有这个读数」，而不是拿 0 去减。
+    """
+    out: Dict[str, float] = {}
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            channel = node.get("channel")
+            value = node.get("value")
+            if (isinstance(channel, str) and node.get("present") is True
+                    and isinstance(value, (int, float))):
+                out.setdefault(channel, float(value))
+            for child in node.values():
+                walk(child)
+        elif isinstance(node, list):
+            for child in node:
+                walk(child)
+
+    walk(signature)
+
+    exposure = signature.get("exposure")
+    if isinstance(exposure, dict) and exposure.get("available"):
+        for key in ("exposed_pct", "exposed_us", "covered_us"):
+            value = exposure.get(key)
+            if isinstance(value, (int, float)):
+                out.setdefault(f"derived:exposure.{key}", float(value))
+    return out
+
+
+def lookup_snapshot_value(snapshot: Optional[Dict[str, float]],
+                          needle: str) -> Optional[float]:
+    """在快照里按字段名找值。快照的键是完整通道串，这里按子串匹配。"""
+    if not snapshot:
+        return None
+    for channel, value in snapshot.items():
+        if needle in channel:
+            return value
+    return None
+
+
 def lookup_signature_value(signature: Dict[str, Any],
                            needle: str) -> Tuple[Optional[float], Optional[str]]:
     """在架构签名里按通道名找值。
@@ -255,22 +317,46 @@ def lookup_signature_value(signature: Dict[str, Any],
     return None, None
 
 
-def verify_mechanism_line(line: Dict[str, Any],
-                          signature: Dict[str, Any]) -> Dict[str, Any]:
-    """核验一条机制行的锚点在本次 signature 上是否成立。
+def _expected_direction(operator: str) -> Optional[int]:
+    """从比较符推出机制声称的变化方向。
 
-    三种结果，**不要混淆后两种**：
-      True   表达式求值为真，机制确实落地
-      False  求值为假，机制没有落地 —— 那么这次的增益来自别处
-      None   无法求值（字段没采到、表达式写法不认识）。这不等于失败，
-             但也不构成验证，所以同样不足以支撑 accept
+    `field < 阈值` 说明声称的是「把它降下来」，`field > 阈值` 是「升上去」。
+    比较符本身已经编码了哪边算好，不必再维护一张「每个标签该增该减」的
+    对照表 —— 那张表会和词汇表漂移。
+    """
+    if operator in ("<", "<="):
+        return -1
+    if operator in (">", ">="):
+        return +1
+    return None  # == / != 不蕴含方向
+
+
+def verify_mechanism_line(line: Dict[str, Any],
+                          signature: Dict[str, Any],
+                          previous_snapshot: Optional[Dict[str, float]] = None,
+                          move_min_pct: float = MECHANISM_MOVE_MIN_PCT
+                          ) -> Dict[str, Any]:
+    """核验一条机制行：阈值成立，**而且**那个字段确实因本次改动而移动。
+
+    两步缺一不可。只查阈值的话，一个本来停顿就很低的 kernel 会让机制行
+    平凡成立 —— 门禁看起来过了，实际什么都没验证。论文要的顺序证据正是
+    「改动前后两次读数」这个序对。
+
+    四种结果，**不要混**：
+      True     阈值成立，且字段朝声称的方向移动了 —— 机制确实落地
+      False    阈值不成立 —— 机制没落地，这次的增益来自别处
+      vacuous  阈值成立但字段没动（或动反了）—— 不是本次改动造成的，
+               和 False 一样说明增益另有来源，但成因不同，要分开说
+      None     无法求值（字段没采到、缺上一轮读数、表达式不认识）。
+               不等于失败，但也不构成验证
     """
     line_id = line.get("id", "<无 id>")
     label = line.get("label")
     anchor = line.get("anchor") or {}
     expr = anchor.get("expr") if isinstance(anchor, dict) else None
 
-    out: Dict[str, Any] = {"id": line_id, "label": label, "expr": expr}
+    out: Dict[str, Any] = {"id": line_id, "label": label, "expr": expr,
+                           "vacuous": False}
 
     if not isinstance(expr, str) or not expr.strip():
         out.update(verified=None, reason="机制行没有可求值的锚点表达式")
@@ -294,13 +380,62 @@ def verify_mechanism_line(line: Dict[str, Any],
                            "缺失不等于不成立 —— 但也不构成验证"))
         return out
 
-    ok = _COMPARATORS[op](actual, threshold)
+    out.update(actual=actual, threshold=threshold, operator=op,
+               channel=hit_channel)
+
+    threshold_ok = _COMPARATORS[op](actual, threshold)
+    if not threshold_ok:
+        out.update(verified=False,
+                   reason=f"{field} 实测 {actual} {op} {threshold} 不成立")
+        return out
+
+    # 阈值成立，再看它是不是因本次改动而移动的
+    previous = lookup_snapshot_value(previous_snapshot, field)
+    if previous is None:
+        out.update(
+            verified=None,
+            reason=(f"{field} 实测 {actual} {op} {threshold} 成立，但缺少上一轮"
+                    "（或参考）的同字段读数，无法判断它是否因本次改动而变化。"
+                    "阈值成立也可能只是它本来就在那个位置 —— "
+                    "这不构成顺序证据"))
+        return out
+
+    out["previous"] = previous
+    delta = actual - previous
+    denominator = max(abs(previous), _MOVE_EPS)
+    moved_pct = delta / denominator * 100.0
+    out["moved_pct"] = moved_pct
+
+    expected = _expected_direction(op)
+    if expected is None:
+        # == / != 不蕴含方向，只要动过即可
+        enough = abs(moved_pct) >= move_min_pct
+        direction_ok = True
+    else:
+        enough = abs(moved_pct) >= move_min_pct
+        direction_ok = (moved_pct < 0) if expected < 0 else (moved_pct > 0)
+
+    if enough and direction_ok:
+        arrow = "降至" if delta < 0 else "升至"
+        out.update(verified=True,
+                   reason=(f"{field} 由 {previous} {arrow} {actual}"
+                           f"（{moved_pct:+.1f}%），且 {op} {threshold} 成立"))
+        return out
+
+    if not enough:
+        out.update(
+            verified=False, vacuous=True,
+            reason=(f"{field} 本来就是 {previous}，本轮 {actual}，"
+                    f"仅变动 {moved_pct:+.1f}%（低于 {move_min_pct}%）。"
+                    f"阈值 {op} {threshold} 成立，但不是本次改动造成的 —— "
+                    "这条机制行是平凡通过的"))
+        return out
+
     out.update(
-        verified=bool(ok), actual=actual, threshold=threshold,
-        operator=op, channel=hit_channel,
-        reason=(f"{field} 实测 {actual} {op} {threshold} "
-                f"{'成立' if ok else '不成立'}"),
-    )
+        verified=False, vacuous=True,
+        reason=(f"{field} 由 {previous} 变为 {actual}（{moved_pct:+.1f}%），"
+                f"方向与 {op} {threshold} 声称的相反。"
+                "阈值仍成立，但机制没有朝声称的方向起作用"))
     return out
 
 
@@ -325,11 +460,19 @@ def collect_mechanism_lines(milestone_doc: Dict[str, Any],
 
 def judge_mechanism(milestone_doc: Optional[Dict[str, Any]],
                     signature: Optional[Dict[str, Any]],
-                    decision_id: str) -> Dict[str, Any]:
+                    decision_id: str,
+                    previous_snapshot: Optional[Dict[str, float]] = None,
+                    ) -> Dict[str, Any]:
     """机制裁决：本次改动有没有把它声称的机制做出来。
 
     没给 milestone 或 signature 时返回 unknown —— 工具不替调用方假设
     「没查就是通过」。
+
+    四种状态：
+      verified  全部机制行成立且字段确实朝声称方向移动
+      refuted   有机制行阈值不成立 —— 机制没落地
+      vacuous   阈值成立但字段没动 —— 不是本次改动造成的，平凡通过
+      unknown   无从核验
     """
     if milestone_doc is None or signature is None:
         return {
@@ -353,15 +496,23 @@ def judge_mechanism(milestone_doc: Optional[Dict[str, Any]],
             "reason": f"milestone 里找不到决策 {decision_id} 所属的机制行",
         }
 
-    results = [verify_mechanism_line(line, signature) for line in lines]
+    results = [verify_mechanism_line(line, signature, previous_snapshot)
+               for line in lines]
+
     if all(r["verified"] is True for r in results):
         status = "verified"
-        reason = f"{len(results)} 条机制行全部成立"
-    elif any(r["verified"] is False for r in results):
+        reason = f"{len(results)} 条机制行全部成立，且字段确实朝声称方向移动"
+    elif any(r["verified"] is False and not r.get("vacuous") for r in results):
         status = "refuted"
-        failed = [r["id"] for r in results if r["verified"] is False]
-        reason = (f"机制行 {failed} 不成立 —— 这次的增益来自别处，"
+        failed = [r["id"] for r in results
+                  if r["verified"] is False and not r.get("vacuous")]
+        reason = (f"机制行 {failed} 阈值不成立 —— 这次的增益来自别处，"
                   "不能把它附带的解释当成已验证的机制")
+    elif any(r.get("vacuous") for r in results):
+        status = "vacuous"
+        vacuous = [r["id"] for r in results if r.get("vacuous")]
+        reason = (f"机制行 {vacuous} 是平凡通过的：阈值成立，但那个字段"
+                  "并非因本次改动而变化。增益同样另有来源")
     else:
         status = "unknown"
         pending = [r["id"] for r in results if r["verified"] is None]
@@ -589,7 +740,9 @@ def save_state(path: Path, state: Dict[str, Any]) -> None:
 def new_state(operator: str, input_shape: str, arch: str,
               reference: Dict[str, Any], noise_floor_pct: float,
               target_gain: float, stagnation_threshold: int,
-              budget: Optional[int] = None) -> Dict[str, Any]:
+              budget: Optional[int] = None,
+              reference_snapshot: Optional[Dict[str, float]] = None
+              ) -> Dict[str, Any]:
     """建立 campaign 状态。
 
     论文 §3.1：一次 campaign 取一个算子、**一个输入形状**、一个封存的
@@ -607,6 +760,9 @@ def new_state(operator: str, input_shape: str, arch: str,
         "reference": reference,
         "noise_floor_pct": noise_floor_pct,
         "noise_floor_status": NOISE_MEASURED,
+        # 参考自己的架构签名快照 = 第 0 轮。机制行做差时若没有更近的
+        # 有效台账快照，就拿它当基线。
+        "reference_snapshot": reference_snapshot or None,
         "target_gain": target_gain,
         "budget": {"max_records": budget, "used": 0},
         "state": STATE_ANALYZE,
@@ -669,12 +825,36 @@ def _precision_passed(doc: Dict[str, Any]) -> Optional[bool]:
 # 裁决
 # ---------------------------------------------------------------------------
 
+def previous_snapshot(state: Dict[str, Any]) -> Tuple[Optional[Dict[str, float]], str]:
+    """取做差用的「上一轮」快照，并说明它是哪一轮。
+
+    优先用最近一条**仍然有效**的台账快照；没有就退回参考自己的签名 ——
+    那就是第 0 轮。样例里写的「参考 job 1 为 4.2，本实现 job 2 降至 0.9」
+    正是这种比法。
+
+    已作废的条目不能用作基线：它们建立在旧架构假设上，拿它做差得出的
+    「变化」归因到新实现头上是错的。
+    """
+    for entry in reversed(state.get("ledger", [])):
+        if entry.get("invalidated"):
+            continue
+        snapshot = entry.get("signature_snapshot")
+        if snapshot:
+            label = f"上一轮（决策 {entry.get('decision')}）"
+            return snapshot, label
+    reference = state.get("reference_snapshot")
+    if reference:
+        return reference, "参考实现"
+    return None, "无"
+
+
 def apply_result(state: Dict[str, Any], doc: Dict[str, Any], decision: str,
                  milestone_doc: Optional[Dict[str, Any]] = None,
                  signature: Optional[Dict[str, Any]] = None,
                  recipes_used: Optional[List[str]] = None,
                  recipes_invented: Optional[List[str]] = None,
-                 symptom: str = "") -> Dict[str, Any]:
+                 symptom: str = "",
+                 signature_path: str = "") -> Dict[str, Any]:
     """把一次评测结果并入状态，返回裁决记录。
 
     裁决顺序刻意如此：
@@ -711,6 +891,11 @@ def apply_result(state: Dict[str, Any], doc: Dict[str, Any], decision: str,
         "counts_toward_best": False,
         "kb_admissible": False,
         "symptom": symptom,
+        # 顺序证据靠它做差。存快照而不是路径 —— 路径会失效，而那次测量
+        # 过去了就补不回来。
+        "signature_snapshot": (snapshot_signature(signature)
+                               if signature else None),
+        "signature_path": signature_path or None,
     }
 
     precision = _precision_passed(doc)
@@ -735,7 +920,10 @@ def apply_result(state: Dict[str, Any], doc: Dict[str, Any], decision: str,
             delta = (gain - 1.0) * 100.0
 
             if gain_verdict == VERDICT_ACCEPT:
-                mechanism = judge_mechanism(milestone_doc, signature, decision)
+                baseline, baseline_label = previous_snapshot(state)
+                mechanism = judge_mechanism(
+                    milestone_doc, signature, decision, baseline)
+                mechanism["compared_against"] = baseline_label
                 entry["mechanism"] = mechanism
                 if mechanism["status"] == "verified":
                     entry["verdict"] = VERDICT_ACCEPT
@@ -793,7 +981,10 @@ def apply_result(state: Dict[str, Any], doc: Dict[str, Any], decision: str,
             unver["consecutive"] = int(unver.get("consecutive", 0)) + 1
             status = ((entry.get("mechanism") or {}).get("status")
                       if isinstance(entry.get("mechanism"), dict) else None)
-            key = "streak_refuted" if status == "refuted" else "streak_unknown"
+            # vacuous 与 refuted 同归一桶：两者都说明增益另有来源，
+            # 都该把控制权交回架构层。成因差别在行级 reason 里说清。
+            key = ("streak_refuted" if status in ("refuted", "vacuous")
+                   else "streak_unknown")
             unver[key] = int(unver.get(key, 0)) + 1
         # 只有机制核实过的改动才抬高 best。未核实的保留但不计入 ——
         # 否则 promote 时会把一个解释不清的结果封成下一代的参考。
@@ -975,6 +1166,51 @@ def write_nogo(nogo_path: Path, state: Dict[str, Any],
 # 命令
 # ---------------------------------------------------------------------------
 
+def _load_signature(path: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not path:
+        return None
+    try:
+        doc = json.loads(Path(path).read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise CampaignError(f"无法读取签名 {path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise CampaignError(f"签名 {path} 不是合法 JSON: {exc}") from exc
+    if not isinstance(doc, dict):
+        raise CampaignError(f"签名 {path} 顶层必须是对象")
+    return doc
+
+
+def cmd_set_reference_signature(args: argparse.Namespace) -> int:
+    """登记参考实现自己的架构签名，作为机制做差的第 0 轮基线。"""
+    path = Path(args.state)
+    try:
+        state = load_state(path)
+        signature = _load_signature(args.signature)
+    except CampaignError as exc:
+        print(f"错误: {exc}", file=sys.stderr)
+        return 2
+
+    snapshot = snapshot_signature(signature) if signature else {}
+    if not snapshot:
+        print("错误: 该签名里没有任何有效读数，无法作为做差基线。\n"
+              "  多半是 signature_probe 判了测量不可信、或 metric 缺失。",
+              file=sys.stderr)
+        return 1
+
+    state["reference_snapshot"] = snapshot
+    state.setdefault("ledger", []).append({
+        "at": _now(), "generation": state.get("generation", 0),
+        "input_shape": state.get("input_shape"), "decision": None,
+        "gain": None, "verdict": "reference_signature",
+        "reason": f"登记参考签名快照，含 {len(snapshot)} 个字段",
+        "counts_toward_best": False, "kb_admissible": False,
+    })
+    save_state(path, state)
+    print(f"已登记参考签名快照：{len(snapshot)} 个字段")
+    print("机制行做差时，没有更近的有效台账快照就以它为基线（第 0 轮）。")
+    return 0
+
+
 def cmd_init(args: argparse.Namespace) -> int:
     path = Path(args.state)
     if path.exists() and not args.force:
@@ -989,6 +1225,14 @@ def cmd_init(args: argparse.Namespace) -> int:
               "测量抖动会被当成真实加速。请先用 noise_floor.py 量一次。",
               file=sys.stderr)
 
+    try:
+        reference_signature = _load_signature(args.reference_signature)
+    except CampaignError as exc:
+        print(f"错误: {exc}", file=sys.stderr)
+        return 2
+    reference_snapshot = (snapshot_signature(reference_signature)
+                          if reference_signature else None)
+
     state = new_state(
         operator=args.operator, input_shape=args.input_shape, arch=args.arch,
         reference={
@@ -997,6 +1241,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         },
         noise_floor_pct=args.noise_floor, target_gain=args.target_gain,
         stagnation_threshold=args.stagnation_threshold, budget=args.budget,
+        reference_snapshot=reference_snapshot,
     )
     save_state(path, state)
     print(f"已创建 campaign: {args.operator} @ {args.arch}")
@@ -1042,16 +1287,11 @@ def cmd_record(args: argparse.Namespace) -> int:
         print(f"错误: {args.result} 不是合法 JSON: {exc}", file=sys.stderr)
         return 2
 
-    signature = None
-    if args.signature:
-        try:
-            signature = json.loads(Path(args.signature).read_text(encoding="utf-8"))
-        except OSError as exc:
-            print(f"错误: 无法读取签名 {args.signature}: {exc}", file=sys.stderr)
-            return 2
-        except json.JSONDecodeError as exc:
-            print(f"错误: {args.signature} 不是合法 JSON: {exc}", file=sys.stderr)
-            return 2
+    try:
+        signature = _load_signature(args.signature)
+    except CampaignError as exc:
+        print(f"错误: {exc}", file=sys.stderr)
+        return 2
 
     try:
         milestone_doc = load_milestone(
@@ -1064,6 +1304,7 @@ def cmd_record(args: argparse.Namespace) -> int:
         state, doc, args.decision, milestone_doc=milestone_doc,
         signature=signature, recipes_used=args.recipe,
         recipes_invented=args.invented, symptom=args.symptom,
+        signature_path=args.signature or "",
     )
     save_state(path, state)
 
@@ -1072,9 +1313,13 @@ def cmd_record(args: argparse.Namespace) -> int:
 
     mechanism = entry.get("mechanism")
     if isinstance(mechanism, dict) and mechanism.get("lines"):
-        print("\n  机制核验:")
+        print(f"\n  机制核验（做差基线：{mechanism.get('compared_against', '无')}）:")
         for line in mechanism["lines"]:
-            mark = {True: "成立", False: "不成立", None: "无法求值"}[line["verified"]]
+            if line.get("vacuous"):
+                mark = "平凡通过"
+            else:
+                mark = {True: "成立", False: "不成立",
+                        None: "无法求值"}[line["verified"]]
             print(f"    [{mark}] {line['id']} ({line.get('label')}): {line['reason']}")
 
     if entry["verdict"] == VERDICT_ACCEPT_UNVERIFIED:
@@ -1269,8 +1514,10 @@ def cmd_promote(args: argparse.Namespace) -> int:
     unver_reset["streak_unknown"] = 0
     state["target_gain"] = args.phase_target_gain
     state["best"] = {"gain": 1.0, "time_us": None, "artifact": None}
-    # 参考换了，噪声底必须重测
+    # 参考换了，噪声底和参考签名都必须重取 —— 新参考是另一个二进制，
+    # 拿上一代的签名做差会把两代之间的差异算到本代改动头上。
     state["noise_floor_status"] = NOISE_PENDING
+    state["reference_snapshot"] = None
     state.setdefault("ledger", []).append({
         "at": _now(), "generation": generation,
         "input_shape": state.get("input_shape"), "decision": None,
@@ -1481,6 +1728,9 @@ def build_parser() -> argparse.ArgumentParser:
                         default=DEFAULT_STAGNATION_THRESHOLD)
     p_init.add_argument("--budget", type=int, default=None,
                         help="评测次数上限；不给则不限")
+    p_init.add_argument("--reference-signature", default=None,
+                        help="参考实现的 signature_probe 输出。机制行要靠它"
+                             "做差（第 0 轮基线）；不给则首轮无法构成顺序证据")
     p_init.add_argument("--force", action="store_true")
     p_init.set_defaults(func=cmd_init)
 
@@ -1512,6 +1762,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_reopen.add_argument("--decision", required=True, help="要重开的决策 id")
     p_reopen.add_argument("--reason", default="")
     p_reopen.set_defaults(func=cmd_reopen)
+
+    p_rs = sub.add_parser("set-reference-signature",
+                          help="登记参考签名快照，作为机制做差的第 0 轮基线",
+                          parents=[common])
+    p_rs.add_argument("--signature", required=True,
+                      help="参考实现的 signature_probe 输出")
+    p_rs.set_defaults(func=cmd_set_reference_signature)
 
     p_nf = sub.add_parser("set-noise-floor", help="更新实测噪声底",
                           parents=[common])

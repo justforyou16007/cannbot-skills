@@ -101,6 +101,8 @@ msprof 分辨不了 tile 形状、buffer 布局、double buffer 深度、同步�
 3. 量噪声底        noise_floor.py --from-results
 4. 采参考签名      ops-profiling 采 msprof
                    → signature_probe.py 提成结构化签名
+                   → 它同时是机制做差的第 0 轮基线，开 campaign 时
+                     用 --reference-signature 传进去
 5. 查知识库        hwkb.py query --symptom <签名里的症状>
 6. 查死路表        hwkb.py nogo check --symptom <同上>
 7. 写 milestone    照 example-milestone.json 的结构
@@ -108,7 +110,8 @@ msprof 分辨不了 tile 形状、buffer 布局、double buffer 深度、同步�
 9. 交给 coding agent 逐行实现
 10. 停滞时回到第 4 步：lever_probe.py 做消融定价，再改课程表
 11. 需重开架构时  campaign.py reopen（按依赖图自动作废下游）
-12. 代际提升后    重测噪声底 → campaign.py set-noise-floor
+12. 代际提升后    重测噪声底 + 对新参考重采签名
+                   set-noise-floor + set-reference-signature
 ```
 
 第 5、6 两步不要跳过。知识库是跨 campaign 存活的东西，
@@ -138,7 +141,7 @@ msprof 分辨不了 tile 形状、buffer 布局、double buffer 深度、同步�
 | `no_improvement` | 连续若干轮有有效测量但增益不足 | 定价，找还有空间的方向 |
 | `graph_exhausted` | 决策图每条都试过了还没达标 | 课程表本身不够，要加新决策或改架构 |
 | `gate_impasse` | 有门禁行挂着 OPEN，或 DEFERRED 指向不存在的手段 | 那条测试实际被丢弃了，必须有人接 |
-| `mechanism_refuted` | **连续多次「更快但机制核验为假」** | **改课程表的机制假设**，见下 |
+| `mechanism_refuted` | **连续多次「更快但机制不算数」**（阈值不成立或平凡通过） | **改课程表的机制假设**，见下 |
 | `mechanism_never_verified` | 连续多次机制无从核验 | 补 record 的参数，课程表不用动 |
 
 > 注意精度不过、评测缺失**不**计入 `no_improvement` —— 那是实现问题，
@@ -149,6 +152,16 @@ msprof 分辨不了 tile 形状、buffer 布局、double buffer 深度、同步�
 连续多次「改动确实更快，但它声称的机制没有发生」意味着一件具体的事：
 
 **你对参考行为的解释错了，而实现碰对了别的东西。**
+
+两种子情形都算在内：
+
+| 子情形 | 含义 |
+|---|---|
+| 阈值不成立 | 机制明确没落地 |
+| **平凡通过** | 阈值成立，但那个字段跟基线比没动 —— 不是这次改动造成的 |
+
+第二种尤其值得留意：它说明你的机制假设挑错了观测量。那个字段本来就在
+阈值的正确一侧，用它做判据等于什么都没判。
 
 这正是论文说的「认证把真正起作用的机制和只是伴随发生的分开」要抓的情形。
 该做的是回到参考分析，重新解释那个签名，改写机制假设 —— 必要时

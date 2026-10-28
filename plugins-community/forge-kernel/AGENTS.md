@@ -96,7 +96,9 @@ Campaign 编排者。你调度两个 Agent，监控状态机，汇总结果。
                         这一步不能跳过，也不能抄论文的 1~5%
 步骤 4  采参考签名      ops-profiling 的 msprof
                         取 PipeUtilization.csv / OpBasicInfo.csv
-步骤 5  开 campaign     campaign.py init（含 --input-shape 与 --budget）
+步骤 5  开 campaign     campaign.py init
+                        含 --input-shape、--budget、--reference-signature
+                        最后一个是机制做差的第 0 轮基线，漏了首轮无法核验
 步骤 6  产出课程表      调度 forge-arch
 步骤 7  逐行实现        调度 forge-coder
                         每行：fence_check → 评测 → signature_probe
@@ -104,7 +106,8 @@ Campaign 编排者。你调度两个 Agent，监控状态机，汇总结果。
 步骤 8  停滞处理        三个口子任一触发 → 交回 forge-arch
                         必要时 campaign.py reopen 按依赖图作废下游
 步骤 9  达标            状态转 shipped → promote
-步骤 10 重测噪声底      新参考换了，set-noise-floor 之前不许 record
+步骤 10 重取基线        新参考换了，噪声底与参考签名都要重取
+                        set-noise-floor + set-reference-signature
 步骤 11 知识沉淀        认证过的发现入库，证伪的方向进死路表
                         ledger --recipes 看知识库有没有在帮忙
 ```

@@ -122,17 +122,49 @@ promote 时封存的参考与锚定的目标就对不上了。
 一次 campaign 达成目标，不等于它当中提出的每个解释都成立。一个巧合加速
 若被写进知识库，其他算子会照着它做决策。
 
-机制核验按机制行的**停顿锚点**求值（见 `forge-milestone` 的
-`mechanism-labels.md`）。三种结果不要混：
+机制核验按机制行的**停顿锚点**求值，而且查两件事：
+
+1. 阈值成立
+2. 那个字段确实朝声称的方向**移动过**（跟上一轮或参考做差）
+
+只查第一条不够。阈值来自参考实测，「低于 4.2」的含义是「我比参考等得
+少」—— 它拦不住「这个 kernel 的停顿本来就只有 0.9，改动做的是别的事」。
+那种情况下门禁看起来过了，实际什么都没验证。
+
+四种结果不要混：
 
 | 结果 | 含义 | 连续多次时该做什么 |
 |---|---|---|
-| 成立 | 机制确实落地 | — |
-| 不成立 | 机制没落地 —— 这次的增益来自别处 | **改课程表的机制假设** |
-| 无法求值 | 字段没采到或表达式不认识。**不等于失败，但也不构成验证** | 补 record 的参数 |
+| 成立 | 阈值成立且字段确实动过 | — |
+| 不成立 | 阈值不成立 —— 机制没落地 | **改课程表的机制假设** |
+| 平凡通过 | 阈值成立但字段没动 —— 不是本次改动造成的 | 同上 |
+| 无法求值 | 字段没采到、缺基线、表达式不认识 | 补 record 的参数或基线 |
 
 不传 `--signature` / `--milestone` 时一律判为未核实 —— 工具不替调用方
 假设「没查就是通过」。
+
+### 做差基线
+
+| 情形 | 基线 |
+|---|---|
+| 有更近的有效台账快照 | 上一轮那条决策 |
+| 首轮 | **参考自己的签名**（第 0 轮） |
+| 都没有 | 判为无法核验 |
+
+所以 `init` 要带 `--reference-signature`，或事后补：
+
+```bash
+python3 scripts/campaign.py set-reference-signature \
+    --state ./forge_work/campaign_state.json \
+    --signature reference_signature.json
+```
+
+台账里存的是签名**快照**（通道→数值），不是文件路径 —— 路径会失效，
+而那次测量过去了就补不回来。
+
+`reopen` 作废过的条目不能当基线：它们建立在旧架构假设上，拿它做差会把
+两套假设之间的差异算到本次改动头上。`promote` 换参考后参考快照一并清空，
+需要对新参考重新采一次。
 
 ### 「没核验」与「被证伪」是两回事
 
@@ -239,7 +271,7 @@ python3 scripts/campaign.py set-noise-floor --state <state> --value <实测值>
 
 | 脚本 | 用途 |
 |---|---|
-| `scripts/campaign.py` | 状态机：init / record / reopen / set-noise-floor / set-budget / promote / status / ledger |
+| `scripts/campaign.py` | 状态机：init / record / reopen / set-reference-signature / set-noise-floor / set-budget / promote / status / ledger |
 | `scripts/noise_floor.py` | 实测噪声底 |
 | `scripts/seal_reference.py` | 封存参考，产出禁读与禁词清单 |
 | `scripts/reference_adapter.py` | 三种参考来源归一化 + 环境预检 |

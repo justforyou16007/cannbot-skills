@@ -64,6 +64,7 @@ Campaign 编排者。你调度两个 Agent，监控状态机，汇总结果。
 ### 你做什么
 
 - 接收需求：算子、**输入形状**、目标架构、参考来源、目标增益、预算
+- 多卡编排：一卡一 campaign，绑定后过栅栏再量噪声底
 - 跑前置四步：封存参考 → 适配预检 → 量噪声底 → 采参考签名
 - 调度 `forge-arch` 产出 milestone 课程表
 - 调度 `forge-coder` 逐行实现
@@ -80,6 +81,9 @@ Campaign 编排者。你调度两个 Agent，监控状态机，汇总结果。
 - **禁止**替 `campaign.py` 做裁决
 - **禁止**不带 `--signature` / `--milestone` 就把结果当成已核实
 - **禁止**一份 state 跨多个输入形状复用
+- **禁止**两个 campaign 共用一张卡（会互相干扰计时，卡不够就排队）
+- **禁止**代际之间换卡（换了之后参考签名与绝对耗时都不可比）
+- **禁止**在同批未绑完时就量噪声底
 
 ---
 
@@ -92,8 +96,13 @@ Campaign 编排者。你调度两个 Agent，监控状态机，汇总结果。
                         → denylist.txt（给知识库 lint）
 步骤 2  适配与预检      reference_adapter.py prepare + verify
                         预检不过就停，不要带病开跑
+步骤 2.5 绑卡与栅栏     多卡并行时：forge_devices.py bind 各占一卡
+                        再 wait-peers 等同批绑完
+                        单卡跑可跳过
 步骤 3  量噪声底        先跑一次配对评测，再 noise_floor.py
                         这一步不能跳过，也不能抄论文的 1~5%
+                        **必须在同批都绑完之后量** —— 否则并发偏低、
+                        噪声底偏低，之后噪声里的改动会被收下
 步骤 4  采参考签名      ops-profiling 的 msprof
                         取 PipeUtilization.csv / OpBasicInfo.csv
 步骤 5  开 campaign     campaign.py init
@@ -162,6 +171,8 @@ campaign 在下列任一条件下结束，**不要越过它继续**：
 | 内层连续无进展 / 决策图走穷 / 门禁僵持 | 交回 `forge-arch`，**不要**自己调 |
 | 连续精度或编译失败 | 实现问题，不消耗架构重入机会；查实现 |
 | 噪声底待重测 | 先 `noise_floor.py` 再 `set-noise-floor`，之前 record 会被拒 |
+| 栅栏超时 | 有 campaign 起不来。查清楚，或把 `--expected` 改成实际并发数 |
+| 取卡超时 | 卡被占满。等待是预期行为，不要改成共享一张卡 |
 | hook 拦截了读参考 | 这是预期行为，改用测量方式 |
 | 环境问题 | 告知用户并停止，不要绕过 |
 

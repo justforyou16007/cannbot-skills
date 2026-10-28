@@ -285,6 +285,38 @@ arch agent 此时该做的是消融、给手段定价、必要时**重开 M0 的
 
 最常见的原因其实是**没传这两个参数** —— 工具不替你假设「没查就是通过」。
 
+### Q：产物封存库和工作目录是什么关系？
+
+工作目录（`forge_work/`）是**这一次** campaign 的草稿，随时可以清。
+封存库（默认 `~/.forge-kernel/lib`）是**跨 campaign** 的产物仓库。
+
+`promote` 带 `--library` 时，产物会被**复制**进库并记校验和与血统。
+不带的话只在 state 里留一个路径 —— 工作目录一清，下一代就拿不到
+上一代的产物，而自我提升的前提正是「上一代的产出，下一代还拿得到」。
+
+```bash
+reference_library.py lineage --library ~/.forge-kernel/lib \
+    --operator add_layer_norm --arch DAV_2201 --input-shape "B=8,S=4096,fp16"
+```
+
+### Q：能不能直接拿 cann-bench 上最优的算子当参考？
+
+**拿不到。** bench 本地提供的是任务定义：`cases.yaml` 的
+`baseline_perf_us` 是**评分基准线**，`golden.py` 是精度标杆（torch/tf，
+不是高性能实现）。论文里的 "public best" 是从**托管排行榜**读的，
+而且明说它从不作为循环的输入。
+
+所以能挂的是任务身份和目标值：
+
+```bash
+reference_library.py register --library ~/.forge-kernel/lib ... \
+    --bench-task tasks/level2/add_layer_norm --bench-baseline-us 500.0
+```
+
+`bench_baseline_us` 在库里是**目标标注**，不参与 best 的评选 ——
+best 按实测时间选。真正能当参考的二进制只有两类：CANN 内置实现，
+和这套系统自己产出的。
+
 ### Q：机制行明明阈值成立，为什么判「平凡通过」？
 
 因为那个字段跟上一轮（或参考）比**根本没动**。

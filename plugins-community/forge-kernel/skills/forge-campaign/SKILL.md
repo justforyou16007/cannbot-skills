@@ -236,6 +236,82 @@ python3 scripts/campaign.py ledger --recipes
 经验」。这个比例是判断知识库值不值得继续投入的依据 —— 没有它，你无法
 回答「知识库到底有没有在帮忙」，也发现不了某张卡片其实一直在误导。
 
+## 封存产物库
+
+自我提升建立在一个前提上：**上一代的产出，下一代还拿得到**。
+
+`promote` 若只把产物路径记进 state，那个目录被清掉、被覆盖、被后续迭代
+改写，第 n 代就对不上第 n-1 代了 —— 而且没有任何地方能看出参考变过。
+跑到第三代时第一代产物多半已经不在原处。
+
+```bash
+# 登记外来参考为 gen0
+python3 scripts/reference_library.py register --library ~/.forge-kernel/lib \
+    --operator add_layer_norm --arch DAV_2201 --input-shape "B=8,S=4096,fp16" \
+    --kind builtin_aclnn --id aclnnAddLayerNorm \
+    --signature reference_signature.json --time-us 456.5 \
+    --bench-task tasks/level2/add_layer_norm --bench-baseline-us 500.0
+
+# campaign 提升时自动入库（库里没有该算子时会先补登参考为 gen0）
+python3 scripts/campaign.py promote --state ./forge_work/campaign_state.json \
+    --artifact ./best_kernel --library ~/.forge-kernel/lib \
+    --signature architecture_signature.json
+
+# 查当前该用哪一代作参考
+python3 scripts/reference_library.py resolve --library ~/.forge-kernel/lib \
+    --operator add_layer_norm --arch DAV_2201 --input-shape "B=8,S=4096,fp16"
+
+# 校验产物有没有被动过
+python3 scripts/reference_library.py verify --library ~/.forge-kernel/lib
+```
+
+### 库解决四件事
+
+| | 做法 | 不做会怎样 |
+|---|---|---|
+| 留存 | 产物**复制**进库，不是记路径 | 工作目录一清，下一代拿不到上一代 |
+| 可核 | 每代带校验和 | 参考变了无人知晓，而之前所有加速比都已失效 |
+| 身份 | 记 CANN 版本、soc、环境 | 不同环境的数字被放在一起比 |
+| 血统 | 记从哪代来、增益多少、机制核没核实 | 「累计 +45%」说不清是相对谁 |
+
+### 准入：机制未核实的不得入库
+
+和知识库同一条规矩。封存一个解释不清的结果，后续各代都会建立在它之上，
+而没人知道它为什么快 —— 下一代的「增益」也就无从归因。
+
+`campaign.py record` 判为 `accept`（而非 `accept_unverified`）才算核实过。
+
+### 厂商实现没有产物可封
+
+`builtin_aclnn` 的二进制属于 CANN，拷不走也不该拷。这一类入库时只记
+**可观测身份**：架构签名快照、实测时间、环境。
+
+CANN 升级后内置实现变了，签名会漂 —— 这是这类参考唯一的变更检测手段：
+
+```bash
+python3 scripts/reference_library.py drift --library ~/.forge-kernel/lib \
+    --operator add_layer_norm --arch DAV_2201 --input-shape "B=8,S=4096,fp16" \
+    --generation 0 --signature current_signature.json
+```
+
+漂了就说明参考不是原来那个，之前的加速比不可比，应重新 register 一代
+并重测噪声底。
+
+### 挂到 cann-bench
+
+bench 的 `tasks/level*/<算子>/` 提供任务定义（`proto.yaml`、`cases.yaml`、
+`golden.py`、`desc.md`）。可以用 `--bench-task` 与 `--bench-baseline-us`
+把 campaign 挂上去。
+
+> **bench 本地给不出「最优版本」的 kernel。** `cases.yaml` 的
+> `baseline_perf_us` 是**评分基准线**，`golden.py` 是精度标杆（torch/tf，
+> 不是高性能实现）。论文里的 public best 是从**托管排行榜**读的，而且
+> 明说它从不作为循环的输入。
+>
+> 所以 `bench_baseline_us` 在库里是**目标标注**，不参与 best 的评选 ——
+> best 按实测时间选。真正能当参考的二进制只有两类：CANN 内置实现，
+> 和这套系统自己产出的。
+
 ## 自我提升
 
 ```bash
@@ -272,6 +348,7 @@ python3 scripts/campaign.py set-noise-floor --state <state> --value <实测值>
 | 脚本 | 用途 |
 |---|---|
 | `scripts/campaign.py` | 状态机：init / record / reopen / set-reference-signature / set-noise-floor / set-budget / promote / status / ledger |
+| `scripts/reference_library.py` | 封存产物库：register / promote / resolve / lineage / list / verify / drift |
 | `scripts/noise_floor.py` | 实测噪声底 |
 | `scripts/seal_reference.py` | 封存参考，产出禁读与禁词清单 |
 | `scripts/reference_adapter.py` | 三种参考来源归一化 + 环境预检 |

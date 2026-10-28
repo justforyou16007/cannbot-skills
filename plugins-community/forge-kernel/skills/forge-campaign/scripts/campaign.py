@@ -75,6 +75,7 @@ ForgeKernel 跑的是两层循环，这个脚本是两层的调度中枢。
 import argparse
 import json
 import math
+import os
 import re
 import sys
 from datetime import datetime, timezone
@@ -1462,6 +1463,80 @@ def cmd_set_budget(args: argparse.Namespace) -> int:
     return 0
 
 
+def generation_next(state: Dict[str, Any]) -> int:
+    """本次将要封存的产物属于第几代。promote 之前 generation 还没加。"""
+    return int(state.get("generation", 0))
+
+
+def reference_time_us(state: Dict[str, Any]) -> Optional[float]:
+    """反推参考自己的耗时。
+
+    评测给的是 gain = t_参考 / t_候选，台账里存了候选的 time_us，
+    两者相乘即得参考耗时。没有单独记一份参考耗时，是因为它本来就是
+    从同一次配对测量里来的 —— 另存一份反而会出现两个可能不一致的数。
+    """
+    for entry in state.get("ledger", []):
+        if entry.get("invalidated"):
+            continue
+        gain = entry.get("gain")
+        time_us = entry.get("time_us")
+        if (isinstance(gain, (int, float)) and gain > 0
+                and isinstance(time_us, (int, float)) and time_us > 0):
+            return gain * time_us
+    return None
+
+
+def ensure_reference_in_library(lib, library_root: Path,
+                                state: Dict[str, Any]) -> Optional[Any]:
+    """库里还没有这个算子时，先把参考补登为 gen0。
+
+    不补的话血统会从我们自己的 kernel 开始，「累计相对 gen0」读起来就像
+    是相对自己 —— 而整条自我提升链条的意义恰恰在于相对最初那个参考。
+    """
+    key = lib.entry_key(str(state.get("arch")), str(state.get("operator")),
+                        str(state.get("input_shape")))
+    index = lib.load_index(library_root)
+    if key in index.get("entries", {}):
+        return None
+
+    reference = state.get("reference") or {}
+    snapshot = state.get("reference_snapshot")
+    signature_file = None
+    if snapshot:
+        # add_generation 吃的是签名文件；参考快照已经是压好的形状，
+        # 这里临时落一个等价文件交给它，避免为此再开一条入口。
+        import tempfile
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, encoding="utf-8")
+        json.dump({channel: {"channel": channel, "value": value,
+                             "present": True}
+                   for channel, value in snapshot.items()}, handle)
+        handle.close()
+        signature_file = handle.name
+
+    try:
+        return lib.add_generation(
+            library_root,
+            operator=str(state.get("operator")),
+            arch=str(state.get("arch")),
+            input_shape=str(state.get("input_shape")),
+            kind=str(reference.get("kind", "builtin_aclnn")),
+            identifier=str(reference.get("id", state.get("operator"))),
+            artifact=(reference.get("path")
+                      if reference.get("kind") not in lib.ARTIFACTLESS_KINDS
+                      else None),
+            signature=signature_file,
+            time_us=reference_time_us(state),
+            note="由 campaign promote 自动补登的初始参考",
+        )
+    finally:
+        if signature_file:
+            try:
+                os.unlink(signature_file)
+            except OSError:
+                pass
+
+
 def cmd_promote(args: argparse.Namespace) -> int:
     """把本代产出封存为下一代的参考（论文 §3.5）。"""
     path = Path(args.state)
@@ -1496,6 +1571,43 @@ def cmd_promote(args: argparse.Namespace) -> int:
         print("这个停点是对上限的估计，不是证明。如确需继续请加 --force。")
         return 0
 
+    # 封存进库：产物复制进去 + 校验和 + 血统。
+    # 只记路径是不够的 —— 那个目录被清掉、被覆盖，第 n 代就对不上
+    # 第 n-1 代了，而且没有任何地方能看出参考变过。
+    library_record = None
+    library_seeded = None
+    if args.library:
+        best_verified = any(
+            e.get("counts_toward_best") and not e.get("invalidated")
+            for e in state.get("ledger", []))
+        try:
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            import reference_library as lib  # noqa: PLC0415
+
+            seeded = ensure_reference_in_library(
+                lib, Path(args.library), state)
+            manifest = lib.add_generation(
+                Path(args.library),
+                operator=str(state.get("operator")),
+                arch=str(state.get("arch")),
+                input_shape=str(state.get("input_shape")),
+                kind="sealed_kernel",
+                identifier=f"{state.get('operator')}_gen{generation_next(state)}",
+                artifact=args.artifact,
+                signature=args.signature,
+                time_us=state.get("best", {}).get("time_us"),
+                gain=gain,
+                mechanism_verified=best_verified,
+                note=args.note,
+            )
+            library_record = manifest
+            library_seeded = seeded
+        except Exception as exc:  # noqa: BLE001 - 入库失败不该吞掉 promote
+            print(f"错误: 封存进库失败: {exc}", file=sys.stderr)
+            print("  promote 未执行 —— 产物没进库就提升，下一代会拿不到它。",
+                  file=sys.stderr)
+            return 2
+
     generation = int(state.get("generation", 0)) + 1
     state["generation"] = generation
     state["reference"] = {
@@ -1503,6 +1615,10 @@ def cmd_promote(args: argparse.Namespace) -> int:
         "id": f"{state.get('operator')}_gen{generation - 1}",
         "path": args.artifact, "sealed": True,
         "generation": generation - 1, "promoted_gain": gain,
+        "library_dir": (str(Path(args.library)
+                            / f"{state.get('arch')}")
+                        if library_record else None),
+        "library_key": library_record["key"] if library_record else None,
     }
     state["state"] = STATE_ANALYZE
     state["cursor"] = {"milestone": None, "decision": None, "iteration": 0}
@@ -1530,6 +1646,16 @@ def cmd_promote(args: argparse.Namespace) -> int:
     save_state(path, state)
 
     print(f"已提升到第 {generation} 代")
+    if library_record:
+        if library_seeded:
+            print(f"  补登参考  gen{library_seeded['generation']} "
+                  f"{library_seeded['kind']}:{library_seeded['id']}"
+                  "（库里原本没有这个算子）")
+        print(f"  已入库    {library_record['key']} gen{library_record['generation']}"
+              f"（{len(library_record['artifact_files'])} 个文件）")
+    else:
+        print("  未入库    产物只在 state 里留了路径；该目录被清掉后，"
+              "下一代将拿不到它。建议加 --library")
     print(f"  新参考    {state['reference']['id']}（封闭）")
     print(f"  上代增益  {(gain - 1) * 100:+.2f}%")
     print(f"  新目标    {args.phase_target_gain}")
@@ -1785,6 +1911,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_promote.add_argument("--artifact", required=True)
     p_promote.add_argument("--phase-target-gain", type=float,
                            default=DEFAULT_PHASE_TARGET_GAIN)
+    p_promote.add_argument("--library", default=None,
+                           help="封存产物库根目录。给了就把产物复制进库并记"
+                                "校验和与血统 —— 不给的话只在 state 里留一个"
+                                "路径，那个目录被清掉下一代就拿不到它了")
+    p_promote.add_argument("--signature", default=None,
+                           help="本代产物的架构签名，供日后检测漂移")
+    p_promote.add_argument("--note", default="")
     p_promote.add_argument("--force", action="store_true",
                            help="即使增益未超噪声底也强行提升")
     p_promote.set_defaults(func=cmd_promote)

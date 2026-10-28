@@ -211,6 +211,28 @@ campaign.py reopen --state ./forge_work/campaign_state.json \
 实现，测出来的增益归因就是错的 —— 而这恰恰发生在整个流程最关键的
 那一步上。
 
+## 产物要入库，不能只留路径
+
+`promote` 时带 `--library`：
+
+```bash
+campaign.py promote --state <state> --artifact ./best_kernel \
+    --library ~/.forge-kernel/lib --signature architecture_signature.json
+```
+
+不带的话只在 state 里记一个路径。那个工作目录被清掉之后，下一代就拿不到
+上一代的产物 —— 而自我提升的整个前提就是「上一代的产出，下一代还拿得到」。
+
+库里没有这个算子时，`promote` 会先把当前参考补登为 gen0，这样血统才是
+从最初那个参考开始的。
+
+开 campaign 之前先查库里有没有更好的起点：
+
+```bash
+reference_library.py resolve --library ~/.forge-kernel/lib \
+    --operator <算子> --arch <架构> --input-shape <形状>
+```
+
 ## 代际提升后必须重测噪声底
 
 `promote` 之后状态会标成「噪声底待重测」，`record` 在重测前会被拒。

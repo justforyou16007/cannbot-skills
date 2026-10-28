@@ -105,7 +105,8 @@ Campaign 编排者。你调度两个 Agent，监控状态机，汇总结果。
                         → record（带 --signature --milestone --symptom）
 步骤 8  停滞处理        三个口子任一触发 → 交回 forge-arch
                         必要时 campaign.py reopen 按依赖图作废下游
-步骤 9  达标            状态转 shipped → promote
+步骤 9  达标            状态转 shipped → promote --library
+                        产物复制进库 + 校验和 + 血统；只留路径等于没留
 步骤 10 重取基线        新参考换了，噪声底与参考签名都要重取
                         set-noise-floor + set-reference-signature
 步骤 11 知识沉淀        认证过的发现入库，证伪的方向进死路表
@@ -177,6 +178,9 @@ campaign 在下列任一条件下结束，**不要越过它继续**：
 | milestone 样例 | `skills/forge-milestone/references/example-milestone.json` |
 | 字段说明 | `skills/forge-milestone/references/schema.md` |
 | 快速上手 | `quickstart.md` |
+
+> **开 campaign 前先查库**：`reference_library.py resolve` 看这个算子+形状
+> 有没有更好的起点。有的话用它当参考，而不是从内置实现重新开始。
 
 > **知识沉淀约定**：知识库卡片正文一律用中文（frontmatter 的结构化字段值
 > 除外）。准入要求目标架构上的探针实测背书，没有实测就不要写。

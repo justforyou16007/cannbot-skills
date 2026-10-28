@@ -95,19 +95,29 @@ STALL_NO_IMPROVEMENT = "no_improvement"
 STALL_GRAPH_EXHAUSTED = "graph_exhausted"
 STALL_GATE_IMPASSE = "gate_impasse"
 
-#: 第四个口子：机制始终没被核验过。
+#: 第四、第五个口子：连续多次「变快了但机制不算数」。
 #:
-#: 论文没有这一条，因为在它的实现里计时与 profiling 在同一个 job 里完成，
+#: 论文没有这两条，因为在它的实现里计时与 profiling 在同一个 job 里完成，
 #: 不存在「忘了采 profiling」这种状态。昇腾上两者必须分两次跑
 #: （acl.prof.init 每进程只能调一次），于是多出一种失效方式：
-#: 一直不传 --signature，每轮都判 accept_unverified —— 它不计入 best
-#: 所以永远到不了 shipped，又会清零停滞计数所以永远不转 stalled，
-#: 循环就这么一直跑下去，而 status 每轮都说「继续实现」。
+#: 一直判 accept_unverified —— 它不计入 best 所以永远到不了 shipped，
+#: 又会清零停滞计数所以永远不转 stalled，循环就这么一直跑下去，
+#: 而 status 每轮都说「继续实现」。
 #:
-#: 每轮确实打印了提示，但连跑的 agent 不会因为一行提示改变行为 ——
-#: 它看到的是「接受了，继续」。所以要让这件事走和另外三个口子同一条通路，
-#: 架构层才看得见。
+#: 两条分开，是因为**该做的事完全不同**：
+#:
+#:   UNVERIFIED  机制没被核验过（多半是 record 没带 --signature）。
+#:               这是流程缺口，补参数重跑即可。
+#:
+#:   REFUTED     机制被核验了，而且求值为假。这**不是**流程问题，
+#:               而是一个很强的架构信号：对参考行为的解释错了，但实现
+#:               碰对了别的东西。该做的是改课程表里的机制假设，不是补参数。
+#:               论文说认证把真正起作用的机制和只是伴随发生的分开 ——
+#:               要抓的正是这种情形。
+#:
+#: 混成一条会让架构层去补参数重跑，而真正该改的课程表没人碰。
 STALL_MECHANISM_UNVERIFIED = "mechanism_never_verified"
+STALL_MECHANISM_REFUTED = "mechanism_refuted"
 
 #: 内层连续多少轮「测出来了但增益不够」才交回架构层。
 DEFAULT_STAGNATION_THRESHOLD = 3
@@ -518,16 +528,30 @@ def next_action(state: Dict[str, Any]) -> Dict[str, str]:
             STALL_NO_IMPROVEMENT: "内层无进展",
             STALL_GRAPH_EXHAUSTED: "决策图走穷",
             STALL_GATE_IMPASSE: "门禁僵持",
-            STALL_MECHANISM_UNVERIFIED: "机制从未核实",
+            STALL_MECHANISM_UNVERIFIED: "机制无法核验",
+            STALL_MECHANISM_REFUTED: "机制被证伪",
         }
         listed = "；".join(
             f"{titles.get(r['kind'], r['kind'])}（{r['detail']}）"
             for r in reasons)
-        return {
-            "action": "re-analyze",
-            "reason": (f"{listed}。交回架构层：做消融定价、必要时用 reopen "
-                       "重开 M0 的架构决策，而不是在当前架构下继续硬调"),
-        }
+        kinds = {r["kind"] for r in reasons}
+        if STALL_MECHANISM_REFUTED in kinds:
+            tail = ("交回架构层：先重新分析参考、修正机制假设 —— "
+                    "连续多次「更快但机制不成立」说明对参考行为的解释错了，"
+                    "补参数重跑解决不了")
+            action = "re-analyze"
+        elif kinds == {STALL_MECHANISM_UNVERIFIED}:
+            # 这一种不必惊动架构层：课程表没问题，是调用少了参数。
+            # 动作标签也要说准 —— 它是机器可读的那一个，标成 re-analyze
+            # 会让架构层白跑一轮分析。
+            tail = ("补齐 record 的 --signature / --milestone 后重跑 —— "
+                    "这是流程缺口，不必改课程表")
+            action = "fix-invocation"
+        else:
+            tail = ("交回架构层：做消融定价、必要时用 reopen "
+                    "重开 M0 的架构决策，而不是在当前架构下继续硬调")
+            action = "re-analyze"
+        return {"action": action, "reason": f"{listed}。{tail}"}
     return {"action": "implement", "reason": "继续实现当前决策行"}
 
 
@@ -598,6 +622,11 @@ def new_state(operator: str, input_shape: str, arch: str,
         "mechanism_unverified": {
             "consecutive": 0,
             "threshold": DEFAULT_UNVERIFIED_THRESHOLD,
+            # 当前这段连续里，两种成因各占多少。两者该做的事不同，
+            # 不拆开就只能给出一句笼统的提示，而那句提示会把架构层
+            # 引向错误的动作。
+            "streak_refuted": 0,
+            "streak_unknown": 0,
         },
         "best": {"gain": 1.0, "time_us": None, "artifact": None},
         "ledger": [],
@@ -745,16 +774,27 @@ def apply_result(state: Dict[str, Any], doc: Dict[str, Any], decision: str,
     impl = state.setdefault("implementation_failures", {
         "consecutive": 0, "threshold": DEFAULT_IMPL_FAILURE_THRESHOLD})
     unver = state.setdefault("mechanism_unverified", {
-        "consecutive": 0, "threshold": DEFAULT_UNVERIFIED_THRESHOLD})
+        "consecutive": 0, "threshold": DEFAULT_UNVERIFIED_THRESHOLD,
+        "streak_refuted": 0, "streak_unknown": 0})
 
     if entry["verdict"] in (VERDICT_ACCEPT, VERDICT_ACCEPT_UNVERIFIED):
         stag["since_improvement"] = 0
         impl["consecutive"] = 0
         if entry["verdict"] == VERDICT_ACCEPT:
             unver["consecutive"] = 0
+            unver["streak_refuted"] = 0
+            unver["streak_unknown"] = 0
         else:
-            # 连续若干次「变快了但说不清为什么」= profiling 没接进回路
+            # 连续若干次「变快了但机制不算数」。两种成因分开记：
+            #   refuted  机制核验了但为假 —— 架构信号，该改课程表的假设
+            #   unknown  机制没被核验     —— 流程缺口，该补 record 的参数
+            # 合并计数就只能给一句笼统提示，而那句提示会把架构层引向
+            # 错误的动作。
             unver["consecutive"] = int(unver.get("consecutive", 0)) + 1
+            status = ((entry.get("mechanism") or {}).get("status")
+                      if isinstance(entry.get("mechanism"), dict) else None)
+            key = "streak_refuted" if status == "refuted" else "streak_unknown"
+            unver[key] = int(unver.get(key, 0)) + 1
         # 只有机制核实过的改动才抬高 best。未核实的保留但不计入 ——
         # 否则 promote 时会把一个解释不清的结果封成下一代的参考。
         if entry["counts_toward_best"] and entry["gain"] is not None:
@@ -806,18 +846,36 @@ def _advance_state(state: Dict[str, Any],
 
     reasons: List[Dict[str, str]] = []
 
-    # 这一条排最前：机制一直没核验说明 profiling 根本没接进回路，
-    # 此时 best 卡在 1.0、另外几个信号也都是降级的，先修这个。
+    # 机制相关的两条排最前：机制不算数时 best 卡在 1.0、其他信号也都是
+    # 降级的，先修这个。两条分开报，因为该做的事完全不同。
     unver = state.get("mechanism_unverified", {})
     if int(unver.get("consecutive", 0)) >= int(
             unver.get("threshold", DEFAULT_UNVERIFIED_THRESHOLD)):
-        reasons.append({
-            "kind": STALL_MECHANISM_UNVERIFIED,
-            "detail": (f"连续 {unver.get('consecutive')} 次判为 "
-                       "accept_unverified —— 改动都更快了，但一次机制也没核实。"
-                       "通常是 record 没带 --signature / --milestone；"
-                       "best 会一直卡在 1.0，campaign 永远到不了 shipped"),
-        })
+        refuted = int(unver.get("streak_refuted", 0))
+        unknown = int(unver.get("streak_unknown", 0))
+        total = int(unver.get("consecutive", 0))
+
+        # 被证伪排在没核验之前：它是实打实的架构信号，而没核验只是流程缺口。
+        if refuted:
+            reasons.append({
+                "kind": STALL_MECHANISM_REFUTED,
+                "detail": (
+                    f"最近 {total} 次 accept_unverified 里有 {refuted} 次"
+                    "**机制核验为假**：改动确实更快，但它声称的机制没有发生。"
+                    "这不是参数没传 —— 是课程表里对参考行为的解释错了，"
+                    "而实现碰对了别的东西。该做的是重新分析参考、改写机制"
+                    "假设（必要时 reopen 相关决策），不是补参数重跑"),
+            })
+        if unknown:
+            reasons.append({
+                "kind": STALL_MECHANISM_UNVERIFIED,
+                "detail": (
+                    f"最近 {total} 次 accept_unverified 里有 {unknown} 次"
+                    "**机制无法核验**：多半是 record 没带 --signature / "
+                    "--milestone，也可能是签名里缺该字段或签名自判不可信。"
+                    "补齐后重跑即可；在此之前 best 会一直卡在 1.0，"
+                    "campaign 永远到不了 shipped"),
+            })
 
     impasse = gate_impasse(milestone_doc)
     if impasse:
@@ -1079,7 +1137,10 @@ def cmd_reopen(args: argparse.Namespace) -> int:
     # 三个计数器一起归零，与 promote 的处理对齐
     state.setdefault("stagnation", {})["since_improvement"] = 0
     state.setdefault("implementation_failures", {})["consecutive"] = 0
-    state.setdefault("mechanism_unverified", {})["consecutive"] = 0
+    unver_reset = state.setdefault("mechanism_unverified", {})
+    unver_reset["consecutive"] = 0
+    unver_reset["streak_refuted"] = 0
+    unver_reset["streak_unknown"] = 0
     state.pop("stall_reason", None)
     state.pop("stall_reasons", None)
     state.pop("stall_detail", None)
@@ -1202,7 +1263,10 @@ def cmd_promote(args: argparse.Namespace) -> int:
     state["cursor"] = {"milestone": None, "decision": None, "iteration": 0}
     state.setdefault("stagnation", {})["since_improvement"] = 0
     state.setdefault("implementation_failures", {})["consecutive"] = 0
-    state.setdefault("mechanism_unverified", {})["consecutive"] = 0
+    unver_reset = state.setdefault("mechanism_unverified", {})
+    unver_reset["consecutive"] = 0
+    unver_reset["streak_refuted"] = 0
+    unver_reset["streak_unknown"] = 0
     state["target_gain"] = args.phase_target_gain
     state["best"] = {"gain": 1.0, "time_us": None, "artifact": None}
     # 参考换了，噪声底必须重测
@@ -1265,8 +1329,9 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"实现失败  {impl.get('consecutive')}/{impl.get('threshold')}"
           "（精度/评测问题，不触发架构重入）")
     unver = state.get("mechanism_unverified", {})
-    print(f"机制未核实 {unver.get('consecutive')}/{unver.get('threshold')}"
-          "（连续多次即判 profiling 没接进回路）")
+    print(f"机制不算数 {unver.get('consecutive')}/{unver.get('threshold')}"
+          f"（其中被证伪 {unver.get('streak_refuted', 0)}，"
+          f"无法核验 {unver.get('streak_unknown', 0)}）")
     cap = budget.get("max_records")
     print(f"预算      {budget.get('used', 0)}/{cap if cap else '不限'}")
     print(f"台账条目  {len(state.get('ledger', []))}")

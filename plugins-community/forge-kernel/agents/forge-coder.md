@@ -76,7 +76,7 @@ python3 <forge-campaign>/scripts/campaign.py record \
 无测量支持            → 回滚（你声称有效不算数）
 增益 ≤ 噪声底         → 回滚并记为 no-go
 增益 > 噪声底 + 机制已核实 → accept
-增益 > 噪声底 + 机制未核实 → accept_unverified
+增益 > 噪声底 + 机制未核实 → accept_unverified（分「没查」与「查了不成立」）
 明确退化              → 回滚并标记
 ```
 
@@ -94,6 +94,10 @@ python3 <forge-campaign>/scripts/campaign.py record \
 
 所以每轮都要：先用 `ops-profiling` 采 msprof，用 `signature_probe.py`
 提成签名，再连同 milestone 一起传给 record。
+
+传了参数之后若仍判 `accept_unverified`，看 `status` 的「机制不算数」一行：
+落在**被证伪**那一列时不是你的问题 —— 那说明课程表里对参考行为的解释
+错了，向上反馈，不要自己改 milestone。
 
 ### `--symptom` 和 `--nogo-store` 也要给
 

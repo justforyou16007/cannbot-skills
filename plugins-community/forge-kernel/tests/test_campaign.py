@@ -443,6 +443,106 @@ def test_unverified_stall_names_the_missing_flags():
     assert "--milestone" in detail
 
 
+# ---------------------------------------------------------------------------
+# 「没核验」与「被证伪」是两回事
+#
+# 两者都走 accept_unverified，但该做的事相反：
+#   没核验  补 record 的参数即可，课程表没问题
+#   被证伪  课程表里对参考行为的解释错了，补参数解决不了
+# 混成一条提示会把架构层引向错误的动作 —— 它会去补参数重跑，而真正该改的
+# 机制假设没人碰。
+# ---------------------------------------------------------------------------
+
+def test_refuted_mechanism_gets_its_own_stall_kind():
+    state = fresh_state(target=10.0, threshold=99)
+    for _ in range(3):
+        campaign.apply_result(state, result(speedup=1.30), "D0.1",
+                              milestone_doc=milestone(), signature=signature(9.9))
+    assert state["state"] == campaign.STATE_STALLED
+    assert state["stall_reason"] == campaign.STALL_MECHANISM_REFUTED
+
+
+def test_refuted_detail_points_at_the_curriculum_not_the_flags():
+    """核心用例：被证伪时不能说「通常是没带 --signature」。"""
+    state = fresh_state(target=10.0, threshold=99)
+    for _ in range(3):
+        campaign.apply_result(state, result(speedup=1.30), "D0.1",
+                              milestone_doc=milestone(), signature=signature(9.9))
+    detail = state["stall_reasons"][0]["detail"]
+    assert "机制核验为假" in detail
+    assert "解释错了" in detail
+    assert "不是参数没传" in detail
+
+
+def test_refuted_action_sends_work_to_architecture():
+    state = fresh_state(target=10.0, threshold=99)
+    for _ in range(3):
+        campaign.apply_result(state, result(speedup=1.30), "D0.1",
+                              milestone_doc=milestone(), signature=signature(9.9))
+    action = campaign.next_action(state)
+    assert action["action"] == "re-analyze"
+    assert "修正机制假设" in action["reason"]
+
+
+def test_pure_unverified_action_is_fix_invocation():
+    """纯流程缺口不该惊动架构层 —— 标成 re-analyze 会让它白跑一轮分析。"""
+    state = fresh_state(target=10.0, threshold=99)
+    for _ in range(3):
+        campaign.apply_result(state, result(speedup=1.30), "D0.1")
+    action = campaign.next_action(state)
+    assert action["action"] == "fix-invocation"
+    assert "不必改课程表" in action["reason"]
+
+
+def test_mixed_streak_reports_both_reasons():
+    """两种成因并存时都要报，且被证伪排在前面（它是架构信号）。"""
+    state = fresh_state(target=10.0, threshold=99)
+    campaign.apply_result(state, result(speedup=1.30), "D0.1")
+    campaign.apply_result(state, result(speedup=1.30), "D0.1")
+    campaign.apply_result(state, result(speedup=1.30), "D0.1",
+                          milestone_doc=milestone(), signature=signature(9.9))
+    kinds = [r["kind"] for r in state["stall_reasons"]]
+    assert campaign.STALL_MECHANISM_REFUTED in kinds
+    assert campaign.STALL_MECHANISM_UNVERIFIED in kinds
+    assert kinds.index(campaign.STALL_MECHANISM_REFUTED) < \
+        kinds.index(campaign.STALL_MECHANISM_UNVERIFIED)
+    assert campaign.next_action(state)["action"] == "re-analyze"
+
+
+def test_streak_breakdown_tracked():
+    state = fresh_state(target=10.0, threshold=99)
+    campaign.apply_result(state, result(speedup=1.30), "D0.1")
+    campaign.apply_result(state, result(speedup=1.30), "D0.1",
+                          milestone_doc=milestone(), signature=signature(9.9))
+    unver = state["mechanism_unverified"]
+    assert unver["streak_unknown"] == 1
+    assert unver["streak_refuted"] == 1
+    assert unver["consecutive"] == 2
+
+
+def test_verified_accept_clears_the_breakdown():
+    state = fresh_state(target=10.0, threshold=99)
+    campaign.apply_result(state, result(speedup=1.30), "D0.1",
+                          milestone_doc=milestone(), signature=signature(9.9))
+    campaign.apply_result(state, result(speedup=1.40), "D0.1",
+                          milestone_doc=milestone(), signature=signature(0.9))
+    unver = state["mechanism_unverified"]
+    assert unver["consecutive"] == 0
+    assert unver["streak_refuted"] == 0
+    assert unver["streak_unknown"] == 0
+
+
+def test_untrustworthy_signature_counts_as_unknown_not_refuted():
+    """签名自判不可信时无从判断机制成没成立，不能算证伪。"""
+    state = fresh_state(target=10.0, threshold=99)
+    campaign.apply_result(
+        state, result(speedup=1.30), "D0.1",
+        milestone_doc=milestone(), signature=signature(9.9, trustworthy=False))
+    unver = state["mechanism_unverified"]
+    assert unver["streak_unknown"] == 1
+    assert unver["streak_refuted"] == 0
+
+
 def test_verified_accept_resets_unverified_counter():
     state = fresh_state(target=10.0, threshold=99)
     campaign.apply_result(state, result(speedup=1.10), "D0.1")

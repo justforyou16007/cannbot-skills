@@ -80,10 +80,33 @@ PARSERS = {
 }
 
 #: 需要数值的参数：占位符要换成数字，换成字符串会假性失败。
-NUMERIC_OPTIONS = {
-    "--value", "--noise-floor", "--target-gain", "--budget",
-    "--max-records", "--stagnation-threshold", "--phase-target-gain",
-}
+#: 清单不手维护 —— 见下。
+def _numeric_options() -> set:
+    """从 parser 里推出哪些选项收数值，不手维护清单。
+
+    手维护过一版，漏了 8 个（--baseline-us / --time-us / --gain 等），
+    于是那些示例里的占位符被换成 "placeholder" 再喂给 type=float，
+    解析必然失败 —— 而失败的是门禁自己，不是文档。这类假失败最后的
+    结局是有人把门禁关掉，那就全白做了。
+
+    parser 自己知道每个选项收什么类型，问它即可。
+    """
+    found = set()
+
+    def walk(parser):
+        for action in parser._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                for sub in action.choices.values():
+                    walk(sub)
+            elif action.type in (float, int):
+                found.update(action.option_strings)
+
+    for factory in PARSERS.values():
+        walk(factory())
+    return found
+
+
+NUMERIC_OPTIONS = _numeric_options()
 
 #: 省略号表示「其余参数同上」，不是完整命令。
 ELLIPSES = {"...", "…"}
@@ -172,7 +195,7 @@ def _iter_candidate_lines():
         text = path.read_text(encoding="utf-8")
         for block in _fenced_blocks(text):
             for line in _join_continuations(block).splitlines():
-                if "campaign.py" in line:
+                if _mentions_a_gated_script(line):
                     yield path, line
 
     for directory in SCRIPT_DIRS:
@@ -316,3 +339,29 @@ def test_every_gated_script_has_documented_commands():
     assert not missing, (
         f"这些脚本在门禁里零覆盖: {sorted(missing)}。"
         "要么文档里没有可执行示例，要么被抽取规则误过滤了")
+
+
+@pytest.mark.parametrize("source", ["markdown", "docstring"])
+def test_every_gated_script_is_covered_from_each_source(source):
+    """两个来源要分别够得着每个脚本，不能只看合计。
+
+    上一条只问「这个脚本有没有被扫到」。但示例有两个来源 —— markdown
+    文档和脚本自己的 docstring（含运行时打印的恢复提示）—— 合计非零
+    并不说明两边都扫到了。
+
+    这不是假想：markdown 分支曾经一直硬编码着 `"campaign.py" in line`，
+    于是九个脚本的 61 条 markdown 示例全程无人看管。而因为它们各自都有
+    docstring 示例，合计不为零，上一条守卫一路放行。**少覆盖一个来源和
+    少覆盖一个脚本是同一种失效，只是前者看不出来。**
+
+    所以按来源分别断言。一侧断掉时当场点名是哪一侧，而不是等到某条
+    示例漂了之后才发现根本没人在看。
+    """
+    covered = {
+        script for path, script, _a, _v in DOC_COMMANDS
+        if (str(path).endswith(".md")) == (source == "markdown")
+    }
+    missing = set(PARSERS) - covered
+    assert not missing, (
+        f"这些脚本在「{source}」这一侧零覆盖: {sorted(missing)}。"
+        "合计不为零不代表两边都扫到了 —— 抽取规则可能只对另一侧生效")

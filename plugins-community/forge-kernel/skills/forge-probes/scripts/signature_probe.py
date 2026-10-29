@@ -964,7 +964,10 @@ def render_text(sig: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """构造命令行。独立出来是为了让文档命令门禁能拿到它 ——
+    门禁拿真实 parser 去解析文档里的示例，parser 藏在 main 里就够不着。
+    """
     parser = argparse.ArgumentParser(
         description="从 msprof CSV 提取结构化架构签名（论文 NCU pass 的昇腾对应物）",
     )
@@ -981,7 +984,11 @@ def main() -> int:
                         help="把签名 JSON 写到文件")
     parser.add_argument("--json", action="store_true", dest="as_json",
                         help="标准输出用 JSON")
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
 
     try:
         sig = build_signature(args.prof_dir, args.archive_dir,

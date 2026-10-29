@@ -636,6 +636,12 @@ def verify(library: Path, operator: Optional[str] = None
                 0)
 
     index = load_index(library)
+    if not index.get("entries"):
+        # 与 drift 的 inconclusive 同理：校验 0 代证明不了任何事。
+        # --library 有默认值，忘了带参数时会对着一个自动创建的空目录
+        # 拿绿灯 —— 那正是这条要拦的情形。
+        return ([f"库里没有任何代次: {library}。没有东西可校验，"
+                 "这不等于「校验通过」。确认 --library 指对了吗？"], 0)
     problems: List[str] = []
     checked = 0
 
@@ -1094,7 +1100,11 @@ def cmd_verify(args: argparse.Namespace) -> int:
     if not problems:
         print(f"校验通过：{checked} 代产物与封存时一致")
         return 0
-    print(f"校验失败：{checked} 代中有 {len(problems)} 处问题\n", file=sys.stderr)
+    if checked:
+        print(f"校验失败：{checked} 代中有 {len(problems)} 处问题\n",
+              file=sys.stderr)
+    else:
+        print("校验未能进行：\n", file=sys.stderr)
     for problem in problems:
         print(f"  {problem}", file=sys.stderr)
     print("\n参考一变，之前所有相对它的加速比都不再可比。"
@@ -1155,7 +1165,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="封存产物库：跨 campaign 保存参考与各代产出")
     parser.add_argument("--library", default=str(
-        Path.home() / ".forge-kernel" / "library"),
+        Path.home() / ".forge-kernel" / "lib"),
         help="库根目录（也可写在子命令后面）")
     parser.add_argument("--json", action="store_true", dest="as_json")
     sub = parser.add_subparsers(dest="command", required=True)

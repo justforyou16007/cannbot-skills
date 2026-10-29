@@ -27,6 +27,7 @@ parser 去解析一遍。
 运行: python3 -m pytest plugins-community/forge-kernel/tests/ -v
 """
 
+import argparse
 import contextlib
 import io
 import re
@@ -38,9 +39,45 @@ import pytest
 
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS = PLUGIN_ROOT / "skills" / "forge-campaign" / "scripts"
-sys.path.insert(0, str(SCRIPTS))
+
+#: 所有带 build_parser() 的脚本都要进门禁。
+#:
+#: 只盯一个脚本的话，另外几个的文档示例照样会漂 —— 而漂移的代价不是
+#: 报错本身，是 agent 拿到 "unrecognized arguments" 之后会判定脚本坏了、
+#: 转而自己判断，把裁决回路整个旁路掉。
+SCRIPT_DIRS = [
+    PLUGIN_ROOT / "skills" / "forge-campaign" / "scripts",
+    PLUGIN_ROOT / "skills" / "forge-hwkb" / "scripts",
+    PLUGIN_ROOT / "skills" / "forge-probes" / "scripts",
+    PLUGIN_ROOT / "skills" / "forge-milestone" / "scripts",
+]
+for _directory in SCRIPT_DIRS:
+    sys.path.insert(0, str(_directory))
 
 import campaign  # noqa: E402
+import fence_check  # noqa: E402
+import hwkb  # noqa: E402
+import lever_probe  # noqa: E402
+import milestone_validate  # noqa: E402
+import noise_floor  # noqa: E402
+import reference_adapter  # noqa: E402
+import reference_library  # noqa: E402
+import seal_reference  # noqa: E402
+import signature_probe  # noqa: E402
+
+#: 脚本名 → 它的 parser 工厂。
+PARSERS = {
+    "campaign.py": campaign.build_parser,
+    "reference_library.py": reference_library.build_parser,
+    "reference_adapter.py": reference_adapter.build_parser,
+    "seal_reference.py": seal_reference.build_parser,
+    "hwkb.py": hwkb.build_parser,
+    "fence_check.py": fence_check.build_parser,
+    "lever_probe.py": lever_probe.build_parser,
+    "signature_probe.py": signature_probe.build_parser,
+    "noise_floor.py": noise_floor.build_parser,
+    "milestone_validate.py": milestone_validate.build_parser,
+}
 
 #: 需要数值的参数：占位符要换成数字，换成字符串会假性失败。
 NUMERIC_OPTIONS = {
@@ -51,7 +88,25 @@ NUMERIC_OPTIONS = {
 #: 省略号表示「其余参数同上」，不是完整命令。
 ELLIPSES = {"...", "…"}
 
-RE_INVOCATION = re.compile(r"campaign\.py\s+(.+)")
+RE_INVOCATION = re.compile(
+    r"(" + "|".join(re.escape(name) for name in PARSERS) + r")\s+(.+)")
+
+
+def _mentions_a_gated_script(line: str) -> bool:
+    return any(name in line for name in PARSERS)
+
+
+def _has_subcommands(script: str) -> bool:
+    """这个脚本是不是子命令式的。
+
+    子命令式的脚本（campaign.py 等）第一个词必须是子命令名；扁平的
+    （fence_check.py、noise_floor.py 等）第一个词就是选项。拿前者的
+    规则去筛后者，会把后者的全部示例当成「不是命令」悄悄跳过 ——
+    于是它们零覆盖，而门禁看起来一切正常。
+    """
+    parser = PARSERS[script]()
+    return any(isinstance(a, argparse._SubParsersAction)  # noqa: SLF001
+               for a in parser._actions)                  # noqa: SLF001
 
 
 def _join_continuations(text: str) -> str:
@@ -107,7 +162,7 @@ def _docstring_usage(text: str):
     if not match:
         return
     for line in match.group(1).splitlines():
-        if line.startswith(("    ", "\t")) and "campaign.py" in line:
+        if line.startswith(("    ", "\t")) and _mentions_a_gated_script(line):
             yield line
 
 
@@ -120,11 +175,12 @@ def _iter_candidate_lines():
                 if "campaign.py" in line:
                     yield path, line
 
-    for path in sorted(SCRIPTS.glob("*.py")):
-        text = path.read_text(encoding="utf-8")
-        joined = _join_continuations(text)
-        for line in _docstring_usage(joined):
-            yield path, line
+    for directory in SCRIPT_DIRS:
+        for path in sorted(directory.glob("*.py")):
+            text = path.read_text(encoding="utf-8")
+            joined = _join_continuations(text)
+            for line in _docstring_usage(joined):
+                yield path, line
         # 程序运行时打印给用户的恢复提示 —— 照抄必须能跑。
         # 从模块 docstring 之后开始找，否则会把 docstring 里的多行用法
         # 在引号处截断，产出一条残缺的重复条目。
@@ -132,8 +188,9 @@ def _iter_candidate_lines():
         end = re.match(r'\A\s*(?:#[^\n]*\n)*\s*""".*?"""', joined, re.DOTALL)
         if end:
             body = joined[end.end():]
+        names = "|".join(re.escape(n) for n in PARSERS)
         for match in re.finditer(
-                r'"\s*(campaign\.py\s+[a-z-]+[^"\\]*)', body):
+                r'"\s*((?:' + names + r')\s+[a-z-]+[^"\\]*)', body):
             yield path, match.group(1)
 
 
@@ -150,7 +207,8 @@ def extract_commands():
         # 是对命令的指代而非可照抄的命令本身。
         if re.search(r"[\u4e00-\u9fff]", raw_line[: match.start()]):
             continue
-        argline = match.group(1)
+        script = match.group(1)
+        argline = match.group(2)
         argline = argline.split("#", 1)[0].strip().rstrip("`\"')")
         if not argline or _looks_like_prose(argline):
             continue
@@ -158,8 +216,10 @@ def extract_commands():
             tokens = shlex.split(argline)
         except ValueError:
             continue
-        if not tokens or tokens[0].startswith("-"):
+        if not tokens:
             continue
+        if _has_subcommands(script) and tokens[0].startswith("-"):
+            continue   # 子命令式脚本的首词必须是子命令名
         if any(t in ELLIPSES for t in tokens):
             continue
 
@@ -171,11 +231,11 @@ def extract_commands():
                 token = "1.0" if previous in NUMERIC_OPTIONS else "placeholder"
             argv.append(token)
 
-        key = (str(path), tuple(argv))
+        key = (str(path), script, tuple(argv))
         if key in seen:
             continue
         seen.add(key)
-        out.append((path, argline, argv))
+        out.append((path, script, argline, argv))
     return out
 
 
@@ -189,13 +249,13 @@ def test_documented_commands_were_found():
 
 
 @pytest.mark.parametrize(
-    "source,argline,argv",
+    "source,script,argline,argv",
     DOC_COMMANDS,
-    ids=[f"{p.name}:{a[:40]}" for p, a, _ in DOC_COMMANDS],
+    ids=[f"{p.name}:{s}:{a[:30]}" for p, s, a, _ in DOC_COMMANDS],
 )
-def test_documented_command_parses(source, argline, argv):
+def test_documented_command_parses(source, script, argline, argv):
     """文档里写的命令，拿真实 parser 解析必须通过。"""
-    parser = campaign.build_parser()
+    parser = PARSERS[script]()
     buf = io.StringIO()
     try:
         with contextlib.redirect_stderr(buf), contextlib.redirect_stdout(buf):
@@ -206,19 +266,53 @@ def test_documented_command_parses(source, argline, argv):
             detail = message[-1] if message else "（无输出）"
             pytest.fail(
                 f"{source.relative_to(PLUGIN_ROOT)} 里的命令解析失败\n"
-                f"  原文: campaign.py {argline}\n"
+                f"  原文: {script} {argline}\n"
                 f"  报错: {detail}\n"
                 f"  照抄这条命令的人（或 agent）会直接撞上这个错误")
 
 
-def test_state_works_in_both_positions():
-    """--state 写在子命令前后都要能跑。
+#: 脚本 → (全局参数, 一个无必填项的子命令路径)
+GLOBAL_OPTIONS = [
+    ("campaign.py", "--state", ["status"], "state"),
+    ("reference_library.py", "--library", ["list"], "library"),
+    ("hwkb.py", "--kb-root", ["nogo", "check", "--symptom", "x"], "kb_root"),
+]
+
+
+@pytest.mark.parametrize("script,option,subcommand,dest", GLOBAL_OPTIONS)
+def test_global_option_works_in_both_positions(script, option, subcommand, dest):
+    """全局参数写在子命令前后都要能跑。
 
     只支持一种位置时，写错的人拿到的是 'unrecognized arguments'，
-    它不说该放哪里 —— 这正是 agent 会开始自己猜的地方。
+    它不说该放哪里 —— 这正是 agent 会开始自己猜的地方，而它猜的方向
+    往往是「这个脚本坏了，我自己判断算了」。
     """
-    parser = campaign.build_parser()
-    before = parser.parse_args(["--state", "a.json", "status"])
-    after = parser.parse_args(["status", "--state", "a.json"])
-    assert before.state == "a.json"
-    assert after.state == "a.json"
+    parser = PARSERS[script]()
+    before = parser.parse_args([option, "X"] + subcommand)
+    after = parser.parse_args(subcommand + [option, "X"])
+    assert getattr(before, dest) == "X"
+    assert getattr(after, dest) == "X"
+
+
+def test_every_script_with_a_parser_is_gated():
+    """新增带 build_parser 的脚本时，别忘了挂进门禁。"""
+    found = set()
+    for directory in SCRIPT_DIRS:
+        for path in directory.glob("*.py"):
+            if "def build_parser" in path.read_text(encoding="utf-8"):
+                found.add(path.name)
+    missing = found - set(PARSERS)
+    assert not missing, f"这些脚本有 build_parser 但没进门禁: {sorted(missing)}"
+
+
+def test_every_gated_script_has_documented_commands():
+    """每个进门禁的脚本都要有被扫到的示例。
+
+    零覆盖意味着门禁对它形同虚设 —— 而那正是之前只盯 campaign.py 时的
+    状态：其余九个脚本的文档示例怎么漂都没人管。
+    """
+    covered = {script for _p, script, _a, _v in DOC_COMMANDS}
+    missing = set(PARSERS) - covered
+    assert not missing, (
+        f"这些脚本在门禁里零覆盖: {sorted(missing)}。"
+        "要么文档里没有可执行示例，要么被抽取规则误过滤了")

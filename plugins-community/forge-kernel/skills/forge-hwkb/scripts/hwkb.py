@@ -615,41 +615,64 @@ def _report(issues: List[Issue], as_json: bool, ok_message: str) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """构造命令行。
+
+    `--kb-root` 与 `--json` 同时挂顶层和每个子命令，两种写法都能跑：
+
+        hwkb.py --kb-root ./kb nogo add ...
+        hwkb.py nogo add --kb-root ./kb ...
+
+    只挂顶层是 argparse 的默认做法，但它要求全局参数写在子命令**之前**，
+    而人和 agent 的直觉都是写在后面。写错时只报
+    「unrecognized arguments」，不说该放哪里 —— agent 拿到这个报错往往
+    不会去调参数位置，而是判定脚本坏了、转而自己判断。
+
+    子命令那份用 SUPPRESS 作默认值：不传时不写入 namespace，顶层取值
+    得以保留；传了才覆盖。用普通默认值的话，`--kb-root X nogo add` 会被
+    子命令的默认值悄悄覆盖回去。
+    """
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--kb-root", default=argparse.SUPPRESS,
+                        help=f"知识库根目录（默认 {DEFAULT_KB_ROOT}）")
+    common.add_argument("--json", action="store_true", dest="as_json",
+                        default=argparse.SUPPRESS,
+                        help="以 JSON 输出，供脚本消费")
+
     parser = argparse.ArgumentParser(
         description="ForgeKernel 硬件知识库：准入、检索、边界 lint、死路表",
     )
     parser.add_argument("--kb-root", default=str(DEFAULT_KB_ROOT),
-                        help=f"知识库根目录（默认 {DEFAULT_KB_ROOT}）")
+                        help="知识库根目录（也可写在子命令后面）")
     parser.add_argument("--json", action="store_true", dest="as_json",
-                        help="以 JSON 输出，供脚本消费")
+                        help="以 JSON 输出（也可写在子命令后面）")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_val = sub.add_parser("validate", help="校验草稿卡片，不入库")
+    p_val = sub.add_parser("validate", help="校验草稿卡片，不入库", parents=[common])
     p_val.add_argument("--card", required=True)
     p_val.set_defaults(func=cmd_validate)
 
-    p_add = sub.add_parser("add", help="校验通过后写入知识库")
+    p_add = sub.add_parser("add", help="校验通过后写入知识库", parents=[common])
     p_add.add_argument("--card", required=True)
     p_add.add_argument("--force", action="store_true", help="允许覆盖同 id 卡片")
     p_add.set_defaults(func=cmd_add)
 
-    p_q = sub.add_parser("query", help="按症状/架构/算子族检索")
+    p_q = sub.add_parser("query", help="按症状/架构/算子族检索", parents=[common])
     p_q.add_argument("--symptom", default="")
     p_q.add_argument("--arch", default=None, choices=sorted(ARCH_DIRS))
     p_q.add_argument("--family", default="")
     p_q.add_argument("--include-retired", action="store_true")
     p_q.set_defaults(func=cmd_query)
 
-    p_lint = sub.add_parser("lint", help="no-code 边界检查")
+    p_lint = sub.add_parser("lint", help="no-code 边界检查", parents=[common])
     p_lint.add_argument("--card", default=None, help="不给则检查整库")
     p_lint.add_argument("--all", action="store_true", help="检查整库（等价于不给 --card）")
     p_lint.add_argument("--arch", default=None, choices=sorted(ARCH_DIRS))
     p_lint.set_defaults(func=cmd_lint)
 
-    p_nogo = sub.add_parser("nogo", help="死路表")
+    p_nogo = sub.add_parser("nogo", help="死路表", parents=[common])
     nogo_sub = p_nogo.add_subparsers(dest="nogo_command", required=True)
 
-    p_na = nogo_sub.add_parser("add", help="登记一条已验证无效的方向")
+    p_na = nogo_sub.add_parser("add", help="登记一条已验证无效的方向", parents=[common])
     p_na.add_argument("--symptom", required=True)
     p_na.add_argument("--tried", required=True, help="试过的方向")
     p_na.add_argument("--evidence", required=True, help="证明它无效的实测证据")
@@ -657,7 +680,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_na.add_argument("--operator", default="")
     p_na.set_defaults(func=cmd_nogo_add)
 
-    p_nc = nogo_sub.add_parser("check", help="重试前置检查")
+    p_nc = nogo_sub.add_parser("check", help="重试前置检查", parents=[common])
     p_nc.add_argument("--symptom", required=True)
     p_nc.add_argument("--arch", default=None, choices=sorted(ARCH_DIRS))
     p_nc.set_defaults(func=cmd_nogo_check)

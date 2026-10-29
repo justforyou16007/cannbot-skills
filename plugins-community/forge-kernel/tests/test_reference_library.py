@@ -27,6 +27,7 @@
 """
 
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -845,3 +846,54 @@ def test_complete_chain_still_uses_cumulative(tmp_path):
                           **IDENTITY)
     # gen2 绝对耗时更大（慢机器上测的），但累计增益更高
     assert rl.resolve(library, **IDENTITY)["generation"] == 2
+
+
+# ---------------------------------------------------------------------------
+# 回归：空库不是「校验通过」，默认路径不能与文档对不上
+# ---------------------------------------------------------------------------
+
+def test_verify_on_empty_but_existing_library_is_not_a_pass(tmp_path):
+    """目录存在但没有任何代次时，校验 0 代证明不了任何事。
+
+    与 drift 的 inconclusive 同一个道理。这个场景容易撞上，因为
+    --library 有默认值：忘了带参数就是对着一个自动创建的空目录拿绿灯。
+    """
+    empty = tmp_path / "emptylib"
+    empty.mkdir()
+    problems, checked = rl.verify(empty)
+    assert problems
+    assert "没有东西可校验" in problems[0]
+    assert checked == 0
+
+
+def test_verify_cli_returns_nonzero_on_empty_library(tmp_path):
+    import argparse
+    empty = tmp_path / "emptylib"
+    empty.mkdir()
+    code = rl.cmd_verify(argparse.Namespace(
+        library=str(empty), operator=None, as_json=False))
+    assert code == 1
+
+
+def test_default_library_path_matches_the_docs():
+    """默认值和文档写的要一致。
+
+    对不上的后果很具体：文档教 `~/.forge-kernel/lib`，代码默认
+    `~/.forge-kernel/library`，于是忘了带 --library 的人对着另一个
+    （自动创建的空）目录操作，而两边都不报错。
+    """
+    parser = rl.build_parser()
+    default = next(a.default for a in parser._actions
+                   if "--library" in a.option_strings)
+
+    plugin_root = Path(__file__).resolve().parent.parent
+    mentioned = set()
+    for doc in plugin_root.rglob("*.md"):
+        mentioned.update(re.findall(r"~/\.forge-kernel/[A-Za-z0-9_-]+",
+                                    doc.read_text(encoding="utf-8")))
+    if not mentioned:
+        pytest.skip("文档里没有提到默认库路径")
+
+    expanded = {Path(m.replace("~", str(Path.home()))) for m in mentioned}
+    assert Path(default) in expanded, (
+        f"代码默认 {default}，文档写的是 {sorted(mentioned)}")

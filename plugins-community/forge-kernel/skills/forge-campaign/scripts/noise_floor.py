@@ -244,7 +244,10 @@ def _ratios_from_docs(docs: List[Dict[str, Any]]) -> List[float]:
     return ratios
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """构造命令行。独立出来是为了让文档命令门禁能拿到它 ——
+    门禁拿真实 parser 去解析文档里的示例，parser 藏在 main 里就够不着。
+    """
     parser = argparse.ArgumentParser(
         description="量出噪声底，而不是沿用论文里的经验值",
     )
@@ -259,7 +262,11 @@ def main() -> int:
                         help="以 JSON 输出，供脚本消费")
     parser.add_argument("--output", type=Path, default=None,
                         help="同时写入指定文件")
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
 
     try:
         if args.ratios:

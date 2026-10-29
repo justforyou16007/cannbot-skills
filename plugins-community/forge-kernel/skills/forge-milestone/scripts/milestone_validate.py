@@ -754,7 +754,10 @@ def _load(path: Path) -> Dict[str, Any]:
     return doc
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """构造命令行。独立出来是为了让文档命令门禁能拿到它 ——
+    门禁拿真实 parser 去解析文档里的示例，parser 藏在 main 里就够不着。
+    """
     parser = argparse.ArgumentParser(
         description="校验 ForgeKernel milestone.json 是否满足论文规定的门禁义务",
     )
@@ -766,6 +769,11 @@ def main() -> int:
                         help="只跑指定规则，逗号分隔，如 V2,V6")
     parser.add_argument("--list-rules", action="store_true",
                         help="列出全部规则后退出")
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
     args = parser.parse_args()
 
     if args.list_rules:

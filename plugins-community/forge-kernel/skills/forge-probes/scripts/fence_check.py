@@ -332,7 +332,10 @@ def check(candidate: Path, op_name: str, reference_paths: List[str],
 # 入口
 # ---------------------------------------------------------------------------
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """构造命令行。独立出来是为了让文档命令门禁能拿到它 ——
+    门禁拿真实 parser 去解析文档里的示例，parser 藏在 main 里就够不着。
+    """
     parser = argparse.ArgumentParser(
         description="转发围栏：在计时之前拒绝调用或转发到参考实现的候选",
     )
@@ -347,7 +350,11 @@ def main() -> int:
     parser.add_argument("--exempt", default="",
                         help="豁免的规则号，逗号分隔，如 F-TORCH-FUNC")
     parser.add_argument("--json", action="store_true", dest="as_json")
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
 
     try:
         spec_op, reference_paths = load_reference_paths(args.spec)

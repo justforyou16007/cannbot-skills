@@ -66,9 +66,119 @@ MIN_SAMPLES = 3
 #: 论文观测到的区间，仅用于在结果明显偏离时提醒，不用于裁剪结果。
 PAPER_RANGE_PCT = (1.0, 5.0)
 
+#: 评测自己判定「没跑成」的 gating 取值。
+GATING_FAILED = "failed"
+
 
 class NoiseFloorError(Exception):
     """数据不足以得出噪声底。"""
+
+
+def _positive_times(doc: Dict[str, Any]) -> List[float]:
+    """把这份结果里所有正耗时收集起来，用来判断评测到底有没有跑出数来。"""
+    times: List[float] = []
+    for side in ("baseline", "evolved"):
+        entry = doc.get(side)
+        if isinstance(entry, dict):
+            value = entry.get("time_us")
+            if isinstance(value, (int, float)) and value > 0:
+                times.append(float(value))
+    shape_results = doc.get("shape_results")
+    if isinstance(shape_results, dict):
+        for group in shape_results.values():
+            if not isinstance(group, list):
+                continue
+            for item in group:
+                if not isinstance(item, dict):
+                    continue
+                for key in ("baseline_time_us", "evolved_time_us"):
+                    value = item.get(key)
+                    if isinstance(value, (int, float)) and value > 0:
+                        times.append(float(value))
+    return times
+
+
+def _time_fields_present(doc: Dict[str, Any]) -> bool:
+    """这份结果里到底有没有耗时字段（不管值是多少）。"""
+    for side in ("baseline", "evolved"):
+        entry = doc.get(side)
+        if isinstance(entry, dict) and "time_us" in entry:
+            return True
+    shape_results = doc.get("shape_results")
+    if isinstance(shape_results, dict):
+        for group in shape_results.values():
+            if not isinstance(group, list):
+                continue
+            for item in group:
+                if isinstance(item, dict) and (
+                        "baseline_time_us" in item or "evolved_time_us" in item):
+                    return True
+    return False
+
+
+def assert_usable(doc: Dict[str, Any], label: str) -> None:
+    """崩掉的评测不许用来量噪声底。
+
+    这是本脚本最要紧的一道门。原因在于崩溃时写进结果文件的是
+    `time_us=-1` 和 `cv_pct=0.0` —— 那个 0.0 在形态上和「环境极其干净」
+    完全一样，于是脚本会一声不响地输出 0.00%，还提示把它传给 campaign init。
+
+    噪声底 0 的含义是「任何正增益都算真实改进」。后果不是少测准一点：
+    测量抖动会被当成加速收下，写进知识库和产物库，后续 campaign 还会把它
+    当成有效经验复用。错得很深，而且因为每一步看起来都正常，很难回溯。
+    """
+    gating = doc.get("gating")
+    if gating == GATING_FAILED:
+        raise NoiseFloorError(
+            f"{label} 的 gating=failed，这次评测没跑成（编译失败/精度不过/运行报错），"
+            "不能用来量噪声底。\n"
+            "崩溃的结果里 cv_pct 是填进去的 0.0，拿它算出来的 0.00% 会让"
+            "后续任何正增益都被判为真实改进。\n"
+            "先把评测跑通（看结果文件里的 error 字段和评测日志），再重新量。"
+        )
+    # 只在「字段在、但值全是非正数」时拒绝。这正是崩溃的指纹（写成 -1）。
+    # 压根没有耗时字段的文件是另一回事（手写的、或只留了比值的旧文件），
+    # 那种情况判不出跑没跑成，不该在这里一刀切。
+    if _time_fields_present(doc) and not _positive_times(doc):
+        raise NoiseFloorError(
+            f"{label} 里的 time_us 全是非正数，评测没有产出有效读数"
+            "（崩溃时会写成 -1）。\n"
+            "通常是算子没加载成功或子进程报错。先看结果文件里的 error 字段。"
+        )
+
+
+def detect_forced_self_baseline(doc: Dict[str, Any]) -> List[str]:
+    """认出「自评场景下 speedup 被强制改成 1.0」的结果。
+
+    评测脚本在 baseline 路径与 evolved 路径指向同一处时，会把每个 shape 的
+    speedup 直接改成 1.0（自评理应持平）。但它**不改** baseline_time_us 和
+    evolved_time_us，所以「speedup 恰好是 1.0，而两侧耗时并不相等」就是这件事
+    发生过的指纹。
+
+    为什么必须认出来：比值离散法的全部信息来自 speedup 的波动。speedup 被
+    钉成常数 1.0 之后，离散度必然是 0.00% —— 这个 0 不是「环境干净」，
+    是「这个测法在自评场景下什么也没测」。
+    """
+    hits: List[str] = []
+    shape_results = doc.get("shape_results")
+    if not isinstance(shape_results, dict):
+        return hits
+    for group, items in shape_results.items():
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            speedup = item.get("speedup")
+            t_ref = item.get("baseline_time_us")
+            t_cand = item.get("evolved_time_us")
+            if (speedup == 1.0
+                    and isinstance(t_ref, (int, float)) and t_ref > 0
+                    and isinstance(t_cand, (int, float)) and t_cand > 0
+                    and abs(t_ref - t_cand) / t_ref > 1e-6):
+                hits.append(f"{group}/{item.get('name', '?')}: "
+                            f"speedup=1.0 但 {t_ref:.2f}us vs {t_cand:.2f}us")
+    return hits
 
 
 def extract_cv_values(doc: Dict[str, Any]) -> List[float]:
@@ -117,6 +227,18 @@ def compute_from_cv(cv_values: List[float]) -> Dict[str, Any]:
         raise NoiseFloorError("评测结果中没有 cv_pct")
 
     floor_pct = max(clean)
+    if floor_pct == 0.0:
+        # 恰好 0 不可能是真实的事件计时结果：多次计时完全一致意味着根本没有
+        # 重复测量。真实来源是「崩溃时把 cv_pct 填成了 0.0」或「子进程没上报
+        # 这个字段」。放过去就等于把噪声底定成 0。
+        raise NoiseFloorError(
+            "收集到的 cv_pct 全是 0。事件计时重复多次不可能完全一致，"
+            "所以这不是「环境干净」，而是这个字段没被真正填上 —— "
+            "评测崩溃时会填 0.0，子进程没上报时也是 0.0。\n"
+            "请确认评测跑通（gating 不是 failed、time_us > 0、"
+            "结果里每个 shape 的 cv_pct > 0）后重新量。"
+        )
+
     warnings: List[str] = []
     if floor_pct > PAPER_RANGE_PCT[1]:
         warnings.append(
@@ -124,6 +246,15 @@ def compute_from_cv(cv_values: List[float]) -> Dict[str, Any]:
             "测量环境可能不稳定：检查是否有其他进程占用同一张卡、"
             "是否发生 DVFS 降频（对比 msprof 的 Current Freq 与 Rated Freq）、"
             "num_trials 是否够大。在这个噪声水平下，小于它的真实改进无法被识别"
+        )
+    if floor_pct < PAPER_RANGE_PCT[0]:
+        # 与 compute() 对称。早先只有上限告警，下限这条缺着 —— 而危险的恰恰是
+        # 偏低那一侧：偏高只是让判据变严，偏低会把抖动当成改进收下。
+        warnings.append(
+            f"噪声底 {floor_pct:.2f}% 低于论文观测区间下限 {PAPER_RANGE_PCT[0]}%。"
+            "偏低比偏高危险：判据会把测量抖动当成真实改进收下。"
+            "请确认重复次数（num_trials）足够、每次确实重新执行了 kernel，"
+            "而不是复用了上一次的结果"
         )
 
     return {
@@ -162,6 +293,16 @@ def compute(ratios: List[float]) -> Dict[str, Any]:
 
     # 取大者，保守
     floor_pct = max(cv_pct, half_range_pct)
+    if floor_pct == 0.0:
+        # 和 compute_from_cv 同一条判据：重复测量得到**完全相同**的比值，
+        # 不是环境干净，是这些数不是独立测出来的（最典型的是自评场景下
+        # speedup 被钉成常数 1.0）。噪声底 0 意味着任何正增益都算真实改进。
+        raise NoiseFloorError(
+            "这些比值完全相同，离散度为 0。重复测量不可能给出一模一样的比值，"
+            "所以这不是「环境干净」，而是这些数并非独立测出来的。\n"
+            "最常见的原因是自评场景（baseline 与 evolved 指向同一处）：评测会"
+            "把每个 shape 的 speedup 直接钉成 1.0。改用 --method cv。"
+        )
 
     warnings: List[str] = []
     if floor_pct > PAPER_RANGE_PCT[1]:
@@ -216,21 +357,43 @@ def ratio_from_result(doc: Dict[str, Any]) -> Optional[float]:
 
 
 def _load_docs(paths: List[Path]) -> List[Dict[str, Any]]:
+    """读入结果文件，并在这里一次性挡掉没跑成的评测。
+
+    两种测法（cv 与比值离散）都从这里取数，所以门放这一处就够，不会出现
+    「一条路径有检查、另一条没有」的不对称。
+    """
     docs: List[Dict[str, Any]] = []
     for path in paths:
         try:
-            docs.append(json.loads(path.read_text(encoding="utf-8")))
+            doc = json.loads(path.read_text(encoding="utf-8"))
         except OSError as exc:
             raise NoiseFloorError(f"无法读取 {path}: {exc}") from exc
         except json.JSONDecodeError as exc:
             raise NoiseFloorError(f"{path} 不是合法 JSON: {exc}") from exc
+        if not isinstance(doc, dict):
+            raise NoiseFloorError(f"{path} 的顶层不是对象，不是评测结果文件")
+        assert_usable(doc, str(path))
+        docs.append(doc)
     return docs
 
 
-def _ratios_from_docs(docs: List[Dict[str, Any]]) -> List[float]:
+def _ratios_from_docs(docs: List[Dict[str, Any]],
+                      labels: List[str]) -> List[float]:
     ratios: List[float] = []
     skipped = 0
-    for doc in docs:
+    for doc, label in zip(docs, labels):
+        forced = detect_forced_self_baseline(doc)
+        if forced:
+            raise NoiseFloorError(
+                f"{label} 是自评结果（baseline 与 evolved 指向同一处），"
+                "比值离散法在这种结果上量不出噪声底。\n"
+                f"证据: {forced[0]}\n"
+                "评测脚本在自评时把每个 shape 的 speedup 直接钉成 1.0，"
+                "于是比值之间的离散必然是 0.00% —— 那个 0 不代表环境干净，"
+                "代表这个测法在这里什么也没测到。\n"
+                "自评场景请改用 --method cv：它读的是同一次 job 内多次事件计时"
+                "的变异系数，不经过 speedup，钉死 speedup 影响不到它。"
+            )
         ratio = ratio_from_result(doc)
         if ratio is None:
             skipped += 1
@@ -275,13 +438,15 @@ def main() -> int:
                 return 2
             result = compute(list(args.ratios))
         else:
-            docs = _load_docs(list(args.from_results))
+            paths = list(args.from_results)
+            labels = [str(p) for p in paths]
+            docs = _load_docs(paths)
             cv_values = [v for doc in docs for v in extract_cv_values(doc)]
 
             if args.method == "cv":
                 result = compute_from_cv(cv_values)
             elif args.method == "spread":
-                result = compute(_ratios_from_docs(docs))
+                result = compute(_ratios_from_docs(docs, labels))
             elif cv_values:
                 result = compute_from_cv(cv_values)
             else:
@@ -290,7 +455,7 @@ def main() -> int:
                     "注意这个估计混入了 job 之间的环境差异，比同 job 的 cv_pct 保守",
                     file=sys.stderr,
                 )
-                result = compute(_ratios_from_docs(docs))
+                result = compute(_ratios_from_docs(docs, labels))
     except NoiseFloorError as exc:
         print(f"错误: {exc}", file=sys.stderr)
         return 1

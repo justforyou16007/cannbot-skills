@@ -85,6 +85,16 @@ ALLOWED_PROVENANCE_KINDS = {"probe_verdict", "public_doc", "public_api"}
 NOGO_FILENAME = "nogo.json"
 DENYLIST_FILENAME = "denylist.txt"
 
+#: 卡片 id 的合法形状：R-<架构号>-<序号>，如 R-2201-001。
+#:
+#: 为什么要校验：id 会被直接拼成入库文件名（<kb_root>/<arch>/<id>.md）。
+#: 不校验的话，`id: ../../../../tmp/x` 这种写法会把文件写到知识库之外，
+#: 而且「目标已存在就要 --force」那道保护也一起失效 —— 判存在性用的是
+#: 拼好的路径，指向哪里取决于 id 本身。
+#: 顺带还挡住两类更常见的事故：id 里带空格或斜杠导致检索对不上、
+#: 大小写不一致导致同一条经验入库两次。
+RE_CARD_ID = re.compile(r"^R-\d{3,5}-\d{3,4}$")
+
 #: lint 用：出处里出现源码文件路径，说明引用了不该读的东西。
 RE_SOURCE_PATH = re.compile(
     r"[\w./-]+\.(?:cpp|cc|cxx|h|hpp|cu|cuh|py|s|asm)\b", re.IGNORECASE
@@ -233,6 +243,17 @@ def check_admission(meta: Dict[str, Any], body: str) -> List[Issue]:
         if _is_blank(meta.get(field)):
             out.append(Issue("A-FIELD", f"frontmatter 缺少必填字段 '{field}'"))
 
+    card_id = meta.get("id")
+    if card_id is not None and not _is_blank(card_id):
+        if not RE_CARD_ID.match(str(card_id).strip()):
+            out.append(Issue(
+                "A-ID",
+                f"卡片 id '{card_id}' 不合规；要求形如 R-2201-001"
+                "（R-<架构号>-<序号>）。id 会被直接拼成入库文件名，"
+                "带路径分隔符或其他字符会把文件写到知识库之外，"
+                "「已存在需 --force」那道保护也会一起失效",
+            ))
+
     arch = meta.get("arch")
     if arch and arch not in ARCH_DIRS:
         out.append(Issue(
@@ -326,6 +347,27 @@ def load_denylist(kb_root: Path) -> List[str]:
     return out
 
 
+def compile_denylist(denylist: List[str]) -> Optional[re.Pattern]:
+    """把专有名词清单编成一条带词边界的正则。
+
+    为什么要词边界：裸子串匹配会让清单里的短名字吃掉候选里更长的名字 ——
+    `DataCopyEx` 命中 `DataCopyExtParams`，而后者是另一个符号。这种误报会
+    让人把整条检查豁免掉，真越界也跟着放过去。
+
+    为什么合成一条：逐个名词扫全文是「名词数 × 文本长度」，清单上千条时
+    每张卡片的 lint 都要等。合成一条正则，全文只过一遍。
+    """
+    tokens = sorted({t for t in denylist if t}, key=lambda t: (-len(t), t))
+    if not tokens:
+        return None
+    body = "|".join(re.escape(token) for token in tokens)
+    # 边界取严，与 fence_check 的 compile_denylist 保持同一判据（理由见那边）：
+    # 放宽右边界就分不开「参考类名加后缀」和「另一个公开接口名」，而误伤的
+    # 代价是整条规则被豁免掉。
+    return re.compile(rf"(?<![A-Za-z0-9_])({body})(?![A-Za-z0-9_])",
+                      re.IGNORECASE)
+
+
 def check_no_code_boundary(meta: Dict[str, Any], body: str,
                            denylist: List[str]) -> List[Issue]:
     """边界检查：卡片不得留下参考实现的痕迹。
@@ -336,10 +378,18 @@ def check_no_code_boundary(meta: Dict[str, Any], body: str,
     """
     out: List[Issue] = []
     haystack = yaml.safe_dump(meta, allow_unicode=True) + "\n" + body
-    lowered = haystack.lower()
 
-    for token in denylist:
-        if token.lower() in lowered:
+    pattern = compile_denylist(denylist)
+    if pattern is not None:
+        # 报错信息里用清单上的原始拼写，方便按原文去清单里核对
+        canonical = {t.lower(): t for t in denylist if t}
+        reported: set = set()
+        for match in pattern.finditer(haystack):
+            hit = match.group(1)
+            token = canonical.get(hit.lower(), hit)
+            if token in reported:
+                continue
+            reported.add(token)
             out.append(Issue(
                 "L-DENY",
                 f"出现参考实现专有名词 '{token}'；"
@@ -374,8 +424,16 @@ def arch_dir(kb_root: Path, arch: str) -> Path:
     return kb_root / sub
 
 
-def iter_cards(kb_root: Path, arch: Optional[str] = None):
-    """遍历知识库里的卡片，产出 (路径, meta, body)。解析失败的跳过并记录。"""
+def iter_cards(kb_root: Path, arch: Optional[str] = None,
+               unreadable: Optional[List[Tuple[Path, str]]] = None):
+    """遍历知识库里的卡片，产出 (路径, meta, body)。
+
+    解析失败的卡片不会被产出，但**会被记到 unreadable 里**（调用方给了
+    这个列表的话）。为什么不能一声不响地跳过：`lint --all` 就是靠这个函数
+    遍历的，一个解析不动的文件被跳过之后，lint 会报「全部通过」——
+    而解析不动的最常见原因恰恰是有人把参考源码整段粘进了卡片，
+    把 frontmatter 撑坏了。最该被 lint 拦住的东西，成了唯一躲过 lint 的。
+    """
     arches = [arch] if arch else list(ARCH_DIRS)
     for name in arches:
         directory = kb_root / ARCH_DIRS.get(name, "")
@@ -386,7 +444,9 @@ def iter_cards(kb_root: Path, arch: Optional[str] = None):
                 continue
             try:
                 meta, body = load_card(path)
-            except ValueError:
+            except (ValueError, OSError) as exc:
+                if unreadable is not None:
+                    unreadable.append((path, str(exc)))
                 continue
             yield path, meta, body
 
@@ -428,10 +488,19 @@ def cmd_add(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print(f"错误: {exc}", file=sys.stderr)
         return 2
+    card_id = str(meta["id"]).strip()
+    if not RE_CARD_ID.match(card_id):
+        # 准入校验已经查过一遍。这里再查是因为「校验」和「拼路径」之间
+        # 隔着好几十行，任何一次重构把前者绕过去，后者就会往任意位置写文件。
+        # 拼路径之前自己确认一次，不依赖调用链上游。
+        print(f"错误: 卡片 id '{card_id}' 不合规，拒绝据此拼接入库路径",
+              file=sys.stderr)
+        return 2
+
     try:
         with exclusive(kb_root):
             target_dir.mkdir(parents=True, exist_ok=True)
-            target = target_dir / f"{meta['id']}.md"
+            target = target_dir / f"{card_id}.md"
             if target.exists() and not args.force:
                 print(f"错误: {target} 已存在；如确需覆盖请加 --force",
                       file=sys.stderr)
@@ -455,7 +524,8 @@ def cmd_query(args: argparse.Namespace) -> int:
     family = (args.family or "").strip().lower()
 
     hits = []
-    for path, meta, body in iter_cards(kb_root, args.arch):
+    unreadable: List[Tuple[Path, str]] = []
+    for path, meta, body in iter_cards(kb_root, args.arch, unreadable):
         if meta.get("status") == "retired" and not args.include_retired:
             continue
         if family:
@@ -491,6 +561,13 @@ def cmd_query(args: argparse.Namespace) -> int:
             print(f"{meta.get('id')}  [{meta.get('arch')}]  {meta.get('mechanism')}")
             print(f"    症状: {meta.get('symptom')}")
             print(f"    路径: {path}")
+
+    # 检索不到和「有卡片没读进来」是两件事。不说的话，一次「未命中任何经验」
+    # 会被当成「库里确实没有」，于是一条已有的经验被白白重走一遍。
+    for path, reason in unreadable:
+        print(f"提示: {path.name} 无法解析（{reason}），未纳入本次检索。"
+              "若它可能含相关经验，请先修好这张卡片。", file=sys.stderr)
+
     return 0 if hits else 1
 
 
@@ -510,10 +587,23 @@ def cmd_lint(args: argparse.Namespace) -> int:
         scope = args.card
     else:
         count = 0
-        for path, meta, body in iter_cards(kb_root, args.arch):
+        unreadable: List[Tuple[Path, str]] = []
+        for path, meta, body in iter_cards(kb_root, args.arch, unreadable):
             count += 1
             for issue in check_no_code_boundary(meta, body, denylist):
                 all_issues.append(Issue(issue.code, f"{path.name}: {issue.message}"))
+        # 解析不动的卡片要算成问题，不能跳过。
+        #
+        # lint 的职责是「库里没有参考实现的痕迹」。一个解析不动的文件没被
+        # 检查过，所以这句话对它并不成立 —— 而解析不动最常见的原因恰恰是
+        # 有人把参考源码整段粘进了卡片，把 frontmatter 撑坏了。
+        # 跳过它等于：最该被 lint 拦住的东西，成了唯一躲过 lint 的。
+        for path, reason in unreadable:
+            all_issues.append(Issue(
+                "L-PARSE",
+                f"{path.name}: 无法解析（{reason}）。"
+                "未经检查的卡片不能算「未越界」—— "
+                "frontmatter 坏掉的常见原因是正文里粘了大段源码"))
         scope = f"{count} 张卡片"
 
     return _report(all_issues, args.as_json, f"{scope} 未越过 no-code 边界")
@@ -527,15 +617,46 @@ def _nogo_path(kb_root: Path) -> Path:
     return kb_root / NOGO_FILENAME
 
 
+class NogoError(Exception):
+    """死路表读不出来。"""
+
+
 def load_nogo(kb_root: Path) -> List[Dict[str, Any]]:
+    """读死路表。读不动就报错，不要当成空表。
+
+    为什么不能退回空表：`nogo add` 的流程是「读出全部条目 → 追加一条 →
+    整份写回」。文件损坏时读成空表，这一写就把整张死路表清空了，只剩刚
+    加的那一条。而死路表的作用是防止后续 campaign 重走已经证伪的路 ——
+    它被悄悄清空之后，那些路会被一条条重试，每条都要花掉真实的评测预算。
+
+    损坏本身不罕见：写入过程被 Ctrl-C 打断就会留下一个截断的 JSON。
+    """
     path = _nogo_path(kb_root)
     if not path.exists():
         return []
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise NogoError(f"无法读取死路表 {path}: {exc}") from exc
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise NogoError(
+            f"死路表 {path} 不是合法 JSON: {exc}\n"
+            "  多半是上一次写入被打断留下了截断的文件。\n"
+            "  这里不会退回空表继续 —— 那样下一次 nogo add 会把整张表\n"
+            "  覆盖成只有一条，之前所有证伪过的方向会被重新尝试一遍。\n"
+            f"  请先人工确认 {path} 的内容（必要时从 git 历史恢复）。"
+        ) from exc
+    if not isinstance(data, dict):
+        raise NogoError(
+            f"死路表 {path} 的顶层不是对象，无法解析出 entries")
+    entries = data.get("entries")
+    if entries is None:
         return []
-    return data.get("entries", []) if isinstance(data, dict) else []
+    if not isinstance(entries, list):
+        raise NogoError(f"死路表 {path} 里的 entries 不是数组")
+    return entries
 
 
 def cmd_nogo_add(args: argparse.Namespace) -> int:
@@ -560,7 +681,7 @@ def cmd_nogo_add(args: argparse.Namespace) -> int:
                            indent=2) + "\n",
                 encoding="utf-8",
             )
-    except TimeoutError as exc:
+    except (TimeoutError, NogoError) as exc:
         print(f"错误: {exc}", file=sys.stderr)
         return 2
     print(f"已登记死路（当前 {len(entries)} 条）: {args.tried}")
@@ -574,8 +695,17 @@ def cmd_nogo_check(args: argparse.Namespace) -> int:
     """
     kb_root = Path(args.kb_root)
     needle = args.symptom.strip().lower()
+    try:
+        all_entries = load_nogo(kb_root)
+    except NogoError as exc:
+        # 不能退回「未命中死路，该方向可以尝试」—— 那是在表读不出来的情况下
+        # 给出一个肯定的放行结论，而调用方正是据此决定要不要花预算重试。
+        print(f"错误: {exc}", file=sys.stderr)
+        print("  死路表读不出来时无法回答「这个方向试过没有」，"
+              "不要当成「没试过」。", file=sys.stderr)
+        return 2
     hits = [
-        e for e in load_nogo(kb_root)
+        e for e in all_entries
         if needle in str(e.get("symptom", "")).lower()
         and (not args.arch or e.get("arch") == args.arch)
     ]

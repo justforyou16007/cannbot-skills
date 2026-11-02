@@ -1476,8 +1476,16 @@ def test_noise_floor_needs_minimum_samples():
         noise_floor.compute([1.0, 1.01])
 
 
-def test_noise_floor_on_identical_readings_is_zero():
-    assert noise_floor.compute([1.0, 1.0, 1.0])["floor_pct"] == pytest.approx(0.0)
+def test_noise_floor_on_identical_readings_is_refused():
+    """完全相同的比值不是「环境干净」，是这些数不是独立测出来的。
+
+    这条用例原先断言返回 0.00%。改掉的理由：噪声底 0 的含义是「任何正增益
+    都算真实改进」，而重复测量给出一模一样的比值在物理上不会发生 —— 实际
+    成因是自评场景下 speedup 被钉成常数 1.0。返回 0 并提示「把这个数传给
+    campaign init」会让测量抖动被当成加速收进知识库。
+    """
+    with pytest.raises(noise_floor.NoiseFloorError, match="完全相同"):
+        noise_floor.compute([1.0, 1.0, 1.0])
 
 
 def test_noise_floor_grows_with_spread():
@@ -1682,3 +1690,388 @@ def test_lookup_matches_dedupes_channels():
            "a": {"value": 1.0, "channel": AIV, "present": True},
            "b": {"nested": {"value": 1.0, "channel": AIV, "present": True}}}
     assert len(campaign.lookup_signature_matches(sig, "aiv_mte2")) == 1
+
+
+# ===========================================================================
+# init 的前置校验
+#
+# 这三道门挡的都是「能一路跑完、但结论全错」的情形。它们的共同点是要跑很久
+# 才会暴露：架构串填错要等到第一张卡片入库被拒；签名不可信要等到机制做差
+# 得出莫名其妙的结论；派发未确认则根本不知道基线测的是谁。
+# ===========================================================================
+
+def test_init_rejects_unknown_arch(tmp_path):
+    argv = init_argv(tmp_path / "s.json")
+    argv[argv.index("--arch") + 1] = "ascend910b"
+    code, out = run(argv)
+    assert code == 2
+    assert "DAV_2201" in out
+
+
+def test_init_accepts_unknown_arch_when_explicitly_allowed(tmp_path):
+    argv = init_argv(tmp_path / "s.json") + ["--allow-unknown-arch"]
+    argv[argv.index("--arch") + 1] = "DAV_9999"
+    code, _ = run(argv)
+    assert code == 0
+
+
+def test_known_archs_match_the_knowledge_base():
+    """架构串的真正来源是 forge-hwkb 的 ARCH_DIRS，两边必须一致。
+
+    不一致的后果是 campaign 能跑完而卡片永远入不了库 —— 所以这里用一条
+    用例盯住，不靠人记得同步改两个文件。
+    """
+    hwkb_scripts = (Path(__file__).resolve().parent.parent
+                    / "skills" / "forge-hwkb" / "scripts")
+    sys.path.insert(0, str(hwkb_scripts))
+    import hwkb  # noqa: PLC0415
+
+    assert set(campaign.KNOWN_ARCHS) == set(hwkb.ARCH_DIRS)
+
+
+def test_reference_spec_constants_match_the_adapter():
+    """campaign 里这两个常量是从 reference_adapter 抄来的，不能漂。"""
+    import reference_adapter  # noqa: PLC0415
+
+    assert campaign.SPEC_FILENAME == reference_adapter.SPEC_FILENAME
+    assert campaign.KIND_BUILTIN == reference_adapter.KIND_BUILTIN
+
+
+def test_init_rejects_untrusted_reference_signature(tmp_path):
+    """签名自己判了测量不可信，就不能当第 0 轮基线。"""
+    sig_path = tmp_path / "bad_sig.json"
+    sig_path.write_text(json.dumps({
+        "trust": {"trustworthy": False,
+                  "blocking_reasons": ["缺少 metric: ResourceConflictRatio"]},
+    }), encoding="utf-8")
+
+    code, out = run(init_argv(tmp_path / "s.json",
+                              reference_signature=sig_path))
+    assert code == 2
+    assert "ResourceConflictRatio" in out
+
+
+def test_init_accepts_untrusted_signature_when_explicitly_allowed(tmp_path):
+    sig_path = tmp_path / "bad_sig.json"
+    sig_path.write_text(json.dumps({"trust": {"trustworthy": False}}),
+                        encoding="utf-8")
+    code, _ = run(init_argv(tmp_path / "s.json", reference_signature=sig_path)
+                  + ["--allow-untrusted-signature"])
+    assert code == 0
+
+
+def test_init_accepts_trustworthy_signature(tmp_path):
+    code, _ = run(init_argv(
+        tmp_path / "s.json",
+        reference_signature=write_reference_signature(tmp_path)))
+    assert code == 0
+
+
+# ---------------------------------------------------------------------------
+# 派发确认
+#
+# builtin_aclnn 这种参考依赖「空 OPP 目录让 aclnn 落到内置实现」这一行为。
+# 它没在本机证实过时，第 0 轮基线测的可能根本不是内置实现，后面每一轮
+# 加速比都是对着一个未知对象算出来的。
+# ---------------------------------------------------------------------------
+
+def write_spec(tmp_path, dispatch_verified, kind="builtin_aclnn",
+               reference_id="demo_op"):
+    path = tmp_path / campaign.SPEC_FILENAME
+    path.write_text(json.dumps({
+        "kind": kind, "op_name": "demo_op", "reference_id": reference_id,
+        "baseline_path": str(tmp_path / "null_opp"),
+        "dispatch_verified": dispatch_verified,
+    }), encoding="utf-8")
+    return path
+
+
+def test_init_rejects_unverified_dispatch(tmp_path):
+    spec = write_spec(tmp_path, False)
+    code, out = run(init_argv(tmp_path / "s.json")
+                    + ["--reference-spec", str(spec)])
+    assert code == 2
+    assert "dispatch_verified" in out
+
+
+def test_init_accepts_verified_dispatch(tmp_path):
+    spec = write_spec(tmp_path, True)
+    code, _ = run(init_argv(tmp_path / "s.json")
+                  + ["--reference-spec", str(spec)])
+    assert code == 0
+
+
+def test_init_allows_unverified_dispatch_on_request(tmp_path):
+    spec = write_spec(tmp_path, False)
+    code, out = run(init_argv(tmp_path / "s.json")
+                    + ["--reference-spec", str(spec),
+                       "--allow-unverified-dispatch"])
+    assert code == 0
+    assert "milestone" in out
+
+
+def test_init_finds_spec_next_to_the_state_file(tmp_path):
+    """实际流程里 spec 就躺在工作目录里，不传也该被用上。"""
+    write_spec(tmp_path, False)
+    code, out = run(init_argv(tmp_path / "s.json"))
+    assert code == 2
+    assert "dispatch_verified" in out
+
+
+def test_init_warns_when_reference_id_differs_from_spec(tmp_path):
+    """quickstart 用 aclnnXxx、prepare 默认写算子名，两值并存容易让人误解。"""
+    spec = write_spec(tmp_path, True, reference_id="demo_op")
+    argv = init_argv(tmp_path / "s.json") + ["--reference-spec", str(spec)]
+    code, out = run(argv)
+    assert code == 0
+    assert "--reference-id" in out and "建议统一成算子名" in out
+
+
+def test_init_without_spec_still_works_but_warns(tmp_path):
+    """没有 spec 时不卡死流程，但要说清少了哪一道确认。"""
+    code, out = run(init_argv(tmp_path / "s.json"))
+    assert code == 0
+    assert campaign.SPEC_FILENAME in out
+
+
+# ===========================================================================
+# 噪声底：崩掉的评测不能量出一个数来
+#
+# 评测崩溃时写进结果文件的是 time_us=-1 和 cv_pct=0.0。那个 0.0 在形态上
+# 和「环境极其干净」完全一样，于是脚本会一声不响地输出 0.00%，还提示把它
+# 传给 campaign init。噪声底 0 的含义是「任何正增益都算真实改进」。
+# ===========================================================================
+
+def eval_result(gating="partial_passed", speedup=1.02, cv=2.4,
+                baseline_us=314.4, evolved_us=308.2):
+    return {
+        "gating": gating,
+        "shape_results": {"target": [{
+            "name": "s0", "baseline_time_us": baseline_us,
+            "evolved_time_us": evolved_us, "speedup": speedup,
+            "cv_pct": cv, "precision_passed": True,
+        }]},
+        "baseline": {"time_us": baseline_us, "cv_pct": 0.0},
+        "evolved": {"time_us": evolved_us, "cv_pct": cv},
+        "comparison": {"speedup": speedup, "cv_pct": cv},
+    }
+
+
+def write_result(tmp_path, name, **kw):
+    path = tmp_path / name
+    path.write_text(json.dumps(eval_result(**kw)), encoding="utf-8")
+    return path
+
+
+def test_noise_floor_refuses_failed_evaluation(tmp_path):
+    path = write_result(tmp_path, "failed.json", gating="failed",
+                        speedup=0.0, cv=0.0, baseline_us=-1, evolved_us=-1)
+    with pytest.raises(noise_floor.NoiseFloorError, match="gating=failed"):
+        noise_floor._load_docs([path])
+
+
+def test_noise_floor_refuses_result_without_any_positive_time(tmp_path):
+    path = write_result(tmp_path, "crashed.json", gating="partial_passed",
+                        baseline_us=-1, evolved_us=-1)
+    with pytest.raises(noise_floor.NoiseFloorError, match="time_us"):
+        noise_floor._load_docs([path])
+
+
+def test_noise_floor_refuses_all_zero_cv():
+    """cv 全 0 不是「环境干净」，是这个字段没被真正填上。"""
+    with pytest.raises(noise_floor.NoiseFloorError, match="全是 0"):
+        noise_floor.compute_from_cv([0.0, 0.0, 0.0])
+
+
+def test_noise_floor_warns_when_below_paper_lower_bound():
+    """偏低比偏高危险：判据会把抖动当成真实改进收下。
+
+    compute() 一直有这条下限告警，compute_from_cv() 当初漏了 —— 两条
+    路径不对称，而实际用的恰恰是后者。
+    """
+    out = noise_floor.compute_from_cv([0.2, 0.3])
+    assert any("低于" in w for w in out["warnings"])
+
+
+def test_noise_floor_rejects_spread_on_self_evaluation(tmp_path):
+    """自评时 speedup 被钉成 1.0，比值离散法结构性地量不出东西。"""
+    paths = [write_result(tmp_path, f"run{i}.json", speedup=1.0,
+                          baseline_us=314.38 + i, evolved_us=319.84 + i,
+                          cv=2.3 + i * 0.3)
+             for i in range(3)]
+    docs = noise_floor._load_docs(paths)
+    with pytest.raises(noise_floor.NoiseFloorError, match="自评"):
+        noise_floor._ratios_from_docs(docs, [str(p) for p in paths])
+
+
+def test_noise_floor_cv_method_works_on_self_evaluation(tmp_path):
+    """同一批自评结果用 cv 法照样能量出噪声底 —— cv 不经过 speedup。"""
+    paths = [write_result(tmp_path, f"run{i}.json", speedup=1.0,
+                          baseline_us=314.38, evolved_us=319.84,
+                          cv=[2.31, 2.95, 2.63][i])
+             for i in range(3)]
+    docs = noise_floor._load_docs(paths)
+    values = [v for doc in docs for v in noise_floor.extract_cv_values(doc)]
+    assert noise_floor.compute_from_cv(values)["floor_pct"] == pytest.approx(2.95)
+
+
+def test_forced_self_baseline_not_flagged_when_times_match(tmp_path):
+    """两侧耗时本来就相等时，speedup=1.0 是真的持平，不是被钉的。"""
+    path = write_result(tmp_path, "equal.json", speedup=1.0,
+                        baseline_us=300.0, evolved_us=300.0)
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    assert noise_floor.detect_forced_self_baseline(doc) == []
+
+
+# ---------------------------------------------------------------------------
+# 复合锚点：两种连接词都要认
+#
+# `and`/`or` 需要词边界（否则 "operand" 里的 "and" 会命中），而 `&&`/`||`
+# 两侧没有单词字符，加 \b 会让这两个分支永远匹配不上 —— 一条用 && 写的
+# 复合条件就会只验第一个子句再报「成立」，正是这道门要拦的情形。
+# ---------------------------------------------------------------------------
+
+def mech_line(expr):
+    return {"id": "L1", "label": "ub_resident_reuse", "anchor": {"expr": expr}}
+
+
+def test_compound_anchor_with_and_is_not_verified():
+    out = campaign.verify_mechanism_line(
+        mech_line(f"{CHANNEL} < 4.2 and other_field < 0.3"),
+        signature(0.9), {CHANNEL: REFERENCE_STALL})
+    assert out["verified"] is None
+    assert "多个条件" in out["reason"]
+
+
+def test_compound_anchor_with_c_style_and_is_not_verified():
+    out = campaign.verify_mechanism_line(
+        mech_line(f"{CHANNEL} < 4.2 && mechanism_ok"),
+        signature(0.9), {CHANNEL: REFERENCE_STALL})
+    assert out["verified"] is None, out
+
+
+def test_compound_anchor_with_c_style_or_is_not_verified():
+    out = campaign.verify_mechanism_line(
+        mech_line(f"{CHANNEL} < 4.2 || fallback"),
+        signature(0.9), {CHANNEL: REFERENCE_STALL})
+    assert out["verified"] is None, out
+
+
+def test_word_operand_is_not_mistaken_for_a_connective():
+    """「operand」里含 and，不能据此把单条件判成复合条件。"""
+    out = campaign.verify_mechanism_line(
+        {"id": "L1", "label": "ub_resident_reuse",
+         "anchor": {"expr": f"{CHANNEL} < 4.2"}},
+        signature(0.9), {CHANNEL: REFERENCE_STALL})
+    assert out["verified"] is True, out
+
+
+def test_single_anchor_still_verifies():
+    out = campaign.verify_mechanism_line(
+        mech_line(f"{CHANNEL} < 4.2"),
+        signature(0.9), {CHANNEL: REFERENCE_STALL})
+    assert out["verified"] is True, out
+
+
+# ---------------------------------------------------------------------------
+# 不可信签名：set-reference-signature 走的是同一道门
+#
+# promote 会把 reference_snapshot 清空，所以第 1 代起每一代都只能靠这条命令
+# 登记参考签名。门只守在 init 上等于只守住了第 0 代。
+# ---------------------------------------------------------------------------
+
+def test_set_reference_signature_rejects_untrusted(tmp_path):
+    state_file = tmp_path / "s.json"
+    assert run(init_argv(state_file))[0] == 0
+
+    sig_path = tmp_path / "bad.json"
+    sig_path.write_text(json.dumps({
+        "trust": {"trustworthy": False,
+                  "blocking_reasons": ["发生 DVFS 降频"]},
+        "stalls": {"wait": {"mte2_wait": {
+            "value": 0.9, "channel": CHANNEL, "present": True}}},
+    }), encoding="utf-8")
+
+    code, out = run(["--state", str(state_file), "set-reference-signature",
+                     "--signature", str(sig_path)])
+    assert code == 2
+    assert "DVFS" in out
+
+
+def test_set_reference_signature_accepts_untrusted_when_allowed(tmp_path):
+    state_file = tmp_path / "s.json"
+    assert run(init_argv(state_file))[0] == 0
+
+    sig_path = tmp_path / "bad.json"
+    sig_path.write_text(json.dumps({
+        "trust": {"trustworthy": False, "blocking_reasons": ["降频"]},
+        "stalls": {"wait": {"mte2_wait": {
+            "value": 0.9, "channel": CHANNEL, "present": True}}},
+    }), encoding="utf-8")
+
+    code, _ = run(["--state", str(state_file), "set-reference-signature",
+                   "--signature", str(sig_path),
+                   "--allow-untrusted-signature"])
+    assert code == 0
+
+
+def test_set_reference_signature_accepts_trustworthy(tmp_path):
+    state_file = tmp_path / "s.json"
+    assert run(init_argv(state_file))[0] == 0
+    code, _ = run(["--state", str(state_file), "set-reference-signature",
+                   "--signature", str(write_reference_signature(tmp_path))])
+    assert code == 0
+
+
+# ---------------------------------------------------------------------------
+# 台账按代过滤
+#
+# 台账跨代累积（promote 不清空，这是对的 —— 要能回看整条链）。但读台账
+# 回答关于本代的问题时必须按代过滤：promote 换了参考，跨代的数全不可比。
+# ---------------------------------------------------------------------------
+
+def ledger_entry(generation, **kw):
+    base = {"generation": generation, "decision": "D0.1",
+            "verdict": campaign.VERDICT_ACCEPT, "gain": 1.4,
+            "time_us": 210.0, "counts_toward_best": True,
+            "kb_admissible": True, "invalidated": False}
+    base.update(kw)
+    return base
+
+
+def test_generation_entries_filters_by_current_generation():
+    state = fresh_state()
+    state["generation"] = 1
+    state["ledger"] = [ledger_entry(0), ledger_entry(1, decision="D1.1")]
+    kept = campaign.generation_entries(state)
+    assert [e["decision"] for e in kept] == ["D1.1"]
+
+
+def test_generation_entries_keeps_entries_without_generation():
+    """老 state 没记代号时当作本代 —— 宁可多算一条，不要静默丢掉证据。"""
+    state = fresh_state()
+    entry = ledger_entry(0)
+    del entry["generation"]
+    state["ledger"] = [entry]
+    assert len(campaign.generation_entries(state)) == 1
+
+
+def test_graph_not_exhausted_right_after_promote():
+    """上一代试过的决策在本代是全新的 —— 参考换了，结论可能完全不同。"""
+    doc = milestone({"D0.1": [], "D0.2": []})
+    state = fresh_state()
+    state["ledger"] = [ledger_entry(0, decision="D0.1"),
+                       ledger_entry(0, decision="D0.2")]
+    assert campaign.graph_exhausted(state, doc) is True
+
+    state["generation"] = 1
+    assert campaign.graph_exhausted(state, doc) is False
+
+
+def test_previous_snapshot_does_not_cross_generations():
+    """上一代的签名来自另一个二进制，拿它做差会把两代差异算到本代头上。"""
+    state = fresh_state()
+    state["ledger"] = [ledger_entry(0, signature_snapshot={CHANNEL: 1.1})]
+    state["generation"] = 1
+    snapshot, label = campaign.previous_snapshot(state)
+    assert label == "参考实现", label

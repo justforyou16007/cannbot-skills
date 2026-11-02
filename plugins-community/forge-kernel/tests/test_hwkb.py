@@ -350,8 +350,39 @@ def test_nogo_filters_by_arch(tmp_path):
     assert hwkb.cmd_nogo_check(other) == 0  # 架构不同，不该命中
 
 
-def test_nogo_corrupt_file_degrades_gracefully(tmp_path):
+def test_nogo_corrupt_file_is_refused_not_silently_emptied(tmp_path):
+    """损坏的死路表必须报错，不能退回空表。
+
+    这条用例原先断言「优雅降级为空表」。改掉的理由是那条降级路径紧接着就会
+    毁掉数据：`nogo add` 的流程是「读出全部条目 → 追加一条 → 整份写回」，
+    读成空表意味着下一步写入把整张死路表覆盖成只有新加的那一条。
+
+    死路表的作用是防止后续 campaign 重走已经证伪的方向。它被悄悄清空之后，
+    那些方向会被一条条重试，每条都要花掉真实的评测预算 —— 而没有任何
+    报错提示发生过这件事。文件损坏本身不罕见：写入时被 Ctrl-C 打断就会
+    留下一个截断的 JSON。
+    """
     (tmp_path / hwkb.NOGO_FILENAME).write_text("不是 JSON", encoding="utf-8")
+    with pytest.raises(hwkb.NogoError, match="不是合法 JSON"):
+        hwkb.load_nogo(tmp_path)
+
+
+def test_nogo_check_refuses_instead_of_reporting_no_hit(tmp_path):
+    """表读不出来时不能回答「没试过，可以尝试」。
+
+    调用方正是据此决定要不要花预算重试，所以这里给出肯定的放行结论比
+    报错危险得多。
+    """
+    import argparse  # noqa: PLC0415
+
+    (tmp_path / hwkb.NOGO_FILENAME).write_text('{"entries": [', encoding="utf-8")
+    args = argparse.Namespace(kb_root=str(tmp_path), symptom="MTE2 偏高",
+                              arch=None, as_json=False)
+    assert hwkb.cmd_nogo_check(args) == 2
+
+
+def test_nogo_missing_file_is_still_an_empty_list(tmp_path):
+    """文件不存在是正常起点，不是错误 —— 别把这两件事混起来。"""
     assert hwkb.load_nogo(tmp_path) == []
 
 
@@ -454,3 +485,42 @@ def test_query_skips_retired_by_default(tmp_path):
     _seed(tmp_path, status="retired")
     assert _query(tmp_path) == 1
     assert _query(tmp_path, include_retired=True) == 0
+
+
+# ---------------------------------------------------------------------------
+# 卡片 lint 的名词匹配同样要带词边界
+# ---------------------------------------------------------------------------
+
+def test_lint_denylist_does_not_match_longer_identifier():
+    """清单里的 DataCopyEx 不应命中正文里的 DataCopyExtParams。"""
+    card = (
+        "---\n"
+        "id: R-2201-902\n"
+        "arch: DAV_2201\n"
+        "mechanism: 用 DataCopyExtParams 描述非连续搬运\n"
+        "symptom: MTE2 偏高\n"
+        "symptom_channel: evaluation_results.json:baseline.pipeline.mte2_pct\n"
+        "---\n"
+        "## 机制\n按 DataCopyPadExtParams 补边。\n"
+    )
+    meta, body = hwkb.parse_card(card)
+    issues = hwkb.check_no_code_boundary(
+        meta, body, ["DataCopyEx", "DataCopyPad"])
+    assert "L-DENY" not in {i.code for i in issues}
+
+
+def test_lint_denylist_matches_whole_word_case_insensitively():
+    """带词边界之后，大小写不同的整词命中仍要报。"""
+    card = (
+        "---\n"
+        "id: R-2201-903\n"
+        "arch: DAV_2201\n"
+        "mechanism: 照搬 refsecretcore 的编排\n"
+        "symptom: MTE2 偏高\n"
+        "symptom_channel: evaluation_results.json:baseline.pipeline.mte2_pct\n"
+        "---\n"
+        "## 机制\n按参考做。\n"
+    )
+    meta, body = hwkb.parse_card(card)
+    issues = hwkb.check_no_code_boundary(meta, body, ["RefSecretCore"])
+    assert "L-DENY" in {i.code for i in issues}

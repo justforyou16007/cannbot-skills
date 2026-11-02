@@ -54,6 +54,7 @@ import os
 import shutil
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -287,6 +288,16 @@ def check_device() -> Tuple[bool, str]:
 
 def cmd_verify(args: argparse.Namespace) -> int:
     """在目标机器上把「参考能不能用」变成一次有确切结论的检查。"""
+    # 参数本身的问题先报，别让人等完 npu-smi 探测再看到一行用法错误
+    if args.confirm_dispatch and not (args.evidence or "").strip():
+        print("错误: --confirm-dispatch 必须同时给 --evidence。\n"
+              "  这个字段是别人日后判断「这个基线算不算数」的唯一依据，"
+              "空着等于没确认。\n"
+              "  写明观测到的算子名与来源，例如："
+              "\"msprof op_summary 中 Op Name=AddLayerNorm、Block Dim=40\"",
+              file=sys.stderr)
+        return 2
+
     spec_path = Path(args.spec)
     try:
         spec = json.loads(spec_path.read_text(encoding="utf-8"))
@@ -338,11 +349,22 @@ def cmd_verify(args: argparse.Namespace) -> int:
 
     if spec.get("kind") == KIND_BUILTIN:
         print("\n— 派发行为 —")
-        print("  [待确认] 「空 OPP 目录使 aclnn 落到内置实现」这一行为尚未在本机证实。")
-        print("           确认方式：跑一次 evaluate_ops_direct.py，令 baseline 与")
-        print("           evolved 都指向本参考路径，再用 msprof 采集，查看")
-        print("           kernel_details 中出现的算子名是否为厂商内置实现的名字。")
-        print("           若出现的是自定义算子名，说明派发没有按预期落下去。")
+        if spec.get("dispatch_verified") is True:
+            print("  [通过] 已确认派发落到内置实现。")
+            print(f"         证据: {spec.get('dispatch_evidence') or '（未记录）'}")
+            print(f"         确认时间: {spec.get('dispatch_verified_at') or '（未记录）'}")
+        elif args.confirm_dispatch:
+            print("  [待写入] 本次将按 --evidence 给出的证据确认派发行为。")
+        else:
+            print("  [待确认] 「空 OPP 目录使 aclnn 落到内置实现」这一行为尚未在本机证实。")
+            print("           确认方式：跑一次 evaluate_ops_direct.py，令 baseline 与")
+            print("           evolved 都指向本参考路径，再用 msprof 采集，查看")
+            print("           kernel_details 中出现的算子名是否为厂商内置实现的名字。")
+            print("           若出现的是自定义算子名，说明派发没有按预期落下去。")
+            print("           确认后把证据回写进来（这一步不是记录，是开 campaign 的前提）：")
+            print(f"             python3 reference_adapter.py verify --spec {spec_path} \\")
+            print("                 --confirm-dispatch --evidence \"msprof op_summary 中 "
+                  "Op Name=AddLayerNorm、Block Dim=40；三次自评 precision_passed=true\"")
 
     print()
     if failures:
@@ -355,10 +377,31 @@ def cmd_verify(args: argparse.Namespace) -> int:
         print("\n把以上整段输出回贴即可定位问题。", file=sys.stderr)
         return 1
 
+    if args.confirm_dispatch:
+        if spec.get("kind") != KIND_BUILTIN:
+            print(f"错误: --confirm-dispatch 只对 {KIND_BUILTIN} 来源有意义；"
+                  f"本 spec 的来源是 {spec.get('kind')}", file=sys.stderr)
+            return 2
+        spec["dispatch_verified"] = True
+        spec["dispatch_evidence"] = args.evidence.strip()
+        spec["dispatch_verified_at"] = datetime.now(timezone.utc).isoformat(
+            timespec="seconds")
+        try:
+            spec_path.write_text(
+                json.dumps(spec, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8")
+        except OSError as exc:
+            print(f"错误: 无法写回 {spec_path}: {exc}", file=sys.stderr)
+            return 2
+        print(f"已把 dispatch_verified 置为 true（{spec_path}）")
+        print(f"  证据 {spec['dispatch_evidence']}")
+        print("campaign.py init 会读这个字段；为 false 时它拒绝开 campaign。")
+        return 0
+
     print("预检通过。")
-    if spec.get("kind") == KIND_BUILTIN:
-        print("注意：派发行为仍需按上面的方式确认一次，确认后"
-              "把 reference_spec.json 的 dispatch_verified 置为 true。")
+    if spec.get("kind") == KIND_BUILTIN and spec.get("dispatch_verified") is not True:
+        print("注意：派发行为仍未确认，campaign.py init 会拒绝用这份 spec 开 campaign。"
+              "按上面给出的命令确认后再继续。")
     return 0
 
 
@@ -384,6 +427,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_ver = sub.add_parser("verify", help="在目标机器上预检参考是否可用")
     p_ver.add_argument("--spec", required=True)
+    p_ver.add_argument("--confirm-dispatch", action="store_true",
+                       help="确认派发确实落到内置实现，把 dispatch_verified "
+                            "回写为 true。必须同时给 --evidence")
+    p_ver.add_argument("--evidence", default="",
+                       help="派发确认的观测证据，例如 msprof 里看到的算子名")
     p_ver.set_defaults(func=cmd_verify)
 
     return parser

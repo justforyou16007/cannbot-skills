@@ -897,3 +897,20 @@ def test_default_library_path_matches_the_docs():
     expanded = {Path(m.replace("~", str(Path.home()))) for m in mentioned}
     assert Path(default) in expanded, (
         f"代码默认 {default}，文档写的是 {sorted(mentioned)}")
+
+
+def test_verify_on_vendor_only_library_is_not_a_failure(tmp_path):
+    """只登记了厂商实现是健康状态（promote 之前的库就是这样）。
+
+    把它报成「校验失败」等于让正常流程见红，而见红见多了就没人看了。
+    该说的是「这些代没有被校验」，并指向 drift。
+    """
+    library = tmp_path / "lib"
+    rl.add_generation(library, operator="demo", arch="DAV_2201",
+                      input_shape="B=8", kind="builtin_aclnn",
+                      identifier="ref", time_us=300.0)
+    problems, checked = rl.verify(library)
+    assert problems == [], problems
+    assert checked.generations == 1
+    assert checked.files_compared == 0
+    assert checked.artifactless == 1

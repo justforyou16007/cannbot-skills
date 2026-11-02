@@ -65,6 +65,12 @@ ARCHITECTURAL = "architectural"
 TACTICAL = "tactical"
 
 #: V4：出处标记的两种合法形态。
+#: 机制锚点要求的形状：一个「通道 比较符 数值」。与 campaign.py 的
+#: RE_MECH_EXPR 对应 —— 核验端只认这一种形状，所以这一端就要把别的形状拦掉。
+RE_MECH_COMPARISON = re.compile(
+    r"[\w:.()%/\-]+?\s*(?:<=|>=|==|!=|<|>)\s*-?\d+(?:\.\d+)?")
+RE_BOOL_CONNECTIVE = re.compile(r"\b(?:and|or)\b|&&|\|\|", re.IGNORECASE)
+
 RE_MEASURED = re.compile(r"^\[MEASURED,\s*job\s+\S+\]")
 RE_ESTIMATE = re.compile(r"^\[ESTIMATE\]")
 
@@ -683,6 +689,25 @@ def check_mechanism_labels(doc: Dict[str, Any]) -> List[Violation]:
 
         anchor = line.get("anchor")
         expr = anchor.get("expr") if isinstance(anchor, dict) else None
+
+        # 复合条件在这里就拦住，而不是留到 record 时才发现核验不了。
+        #
+        # 核验端（campaign.py 的 verify_mechanism_line）只认单个
+        # 「通道 比较符 数值」。写成 `a < 4.2 and b < 0.3` 的话，这条机制行
+        # 会在 record 时判为「无法核验」—— 到那时课程表已经写完、代码也写完了，
+        # 而失败原因看起来像是实现问题。两端的判据要一致，门禁才有意义。
+        if isinstance(expr, str) and expr.strip():
+            matches = RE_MECH_COMPARISON.findall(expr)
+            if len(matches) > 1 or RE_BOOL_CONNECTIVE.search(expr):
+                out.append(Violation(
+                    "V11", f"{base}.anchor.expr",
+                    f"锚点表达式含多个条件：{expr!r}。"
+                    "机制核验只认单个「通道 比较符 数值」—— 复合条件会被判为"
+                    "无法核验，这条机制行拿不到顺序证据。"
+                    "请拆成多条机制行，每条锚定一个停顿字段",
+                ))
+                continue
+
         haystack = " ".join(str(x) for x in (expr, line.get("statement")) if x)
         if not any(token in haystack for token in required):
             out.append(Violation(
@@ -707,7 +732,104 @@ def check_mechanism_labels(doc: Dict[str, Any]) -> List[Violation]:
 # 调度
 # ---------------------------------------------------------------------------
 
+def check_document_shape(doc: Dict[str, Any]) -> List[Violation]:
+    """课程表得先是一份课程表。
+
+    为什么单独立一条规则：其余十一条规则都在「遍历决策/门禁行」的循环里做
+    检查，而空文档、键名拼错、门禁行写成一句话这三种情况下，那些循环一次
+    都不会执行 —— 于是零违规，输出「通过：满足全部门禁义务（共 0 条决策）」。
+
+    「没东西可查」被当成了「查过了，没问题」。这是整条门禁链最脆的一环：
+    `forge-coder` 的规则是「validate 不通过就不要开始实现」，它拿到 rc=0
+    就会在一份空课程表上开工，而后续每一条机制行都无从核验。
+
+    所以这里只问三个问题：有没有 milestones、里面有没有决策、门禁行是不是
+    结构化对象。
+    """
+    out: List[Violation] = []
+
+    milestones = doc.get("milestones")
+    if milestones is None:
+        known = sorted(k for k in doc if isinstance(k, str))
+        out.append(Violation(
+            "V0", "milestones",
+            "文档里没有 milestones 字段，没有任何内容可校验 —— "
+            "「零违规」在这里不等于通过。"
+            + (f"顶层实际有的键: {known}（是不是拼错了？）" if known
+               else "文档是空的。")))
+        return out
+
+    if not isinstance(milestones, list):
+        out.append(Violation(
+            "V0", "milestones",
+            f"milestones 必须是数组，实际是 {type(milestones).__name__}"))
+        return out
+
+    if not milestones:
+        out.append(Violation(
+            "V0", "milestones",
+            "milestones 是空数组。一份没有里程碑的课程表无法指导实现，"
+            "也没有任何门禁义务可查"))
+        return out
+
+    total_decisions = 0
+    for idx, milestone in enumerate(milestones):
+        if not isinstance(milestone, dict):
+            out.append(Violation(
+                "V0", f"milestones[{idx}]",
+                f"里程碑必须是对象，实际是 {type(milestone).__name__}；"
+                "非对象条目会被其余规则整条跳过，等于不受任何约束"))
+            continue
+        mid = milestone.get("id", f"<milestones[{idx}] 无 id>")
+
+        decisions = milestone.get("decisions")
+        if isinstance(decisions, list):
+            for d_idx, decision in enumerate(decisions):
+                if isinstance(decision, dict):
+                    total_decisions += 1
+                else:
+                    out.append(Violation(
+                        "V0", f"{mid}.decisions[{d_idx}]",
+                        f"决策必须是对象，实际是 {type(decision).__name__}；"
+                        "非对象条目会被五元组、触发器、依赖图等规则整条跳过"))
+
+        gate = milestone.get("gate")
+        if gate is not None and not isinstance(gate, dict):
+            out.append(Violation(
+                "V0", f"{mid}.gate",
+                f"gate 必须是对象，实际是 {type(gate).__name__}；"
+                "非对象的 gate 会让门禁相关的全部规则失效"))
+            continue
+        if isinstance(gate, dict):
+            for category in LINE_CATEGORIES:
+                lines = gate.get(category)
+                if lines is None:
+                    continue
+                if not isinstance(lines, list):
+                    out.append(Violation(
+                        "V0", f"{mid}.gate.{category}",
+                        f"{category} 必须是数组，实际是 "
+                        f"{type(lines).__name__}"))
+                    continue
+                for l_idx, line in enumerate(lines):
+                    if not isinstance(line, dict):
+                        out.append(Violation(
+                            "V0", f"{mid}.gate.{category}[{l_idx}]",
+                            f"门禁行必须是对象（含 id/statement/anchor），"
+                            f"实际是 {type(line).__name__}: {line!r}。"
+                            "写成一句话的门禁行会被全部规则跳过 —— "
+                            "它读起来像一条义务，实际不受任何核验"))
+
+    if total_decisions == 0:
+        out.append(Violation(
+            "V0", "milestones[].decisions",
+            "整份课程表里没有一条决策。没有决策就没有可实现的东西，"
+            "也没有可核验的机制"))
+    return out
+
+
 RULES = {
+    "V0": ("课程表结构完整", check_document_shape),
     "V1": ("五元组完整", check_five_tuple),
     "V2": ("决策必须有触发器", check_trigger),
     "V3": ("派生图无环", check_decision_graph),

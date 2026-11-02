@@ -77,19 +77,66 @@ python3 -m pytest plugins-community/forge-kernel/tests/ -q
 
 ### 步骤 1：封存参考
 
+**先挑文件，再封存，而且中转目录要放在工作区之外。** 两条约束各有原因。
+
+封存范围只含**这一个算子**的产物，不要封整棵 `opp/built-in`。整棵树封进来
+会同时坏两件事：
+
+- 别的算子里的 `class Kernel`、`class Buffer` 会被当成本参考的专有名词，
+  一个正常写的候选能被围栏拦十几处，全是误伤；
+- 禁读清单长到几千条后，PreToolUse hook 的比对开销压在**每一次**工具调用上。
+
+中转目录放在工作区**之外**，因为边界 hook 对 `Grep`/`Glob` 要判两个方向：
+目标在封存目录**内**，以及目标是封存目录的**上层** —— 后者递归搜下去同样
+能读到参考源码，不拦就是条绕过去的路。代价是中转目录一旦落在工作目录下，
+`Grep path=.`（搜自己的候选代码）就成了「上层目录」，会被一并拦住。
+封存位置选错时 `seal` 会当场警告并给出建议路径。
+
 ```bash
 SK=.claude/skills/forge-campaign/scripts
+B=/usr/local/Ascend/cann-8.5.0/opp/built-in/op_impl/ai_core/tbe
+
+# 中转目录在工作区外。本机没有 /cache 时用 ~/.cache 或 /tmp 下的目录
+STAGE=/cache/forge-kernel/ref_stage/add_layer_norm
+mkdir -p "$STAGE"
+
+for f in $(find $B/impl/ops_nn/ascendc/add_layer_norm -type f) \
+         $B/impl/ops_nn/dynamic/add_layer_norm.py \
+         $B/kernel/config/ascend910b/ops_nn/add_layer_norm.json; do
+    ln -sf "$f" "$STAGE/$(basename $f)"
+done
 
 python3 $SK/seal_reference.py seal \
-    --artifact /path/to/reference \
+    --artifact "$STAGE" \
     --op-name add_layer_norm \
     --work-dir ./forge_work
 ```
 
+封存会对软链做 `resolve()`，清单里落的是真实绝对路径 —— 所以中转目录放在
+哪里都不影响拦截效果，只影响会不会误拦你自己的代码。
+
 产出两份清单：
 
-- `forge_work/sealed_paths.txt` → PreToolUse hook 读它，拦截读参考源码
+- `forge_work/sealed_paths.txt` → PreToolUse hook 读它，拦截读参考源码**与配置**
 - `forge_work/denylist.txt` → 知识库 lint 读它，拦截参考专有名词入库
+
+配置文件（算子的 `.json`）必须一起封：它把参考实现了哪些分支、每个分支用
+什么 tiling key、支持哪些输入形态组合全列了出来 —— 那正是本该从硬件行为
+反推的结论，而且照抄它连代码都不用读。
+
+专有名词清单会自动减掉**公开接口名**。判据是扫机器上的 `ascendc/include`，
+自动找不到时用 `--public-headers` 指过去：
+
+```bash
+python3 $SK/seal_reference.py seal \
+    --artifact "$STAGE" --op-name add_layer_norm \
+    --work-dir ./forge_work \
+    --public-headers /usr/local/Ascend/cann-8.5.0/aarch64-linux/ascendc/include
+```
+
+不做这一步减法的话，`DataCopyPad`、`WholeReduceSum` 这类谁都该用的接口会
+进禁用名单，于是**任何**正常候选都被围栏拦住 —— 最后的结局是围栏被整条
+豁免掉，真正的转发也跟着放过去。
 
 参考本身是二进制（如内置实现）时会提示"未发现源码文件"，这是正常的 ——
 那种情况天然满足封闭要求。
@@ -108,42 +155,83 @@ python3 $SK/reference_adapter.py verify --spec ./forge_work/reference_spec.json
 > 整段输出可以直接回贴排障。
 
 `builtin_aclnn` 依赖「空 OPP 目录使 aclnn 派发落到内置实现」这一行为，
-**该行为尚未在真机验证过**。verify 会提示如何确认：跑一次评测后用 msprof
-看 `kernel_details` 里出现的算子名是不是厂商内置实现的名字。
+这个行为**必须在本机确认一次**。确认方式：令 baseline 与 evolved 都指向
+本参考路径跑一次自评，再用 msprof 采集，看 `op_summary` 里出现的算子名
+是不是厂商内置实现的名字。确认后把证据回写：
+
+```bash
+python3 $SK/reference_adapter.py verify --spec ./forge_work/reference_spec.json \
+    --confirm-dispatch \
+    --evidence "msprof op_summary 中 Op Name=AddLayerNorm、Block Dim=40；三次自评 precision_passed=true"
+```
+
+**这不是留个记录，是开 campaign 的前提**：`campaign.py init` 会读
+`dispatch_verified`，为 false 时拒绝开 campaign。道理很直接 —— 没确认
+派发，第 0 轮基线测的可能根本不是内置实现，后面每一轮加速比都是对着
+一个未知对象算出来的。
 
 ### 步骤 3：量噪声底
 
 先跑一次配对评测拿到结果，再量：
 
 ```bash
-python3 $SK/noise_floor.py --from-results evaluation_results.json
+python3 $SK/noise_floor.py --from-results evaluation_results.json --method cv
 ```
 
 输出的"噪声底"就是接受判据的那条线。
 
+> **只能用跑成功的评测来量。** 评测崩溃时写进结果文件的是 `time_us=-1`
+> 和 `cv_pct=0.0`，而那个 0.0 在形态上和「环境极其干净」一模一样。脚本
+> 现在会直接拒绝 `gating=failed` 的结果，以及 cv 全为 0 的结果 —— 噪声底
+> 定成 0 意味着任何正增益都被判为真实改进，抖动会被当成加速收进知识库。
+>
+> **自评场景（baseline 与 evolved 指向同一处）要显式传 `--method cv`。**
+> 评测脚本在自评时把每个 shape 的 speedup 直接钉成 1.0，所以比值离散法
+> （`--method spread`）必然输出 0.00% —— 那个 0 不代表环境干净，代表这个
+> 测法在这里什么也没测到。脚本现在会认出这种结果并报错而不是给 0。
+>
+> cv 法量的是**同一次 job 内**多次事件计时的离散度。它不含「跨进程配对」
+> 带来的位置偏差：评测总是先跑 baseline 子进程再跑 evolved 子进程，后者
+> 继承了频率/缓存的劣势，实测 evolved 侧恒慢约 2.7%。这个偏差方向恒定，
+> 多测几次消不掉，所以 1.05 的名义目标实际需要 5%+ 的真实改进才站得住。
+
 > 论文报的 1%~5% 是**它们环境的实测值，不是常数**。定太低会把测量抖动
 > 当成果收进来并污染知识库；定太高会把真实的小幅改进当噪声丢掉，
 > 优化提前停在远低于硬件上限的地方。所以这一步必须自己量。
->
-> 噪声底远超 5% 时先查环境：是否有其他进程占同一张卡、是否 DVFS 降频
-> （对比 msprof 的 `Current Freq` 与 `Rated Freq`）。
 
 ### 步骤 4：采参考签名
 
 ```bash
 PB=.claude/skills/forge-probes/scripts
 
-# 先用 ops-profiling 采 msprof，再提成结构化签名
+# 归档态：ops-profiling 的 msprof_perf_summary.py 合并后的目录
 python3 $PB/signature_probe.py --archive-dir ./round_1 \
     --op-name AddLayerNorm --min-gm-bytes 8388608
+
+# 采集态：msprof 原始目录，实机会多一层 PROF_GROUP_*
+python3 $PB/signature_probe.py --prof-dir ./forge_work/prof_ref \
+    --op-name AddLayerNorm --group PROF_GROUP_20261030_171959
 ```
 
 这一步对应论文的 NCU pass。探针把七份 msprof CSV 归并成一份签名：
 launch structure、流水占比、**停顿分解**、搬运量与复用倍数、暴露时间，
 每个值带着它的来源通道（可直接写进 milestone 的 `trigger.channel`）。
 
-> 它会先查测量可信度。降频、ICache 颠簸、停顿数据缺失任一成立，就
-> **扣留全部架构假设** —— 不可信数据推出的架构错得很有说服力。
+> **同一目录下有多次采集时，探针会报错要求 `--group` 指定，不会替你挑。**
+> 它曾经是排序取第一个，于是时间最早、可能只采到两个 metric 的那次被静默
+> 选中 —— 缺 metric 的签名里停顿数据是缺失的，读起来像「完全没有停顿」。
+> 报错信息里会列出每一组各采到几个 metric，挑齐全的那一组。
+
+> **冷启动行会被自动丢弃。** 一次采集里同一个算子有十来行（每次执行一行），
+> 头几次是冷启动：核执行时间超过任务总时长，物理上不可能。实测冷启动
+> 408.52us vs 稳态 233.16us，**高 75%**，而它看起来只是个正常的耗时数字。
+> 探针按「丢掉自相矛盾的行，再取中位数附近那一行」挑，挑行过程写进签名的
+> `row_selection` 字段，可以直接核对。需要更严的稳态起点时用
+> `--steady-from <Task ID>`。
+
+> 它会先查测量可信度。降频、ICache 颠簸、停顿数据缺失、整次采集都没有
+> 稳态行，任一成立就**扣留全部架构假设** —— 不可信数据推出的架构错得很有
+> 说服力。`campaign.py init` 也会拒绝用这种签名当基线。
 
 ### 步骤 5：开 campaign
 
@@ -152,12 +240,27 @@ python3 $SK/campaign.py init \
     --operator add_layer_norm \
     --input-shape "B=8,S=4096,H=1024,fp16" \
     --arch DAV_2201 \
-    --reference-kind builtin_aclnn --reference-id aclnnAddLayerNorm \
-    --noise-floor 2.3 --target-gain 1.05 --budget 40 \
+    --reference-kind builtin_aclnn --reference-id add_layer_norm \
+    --reference-spec ./forge_work/reference_spec.json \
+    --noise-floor 2.95 --target-gain 1.05 --budget 40 \
     --device-id 0 \
     --reference-signature ./forge_work/reference_signature.json \
     --state ./forge_work/campaign_state.json
 ```
+
+> **`--reference-id` 与 prepare 写进 spec 的值保持一致（都用算子名）。**
+> 目前没有任何逻辑按这个值做匹配，不影响运行，但两处写不同的串会让人以为
+> 它们必须对齐；init 发现不一致时会告警。
+
+> **`--reference-spec` 让 init 能校验派发是否已确认。** 不传时它会在工作
+> 目录里自动找 `reference_spec.json`；找不到只告警，找到了就按
+> `dispatch_verified` 判。
+
+> **`--arch` 必须是 `DAV_2201` / `DAV_3510` 之一。** 架构成熟卡片按这个串
+> 分目录存放，填 `ascend910b` 这种串的后果是 campaign 能一路跑完，但每张
+> 卡片入库时都被判 A-ARCH 拒掉 —— 几十轮经验一条也存不住。查法：
+> `npu-smi info` 看芯片型号，再查 `platform_config/*.ini` 的 `NpuArch`
+> （2201 → `DAV_2201`）。
 
 > **`--reference-signature` 传步骤 4 对参考采的那份签名。** 机制行要拿它
 > 做差（第 0 轮基线）；不给的话首轮构不成顺序证据，机制一律判为无法核验。

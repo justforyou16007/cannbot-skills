@@ -86,6 +86,22 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 SCHEMA_VERSION = "2.0"
 
+#: 认得的架构串。
+#:
+#: 真正的来源是 forge-hwkb 的 ARCH_DIRS —— 架构成熟卡片按这些串分目录存放。
+#: 这里填一个对不上的串（比如 "ascend910b"），campaign 能一路跑完，但每张
+#: 卡片入库时都会被 hwkb 判 A-ARCH 拒掉：几十轮的经验一条也存不下来，而这
+#: 件事要跑很久才会暴露。所以在 init 就挡住。
+#:
+#: 两边一致性由 tests/test_campaign.py 的用例盯着，不靠人记得同步改。
+KNOWN_ARCHS = ("DAV_2201", "DAV_3510")
+
+#: 参考定义文件名与「内置实现」这种来源的名字，来源是同目录的
+#: reference_adapter.py。这里只用到两个常量，为此在模块顶层 import 整个脚本
+#: 不值得；一致性同样由 tests/test_campaign.py 的用例盯着。
+SPEC_FILENAME = "reference_spec.json"
+KIND_BUILTIN = "builtin_aclnn"
+
 # 状态机
 STATE_ANALYZE = "analyze"      # 架构层在分析参考 / 修订课程
 STATE_IMPLEMENT = "implement"  # 编码层在实现当前决策行
@@ -217,6 +233,11 @@ def should_stop_promotion(gain: float, noise_floor_pct: float) -> bool:
 # ---------------------------------------------------------------------------
 # 机制核验：把 profiling 接进裁决回路
 # ---------------------------------------------------------------------------
+
+#: 布尔连接词。`and`/`or` 要词边界（否则 "operand" 里的 "and" 会命中），
+#: 而 `&&`/`||` 不能加 \b —— 符号两侧没有「单词字符」，\b 在那里不成立，
+#: 加了等于这两个分支永远匹配不上。两类分开写。
+RE_BOOL_CONNECTIVE = re.compile(r"\b(?:and|or)\b|&&|\|\|", re.IGNORECASE)
 
 #: 机制行锚点表达式的形状：<通道> <比较符> <数值>
 RE_MECH_EXPR = re.compile(
@@ -381,6 +402,29 @@ def verify_mechanism_line(line: Dict[str, Any],
     if not match:
         out.update(verified=None,
                    reason=f"锚点表达式 {expr!r} 不是「通道 比较符 数值」的形状，无法求值")
+        return out
+
+    # 复合条件不能按「只看第一个子句」处理。
+    #
+    # search() 只取第一处匹配，后面的部分被丢掉。于是
+    # `a < 4.2 and b < 0.3` 这种写法只有 a 被核验，而输出照样报「机制成立」——
+    # 一条只验证了一半的机制行会被当成完整的顺序证据，封进产物库和知识库。
+    # 要么两个子句都验，要么明说验不了；悄悄验一半是最坏的那种。
+    #
+    # 这里选「明说验不了」：第二步「字段是否因本次改动而移动」是按单个通道
+    # 做的，多子句需要每个通道各有基线、各判方向，那是另一件事。拆成多条
+    # 机制行本来也更清楚 —— 一条机制对一个停顿字段。
+    leftover = (expr[:match.start()] + expr[match.end():]).strip()
+    if RE_MECH_EXPR.search(leftover) or RE_BOOL_CONNECTIVE.search(expr):
+        out.update(
+            verified=None,
+            reason=(f"锚点表达式 {expr!r} 含多个条件，本核验只认单个"
+                    "「通道 比较符 数值」。\n"
+                    f"  只验第一个子句（{match.group(0).strip()}）再报「成立」"
+                    "会让一条半验证的机制行被当成完整证据收下，"
+                    "所以这里直接判为无法核验。\n"
+                    "  请拆成多条机制行，每条锚定一个停顿字段 —— "
+                    "一条机制对应一个可观测量，本来也更清楚"))
         return out
 
     channel = match.group("channel")
@@ -636,7 +680,7 @@ def graph_exhausted(state: Dict[str, Any],
     if not decisions:
         return False
     tried = {
-        entry.get("decision") for entry in state.get("ledger", [])
+        entry.get("decision") for entry in generation_entries(state)
         if entry.get("decision")
         and not entry.get("invalidated")
         and entry.get("verdict") in CANDIDATE_VERDICTS
@@ -862,6 +906,39 @@ def _precision_passed(doc: Dict[str, Any]) -> Optional[bool]:
 # 裁决
 # ---------------------------------------------------------------------------
 
+def generation_entries(state: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """只取**本代**的台账条目。
+
+    台账是跨代累积的 —— promote 不清空它，这是对的：要能回看整条自我提升
+    链条。但「读台账回答关于本代的问题」时必须按代过滤，因为 promote 把
+    参考换成了上一代的产出，于是跨代的数全部不可比：
+
+      best（增益与耗时）  上一代的 1.4x 是相对**旧参考**的。混进本代会让
+                          一个还没开始优化的新代直接带着 1.4x，而 promote
+                          正是特意把 best 归零的。
+      机制做差的基线      上一代的签名来自另一个二进制。拿它做差，两代之间
+                          的差异会被算到本代某一次改动头上。
+      决策图是否走穷      上一代试过的决策在本代是全新的（参考变了，同一个
+                          决策的结论可能完全不同）。不过滤的话，promote 之后
+                          第一次 record 就会报「每条决策都已试过」。
+      机制是否已核实      上一代核实过不代表本代核实过。不过滤会让一个零核实
+                          的代被封进产物库时标上 mechanism_verified=true。
+
+    条目里没有 generation 字段时当作本代。那种条目只会出现在手工改过的
+    state 里；当作本代是保守选择 —— 宁可多算一条，不要静默丢掉证据。
+    """
+    current = int(state.get("generation", 0) or 0)
+    out: List[Dict[str, Any]] = []
+    for entry in state.get("ledger", []):
+        if not isinstance(entry, dict):
+            continue
+        gen = entry.get("generation")
+        if isinstance(gen, (int, float)) and int(gen) != current:
+            continue
+        out.append(entry)
+    return out
+
+
 #: 改动被保留下来的裁决。只有这些代表「当前代码的样子」。
 #:
 #: revert / regression 的代码已经撤回，它们的签名记录的是一个**不复存在**
@@ -885,7 +962,7 @@ def previous_snapshot(state: Dict[str, Any]) -> Tuple[Optional[Dict[str, float]]
 
     都没有就退回参考自己的签名 —— 那就是第 0 轮。
     """
-    for entry in reversed(state.get("ledger", [])):
+    for entry in reversed(generation_entries(state)):
         if entry.get("invalidated"):
             continue
         if entry.get("verdict") not in KEPT_VERDICTS:
@@ -1210,12 +1287,33 @@ def _write_nogo_locked(nogo_path: Path, state: Dict[str, Any],
     """write_nogo 的实体。调用方必须已持锁。"""
     entries: List[Dict[str, Any]] = []
     if nogo_path.exists():
+        # 读不出来就停手。这个函数是「读全部 → 追加一条 → 整份写回」，
+        # 把损坏文件读成空表意味着下一行写入会清掉整张死路表，只剩新加的
+        # 那一条。死路表的作用是防止后续代次重走已证伪的路；它被悄悄清空
+        # 之后，那些路会被一条条重试，每条都要花掉真实的评测预算。
         try:
-            doc = json.loads(nogo_path.read_text(encoding="utf-8"))
-            if isinstance(doc, dict):
-                entries = doc.get("entries", []) or []
-        except (OSError, json.JSONDecodeError):
+            text = nogo_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise CampaignError(f"无法读取死路表 {nogo_path}: {exc}") from exc
+        try:
+            doc = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise CampaignError(
+                f"死路表 {nogo_path} 不是合法 JSON: {exc}\n"
+                "  多半是上一次写入被打断留下了截断的文件。\n"
+                "  这里不会当成空表继续 —— 那样会把整张表覆盖成只有一条，\n"
+                "  之前所有证伪过的方向都会被重新试一遍。\n"
+                "  请先人工确认该文件（必要时从 git 历史恢复）。") from exc
+        if not isinstance(doc, dict):
+            raise CampaignError(
+                f"死路表 {nogo_path} 的顶层不是对象，无法解析出 entries")
+        existing = doc.get("entries")
+        if existing is None:
             entries = []
+        elif isinstance(existing, list):
+            entries = existing
+        else:
+            raise CampaignError(f"死路表 {nogo_path} 里的 entries 不是数组")
 
     gain = entry.get("gain")
     evidence = (f"[MEASURED] 增益 {(gain - 1) * 100:+.2f}%，未超噪声底 "
@@ -1266,6 +1364,23 @@ def cmd_set_reference_signature(args: argparse.Namespace) -> int:
         print(f"错误: {exc}", file=sys.stderr)
         return 2
 
+    # 与 init 同一道门。这条路径不是补充手段而是**主要**手段：promote 会把
+    # reference_snapshot 清空，所以第 1 代起每一代都只能靠它登记参考签名。
+    # 门只守在 init 上等于只守住了第 0 代。
+    if signature is not None and not args.allow_untrusted_signature:
+        reasons = _signature_blocking_reasons(signature)
+        if reasons:
+            print(f"错误: {args.signature} 这份签名自己判了测量不可信"
+                  "（trust.trustworthy=false），不能作为做差基线。",
+                  file=sys.stderr)
+            for reason in reasons:
+                print(f"  - {reason}", file=sys.stderr)
+            print("  不可信的签名作基线，之后每一轮机制做差都建立在错的起点上，"
+                  "而且每个数看起来都正常。\n"
+                  "  先按签名里 trust 的提示重采，或加 "
+                  "--allow-untrusted-signature 明确接受。", file=sys.stderr)
+            return 2
+
     snapshot = snapshot_signature(signature) if signature else {}
     if not snapshot:
         print("错误: 该签名里没有任何有效读数，无法作为做差基线。\n"
@@ -1287,6 +1402,129 @@ def cmd_set_reference_signature(args: argparse.Namespace) -> int:
     return 0
 
 
+def _signature_blocking_reasons(doc: Dict[str, Any]) -> List[str]:
+    """签名自己判了「这次测量不可信」时，把阻塞原因取出来。
+
+    signature_probe 在降频、ICache 缺失率过高、关键 metric 缺失等情况下会把
+    trustworthy 置 false 并扣留架构假设。那份签名若被当作第 0 轮基线，后面
+    每一轮的机制做差都建立在一个错的起点上，而且因为每个数看起来都正常，
+    错误不会自己冒出来。
+    """
+    trust = doc.get("trust")
+    if not isinstance(trust, dict):
+        return []
+    if trust.get("trustworthy") is False:
+        reasons = trust.get("blocking_reasons")
+        if isinstance(reasons, list) and reasons:
+            return [str(r) for r in reasons]
+        return ["签名里 trust.trustworthy=false，但未写明阻塞原因"]
+    return []
+
+
+def _find_reference_spec(explicit: Optional[str], state: str,
+                         reference_path: Optional[str]) -> Optional[Path]:
+    """找出本次 campaign 对应的 reference_spec.json。
+
+    不强制命令行传：实际流程里它就躺在工作目录里（prepare 写的），
+    自动找到就能把门禁用上；找不到才退回告警。门禁只在证据确实存在时
+    才生效，这样既堵住了洞，也不会把没有 spec 的用法整个卡死。
+    """
+    if explicit:
+        return Path(explicit)
+    candidates: List[Path] = []
+    if reference_path:
+        ref = Path(reference_path)
+        candidates += [ref / SPEC_FILENAME, ref.parent / SPEC_FILENAME]
+    candidates.append(Path(state).resolve().parent / SPEC_FILENAME)
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _check_arch(arch: str, allow_unknown: bool) -> Optional[str]:
+    """架构串对不上就别开 campaign。返回错误文本，没问题返回 None。"""
+    if arch in KNOWN_ARCHS or allow_unknown:
+        return None
+    return (
+        f"架构串 {arch!r} 不在已知列表 {list(KNOWN_ARCHS)} 里。\n"
+        "  架构成熟卡片按这个串分目录存放。填错的后果是 campaign 能一路跑完，\n"
+        "  但每张卡片入库时都被 forge-hwkb 判 A-ARCH 拒掉 —— 几十轮攒下来的\n"
+        "  经验一条也存不住，而这件事要跑很久才会暴露。\n"
+        "  怎么查本机该填哪个：\n"
+        "    npu-smi info                                   先看芯片型号（如 910B3）\n"
+        "    grep -r NpuArch \"$ASCEND_HOME_PATH\"/*/data/platform_config/*.ini\n"
+        "    NpuArch=2201 对应 DAV_2201，NpuArch=3510 对应 DAV_3510\n"
+        "  确实是新硬件时加 --allow-unknown-arch，但要同时在 forge-hwkb 的\n"
+        "  ARCH_DIRS 里把这个架构登记上，否则入库问题照旧。"
+    )
+
+
+def _check_reference_spec(spec_path: Optional[Path], kind: str,
+                          reference_id: str,
+                          allow_unverified: bool) -> Tuple[Optional[str], List[str]]:
+    """核对参考定义。返回 (拒绝理由, 告警列表)。
+
+    要挡住的是这一种情形：参考声明为「CANN 内置实现」，而「空 OPP 目录能让
+    aclnn 落到内置实现」这件事根本没在本机证实过。没证实就意味着第 0 轮基线
+    测的可能压根不是内置实现，后面所有加速比都是对着一个未知对象算的。
+    """
+    warnings: List[str] = []
+    if spec_path is None:
+        if kind == KIND_BUILTIN:
+            warnings.append(
+                f"没找到 {SPEC_FILENAME}，无法确认派发是否真的落到内置实现。\n"
+                "    建议先跑 reference_adapter.py prepare/verify 产出并确认它，"
+                "再用 --reference-spec 指过来。"
+            )
+        return None, warnings
+
+    try:
+        spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        return f"无法读取参考定义 {spec_path}: {exc}", warnings
+    except json.JSONDecodeError as exc:
+        return f"{spec_path} 不是合法 JSON: {exc}", warnings
+    if not isinstance(spec, dict):
+        return f"{spec_path} 的顶层必须是对象", warnings
+
+    spec_kind = spec.get("kind")
+    if spec_kind != kind:
+        warnings.append(
+            f"--reference-kind 是 {kind}，而 {spec_path.name} 里写的是 {spec_kind}。"
+            "两者应当一致，请确认用的是同一个参考。")
+    spec_id = spec.get("reference_id")
+    if spec_id and spec_id != reference_id:
+        warnings.append(
+            f"--reference-id 是 {reference_id!r}，而 {spec_path.name} 里是 "
+            f"{spec_id!r}。目前没有任何逻辑按这个值做匹配，不影响运行，"
+            "但两处不一致容易让人以为它们必须对齐 —— 建议统一成算子名。")
+
+    # 两者不一致时，这份 spec 多半根本不是本次参考的定义（工作目录里留着上一个
+    # 参考的 spec 就会这样）。那种情况下拿它的 dispatch_verified 去拦 init 是错的：
+    # 建议会变成「去确认 aclnn 派发」，而本次参考压根不是 aclnn。
+    # 所以只在**声明的来源**是内置实现时才要求派发确认；对不上的事由上面的
+    # 告警负责提醒，让人去确认用的是不是同一份 spec。
+    if kind == KIND_BUILTIN and spec.get("dispatch_verified") is not True:
+        if allow_unverified:
+            warnings.append(
+                "派发行为未确认，但已用 --allow-unverified-dispatch 放行。"
+                "第 0 轮基线可能测的不是内置实现，请在 milestone 里记录这件事。")
+        else:
+            return (
+                f"{spec_path} 里 dispatch_verified 不是 true，"
+                "即「空 OPP 目录会让 aclnn 落到内置实现」这件事还没在本机证实过。\n"
+                "  没证实就开 campaign，第 0 轮基线测的可能根本不是内置实现，"
+                "后面每一轮加速比都是对着一个未知对象算出来的。\n"
+                "  确认并回写：\n"
+                "    python3 reference_adapter.py verify "
+                f"--spec {spec_path} \\\n"
+                "        --confirm-dispatch --evidence \"<msprof 里看到的算子名等证据>\"\n"
+                "  确实要先跑起来再说时加 --allow-unverified-dispatch。"
+            ), warnings
+    return None, warnings
+
+
 def cmd_init(args: argparse.Namespace) -> int:
     path = Path(args.state)
     if path.exists() and not args.force:
@@ -1301,11 +1539,43 @@ def cmd_init(args: argparse.Namespace) -> int:
               "测量抖动会被当成真实加速。请先用 noise_floor.py 量一次。",
               file=sys.stderr)
 
+    arch_error = _check_arch(args.arch, args.allow_unknown_arch)
+    if arch_error:
+        print(f"错误: {arch_error}", file=sys.stderr)
+        return 2
+
     try:
         reference_signature = _load_signature(args.reference_signature)
     except CampaignError as exc:
         print(f"错误: {exc}", file=sys.stderr)
         return 2
+
+    if reference_signature is not None:
+        reasons = _signature_blocking_reasons(reference_signature)
+        if reasons and not args.allow_untrusted_signature:
+            print(f"错误: {args.reference_signature} 这份签名自己判了测量不可信"
+                  "（trust.trustworthy=false），不能作为第 0 轮基线。",
+                  file=sys.stderr)
+            for reason in reasons:
+                print(f"  - {reason}", file=sys.stderr)
+            print("  不可信的签名作基线，后面每一轮机制做差都建立在错的起点上，"
+                  "而且每个数看起来都正常，错误不会自己冒出来。\n"
+                  "  先按签名里 trust 的提示重采（常见原因：降频、"
+                  "metric 没采齐、取到了冷启动行），或加 "
+                  "--allow-untrusted-signature 明确接受。", file=sys.stderr)
+            return 2
+
+    spec_path = _find_reference_spec(
+        args.reference_spec, args.state, args.reference_path)
+    refusal, spec_warnings = _check_reference_spec(
+        spec_path, args.reference_kind, args.reference_id,
+        args.allow_unverified_dispatch)
+    if refusal:
+        print(f"错误: {refusal}", file=sys.stderr)
+        return 2
+    for warning in spec_warnings:
+        print(f"警告: {warning}", file=sys.stderr)
+
     reference_snapshot = (snapshot_signature(reference_signature)
                           if reference_signature else None)
 
@@ -1324,6 +1594,8 @@ def cmd_init(args: argparse.Namespace) -> int:
     print(f"已创建 campaign: {args.operator} @ {args.arch}")
     print(f"  输入形状  {args.input_shape}")
     print(f"  参考      {args.reference_kind}:{args.reference_id}（封闭，只测不读）")
+    if spec_path is not None:
+        print(f"  参考定义  {spec_path}")
     print(f"  噪声底    {args.noise_floor}%")
     print(f"  目标增益  {args.target_gain}")
     if args.budget:
@@ -1405,8 +1677,26 @@ def cmd_record(args: argparse.Namespace) -> int:
         print("        要让它算数，补上 --signature 与 --milestone 重新核验机制。")
 
     if entry["verdict"] in (VERDICT_REVERT, VERDICT_REGRESSION):
-        if args.nogo_kb_root:
-            count = write_nogo(Path(args.nogo_kb_root), state, entry)
+        # 精度不过 / 压根没测出数，这两种是**实现**失败，不是这个方向走不通。
+        #
+        # 死路表的前提是「测过且无效」（hwkb 的 nogo add 也拒绝无证据的条目）。
+        # 把一次精度 bug 登记成死路，等于判定这条架构方向不可行 —— 后续代次
+        # 不会再试它，而它其实从未被真正测量过。原先这类条目还会被盖上
+        # [MEASURED] 的章，看起来证据充分。
+        failure_kind = entry.get("failure_kind")
+        if failure_kind in ("precision", "no_measurement"):
+            label = {"precision": "精度不达标",
+                     "no_measurement": "没有有效测量"}[failure_kind]
+            print(f"\n  不登记死路：本次是{label}，属实现失败。")
+            print("        死路表只收「测过且确实无效」的方向 —— 收进一个没测过的，")
+            print("        这条架构方向会被永久跳过，而它从未被真正测量。")
+            print("        先把实现修对再测一次；若修不好，由架构层决定要不要弃用。")
+        elif args.nogo_kb_root:
+            try:
+                count = write_nogo(Path(args.nogo_kb_root), state, entry)
+            except CampaignError as exc:
+                print(f"\n错误: 登记死路失败: {exc}", file=sys.stderr)
+                return 1
             print(f"\n  已登记死路（当前 {count} 条）: "
                   f"{Path(args.nogo_kb_root) / NOGO_FILENAME}")
         else:
@@ -1446,7 +1736,7 @@ def cmd_reopen(args: argparse.Namespace) -> int:
     # 那样「重算」就只做了一半。
     best_gain = 1.0
     best_time = None
-    for entry in state.get("ledger", []):
+    for entry in generation_entries(state):
         if entry.get("invalidated") or not entry.get("counts_toward_best"):
             continue
         gain = entry.get("gain")
@@ -1571,12 +1861,10 @@ def ensure_reference_in_library(lib, library_root: Path,
     不补的话血统会从我们自己的 kernel 开始，「累计相对 gen0」读起来就像
     是相对自己 —— 而整条自我提升链条的意义恰恰在于相对最初那个参考。
     """
-    key = lib.entry_key(str(state.get("arch")), str(state.get("operator")),
-                        str(state.get("input_shape")))
-    index = lib.load_index(library_root)
-    if key in index.get("entries", {}):
-        return None
-
+    # 存在性判断交给 add_generation 在锁内做（only_if_new=True），不要在这里
+    # 先读索引再调过去登记：那两步之间没有锁，另一个并行任务可以在这段时间里
+    # 建好同一个键，于是这次登记会把参考接在别人的链上成为 gen1，血统错位。
+    # 并行跑多任务、共用产物库是这个插件明确支持的用法，所以这个窗口会被撞上。
     reference = state.get("reference") or {}
     snapshot = state.get("reference_snapshot")
     signature_file = None
@@ -1604,6 +1892,7 @@ def ensure_reference_in_library(lib, library_root: Path,
                       if reference.get("kind") not in lib.ARTIFACTLESS_KINDS
                       else None),
             signature=signature_file,
+            only_if_new=True,
             time_us=reference_time_us(state),
             note="由 campaign promote 自动补登的初始参考",
         )
@@ -1655,9 +1944,11 @@ def cmd_promote(args: argparse.Namespace) -> int:
     library_record = None
     library_seeded = None
     if True:
+        # 只看本代：上一代核实过的机制不能替本代背书。这个标志会写进
+        # 产物库，而库的准入门禁靠它区分「机制已核实的产物」和「只是跑得快」。
         best_verified = any(
             e.get("counts_toward_best") and not e.get("invalidated")
-            for e in state.get("ledger", []))
+            for e in generation_entries(state))
         try:
             sys.path.insert(0, str(Path(__file__).resolve().parent))
             import reference_library as lib  # noqa: PLC0415
@@ -1941,6 +2232,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_init.add_argument("--reference-signature", default=None,
                         help="参考实现的 signature_probe 输出。机制行要靠它"
                              "做差（第 0 轮基线）；不给则首轮无法构成顺序证据")
+    p_init.add_argument("--reference-spec", default=None,
+                        help=f"reference_adapter.py prepare 产出的 "
+                             f"{SPEC_FILENAME}。不给则在工作目录里自动查找；"
+                             "找到后会校验派发是否已确认")
+    p_init.add_argument("--allow-unknown-arch", action="store_true",
+                        help="接受不在已知列表里的架构串。"
+                             "新硬件才用，且要同时在 forge-hwkb 登记该架构")
+    p_init.add_argument("--allow-untrusted-signature", action="store_true",
+                        help="接受自判不可信的参考签名作第 0 轮基线。"
+                             "这会让后续所有机制做差建立在错的起点上")
+    p_init.add_argument("--allow-unverified-dispatch", action="store_true",
+                        help="参考声明为内置实现但派发未确认时仍然开 campaign")
     p_init.add_argument("--force", action="store_true")
     p_init.set_defaults(func=cmd_init)
 
@@ -1979,6 +2282,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_rs = sub.add_parser("set-reference-signature",
                           help="登记参考签名快照，作为机制做差的第 0 轮基线",
                           parents=[common])
+    p_rs.add_argument("--allow-untrusted-signature", action="store_true",
+                      help="接受自判不可信的签名作做差基线。"
+                           "这会让之后所有机制做差建立在错的起点上")
     p_rs.add_argument("--signature", required=True,
                       help="参考实现的 signature_probe 输出")
     p_rs.set_defaults(func=cmd_set_reference_signature)

@@ -27,14 +27,36 @@ description: campaign 驱动：参考封存与适配、噪声底实测、配对�
 ### 1. 封存参考
 
 ```bash
+# 中转目录在工作区外：STAGE=/cache/forge-kernel/ref_stage/add_layer_norm
 python3 scripts/seal_reference.py seal \
-    --artifact /path/to/reference --op-name add_layer_norm --work-dir ./forge_work
+    --artifact "$STAGE" --op-name add_layer_norm \
+    --work-dir ./forge_work \
+    --public-headers /usr/local/Ascend/cann-8.5.0/aarch64-linux/ascendc/include
 ```
 
 产出两份清单，交给两个独立于提示词的执行点：
 
-- `sealed_paths.txt` → PreToolUse hook，在工具调用层拦截读参考源码
+- `sealed_paths.txt` → PreToolUse hook，在工具调用层拦截读参考源码**与配置**
 - `denylist.txt` → 知识库 lint，拦截参考专有名词混进可复用经验
+
+**封存范围按单个算子挑，不要封整棵安装树。** 做法是把本算子相关的文件
+软链到一个中转目录，再封这个中转目录 —— 封存会对软链做 `resolve()`，
+清单里落的是真实绝对路径。封整棵树会同时坏两件事：别的算子里的
+`class Kernel` 被当成本参考的专有名词（围栏全是误伤），以及禁读清单长到
+几千条后 hook 的比对开销压在每次工具调用上。文件数超过 500 时 seal 会告警。
+
+**中转目录放在工作区之外**（如 `/cache/forge-kernel/ref_stage/<算子名>`，
+本机没有 `/cache` 时用 `~/.cache` 下的目录）。边界 hook 对 `Grep`/`Glob`
+要判两个方向：目标在封存目录内，以及目标是封存目录的上层 —— 后者递归搜
+下去同样能读到参考源码。所以中转目录落在工作目录下时，`Grep path=.`
+（搜自己的候选代码）会被一并拦住。位置选错时 seal 会当场警告。
+
+**配置文件（算子的 `.json`）和源码一样禁读。** 它把参考实现了哪些分支、
+每个分支用什么 tiling key 全列了出来，照抄它连代码都不用读。
+
+**专有名词会自动减掉公开接口名。** 判据是扫 `ascendc/include`，自动找不到
+时用 `--public-headers` 指过去。不做这步减法，`DataCopyPad` 这类接口名会
+进禁用名单，于是任何正常候选都被拦 —— 最后的结局是围栏被整条豁免掉。
 
 参考本身就是二进制（如 CANN 内置实现）时没有源码可封，这一步会如实
 提示「未发现源码文件」—— 那种情况天然满足封闭要求。
@@ -56,13 +78,24 @@ python3 scripts/reference_adapter.py verify --spec ./forge_work/reference_spec.j
 | `sealed_kernel` | 自己上一代的产出，自我提升用 |
 
 > `builtin_aclnn` 依赖「空 OPP 目录使 aclnn 派发落到内置实现」这一行为，
-> **该行为尚未在真机上验证**。`verify` 子命令就是用来在目标机器上把它
-> 变成一次有确切结论的检查，不要跳过。
+> 这个行为**必须在本机确认一次**。做法：令 baseline 与 evolved 都指向本
+> 参考跑一次自评，用 msprof 看 `op_summary` 里的算子名是不是厂商内置实现
+> 的名字；确认后回写证据：
+>
+> ```bash
+> python3 scripts/reference_adapter.py verify \
+>     --spec ./forge_work/reference_spec.json \
+>     --confirm-dispatch --evidence "msprof op_summary 中 Op Name=AddLayerNorm"
+> ```
+>
+> 这不是留记录，是开 campaign 的前提 —— `campaign.py init` 会读
+> `dispatch_verified`，为 false 时拒绝。没确认派发，第 0 轮基线测的可能
+> 根本不是内置实现，后面每一轮加速比都是对着一个未知对象算出来的。
 
 ### 3. 量噪声底
 
 ```bash
-python3 scripts/noise_floor.py --from-results evaluation_results.json
+python3 scripts/noise_floor.py --from-results evaluation_results.json --method cv
 ```
 
 论文报的 1%~5% 是**它们环境的实测值，不是常数**。定太低会把抖动当成果
@@ -72,13 +105,27 @@ python3 scripts/noise_floor.py --from-results evaluation_results.json
 首选直接读评测结果里的 `cv_pct`（同一 job 内的离散度，正对应论文说的
 same-job noise floor）；没有时才回退到多次结果之间的比值离散。
 
+**只能用跑成功的评测来量。** 崩溃的评测写进文件的是 `time_us=-1` 和
+`cv_pct=0.0`，那个 0.0 和「环境极其干净」在形态上一模一样。脚本现在直接
+拒绝 `gating=failed` 的结果和 cv 全为 0 的结果：噪声底定成 0 意味着任何
+正增益都被判为真实改进。
+
+**自评场景显式传 `--method cv`。** 评测在自评时把 speedup 钉成 1.0，
+比值离散法（`--method spread`）必然输出 0.00% —— 那不是环境干净，是这个
+测法什么也没测到。脚本会认出这种结果并报错。
+
+**cv 法不含跨进程的位置偏差。** 评测总是先跑 baseline 子进程再跑 evolved
+子进程，后者继承频率/缓存劣势，实测 evolved 侧恒慢约 2.7%，方向恒定、
+多测几次消不掉。所以 1.05 的名义目标实际需要 5%+ 的真实改进。
+
 ### 4. 跑 campaign
 
 ```bash
 python3 scripts/campaign.py init --operator add_layer_norm \
     --input-shape "B=8,S=4096,H=1024,fp16" --arch DAV_2201 \
-    --reference-kind builtin_aclnn --reference-id aclnnAddLayerNorm \
-    --noise-floor 2.3 --target-gain 1.05 --budget 40 \
+    --reference-kind builtin_aclnn --reference-id add_layer_norm \
+    --reference-spec ./forge_work/reference_spec.json \
+    --noise-floor 2.95 --target-gain 1.05 --budget 40 \
     --device-id 0 \
     --state ./forge_work/campaign_state.json
 

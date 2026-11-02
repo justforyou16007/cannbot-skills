@@ -53,7 +53,7 @@ import json
 import re
 import sys
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 #: 要扫描的文件后缀。候选的实现与它的 Python 入口都要看。
 SCAN_SUFFIXES = {
@@ -105,18 +105,52 @@ def name_variants(op_name: str) -> Dict[str, str]:
 
     add_layer_norm 在 aclnn 接口上是 AddLayerNorm，在 torch_npu 上可能是
     npu_add_layer_norm。围栏要认全这些形态，否则换个写法就绕过去了。
+
+    输入既可能是 snake_case 也可能是 CamelCase。早先的做法是先整串转小写
+    再按下划线分段首字母大写 —— 对 `add_layer_norm` 正确，但对
+    `AddLayerNorm` 会得到 `Addlayernorm`：没有下划线可分，整串成了一段。
+    于是 `aclnnAddlayernorm` 这条规则永远匹配不上真实代码里的
+    `aclnnAddLayerNorm`，**所有按算子名生成的围栏规则一起失效**，候选直接
+    调厂商接口也判通过。所以先把两种形态都切成单词序列，再各自拼回去。
     """
-    snake = re.sub(r"[-\s]+", "_", op_name.strip()).lower()
-    camel = "".join(part.capitalize() for part in snake.split("_") if part)
-    return {"snake": snake, "camel": camel, "raw": op_name.strip()}
+    raw = op_name.strip()
+    normalized = re.sub(r"[-\s]+", "_", raw)
+
+    words: List[str] = []
+    for chunk in normalized.split("_"):
+        if not chunk:
+            continue
+        # 在「小写/数字 → 大写」的交界处切开，这样 CamelCase 也能拆成单词。
+        # 连续大写（如 GEMMKernel）在最后一个大写前切，避免切成单字母。
+        words.extend(w for w in re.findall(
+            r"[A-Z]+(?![a-z])|[A-Z][a-z0-9]*|[a-z0-9]+", chunk) if w)
+
+    if not words:
+        return {"snake": normalized.lower(), "camel": "", "raw": raw}
+
+    snake = "_".join(w.lower() for w in words)
+    camel = "".join(w[:1].upper() + w[1:].lower() for w in words)
+    return {"snake": snake, "camel": camel, "raw": raw}
 
 
 def build_rules(op_name: str,
                 reference_paths: List[str]) -> List[Tuple[str, re.Pattern, str]]:
     """构造围栏规则。每条都给出「为什么这是转发而不是实现」。"""
     names = name_variants(op_name)
-    camel = re.escape(names["camel"])
-    snake = re.escape(names["snake"])
+
+    # 两种写法各给一组候选，而不是只认推导出来的那一个。
+    #
+    # 为什么要带上原样拼写：缩写词的分词是没法靠规则做对的。`ViTAttention`
+    # 会被切成 Vi/T/Attention（snake 成了 vi_t_attention），`GEMMKernel` 的
+    # 连续大写也还原不回去。这类算子名用原样拼写去匹配才命中得上，而漏一个
+    # 形态的后果不是少报一条 —— 是整条 F-ACLNN 失效，候选直接调厂商接口
+    # 也判通过。多认一种拼写的代价只是规则多一个分支。
+    camel_alts = {names["camel"], names["raw"]}
+    snake_alts = {names["snake"], names["raw"].lower()}
+    camel = "(?:%s)" % "|".join(
+        re.escape(v) for v in sorted(filter(None, camel_alts), key=len, reverse=True))
+    snake = "(?:%s)" % "|".join(
+        re.escape(v) for v in sorted(filter(None, snake_alts), key=len, reverse=True))
 
     rules: List[Tuple[str, re.Pattern, str]] = [
         (
@@ -202,9 +236,42 @@ def strip_comment(line: str, suffix: str) -> str:
     return line[:marker] if marker >= 0 else line
 
 
+def compile_denylist(denylist: Iterable[str]) -> Optional[re.Pattern]:
+    """把专有名词清单编成一条带词边界的正则。
+
+    解决两件事：
+
+    1. 词边界。早先是 `token in code` 裸子串匹配，于是清单里的 `DataCopyEx`
+       会命中候选里的 `DataCopyExtParams` —— 后者是另一个符号，这种命中纯属
+       误报。误报的代价不是多一行输出：围栏只能按规则整条豁免（--exempt
+       F-DENY），一次误报就可能把整类检查关掉，真正的转发也跟着放过去了。
+
+    2. 扫一遍而不是扫 N 遍。逐个名词过每一行是「行数 × 名词数」，清单上千条
+       时慢到没人愿意跑。合成一条正则交给引擎，一行只过一次。
+
+    长名字排在前面：重叠时报出来的是更具体的那一个。
+
+    边界取严，代价是认了的：`KernelAddLayerNormV2` 这种「参考类名加个后缀」
+    不会被这条规则抓到。考虑过放宽右边界（允许后接大写或数字），但那和
+    `DataCopyPad` + `ExtParams` 在形状上完全一样 —— 两者都是「名字 + 大写
+    后缀」，正则分不开，只能选一边。
+
+    选严格边界，因为两种错的代价不对称：误伤会让人直接 `--exempt F-DENY`
+    把整条规则关掉，于是真正的转发也一起放过去；而漏掉改名的情形，还有
+    更硬的一道防线 —— agent 压根读不到参考源码（边界 hook 拦着），所以它
+    不会知道那个类名叫什么。这条规则的职责是拦住无意的名字泄漏，不是对抗
+    刻意的规避。
+    """
+    tokens = sorted({t for t in denylist if t}, key=lambda t: (-len(t), t))
+    if not tokens:
+        return None
+    body = "|".join(re.escape(token) for token in tokens)
+    return re.compile(rf"(?<![A-Za-z0-9_])({body})(?![A-Za-z0-9_])")
+
+
 def scan_file(path: Path,
               rules: List[Tuple[str, re.Pattern, str]],
-              denylist: List[str]) -> List[Finding]:
+              denylist_re: Optional[re.Pattern]) -> List[Finding]:
     try:
         if path.stat().st_size > MAX_FILE_BYTES:
             return []
@@ -244,8 +311,13 @@ def scan_file(path: Path,
             if pattern.search(code):
                 findings.append(Finding(rule, path, line_no, raw, reason))
 
-        for token in denylist:
-            if token and token in code:
+        if denylist_re is not None:
+            reported: Set[str] = set()
+            for match in denylist_re.finditer(code):
+                token = match.group(1)
+                if token in reported:   # 同一行同一个名词只报一次
+                    continue
+                reported.add(token)
                 findings.append(Finding(
                     "F-DENY", path, line_no, raw,
                     f"出现参考实现的专有符号 {token}；候选不应引用参考的内部命名",
@@ -255,8 +327,23 @@ def scan_file(path: Path,
 
 
 def load_denylist(path: Optional[Path]) -> List[str]:
-    if path is None or not path.exists():
+    """读专有名词清单。
+
+    显式给了路径却读不到时必须报错，不能当成空清单。静默退回空清单的后果是
+    F-DENY 这条检查整个消失，而围栏照样打印「通过」—— 一个把参考内部命名
+    抄进来的候选会拿到一张干净的通行证。路径打错一个字母就会这样。
+    """
+    if path is None:
         return []
+    if not path.exists():
+        raise FenceError(
+            f"找不到专有名词清单 {path}。\n"
+            "它由封存步骤生成：\n"
+            "  python3 <forge-campaign>/scripts/seal_reference.py seal "
+            "--artifact <参考> --op-name <算子> --work-dir <工作目录>\n"
+            "确实不需要这项检查时不要传 --denylist —— 但那意味着候选可以"
+            "原样照抄参考的内部命名而不被发现。"
+        )
     out: List[str] = []
     for line in path.read_text(encoding="utf-8").splitlines():
         token = line.split("#", 1)[0].strip()
@@ -299,13 +386,14 @@ def check(candidate: Path, op_name: str, reference_paths: List[str],
         raise FenceError(f"候选路径不存在: {candidate}")
 
     rules = build_rules(op_name, reference_paths)
+    denylist_re = compile_denylist(denylist)
     exempt_set = {r.strip().upper() for r in exempt if r.strip()}
 
     findings: List[Finding] = []
     scanned = 0
     for path in iter_source_files(candidate):
         scanned += 1
-        findings.extend(scan_file(path, rules, denylist))
+        findings.extend(scan_file(path, rules, denylist_re))
 
     kept = [f for f in findings if f.rule not in exempt_set]
     waived = [f for f in findings if f.rule in exempt_set]

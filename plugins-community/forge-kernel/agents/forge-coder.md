@@ -158,6 +158,57 @@ UB 容量、核数这类数值必须运行时用 `PlatformAscendC` 接口取。
 `npu-arch` 文档里的数值只用于分析阶段估算量级，不得写进 kernel ——
 不同子型号有差异。
 
+## 先把候选装成 OPP 包，再谈评测
+
+这一步容易被跳过，跳过的后果是「代码写完了但评测跑不起来」。
+
+`evaluate_ops_direct.py` 的 `--evolved-path` **不收源码目录**。它收的是一个
+**已安装的 OPP 路径**，并且会检查两件事：
+
+- `<install>/vendors/<custom_*>/` 这个目录存在
+- `<install>/vendors/<custom_*>/op_api/lib` 存在（它要拼进 `LD_LIBRARY_PATH`）
+
+所以写完 kernel 源码之后，必须自己补上「源码 → 安装目录」这两步构建。
+forge-kernel 本身不提供构建入口，用 `ops-evaluation` 的脚本：
+
+```bash
+OE=<ops-evaluation>/scripts
+
+# 1) 构建并安装成 OPP 包。要求仓根有 build.sh（ops 仓形态）
+python3 $OE/build_ops.py \
+    --repo-root {你的 ops 仓根目录} \
+    --op-name {op_name} \
+    --soc ascend910b \
+    --install-path {绝对路径}/candidate_install
+
+# 2) 生成 pybind 绑定。要求 <work-dir>/{op_name}.cpp 存在
+python3 $OE/generate_pybind.py {op_name} \
+    --work-dir {绝对路径}/candidate_install
+
+# 3) 这时 --evolved-path 才有东西可指
+python3 $OE/evaluate_ops_direct.py {op_name} \
+    --call-spec call_spec.json \
+    --baseline-path {参考路径} \
+    --evolved-path {绝对路径}/candidate_install \
+    --device-id 0 --shapes-mode target \
+    --output evaluation_results.json
+```
+
+两条硬约束，不满足就别往下走：
+
+- `--install-path` 必须是**绝对路径**。相对路径在评测子进程切换工作目录后
+  会解析到别处，报出来的错和真实原因对不上。
+- 候选必须是 **ops 仓形态**（仓根有 `build.sh`）。`kernel/setup.py` +
+  `CMakeLists.txt` 编出来的 torch C++ 扩展（靠
+  `TORCH_LIBRARY_FRAGMENT` 注册 `torch.ops.npu.xxx` 的那种）走不通这条链：
+  它没有 `vendors/`、没有 `op_api/lib`，而且评测子进程里写死的导入钩子不会
+  去 import 你那个扩展模块，于是 `getattr(torch.ops.npu, "xxx")` 抛
+  `AttributeError`，被外层吞成 `time_us=-1`。**那是「评测跑完了但失败了」，
+  不是「候选慢」** —— 看到 `time_us=-1` 先回来查这里。
+
+参考侧是个例外：`builtin_aclnn` 用的空 `null_opp/vendors/custom_nn/` 目录
+就能过上面的存在性检查，所以参考不需要构建。构建缺口只在候选侧出现。
+
 ## 评测怎么跑
 
 用 `ops-evaluation` 的 **`evaluate_ops_direct.py`**：
@@ -166,13 +217,19 @@ UB 容量、核数这类数值必须运行时用 `PlatformAscendC` 接口取。
 python3 <ops-evaluation>/scripts/evaluate_ops_direct.py {op_name} \
     --call-spec call_spec.json \
     --baseline-path {参考路径} \
-    --evolved-path {你的实现路径} \
+    --evolved-path {已安装的候选 OPP 路径} \
     --device-id 0 --shapes-mode target \
     --output evaluation_results.json
 ```
 
 > **不要用同目录的 `evaluate_ops.py`**。它执行 `from evaluate import AscendBackend`，
 > 而 `AscendBackend` 在仓内不存在，会直接失败。
+
+> **evolved 侧天生略慢，这不是你的实现的问题。** 评测总是先跑 baseline
+> 子进程再跑 evolved 子进程，后者继承了频率/缓存/带宽的劣势。实测同一份
+> 代码自评时 evolved 侧恒慢约 2.7%，方向恒定，多测几次消不掉。所以名义
+> 目标 1.05 实际需要 5%+ 的真实改进才站得住 —— 卡在 2~3% 的增益别急着
+> 当成功，也别急着判定实现失败。
 
 需要流水线占比（验证 mechanism 行）时另外走 `ops-profiling` 的 msprof，
 再用 `signature_probe.py` 提取 —— 配对评测有意不采 msprof，
@@ -192,8 +249,10 @@ python3 <ops-evaluation>/scripts/evaluate_ops_direct.py {op_name} \
 | 情况 | 做法 |
 |---|---|
 | 编译失败 | 自行修复，这属于实现问题 |
+| `time_us=-1` | 不是「慢」，是评测没跑成。先查候选是否装成了 OPP 包（见上节），再查结果文件里的 `error` 字段 |
 | 精度不达标 | 先查是不是混用了精度（如 FP16 直接累加），修不好就回滚 |
 | 增益在噪声内 | 回滚，登记死路表，取下一行决策 |
+| 围栏报 F-DENY | 先看命中的词是不是公开接口名（如 `DataCopyPad`）。是的话属封存误伤，重封参考时带上 `--public-headers`；确属参考内部命名才改实现 |
 | 连续多轮无进展 | `campaign.py` 会转入 `stalled`，**交回架构层**，不要自己硬调 |
 | 环境问题 | 停下来上报，不要绕过 |
 

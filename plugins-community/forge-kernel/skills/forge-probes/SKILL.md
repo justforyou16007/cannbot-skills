@@ -47,8 +47,12 @@ description: ForgeKernel 探针套件，把论文用到的 NCU pass、timeline p
 （milestone 的 `trigger.channel` 可直接引用）。
 
 ```bash
-# msprof 原始目录
+# msprof 原始目录（实机会多一层 PROF_GROUP_*，不用自己剥）
 python3 scripts/signature_probe.py --prof-dir ./prof_out --op-name AddLayerNorm
+
+# 同一目录下有多次采集时，必须指定用哪一次
+python3 scripts/signature_probe.py --prof-dir ./prof_out \
+    --op-name AddLayerNorm --group PROF_GROUP_20261030_171959
 
 # 归档目录（msprof_perf_summary.py 产出）
 python3 scripts/signature_probe.py --archive-dir ./round_1 --op-name AddLayerNorm
@@ -57,6 +61,16 @@ python3 scripts/signature_probe.py --archive-dir ./round_1 --op-name AddLayerNor
 python3 scripts/signature_probe.py --archive-dir ./round_1 \
     --op-name AddLayerNorm --min-gm-bytes 8388608 --json
 ```
+
+**多次采集并存时探针报错，不替你挑。** 它曾经排序取第一个，于是时间最早、
+可能只采到两个 metric 的那次被静默选中 —— 缺 metric 的签名里停顿数据是
+缺失的，读起来像「完全没有停顿」。报错会列出每组各采到几个 metric。
+
+**冷启动行自动丢弃。** 同一个算子在一次采集里有十来行，头几次核执行时间
+超过任务总时长（物理上不可能）。实测冷启动 408.52us vs 稳态 233.16us，
+**高 75%**，而它看起来只是个正常数字 —— 这个数会成为整个 campaign 的参考
+基线。探针按「丢掉自相矛盾的行，再取中位数附近那一行」挑，过程写进签名的
+`row_selection` 字段。需要更严的稳态起点时用 `--steady-from <Task ID>`。
 
 输出分六段：测量可信度、launch structure、pipeline 占比、停顿分解、
 搬运量与带宽、暴露时间；之后是**架构假设**与**开放问题**。
@@ -70,9 +84,11 @@ python3 scripts/signature_probe.py --archive-dir ./round_1 \
 | DVFS 降频 | 各段被按不同比例拉长，一个计算受限的 kernel 会看起来像搬运受限 |
 | ICache 缺失率 >15% | 取指开销混进各段占比 |
 | `ResourceConflictRatio` 缺失 | 停顿数据是架构判断的一半依据，缺了只能瞎猜 |
+| 整次采集没有稳态行 | 所有行都是核执行时间 > 任务时长的冷启动，耗时虚高且不自洽 |
 
 扣留而不是降级，是因为不可信数据推出的架构**错得很有说服力** ——
-数据看着正常，错误极难被发现。
+数据看着正常，错误极难被发现。`campaign.py init` 也会拒绝用
+`trustworthy=false` 的签名当第 0 轮基线。
 
 ### 数据复用倍数
 

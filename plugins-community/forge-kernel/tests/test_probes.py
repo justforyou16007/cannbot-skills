@@ -410,3 +410,60 @@ def test_corrupt_store_reports_clearly(tmp_path):
     path.write_text("不是 JSON", encoding="utf-8")
     with pytest.raises(lp.LeverError, match="不是合法 JSON"):
         lp.load_store(path)
+
+
+# ---------------------------------------------------------------------------
+# 名词匹配要带词边界
+#
+# 裸子串匹配会让清单里的短名字吃掉候选里更长的名字：清单有 DataCopyEx 时，
+# 候选里的 DataCopyExtParams 会被判越界，而后者是另一个符号。这种误报的
+# 代价是围栏被整条豁免掉（--exempt F-DENY），真正的转发也跟着放过去。
+# ---------------------------------------------------------------------------
+
+def test_denylist_does_not_match_longer_identifier(tmp_path):
+    root = candidate(tmp_path, **{"op_kernel__k.cpp": (
+        "void f() {\n"
+        "    AscendC::DataCopyExtParams p{1, 1024, 0, 0, 0};\n"
+        "    AscendC::DataCopyPadExtParams<half> pad{false, 0, 0, 0};\n"
+        "}\n")})
+    result = run_fence(root, denylist=["DataCopyEx", "DataCopyPad"])
+    assert result["passed"] is True, result["findings"]
+
+
+def test_denylist_still_matches_exact_identifier(tmp_path):
+    """带了词边界之后，该拦的还要拦。"""
+    root = candidate(tmp_path, **{"op_kernel__k.cpp": (
+        "void f() {\n"
+        "    AscendC::DataCopyEx(dst, src, 128);\n"
+        "}\n")})
+    result = run_fence(root, denylist=["DataCopyEx"])
+    assert "F-DENY" in rules_of(result)
+
+
+def test_denylist_token_inside_longer_name_is_not_a_hit(tmp_path):
+    """候选自己起的名字里含参考的类名片段，不算引用参考的符号。"""
+    root = candidate(tmp_path, **{"op_kernel__k.cpp": (
+        "class MyOwnAddLayerNormKernel {};\n")})
+    result = run_fence(root, denylist=["AddLayerNormKernelCore", "KernelAddLayerNorm"])
+    assert result["passed"] is True, result["findings"]
+
+
+def test_same_token_twice_on_one_line_reported_once(tmp_path):
+    root = candidate(tmp_path, **{"op_kernel__k.cpp": (
+        "void f() { RefSecretCore(); RefSecretCore(); }\n")})
+    result = run_fence(root, denylist=["RefSecretCore"])
+    assert len([f for f in result["findings"] if f["rule"] == "F-DENY"]) == 1
+
+
+def test_missing_denylist_file_is_an_error_not_an_empty_list(tmp_path):
+    """显式给了清单却读不到时必须报错。
+
+    静默退回空清单的后果是 F-DENY 整条检查消失，而围栏照样打印「通过」——
+    一个照抄参考内部命名的候选会拿到干净的通行证。路径打错一个字母就这样。
+    """
+    with pytest.raises(fc.FenceError, match="找不到专有名词清单"):
+        fc.load_denylist(tmp_path / "nope.txt")
+
+
+def test_no_denylist_option_is_still_allowed():
+    assert fc.load_denylist(None) == []

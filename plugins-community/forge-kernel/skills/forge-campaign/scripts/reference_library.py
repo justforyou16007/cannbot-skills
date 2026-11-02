@@ -450,14 +450,25 @@ def add_generation(library: Path, *, operator: str, arch: str,
                    family: Optional[str] = None,
                    device_id: Optional[int] = None,
                    force: bool = False,
-                   note: str = "") -> Dict[str, Any]:
-    """登记一代。gen 0 是外来参考，之后是本系统的产出。"""
+                   only_if_new: bool = False,
+                   note: str = "") -> Optional[Dict[str, Any]]:
+    """登记一代。gen 0 是外来参考，之后是本系统的产出。
+
+    only_if_new=True 时，这个键已经存在就什么也不做并返回 None。它用于
+    「库里还没有这个算子时才补登参考为 gen0」这种意图：调用方若自己先读
+    索引判断存在性，再调过来登记，那两步之间隔着一段没有锁的时间 ——
+    另一个并行任务在这段时间里建好了同一个键，这次登记就会把参考接在
+    别人的链上成为 gen1，血统从此错位。判断必须和登记在同一把锁里。
+    """
     if kind not in ALL_KINDS:
         raise LibraryError(f"未知来源 '{kind}'；可选: {list(ALL_KINDS)}")
 
     # 整个读-改-写在锁内完成，包括 gen 号的计算与产物复制 ——
     # 三者任何一步被另一个任务插进来都会出事，见 exclusive 的说明。
     with exclusive(library):
+        if only_if_new and entry_key(arch, operator, input_shape) in (
+                load_index(library).get("entries") or {}):
+            return None
         return _add_generation_locked(
             library, operator=operator, arch=arch, input_shape=input_shape,
             kind=kind, identifier=identifier, artifact=artifact,
@@ -513,12 +524,25 @@ def _add_generation_locked(library: Path, *, operator: str, arch: str,
     gen = len(entry["generations"])
     parent = gen - 1 if gen else None
 
-    if gen > 0 and mechanism_verified is False and not force:
+    # 门禁对 False 和 None 一视同仁。
+    #
+    # 早先只拦 False，于是不传这个参数（值为 None，意思是「不知道」）就能
+    # 绕过去 —— `register --kind sealed_kernel` 正是这么调的，一代没有任何
+    # 机制证据的产出可以直接登记成 gen>0 并成为后续代的参考。
+    #
+    # 「不知道机制有没有核实」和「知道没核实」在这里是同一件事：都意味着
+    # 封存一个没人能解释的结果。门禁要的是**肯定的**证据，不是「没有否证」。
+    if gen > 0 and mechanism_verified is not True and not force:
+        unknown = mechanism_verified is None
         raise LibraryError(
-            "机制未核实的产出不得入库作为参考。\n"
-            "  封存一个解释不清的结果，会让后续所有代都建立在它之上，\n"
-            "  而没人知道它为什么快。先把机制核实了再 promote。\n"
-            "  （确需强行入库请用 --force，并在 note 里写明理由）")
+            ("机制核实情况未知的产出不得入库作为参考。\n" if unknown
+             else "机制未核实的产出不得入库作为参考。\n")
+            + "  封存一个解释不清的结果，会让后续所有代都建立在它之上，\n"
+              "  而没人知道它为什么快。先把机制核实了再 promote。\n"
+            + ("  （本次没有传入机制核实状态。campaign.py promote 会按本代台账\n"
+               "    自动算出它；手工 register 时请显式给 --mechanism-verified）\n"
+               if unknown else "")
+            + "  （确需强行入库请用 --force，并在 note 里写明理由）")
 
     gen_dir = _generation_dir(library, key, gen)
     gen_dir.mkdir(parents=True, exist_ok=True)
@@ -624,8 +648,40 @@ def _read_manifest(library: Path, record: Dict[str, Any]) -> Dict[str, Any]:
         raise LibraryError(f"无法读取 {path}: {exc}") from exc
 
 
+class _VerifyCounts(int):
+    """verify 查了多少东西。
+
+    本体就是「查了几代」，所以它是个 int —— 调用方拿它当数字用的写法
+    照旧成立，不必为了多两个计数去改调用点。
+
+    另外带上「真正比对过多少个文件」和「多少代没有产物」，因为只报代数会
+    把「什么都没查」说成「查过了」：厂商实现那一类的产物不归我们保管，
+    没有校验和可比，但它照样占一代。只看代数时，一个全是厂商实现的库会
+    显示「N 代产物与封存时一致」—— 那句话一个字都不成立。
+    """
+
+    def __new__(cls, generations: int, files_compared: int = 0,
+                artifactless: int = 0) -> "_VerifyCounts":
+        obj = super().__new__(cls, generations)
+        obj._files_compared = files_compared   # noqa: SLF001
+        obj._artifactless = artifactless       # noqa: SLF001
+        return obj
+
+    @property
+    def generations(self) -> int:
+        return int(self)
+
+    @property
+    def files_compared(self) -> int:
+        return self._files_compared
+
+    @property
+    def artifactless(self) -> int:
+        return self._artifactless
+
+
 def verify(library: Path, operator: Optional[str] = None
-           ) -> Tuple[List[str], int]:
+           ) -> Tuple[List[str], "_VerifyCounts"]:
     """校验库里每一代的产物是否与封存时一致。
 
     参考一变，之前所有相对它的加速比全部失效。这件事必须是**可发现的**，
@@ -633,7 +689,7 @@ def verify(library: Path, operator: Optional[str] = None
     """
     if not library.exists():
         return ([f"库不存在: {library}。「没有东西可查」不等于「查过且没问题」"],
-                0)
+                _VerifyCounts(0, 0, 0))
 
     index = load_index(library)
     if not index.get("entries"):
@@ -641,9 +697,12 @@ def verify(library: Path, operator: Optional[str] = None
         # --library 有默认值，忘了带参数时会对着一个自动创建的空目录
         # 拿绿灯 —— 那正是这条要拦的情形。
         return ([f"库里没有任何代次: {library}。没有东西可校验，"
-                 "这不等于「校验通过」。确认 --library 指对了吗？"], 0)
+                 "这不等于「校验通过」。确认 --library 指对了吗？"],
+                _VerifyCounts(0, 0, 0))
     problems: List[str] = []
     checked = 0
+    files_compared = 0
+    artifactless = 0
 
     for key, entry in sorted(index["entries"].items()):
         if operator and entry.get("operator") != operator:
@@ -660,7 +719,41 @@ def verify(library: Path, operator: Optional[str] = None
                 problems.append(f"{key} gen{record['generation']}: {exc}")
                 continue
 
-            for file_record in manifest.get("artifact_files", []):
+            artifact_files = manifest.get("artifact_files") or []
+            if not artifact_files:
+                if manifest.get("kind") in ARTIFACTLESS_KINDS:
+                    # 厂商实现没有产物可比对（产物不归我们保管）。这一代
+                    # 「没发现问题」只是因为什么都没查，不能并进「一致」的
+                    # 计数里 —— 它的变更检测要靠 drift 比签名。
+                    artifactless += 1
+                else:
+                    # 这一类**应该**有产物。清单是空的，说明清单本身不对
+                    # （被手工改过，或入库时产物就是空的）。不报的话，
+                    # 「没有文件可比」会被当成「全部一致」。
+                    problems.append(
+                        f"{key} gen{record['generation']}: "
+                        f"来源是 {manifest.get('kind')}，本该有产物，"
+                        "但清单里一个文件都没有 —— 这一代实际上没有被校验过")
+                continue
+
+            # 多出来的文件同样是变化。只查「清单里的文件还在不在、变没变」
+            # 的话，往已封存的产物目录里塞一个新源文件是查不出来的 ——
+            # 而那足以改变构建结果，于是「相对这一代的加速比」已经不可比了。
+            recorded = {f["relative"] for f in artifact_files}
+            artifact_root = gen_dir / ARTIFACT_DIRNAME
+            if artifact_root.is_dir():
+                for path in sorted(artifact_root.rglob("*")):
+                    if not path.is_file():
+                        continue
+                    relative = str(path.relative_to(artifact_root))
+                    if relative not in recorded:
+                        problems.append(
+                            f"{key} gen{record['generation']}: "
+                            f"{relative} 是封存后新增的 —— "
+                            "产物目录里多了东西，这一代不再是封存时的那个")
+
+            for file_record in artifact_files:
+                files_compared += 1
                 path = gen_dir / ARTIFACT_DIRNAME / file_record["relative"]
                 if not path.is_file():
                     problems.append(
@@ -673,7 +766,18 @@ def verify(library: Path, operator: Optional[str] = None
                         f"{file_record['relative']} 内容已变更 —— "
                         "该代产物不再是封存时的那个，"
                         "所有相对它的加速比都已失效")
-    return problems, checked
+
+    if checked == 0:
+        problems.append(
+            f"{library} 里没有匹配 operator={operator!r} 的代次。"
+            "没有东西可校验，这不等于「校验通过」—— 算子名拼对了吗？"
+            "（用 reference_library.py list 看库里实际有什么）")
+    # 注意这里**不**把「一个文件都没比对」算成问题。
+    # 只登记了厂商实现（promote 之前的库就是这样）是完全健康的状态 ——
+    # 那一类的产物本来就不归我们保管。把它报成校验失败等于让正常流程见红，
+    # 而见红见多了就没人看了。该说的是「这些代没有被校验」，由 cmd_verify
+    # 在输出里讲清楚，并指向 drift。
+    return problems, _VerifyCounts(checked, files_compared, artifactless)
 
 
 def signature_drift(library: Path, operator: str, arch: str,
@@ -863,6 +967,8 @@ def cmd_register(args: argparse.Namespace) -> int:
             family=args.family, device_id=args.device_id,
             bench_task=args.bench_task,
             bench_baseline_us=args.bench_baseline_us,
+            mechanism_verified=args.mechanism_verified,
+            force=args.force,
             note=args.note,
         )
     except LibraryError as exc:
@@ -1013,8 +1119,16 @@ def cmd_find(args: argparse.Namespace) -> int:
         mark = "" if hit["family_source"] == "explicit" else "（推断）"
         print(f"{hit['operator']}  [{hit['arch']}]  族 {hit['family']}{mark}")
         print(f"  形状     {hit['input_shape']}")
+        # 累计增益可能是 None：链上有一代没记 gain_over_parent（手工 register
+        # 的代次就没有）。cumulative_gain 如实返回 None 正是为了不把「不知道」
+        # 说成「没变化」—— 那么这里也得如实显示，不能拿 None 去算百分比。
+        # 这条 find 是「开 campaign 前先查库」的入口，它崩掉等于那条建议作废。
+        gain = hit.get("cumulative_gain")
+        shown = (f"累计 {(gain - 1) * 100:+.2f}%"
+                 if isinstance(gain, (int, float))
+                 else "累计增益未知（链上有代次没记 gain_over_parent）")
         print(f"  最优     gen{hit['best_gen']} / 共 {hit['generations']} 代"
-              f"  累计 {(hit['cumulative_gain'] - 1) * 100:+.2f}%")
+              f"  {shown}")
         print(f"  依据     {hit['best_basis']}")
         if hit["artifact_dir"]:
             print(f"  产物     {hit['artifact_dir']}")
@@ -1098,10 +1212,24 @@ def cmd_verify(args: argparse.Namespace) -> int:
         return 2
 
     if not problems:
-        print(f"校验通过：{checked} 代产物与封存时一致")
+        if checked.files_compared == 0 and checked.artifactless:
+            # 一个文件都没比对过，就不能说「与封存时一致」。
+            print(f"没有产物可校验：匹配到 {checked.generations} 代，"
+                  f"其中 {checked.artifactless} 代是厂商实现。")
+            print("  这一类的产物不归我们保管，没有校验和可比 —— "
+                  "它们变没变要用 drift 比签名：")
+            print("    reference_library.py drift --operator <算子> "
+                  "--arch <架构> --input-shape <形状> \\")
+            print("        --generation 0 --signature <当前签名>")
+            return 0
+        print(f"校验通过：{checked.generations} 代中 "
+              f"{checked.files_compared} 个文件与封存时一致")
+        if checked.artifactless:
+            print(f"  其中 {checked.artifactless} 代是厂商实现，没有产物可比"
+                  "校验和 —— 这几代要用 drift 比签名才知道变没变")
         return 0
-    if checked:
-        print(f"校验失败：{checked} 代中有 {len(problems)} 处问题\n",
+    if checked.generations:
+        print(f"校验失败：{checked.generations} 代中有 {len(problems)} 处问题\n",
               file=sys.stderr)
     else:
         print("校验未能进行：\n", file=sys.stderr)
@@ -1186,6 +1314,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_reg.add_argument("--family", default=None,
                        help="算子族；不给则从算子名推断")
     p_reg.add_argument("--device-id", type=int, default=None)
+    p_reg.add_argument("--mechanism-verified", dest="mechanism_verified",
+                       action="store_true", default=None,
+                       help="声明这一代的机制已被探针核实。gen>0 必须给出，"
+                            "否则拒绝入库 —— 库的准入门禁靠它区分"
+                            "「机制已核实的产物」和「只是跑得快」")
+    p_reg.add_argument("--mechanism-unverified", dest="mechanism_verified",
+                       action="store_false",
+                       help="明确声明机制未核实。配合 --force 才能入库")
+    p_reg.add_argument("--force", action="store_true",
+                       help="机制未核实仍强行入库；理由请写进 --note")
     p_reg.add_argument("--note", default="")
     p_reg.set_defaults(func=cmd_register)
 

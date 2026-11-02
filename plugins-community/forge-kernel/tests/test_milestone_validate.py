@@ -62,7 +62,8 @@ def test_example_is_valid(doc):
 def test_all_rules_registered():
     """规则表与文档声明的保持一致。"""
     assert sorted(mv.RULES) == sorted(
-        ["V1", "V2", "V3", "V4", "V5", "V6", "V7", "V8", "V9", "V10", "V11"]
+        ["V0", "V1", "V2", "V3", "V4", "V5", "V6", "V7", "V8", "V9", "V10",
+         "V11"]
     )
 
 
@@ -463,3 +464,78 @@ def test_decisions_not_a_list_does_not_crash():
     doc = {"milestones": [{"id": "M0", "decisions": "坏数据", "gate": {}}]}
     violations = mv.validate(doc)
     assert isinstance(violations, list)
+
+
+# ---------------------------------------------------------------------------
+# V0 课程表结构完整
+#
+# 其余十一条规则都在「遍历决策/门禁行」的循环里做检查。空文档、键名拼错、
+# 门禁行写成一句话这三种情况下，那些循环一次都不会执行 —— 于是零违规，
+# 输出「通过」。而 forge-coder 的规则是「validate 不通过就不要开始实现」，
+# 它拿到 rc=0 就会在一份空课程表上开工。
+# ---------------------------------------------------------------------------
+
+def rules_of(violations):
+    return {v.rule for v in violations}
+
+
+def test_empty_document_does_not_pass():
+    assert "V0" in rules_of(mv.validate({}))
+
+
+def test_misspelled_top_level_key_is_caught():
+    violations = mv.validate({"mileStones": [{"id": "M0"}]})
+    assert "V0" in rules_of(violations)
+    # 报错要指出实际有哪些键，否则光说「没有 milestones」帮不上忙
+    assert any("mileStones" in v.message for v in violations)
+
+
+def test_empty_milestone_list_does_not_pass():
+    assert "V0" in rules_of(mv.validate({"milestones": []}))
+
+
+def test_milestone_without_any_decision_does_not_pass():
+    violations = mv.validate({"milestones": [{"id": "M0", "decisions": []}]})
+    assert "V0" in rules_of(violations)
+
+
+def test_prose_gate_line_is_rejected_not_skipped(doc):
+    """写成一句话的门禁行读起来像义务，实际不受任何核验。"""
+    doc["milestones"][0]["gate"]["mechanism_lines"].append("机制落地了，快了 30%")
+    violations = mv.validate(doc)
+    assert "V0" in rules_of(violations)
+    assert any("门禁行必须是对象" in v.message for v in violations)
+
+
+def test_non_dict_decision_is_rejected_not_skipped(doc):
+    doc["milestones"][0]["decisions"].append("D9.9 顺手把 tiling 调一下")
+    violations = mv.validate(doc)
+    assert "V0" in rules_of(violations)
+
+
+def test_non_dict_milestone_is_rejected_not_skipped(doc):
+    doc["milestones"].append("M9 收尾")
+    assert "V0" in rules_of(mv.validate(doc))
+
+
+# ---------------------------------------------------------------------------
+# V11 复合锚点
+#
+# 核验端只认单个「通道 比较符 数值」。写成复合条件的话，record 时会判为
+# 「无法核验」—— 而那时课程表和代码都写完了，失败看起来像实现问题。
+# 两端判据要一致，门禁才有意义。
+# ---------------------------------------------------------------------------
+
+def test_compound_mechanism_anchor_is_rejected(doc):
+    line = mechanism_line(doc, milestone=1)
+    line["anchor"]["expr"] = (
+        "msprof:ResourceConflictRatio.csv:aiv_mte2_wait_ratio < 4.2 "
+        "and msprof:ResourceConflictRatio.csv:aiv_mte3_wait_ratio < 0.3")
+    violations = mv.validate(doc, rules=["V11"])
+    assert "V11" in rules_of(violations)
+    assert any("多个条件" in v.message for v in violations)
+
+
+def test_single_mechanism_anchor_still_passes(doc):
+    violations = mv.validate(doc, rules=["V11"])
+    assert violations == [], [str(v) for v in violations]

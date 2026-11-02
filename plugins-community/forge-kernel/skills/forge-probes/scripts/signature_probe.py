@@ -56,6 +56,7 @@ import csv
 import glob
 import json
 import os
+import statistics
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -132,85 +133,277 @@ def read_csv_rows(path: Path) -> List[Dict[str, str]]:
         return list(csv.DictReader(handle))
 
 
-def pick_row(rows: List[Dict[str, str]], op_name: Optional[str]) -> Optional[Dict[str, str]]:
-    """挑出目标算子那一行。
+def row_duration(row: Dict[str, str]) -> float:
+    for key in ("Task Duration(us)", "task_duration", "Task Duration"):
+        value = safe_float(row.get(key))
+        if value is not None:
+            return value
+    return 0.0
 
-    不给算子名时取耗时最长的一行 —— 一次采集里通常只有一个被测算子，
-    但偶尔混入框架算子，取最长的比取第一行稳。
+
+def _row_task_id(row: Dict[str, str]) -> Optional[int]:
+    for key in ("Task ID", "task_id", "Task Id"):
+        value = safe_float(row.get(key))
+        if value is not None:
+            return int(value)
+    return None
+
+
+def _is_self_contradictory(row: Dict[str, str]) -> bool:
+    """这一行的核执行时间超过了任务总时长 —— 不可能，说明它不是稳态读数。
+
+    一次采集里算子的头几次执行是冷启动：指令缓存冷、权重未就位、
+    Task Duration 的计时窗口和各核计数器的窗口也对不齐，于是会出现
+    aiv_time > Task Duration 这种自相矛盾的行。
+
+    这类行必须排除，不只是因为它偏大。它偏大的幅度很可观（实测冷启动
+    408us vs 稳态 233us，高 75%），而这个数会成为整个 campaign 的参考基线：
+    后面每一轮候选都在和一个虚高 75% 的数做比，于是任何平庸实现都显得在
+    接近参考，优化会提前停下。
     """
+    duration = row_duration(row)
+    if duration <= 0:
+        return False
+    for key in ("aiv_time(us)", "aiv_time", "aic_time(us)", "aic_time"):
+        value = safe_float(row.get(key))
+        if value is not None and value > duration:
+            return True
+    return False
+
+
+def select_row(rows: List[Dict[str, str]], op_name: Optional[str],
+               steady_from: Optional[int] = None) -> Tuple[Optional[Dict[str, str]],
+                                                           Dict[str, Any]]:
+    """挑出目标算子的**稳态**那一行，并说明是怎么挑的。
+
+    一次采集里同一个算子通常有十来行（每次执行一行）。早先的做法是取第一行，
+    而第一行恰恰是冷启动 —— 最不该用的那一行。
+
+    现在的做法分三步：
+      1. 按算子名筛出候选行（精确匹配优先，退化到子串以便传简称）
+      2. 丢掉自相矛盾的行（核执行时间 > 任务时长），即冷启动
+      3. 剩下的取**中位数附近**那一行
+
+    第 3 步取中位数而不是最小值：最小值是运气最好的一次，拿它当参考基线
+    会让判据偏严；中位数代表这个参考稳定能跑出来的水平，这才是要对标的对象。
+
+    挑行过程一并返回，写进签名的 row_selection 字段 —— 「用了哪一行」直接
+    决定全部后续结论，不该是个看不见的内部决定。
+    """
+    info: Dict[str, Any] = {
+        "candidates": 0, "dropped_cold_start": 0, "dropped_by_steady_from": 0,
+        "picked_task_id": None, "picked_duration_us": None,
+        "duration_min_us": None, "duration_median_us": None,
+        "duration_max_us": None, "steady_from": steady_from,
+        # 能不能按耗时排序。排不出来时「丢冷启动 + 取中位数」两道防线都失效，
+        # 这件事必须说出来，否则可信度检查会报一个并不存在的稳态选择。
+        "duration_ranked": False,
+        "note": "",
+    }
     if not rows:
-        return None
+        info["note"] = "CSV 里没有数据行"
+        return None, info
+
     if op_name:
-        for row in rows:
-            name = (row.get("Op Name") or row.get("op_name") or "").strip()
-            if name == op_name:
-                return row
-        # 退化到子串匹配，便于用户传简称
-        for row in rows:
-            name = (row.get("Op Name") or row.get("op_name") or "").strip()
-            if op_name.lower() in name.lower():
-                return row
-        return None
+        pool = [r for r in rows
+                if (r.get("Op Name") or r.get("op_name") or "").strip() == op_name]
+        if not pool:
+            pool = [r for r in rows
+                    if op_name.lower() in (r.get("Op Name")
+                                           or r.get("op_name") or "").strip().lower()]
+            if pool:
+                info["note"] = f"按子串匹配到 {op_name}"
+        if not pool:
+            info["note"] = f"没有匹配 {op_name} 的行"
+            return None, info
+    else:
+        # 不给算子名时先认出被测算子：一次采集里可能混入框架算子，取耗时
+        # 最长的那个算子。认出来之后再在**它自己**的多次执行里挑稳态行 ——
+        # 跨算子取中位数没有意义，那是把 TinyOp 和 BigOp 混在一起算。
+        longest = max(rows, key=row_duration)
+        target = (longest.get("Op Name") or longest.get("op_name") or "").strip()
+        if target:
+            pool = [r for r in rows
+                    if (r.get("Op Name") or r.get("op_name") or "").strip() == target]
+            info["note"] = f"未指定算子名，按最长耗时认定为 {target}"
+        else:
+            pool = list(rows)
+            info["note"] = "未指定算子名，且 CSV 里没有算子名列"
 
-    def duration(row: Dict[str, str]) -> float:
-        for key in ("Task Duration(us)", "task_duration", "Task Duration"):
-            value = safe_float(row.get(key))
-            if value is not None:
-                return value
-        return 0.0
+    info["candidates"] = len(pool)
 
-    return max(rows, key=duration)
+    if steady_from is not None:
+        def _at_or_after(row: Dict[str, str]) -> bool:
+            task_id = _row_task_id(row)
+            return task_id is None or task_id >= steady_from
+
+        kept = [r for r in pool if _at_or_after(r)]
+        info["dropped_by_steady_from"] = len(pool) - len(kept)
+        if kept:
+            pool = kept
+        else:
+            # 全被滤掉时退回不滤，但要在 row_selection 里说出来 ——
+            # 否则 --steady-from 写错一个数字会悄悄不起作用
+            info["note"] = (f"--steady-from {steady_from} 滤掉了所有行，"
+                            "本次忽略该选项")
+
+    consistent = [r for r in pool if not _is_self_contradictory(r)]
+    info["dropped_cold_start"] = len(pool) - len(consistent)
+    if consistent:
+        pool = consistent
+    elif info["dropped_cold_start"]:
+        # 全部行都自相矛盾：别偷偷挑一行，让可信度检查看到这件事
+        info["note"] = ("所有候选行都出现核执行时间 > 任务时长，"
+                        "整次采集都没有稳态数据")
+
+    durations = sorted(row_duration(r) for r in pool)
+    if durations and durations[-1] > 0:
+        median = statistics.median(durations)
+        info["duration_min_us"] = durations[0]
+        info["duration_median_us"] = median
+        info["duration_max_us"] = durations[-1]
+        info["duration_ranked"] = True
+        picked = min(pool, key=lambda r: abs(row_duration(r) - median))
+    else:
+        picked = pool[0]
+        info["note"] = (info["note"] + "；" if info["note"] else "") + (
+            "没有可解析的 Task Duration 列，无法区分冷启动与稳态，取了第一行")
+
+    info["picked_task_id"] = _row_task_id(picked)
+    info["picked_duration_us"] = row_duration(picked)
+    return picked, info
+
+
+def _group_dir_of(hit: Path, metric: str) -> Path:
+    """一份 CSV 属于哪一次采集。
+
+    msprof 实际落盘比文档里写的多一层：
+        <prof_dir>/PROF_GROUP_<时间戳>/PROF_<Metric>/PROF_000001_*/...
+    所以「这次采集」指的是 PROF_<Metric> 的上一级目录。
+    """
+    marker = f"PROF_{metric}"
+    for parent in hit.parents:
+        if parent.name == marker:
+            return parent.parent
+    return hit.parent
 
 
 def locate_metric_csvs(prof_dir: Optional[Path],
-                       archive_dir: Optional[Path]) -> Tuple[Dict[str, Path], List[str]]:
+                       archive_dir: Optional[Path],
+                       group: Optional[str] = None) -> Tuple[Dict[str, Path], List[str]]:
     """定位七份 metric CSV，返回 (已找到, 缺失的 metric 名)。
 
     支持两种布局，因为上游 ops-profiling 的采集态和归档态路径不同：
-      采集态  <prof_dir>/PROF_<Metric>/**/mindstudio_profiler_output/op_summary_*.csv
+      采集态  <prof_dir>/[PROF_GROUP_*/]PROF_<Metric>/**/.../op_summary_*.csv
       归档态  <archive_dir>/op_summary_<Metric>.csv
+
+    采集态用 `**` 开头来容忍中间的 PROF_GROUP_* 层 —— 文档里记的是不带这一层
+    的树，而实机落盘带。写死一层就会「明明采到了却说没找到」。
+
+    多次采集并存时**不自动挑一次**。早先是把命中结果排序取第一个，于是
+    时间最早、可能只采到两个 metric 的那一次会被静默选中：缺指标的签名里
+    停顿数据是缺失的，读起来像「完全没有停顿」，而下游未必检查这件事。
+    宁可报错要求 --group 指定。
     """
     found: Dict[str, Path] = {}
     missing: List[str] = []
 
-    for metric in METRICS:
-        path: Optional[Path] = None
-        if archive_dir is not None:
+    if archive_dir is not None:
+        for metric in METRICS:
             candidate = archive_dir / f"op_summary_{metric}.csv"
             if candidate.is_file():
-                path = candidate
-        if path is None and prof_dir is not None:
-            pattern = os.path.join(
-                str(prof_dir), f"PROF_{metric}", "**",
-                "mindstudio_profiler_output", "op_summary_*.csv",
+                found[metric] = candidate
+            else:
+                missing.append(metric)
+        if found or prof_dir is None:
+            return found, missing
+        missing = []
+
+    if prof_dir is None:
+        return found, list(METRICS)
+
+    # 先按「采集批次」归拢，再决定用哪一批
+    groups: Dict[str, Dict[str, List[Path]]] = {}
+    for metric in METRICS:
+        pattern = os.path.join(
+            str(prof_dir), "**", f"PROF_{metric}", "**",
+            "mindstudio_profiler_output", "op_summary_*.csv",
+        )
+        for raw in sorted(glob.glob(pattern, recursive=True)):
+            hit = Path(raw)
+            key = str(_group_dir_of(hit, metric))
+            groups.setdefault(key, {}).setdefault(metric, []).append(hit)
+
+    if not groups:
+        return {}, list(METRICS)
+
+    if group:
+        matched = [k for k in groups if Path(k).name == group or k.endswith(group)]
+        if not matched:
+            raise ProbeError(
+                f"没有名为 {group!r} 的采集批次。本目录下有:\n  "
+                + "\n  ".join(f"{Path(k).name}（{len(v)}/{len(METRICS)} 个 metric）"
+                              for k, v in sorted(groups.items()))
             )
-            hits = sorted(glob.glob(pattern, recursive=True))
-            if hits:
-                path = Path(hits[0])
-        if path is None:
+        if len(matched) > 1:
+            raise ProbeError(
+                f"{group!r} 同时匹配到多个采集批次: "
+                + ", ".join(Path(k).name for k in sorted(matched))
+            )
+        chosen = matched[0]
+    elif len(groups) == 1:
+        chosen = next(iter(groups))
+    else:
+        raise ProbeError(
+            f"{prof_dir} 下有 {len(groups)} 次采集并存，不能替你挑一次:\n  "
+            + "\n  ".join(
+                f"{Path(k).name}（{len(v)}/{len(METRICS)} 个 metric："
+                f"{', '.join(sorted(v))}）"
+                for k, v in sorted(groups.items()))
+            + "\n\n用 --group <目录名> 指定用哪一次。\n"
+              "请挑 metric 齐全的那一次：缺 metric 的签名里停顿数据是缺失的，"
+              "读起来像「完全没有停顿」，而那是最容易把人带错方向的误读。"
+        )
+
+    for metric in METRICS:
+        hits = groups[chosen].get(metric) or []
+        if not hits:
             missing.append(metric)
+        elif len(hits) > 1:
+            raise ProbeError(
+                f"采集批次 {Path(chosen).name} 里 {metric} 有 {len(hits)} 份 CSV，"
+                "无法确定用哪一份:\n  "
+                + "\n  ".join(str(h) for h in hits)
+                + "\n\n同一个 metric 采了多次。请清理到只剩一份，"
+                  "或改用 ops-profiling 的归档流程后传 --archive-dir。"
+            )
         else:
-            found[metric] = path
+            found[metric] = hits[0]
     return found, missing
 
 
 def merge_metric_rows(found: Dict[str, Path],
-                      op_name: Optional[str]) -> Tuple[Dict[str, str], Dict[str, str], List[str]]:
+                      op_name: Optional[str],
+                      steady_from: Optional[int] = None
+                      ) -> Tuple[Dict[str, str], Dict[str, str],
+                                 List[str], Dict[str, Any]]:
     """把各 metric 里目标算子的那一行合并成一个大 dict。
 
-    返回 (合并后的列, 列名 -> 来源 metric, 行缺失的 metric)。
+    返回 (合并后的列, 列名 -> 来源 metric, 行缺失的 metric, 挑行过程)。
     记录来源是为了让输出里每个值都能写出它的 channel。
     """
     merged: Dict[str, str] = {}
     origin: Dict[str, str] = {}
     row_missing: List[str] = []
+    selection: Dict[str, Any] = {}
 
     for metric, path in found.items():
         try:
             rows = read_csv_rows(path)
         except OSError as exc:
             raise ProbeError(f"无法读取 {path}: {exc}") from exc
-        row = pick_row(rows, op_name)
+        row, info = select_row(rows, op_name, steady_from)
+        selection[metric] = info
         if row is None:
             row_missing.append(metric)
             continue
@@ -221,12 +414,57 @@ def merge_metric_rows(found: Dict[str, Path],
             if column and column not in merged:
                 merged[column] = value
                 origin[column] = metric
-    return merged, origin, row_missing
+    return merged, origin, row_missing, selection
 
 
 # ---------------------------------------------------------------------------
 # 取值助手
 # ---------------------------------------------------------------------------
+
+#: 判断「这份 CSV 的比例列是 0-1 小数还是百分数」时用的参照列。
+#:
+#: 用流水段占比来判，是因为它们一定有实质数值：一个 kernel 总得有某个流水段
+#: 是忙的。换成冲突率或等待率就判不了 —— 那些值在一个干净的 kernel 上本来
+#: 就可以全都小于 1%，和「0-1 小数」长得一模一样。
+SCALE_PROBE_COLUMNS = (
+    "aiv_vec_ratio", "aic_cube_ratio", "aiv_mte2_ratio", "aic_mte2_ratio",
+    "aiv_mte3_ratio", "aic_mte3_ratio", "aiv_scalar_ratio", "aic_scalar_ratio",
+    "aic_mte1_ratio", "aic_fixpipe_ratio", "vec_ratio", "mte2_ratio",
+)
+
+
+def detect_ratio_scale(merged: Dict[str, str]) -> Tuple[float, str]:
+    """这份 CSV 的比例列要不要乘 100，才能和百分数阈值比。
+
+    为什么必须判：msprof 的同一类数据有两种写法，而列名会告诉你是哪一种 ——
+    带 `(%)` 后缀的列（如 `GM_to_UB_bw_usage_rate(%)`）已经是百分数，
+    不带的（如 `aiv_vec_ratio`、`aiv_mte2_wait_ratio`）是 0-1 小数。
+    本仓 `ops/ops-profiling/scripts/perf_summary.py` 正是这么处理的：
+    对后一类乘 100 再显示，对前一类直接显示。
+
+    本探针的阈值全是百分数（VEC Bound 取 50、ICache 告警取 15、冲突严重取
+    15）。把 0-1 的原始值直接拿去比，这些闸门一个都不可能触发 ——
+    最大可能值 1.0 连最低的阈值 3 都到不了。于是「不通过」从来不出现，
+    而输出看着完全正常：限制资源会显示 0.874 而不是 87.4%。
+    可信度检查里的 ICache 那一条也就此失效。
+
+    判法：看流水段占比的最大值。超过 1 说明这份文件用的是百分数写法，
+    不用动；否则按 0-1 处理，乘 100。判完对**所有**小数族列统一应用同一个
+    系数 —— 逐列各判会把一个真实的 0.5% 冲突率错当成小数放大成 50%。
+    """
+    seen = []
+    for column in SCALE_PROBE_COLUMNS:
+        if column in merged:
+            value = safe_float(merged[column])
+            if value is not None:
+                seen.append(value)
+    if not seen:
+        return 1.0, "无流水段占比可参照，按百分数原样处理（未经确认）"
+    peak = max(seen)
+    if peak > 1.0:
+        return 1.0, f"流水段占比峰值 {peak}，判为百分数写法"
+    return 100.0, f"流水段占比峰值 {peak} 不超过 1，判为 0-1 小数写法，已乘 100"
+
 
 class Reader:
     """按列名取值，并记录它来自哪份 CSV。
@@ -238,6 +476,18 @@ class Reader:
     def __init__(self, merged: Dict[str, str], origin: Dict[str, str]) -> None:
         self.merged = merged
         self.origin = origin
+        self.ratio_scale, self.ratio_scale_basis = detect_ratio_scale(merged)
+
+    def ratio(self, *columns: str) -> Tuple[Optional[float], Optional[str]]:
+        """取一个比例列，统一换算成百分数。
+
+        用于列名**不带** `(%)` 的那一族（占比、等待率、冲突率、ICache 缺失率）。
+        带 `(%)` 的列本来就是百分数，用 number() 取。
+        """
+        value, channel = self.number(*columns)
+        if value is None:
+            return value, channel
+        return value * self.ratio_scale, channel
 
     def number(self, *columns: str) -> Tuple[Optional[float], Optional[str]]:
         for column in columns:
@@ -276,7 +526,8 @@ def field(value: Optional[float], channel: Optional[str],
 # 一、测量可信度
 # ---------------------------------------------------------------------------
 
-def check_trust(reader: Reader, missing_metrics: List[str]) -> Dict[str, Any]:
+def check_trust(reader: Reader, missing_metrics: List[str],
+                selection: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """架构推断之前必过的一关。
 
     这一步不是形式检查。降频会把计算段和搬运段按不同比例拉长，于是一个
@@ -309,7 +560,7 @@ def check_trust(reader: Reader, missing_metrics: List[str]) -> Dict[str, Any]:
             "detail": f"满频运行：{current} / {rated}", "channel": cur_ch,
         })
 
-    icache, icache_ch = reader.number(
+    icache, icache_ch = reader.ratio(
         "aiv_icache_miss_rate", "aic_icache_miss_rate", "icache_miss_rate")
     if icache is None:
         checks.append({
@@ -328,6 +579,60 @@ def check_trust(reader: Reader, missing_metrics: List[str]) -> Dict[str, Any]:
         checks.append({
             "name": "icache", "verdict": "pass",
             "detail": f"ICache 缺失率 {icache}%", "channel": icache_ch,
+        })
+
+    # 取的是稳态行还是冷启动行。放进可信度检查而不是只记在日志里：
+    # 冷启动行实测比稳态高 75%，而它看起来是一个完全正常的耗时数字，
+    # 后面每一轮候选都会和这个虚高的基线做比。
+    if selection:
+        cold_dropped = sum(i.get("dropped_cold_start", 0) for i in selection.values())
+        no_steady = [m for m, i in selection.items()
+                     if i.get("dropped_cold_start") and i.get("candidates")
+                     and "所有候选行" in (i.get("note") or "")]
+        picked = sorted({i.get("picked_task_id") for i in selection.values()
+                         if i.get("picked_task_id") is not None})
+        unranked = sorted(m for m, i in selection.items()
+                          if i.get("candidates") and not i.get("duration_ranked"))
+        if no_steady:
+            blocking = True
+            checks.append({
+                "name": "steady_state", "verdict": "fail",
+                "detail": (f"{', '.join(sorted(no_steady))} 的所有行都出现"
+                           "核执行时间 > 任务时长，整次采集没有稳态数据。"
+                           "多跑几次让算子预热后重新采集"),
+                "channel": None,
+            })
+        elif unranked:
+            checks.append({
+                "name": "steady_state", "verdict": "unknown",
+                "detail": (f"{', '.join(unranked)} 没有可解析的 Task Duration 列，"
+                           "无法区分冷启动与稳态，取的是第一行。"
+                           "冷启动行实测比稳态高 75%，据此做的基线会偏高"),
+                "channel": None,
+            })
+        else:
+            checks.append({
+                "name": "steady_state", "verdict": "pass",
+                "detail": (
+                    "取稳态行（Task ID "
+                    + (", ".join(str(t) for t in picked) if picked else "未标注")
+                    + f"）；{len(selection)} 份 metric 合计丢弃 "
+                      f"{cold_dropped} 行冷启动"),
+                "channel": None,
+            })
+
+    # 比例列的口径没判出来时，所有百分数阈值都可能是 100 倍的错 ——
+    # 而错的方向是「闸门永不触发」：输出里一条告警都没有，看着像一切正常。
+    # 这件事必须进可信度检查，不能只留在 ratio_scale.basis 里等人去看。
+    if "未经确认" in (getattr(reader, "ratio_scale_basis", "") or ""):
+        blocking = True
+        checks.append({
+            "name": "ratio_scale", "verdict": "fail",
+            "detail": ("无法判断比例列是 0-1 小数还是百分数（缺少流水段占比列"
+                       "作参照）。两种口径差 100 倍，判错的后果是占比、等待率、"
+                       "冲突率的全部阈值都不可能触发 —— 输出里一条告警都没有，"
+                       "看着像一切正常。请补采 PipeUtilization 后重做"),
+            "channel": None,
         })
 
     if missing_metrics:
@@ -413,7 +718,7 @@ def extract_pipeline(reader: Reader) -> Dict[str, Any]:
     best_name, best_value = None, -1.0
 
     for name, columns, threshold, label in specs:
-        value, channel = reader.number(*columns)
+        value, channel = reader.ratio(*columns)
         out[name] = field(value, channel)
         if value is None:
             continue
@@ -462,11 +767,11 @@ def extract_stalls(reader: Reader) -> Dict[str, Any]:
     out: Dict[str, Any] = {"wait": {}, "conflict": {}, "flags": []}
 
     for name, columns in waits.items():
-        value, channel = reader.number(*columns)
+        value, channel = reader.ratio(*columns)
         out["wait"][name] = field(value, channel)
 
     for name, columns in conflicts.items():
-        value, channel = reader.number(*columns)
+        value, channel = reader.ratio(*columns)
         out["conflict"][name] = field(value, channel)
 
     total = out["conflict"]["total"]["value"]
@@ -813,15 +1118,18 @@ def collect_open_questions(stalls, memory, exposure) -> List[Dict[str, Any]]:
 
 def build_signature(prof_dir: Optional[Path], archive_dir: Optional[Path],
                     op_name: Optional[str],
-                    min_gm_bytes: Optional[int]) -> Dict[str, Any]:
-    found, missing = locate_metric_csvs(prof_dir, archive_dir)
+                    min_gm_bytes: Optional[int],
+                    group: Optional[str] = None,
+                    steady_from: Optional[int] = None) -> Dict[str, Any]:
+    found, missing = locate_metric_csvs(prof_dir, archive_dir, group)
     if not found:
         searched = []
         if archive_dir is not None:
             searched.append(f"{archive_dir}/op_summary_<Metric>.csv")
         if prof_dir is not None:
             searched.append(
-                f"{prof_dir}/PROF_<Metric>/**/mindstudio_profiler_output/op_summary_*.csv")
+                f"{prof_dir}/**/PROF_<Metric>/**/mindstudio_profiler_output/"
+                "op_summary_*.csv")
         raise ProbeError(
             "未找到任何 msprof metric CSV。已查找:\n  "
             + "\n  ".join(searched)
@@ -829,7 +1137,8 @@ def build_signature(prof_dir: Optional[Path], archive_dir: Optional[Path],
             "采集方式见 ops/ops-profiling 的 msprof_profile_run.sh"
         )
 
-    merged, origin, row_missing = merge_metric_rows(found, op_name)
+    merged, origin, row_missing, selection = merge_metric_rows(
+        found, op_name, steady_from)
     if not merged:
         raise ProbeError(
             f"在已找到的 CSV 里没有匹配到算子 "
@@ -839,7 +1148,7 @@ def build_signature(prof_dir: Optional[Path], archive_dir: Optional[Path],
     reader = Reader(merged, origin)
     all_missing = sorted(set(missing) | set(row_missing))
 
-    trust = check_trust(reader, all_missing)
+    trust = check_trust(reader, all_missing, selection)
     launch = extract_launch(reader)
     pipeline = extract_pipeline(reader)
     stalls = extract_stalls(reader)
@@ -857,6 +1166,14 @@ def build_signature(prof_dir: Optional[Path], archive_dir: Optional[Path],
             "metrics_found": sorted(found),
             "metrics_missing": all_missing,
             "files": {m: str(p) for m, p in sorted(found.items())},
+        },
+        # 用了哪一行直接决定全部后续结论，所以写进签名而不是埋在内部
+        "row_selection": selection,
+        # 比例列的口径同理：判错了所有阈值判定都跟着失效，而输出看着正常
+        "ratio_scale": {
+            "factor": reader.ratio_scale,
+            "basis": reader.ratio_scale_basis,
+            "applies_to": "列名不带 (%) 的占比/等待率/冲突率/ICache 缺失率",
         },
         "trust": trust,
         "launch": launch,
@@ -909,6 +1226,14 @@ def render_text(sig: Dict[str, Any]) -> str:
     add(f"  Block Dim        {launch['block_dim']['value']}")
     add(f"  角色分工         {launch['role_split']['note']}")
     add(f"  Task Duration    {launch['task_duration_us']['value']} us")
+    for metric, info in sorted(sig.get("row_selection", {}).items()):
+        if info.get("picked_duration_us") is None:
+            continue
+        add(f"  取样({metric})  Task ID={info.get('picked_task_id')}"
+            f" {info['picked_duration_us']}us"
+            f"（候选 {info.get('candidates')} 行，"
+            f"丢冷启动 {info.get('dropped_cold_start')} 行，"
+            f"稳态区间 {info.get('duration_min_us')}~{info.get('duration_max_us')}us）")
     add("")
 
     add("— pipeline 占比 —")
@@ -977,7 +1302,14 @@ def build_parser() -> argparse.ArgumentParser:
     source.add_argument("--archive-dir", type=Path,
                         help="归档目录（含 op_summary_<Metric>.csv）")
     parser.add_argument("--op-name", default=None,
-                        help="目标算子名；不给则取耗时最长的一行")
+                        help="目标算子名；不给则在全部行里挑")
+    parser.add_argument("--group", default=None, metavar="DIR_NAME",
+                        help="采集态下指定用哪一次采集（PROF_GROUP_* 的目录名）。"
+                             "多次采集并存且未指定时会报错，不会替你挑一次")
+    parser.add_argument("--steady-from", type=int, default=None, metavar="TASK_ID",
+                        help="只用 Task ID 不小于该值的行。"
+                             "默认已自动丢弃冷启动行（核执行时间 > 任务时长），"
+                             "这个选项用于手工指定更严的稳态起点")
     parser.add_argument("--min-gm-bytes", type=int, default=None,
                         help="理论最小 GM 读取字节数，给了才能算数据复用倍数")
     parser.add_argument("--output", type=Path, default=None,
@@ -992,7 +1324,8 @@ def main() -> int:
 
     try:
         sig = build_signature(args.prof_dir, args.archive_dir,
-                              args.op_name, args.min_gm_bytes)
+                              args.op_name, args.min_gm_bytes,
+                              args.group, args.steady_from)
     except ProbeError as exc:
         print(f"错误: {exc}", file=sys.stderr)
         return 2

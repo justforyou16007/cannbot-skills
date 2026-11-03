@@ -512,7 +512,32 @@ else
 
     ok "Hooks: $hook_link_count discovery symlinks"
 
-    # --- Generate .claude/settings.json (Claude tool only) ---
+    # --- Generate settings.json (hook registration) ---
+    #
+    # 软链 hook 文件只是「让它能被找到」，不等于「它会被调用」。真正的注册
+    # 是把 hooks.json 的 PreToolUse 配置写进 settings.json —— 早先这一步只在
+    # TOOL=claude 时执行，而默认 TOOL 是 opencode。于是按默认装一遍：软链有、
+    # 健康检查通过、而 PreToolUse 一条没注册，整个 campaign 全程零边界，
+    # 同时所有文档、提示词和测试都在说边界生效。
+    #
+    # no-code 边界是这套方法的地基（架构结论必须是从硬件行为反推的），
+    # 所以装不上必须说清楚，不能静默跳过。
+    if [ "$TOOL" != "claude" ] && [ -f "$PLUGIN_ROOT/hooks/hooks.json" ]; then
+        warn "工具是 $TOOL，本脚本只会为 claude 生成 settings.json"
+        echo "       —— 也就是说 PreToolUse 边界 hook **没有被注册**。" >&2
+        echo "       软链已就位，但不会有人调用它。" >&2
+        echo "" >&2
+        echo "       后果：封存参考之后，读参考源码不会被拦，而" >&2
+        echo "       quickstart / agent 提示词都假定边界是生效的。" >&2
+        echo "" >&2
+        echo "       两条出路：" >&2
+        echo "         1. 用 ./init.sh claude 安装（推荐）" >&2
+        echo "         2. 手工把 hooks/hooks.json 的 PreToolUse 配置接进" >&2
+        echo "            $TOOL 的 hook 机制，并用下面这条命令自检：" >&2
+        echo "            FORGE_SEALED_PATHS=<清单> \\" >&2
+        echo "              echo '{\"tool_name\":\"Read\",\"tool_input\":{\"file_path\":\"<被封文件>\"}}' \\" >&2
+        echo "              | hooks/no-code-boundary.sh; echo \$?   # 期望 2" >&2
+    fi
     if [ "$TOOL" = "claude" ] && [ -f "$PLUGIN_ROOT/hooks/hooks.json" ]; then
         SETTINGS_TARGET="$CONFIG_ROOT/settings.json"
         PLUGIN_ROOT_ABS="$(realpath "$PLUGIN_ROOT")"

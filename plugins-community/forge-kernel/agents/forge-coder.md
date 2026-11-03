@@ -214,7 +214,7 @@ python3 $OE/evaluate_ops_direct.py {op_name} \
 用 `ops-evaluation` 的 **`evaluate_ops_direct.py`**：
 
 ```bash
-python3 <ops-evaluation>/scripts/evaluate_ops_direct.py {op_name} \
+python3 <forge-evaluation>/scripts/evaluate_ops_direct.py {op_name} \
     --call-spec call_spec.json \
     --baseline-path {参考路径} \
     --evolved-path {已安装的候选 OPP 路径} \
@@ -225,15 +225,49 @@ python3 <ops-evaluation>/scripts/evaluate_ops_direct.py {op_name} \
 > **不要用同目录的 `evaluate_ops.py`**。它执行 `from evaluate import AscendBackend`，
 > 而 `AscendBackend` 在仓内不存在，会直接失败。
 
-> **evolved 侧天生略慢，这不是你的实现的问题。** 评测总是先跑 baseline
-> 子进程再跑 evolved 子进程，后者继承了频率/缓存/带宽的劣势。实测同一份
-> 代码自评时 evolved 侧恒慢约 2.7%，方向恒定，多测几次消不掉。所以名义
-> 目标 1.05 实际需要 5%+ 的真实改进才站得住 —— 卡在 2~3% 的增益别急着
-> 当成功，也别急着判定实现失败。
+> **位置偏置已经从机制上消除了，别再按 2.7% 折算。** forge-kernel 用的是
+> 自己那一份评测脚本（`skills/forge-evaluation/scripts/`），它默认按
+> **A-B-B-A 四轮**跑：baseline → evolved → evolved → baseline，每侧取两轮
+> 均值；每轮计量前还用被测这一侧的 kernel 做 burn-in，让所有窗口坐在同一个
+> 热平台上。两个机制缺一不可 —— 只镜像，冷启动偏置只是换到另一侧；只
+> burn-in，慢速热漂移还在。
+>
+> 代价是机时翻倍。急着看方向时可以 `--mirror-rounds 1` 退回单轮，但那时
+> evolved 侧会恒慢约 2.7%（先被测的一侧占优），2~3% 的增益读数不可信。
+
+> **结果里会写出 `measurement` 段**（镜像轮数、burn-in、warmup、是否走了
+> baseline 缓存）和 `device_id`。`campaign.py record` 会据此核对这份结果是
+> 哪张卡上、什么测法得到的 —— 卡号与 campaign 不符会被拒。
 
 需要流水线占比（验证 mechanism 行）时另外走 `ops-profiling` 的 msprof，
 再用 `signature_probe.py` 提取 —— 配对评测有意不采 msprof，
 它输出的 `pipeline` 和 `bottleneck` 恒为空。
+
+## 实现完先过结构核验，再去评测
+
+机制行除了停顿锚点，还可能带 `structural_anchor`。它查的是**声称的结构
+在不在**，而且在任何性能数之前就能答：
+
+```bash
+python3 <forge-probes>/scripts/structure_probe.py --candidate {你的候选目录} \
+    --assert "buffer_depth:2" --assert "flag_paired" \
+    --output ./forge_work/structure.json
+```
+
+把报告传给 record：`--structure-report ./forge_work/structure.json`。
+
+**为什么不能跳过**：停顿指标能被别的改动顶下去 —— 减小 tile、改对齐都会让
+`mte2_wait` 降。于是一个写成单缓冲回退的实现，可能因为这轮顺手改了 tile 而
+让停顿恰好落进带内，被判「机制已核实」，而双缓冲从未存在。那个错误的解释
+会被封进产物库和知识库，之后别的算子照着它做决策。
+
+**结构不在时该做什么**：修实现，或者给实现补一张 hwkb 卡片（比如「UB 地址
+错位分配导致双缓冲退化」）。**不要去找架构层改课程表** —— 课程表写对了，
+是实现没做到。裁决会把这种情况归因到 `implementation`，不消耗架构重入机会。
+
+拿不到 `ccec` 时只跑源码层那几条断言（`buffer_depth` / `flag_paired` /
+`has` / `absent`），它们不需要工具链。不要用 `--allow-missing-toolchain`
+糊过去 —— 那会让 IR 层断言标成「查不了」，而查不了不等于通过。
 
 ## 机制行要锚在停顿上，不是占比
 
@@ -252,6 +286,10 @@ python3 <ops-evaluation>/scripts/evaluate_ops_direct.py {op_name} \
 | `time_us=-1` | 不是「慢」，是评测没跑成。先查候选是否装成了 OPP 包（见上节），再查结果文件里的 `error` 字段 |
 | 精度不达标 | 先查是不是混用了精度（如 FP16 直接累加），修不好就回滚 |
 | 增益在噪声内 | 回滚，登记死路表，取下一行决策 |
+| 已达目标 | **还没完**：`campaign.py status` 会说 `confirm-best`。对同一份产物再测一次，然后 `campaign.py confirm --result <新结果> --decision <同一个 id>`。两次都达标才收工 —— best 是历史最大值，而每次评测是一次抽样 |
+| `record` 报 gating 不合格 | 评测自己判了这次没跑成（泛化 shape 算错/退化）。`comparison.*` 只覆盖 target shape，所以要看 `gating` |
+| `record` 报抖动高于噪声底 | 环境比 init 时吵了。先查同卡有没有别的进程、是否降频，再重量噪声底 |
+| 结构核验不成立 | 声称的结构没建出来。修实现或补一张 hwkb 卡片，**不要**改课程表 |
 | 围栏报 F-DENY | 先看命中的词是不是公开接口名（如 `DataCopyPad`）。是的话属封存误伤，重封参考时带上 `--public-headers`；确属参考内部命名才改实现 |
 | 连续多轮无进展 | `campaign.py` 会转入 `stalled`，**交回架构层**，不要自己硬调 |
 | 环境问题 | 停下来上报，不要绕过 |

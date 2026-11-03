@@ -1,9 +1,58 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "_why": [
+    "三组规则，各管一条通路。少任一组，no-code 边界就有一条绕过去的路。",
+    "",
+    "1) PreToolUse hook —— 拦读。Read/Grep/Glob/Bash/NotebookEdit 会碰到封存的",
+    "   参考源码与配置，由 no-code-boundary.sh 比对封存清单后决定。",
+    "",
+    "2) PreToolUse hook 也挂 Edit/Write —— 拦改策略载体。封存清单、hook 脚本、",
+    "   本文件三者任一被改写，边界就静默消失了。被管的对象不该能改管它的东西。",
+    "",
+    "3) permissions.deny —— 拦网络。参考实现在本机被封住了，但它的上游仓库",
+    "   是敞开的：一次 WebFetch 或 pip download 就能拿到同一份源码，而封存清单",
+    "   （比对本地路径）、围栏（比对符号名）、知识库 lint（比对符号名）三道全绿。",
+    "   论文实现的 agent_policy 模块就是为这件事建的，它的 docstring 写明：审计",
+    "   早期 run 的 agent 会话时，发现学生去抓自己正在写的那个算子的公开实现",
+    "   并改写进 kernel。那之前这两条规则都只是提示词。",
+    "",
+    "4) permissions.deny 也拦人类专用归档 —— forge-hwkb/references/provenance/。",
+    "   知识库卡片本身是 agent 要读的（它是跨算子复用的载体），但参考侧的具体",
+    "   细节（哪个文件、哪个函数、第几行、转述的片段）得有一个合法去处，否则真",
+    "   反推出结论的 agent 只有两条路：写进卡片（越界），或者丢掉（结论不可复核）。",
+    "   它会选后者，因为那是免费的。给出归档目录之后，还必须让它读不到 ——",
+    "   否则这个目录只是把参考细节换了个位置继续供给，比写在卡片里更糟：",
+    "   卡片至少过 lint。"
+  ],
+  "permissions": {
+    "deny": [
+      "Read(//**/forge-hwkb/references/provenance/**)",
+      "Grep(//**/forge-hwkb/references/provenance/**)",
+      "Glob(//**/forge-hwkb/references/provenance/**)",
+      "WebFetch",
+      "WebSearch",
+      "Bash(curl:*)",
+      "Bash(wget:*)",
+      "Bash(git clone:*)",
+      "Bash(git fetch:*)",
+      "Bash(git pull:*)",
+      "Bash(pip install:*)",
+      "Bash(pip download:*)",
+      "Bash(pip3 install:*)",
+      "Bash(pip3 download:*)",
+      "Bash(python -m pip:*)",
+      "Bash(python3 -m pip:*)",
+      "Bash(npm install:*)",
+      "Bash(gh repo clone:*)",
+      "Bash(huggingface-cli download:*)",
+      "Bash(scp:*)",
+      "Bash(rsync:*)"
+    ]
+  },
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Read|Grep|Glob|Bash|NotebookEdit",
+        "matcher": "Read|Grep|Glob|Bash|NotebookEdit|Edit|Write|MultiEdit",
         "hooks": [
           {
             "type": "command",

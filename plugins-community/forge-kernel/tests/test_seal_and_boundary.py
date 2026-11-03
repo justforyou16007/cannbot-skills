@@ -165,7 +165,7 @@ def test_hook_blocks_bash_touching_reference(sealed):
         "tool_name": "Bash",
         "tool_input": {"command": f"grep -rn Tile {ref_dir}/"}})
     assert code == 2
-    assert "命令中引用了封存路径" in err
+    assert "封存的参考实现内" in err
 
 
 def test_hook_message_points_at_the_measuring_alternative(sealed):
@@ -198,10 +198,32 @@ def test_hook_allows_unrelated_command(sealed):
 
 
 def test_hook_allows_everything_when_nothing_sealed(tmp_path):
-    """尚未封存任何参考时不得妨碍正常工作。"""
-    code, _ = call_hook(tmp_path / "no_such_dir", {
+    """尚未封存任何参考时不得妨碍正常工作。
+
+    「没封存」的真实形态是**不设**那两个环境变量 —— 所以这里不走 call_hook
+    （它总会设 FORGE_SEALED_PATHS）。设了却读不到是另一回事：那是配置事故，
+    见 test_hook_fails_closed_when_declared_list_is_unreadable。
+    """
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("FORGE_SEALED_PATHS", "FORGE_WORK_DIR")}
+    proc = subprocess.run(
+        ["bash", str(HOOK)],
+        input=json.dumps({"tool_name": "Read",
+                          "tool_input": {"file_path": "/etc/hostname"}}),
+        text=True, capture_output=True, env=env, cwd=str(tmp_path), check=False)
+    assert proc.returncode == 0
+
+
+def test_hook_fails_closed_when_declared_list_is_unreadable(tmp_path):
+    """声明了清单位置却读不到 —— 边界此刻无效，必须拦而不是放行。
+
+    这是打包事故、工作目录被清理、路径拼错的共同形态。静默放行会让整个
+    campaign 在无防护下跑完，而所有文档都说边界生效。
+    """
+    code, err = call_hook(tmp_path / "no_such_dir", {
         "tool_name": "Read", "tool_input": {"file_path": "/etc/hostname"}})
-    assert code == 0
+    assert code == 2
+    assert "读不到" in err
 
 
 def test_hook_survives_malformed_json(sealed):
@@ -237,15 +259,39 @@ def test_hook_escape_hatch_warns_without_blocking(sealed):
 # 与知识库 lint 的衔接
 # ---------------------------------------------------------------------------
 
-def test_sealed_denylist_feeds_knowledge_base_lint(sealed):
-    """封存抽出的名词清单要能直接被知识库 lint 用上，两段不能脱节。"""
+def _hwkb():
     hwkb_scripts = PLUGIN_ROOT / "skills" / "forge-hwkb" / "scripts"
     sys.path.insert(0, str(hwkb_scripts))
     import hwkb  # noqa: PLC0415
+    return hwkb
 
-    work_dir, _, _ = sealed
-    denylist = hwkb.load_denylist(work_dir)
+
+def test_sealed_denylist_feeds_knowledge_base_lint(tmp_path):
+    """封存抽出的名词清单要能被知识库 lint 用上，两段不能脱节。
+
+    这条用例原先是**假的**：它把 work_dir 传进 hwkb.load_denylist 的
+    kb_root 参数位，等于自己手工把两段接上，然后断言「接上了」。而生产
+    路径上 seal 写的是 work_dir、hwkb 读的是 kb_root，中间没有任何一步
+    搬运 —— L-DENY 在真实使用中一条都不报，lint 照样打印「通过」。
+
+    现在按真实调用方式测：seal 自己把清单写进 kb_root，hwkb 用它**默认的**
+    kb_root 去读。
+    """
+    hwkb = _hwkb()
+
+    artifact = tmp_path / "ref"
+    artifact.mkdir()
+    (artifact / "k.cpp").write_text(REF_SOURCE, encoding="utf-8")
+    work_dir = tmp_path / "forge_work"
+    kb_root = tmp_path / "kb"
+
+    seal_reference.seal(artifact, "demo_attn", work_dir,
+                        use_public_api_filter=False, kb_root=kb_root)
+
+    # 关键：从 kb_root 读，而不是从 work_dir 读
+    denylist = hwkb.load_denylist(kb_root)
     assert "ProprietaryAttentionCore" in denylist
+    assert hwkb.denylist_status(kb_root, denylist) is None
 
     card = (
         "---\n"
@@ -577,3 +623,48 @@ def test_seal_warns_when_staging_dir_is_inside_the_work_tree(tmp_path,
     assert seal_reference.main() == 0
     err = capsys.readouterr().err
     assert "工作区之外" in err or "之内" in err
+
+
+def test_seal_writes_denylist_to_the_default_kb_root(tmp_path, monkeypatch):
+    """不传 --kb-root 时也要落到 hwkb 默认读的那个位置。
+
+    这是接线的关键一环：实际流程里没人会传 --kb-root，而 hwkb 的所有文档
+    调用都走默认 kb_root。两个默认值必须指向同一个文件。
+    """
+    hwkb = _hwkb()
+    assert seal_reference.DEFAULT_KB_ROOT.resolve() == hwkb.DEFAULT_KB_ROOT.resolve()
+
+
+def test_denylist_status_flags_missing_list(tmp_path):
+    hwkb = _hwkb()
+    status = hwkb.denylist_status(tmp_path, [])
+    assert status and "未生效" in status
+
+
+def test_denylist_status_flags_empty_list(tmp_path):
+    hwkb = _hwkb()
+    (tmp_path / "denylist.txt").write_text("# 只有注释\n", encoding="utf-8")
+    status = hwkb.denylist_status(tmp_path, [])
+    assert status and "形同不存在" in status
+
+
+def test_lint_says_so_when_denylist_is_not_in_effect(tmp_path, capsys):
+    """lint 打印「通过」时，必须说清这句话覆盖了什么。
+
+    L-DENY 没生效而输出「未越过 no-code 边界」，是在给一个没做过的检查
+    背书 —— 这正是本轮要消除的那种失效形态。
+    """
+    import argparse  # noqa: PLC0415
+    hwkb = _hwkb()
+    (tmp_path / "dav2201").mkdir(parents=True)
+
+    args = argparse.Namespace(kb_root=str(tmp_path), card=None, arch=None,
+                              quarantine=False, as_json=False)
+    hwkb.cmd_lint(args)
+    captured = capsys.readouterr()
+    # 结论那一行要**点名**哪道闸没生效，不能只说「见上」——
+    # 读结论的人得当场知道这句「通过」不覆盖什么。
+    assert "L-DENY" in captured.out
+    assert "未生效" in captured.out
+    assert "这句话不覆盖它们" in captured.out
+    assert "未生效" in captured.err

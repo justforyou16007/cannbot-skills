@@ -26,3 +26,16 @@
 python3 ../../scripts/hwkb.py validate --card draft.md
 python3 ../../scripts/hwkb.py add --card draft.md
 ```
+
+<!-- hwkb:index:begin 以下由 hwkb.py 自动重写，勿手改 -->
+
+## 现有卡片（按症状）
+
+先在这里找「我观测到的现象」，命中就去读那张卡片；
+都不命中再考虑它是一条新经验。
+
+| 触发症状 | 机制 | 卡片 |
+|---|---|---|
+| （暂无经验） | | |
+
+<!-- hwkb:index:end -->

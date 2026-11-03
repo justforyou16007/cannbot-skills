@@ -90,7 +90,8 @@ def _add_nogo(payload):
     args = argparse.Namespace(
         kb_root=str(kb_root), symptom=f"症状{idx}", tried=f"方向{idx}",
         evidence=f"[MEASURED, job {idx}]", arch="DAV_2201",
-        operator=f"op{idx}", as_json=False)
+        operator=f"op{idx}", input_shape="", as_json=False,
+        retry_precondition="UB 余量翻倍后重试")
     return hwkb.cmd_nogo_add(args) == 0
 
 

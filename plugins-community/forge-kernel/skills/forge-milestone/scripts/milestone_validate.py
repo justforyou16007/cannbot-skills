@@ -54,7 +54,16 @@ FIVE_TUPLE_FIELDS = ("action", "purpose", "trigger", "cost", "depends_on")
 LINE_CATEGORIES = ("correctness_lines", "performance_lines", "mechanism_lines")
 
 #: 门禁行的终态。OPEN 表示尚未销账，是 V6 要抓的目标。
-RESOLVED_STATUSES = {"PASS", "FAIL"}
+#: 算「已销账」的状态。
+#:
+#: 刻意**不含** FAIL。FAIL 看起来像一个终态，实际零举证义务：早先
+#: RESOLVED_STATUSES 含它，而销账检查对已销账状态直接跳过 —— 于是把全部
+#: 门禁行改成 FAIL，校验通过、`gate_impasse` 也不报，一个 milestone 可以
+#: 带着满页 FAIL 合法关闭。
+#:
+#: 没中就必须 DEFERRED（交给具名的下游手段，三条举证）或 INFEASIBLE
+#: （宣告做不到，也要举证）。两条都有举证责任，FAIL 没有。
+RESOLVED_STATUSES = {"PASS"}
 DISCHARGE_STATUSES = {"DEFERRED", "INFEASIBLE", "N/A"}
 ALL_STATUSES = RESOLVED_STATUSES | DISCHARGE_STATUSES | {"OPEN"}
 
@@ -398,6 +407,10 @@ def check_provenance(doc: Dict[str, Any]) -> List[Violation]:
 # V5 — 门禁三类行齐全
 # ---------------------------------------------------------------------------
 
+def _is_m0(milestone_id: Any) -> bool:
+    return str(milestone_id).strip().upper().startswith("M0")
+
+
 def check_gate_completeness(doc: Dict[str, Any]) -> List[Violation]:
     """论文 §3.2：每个 milestone 关闭时的门禁含正确性行、带出处的性能行，
     以及一条机制验证行 —— 那条 profiler 锚定的谓词，用来区分「机制真的落地了」
@@ -418,6 +431,22 @@ def check_gate_completeness(doc: Dict[str, Any]) -> List[Violation]:
             continue
         for category in LINE_CATEGORIES:
             lines = gate.get(category)
+            if category == "performance_lines" and _is_m0(mid):
+                # M0 不要求性能行，而且不该有。
+                #
+                # 第一版能跑到哪里事先无法知道：设高了不可达、设低了没意义。
+                # 架构是否真的生效由**机制行**（锚到参考的比率）判断。
+                # 强制要求的唯一产物是训练架构层发明一条敷衍的性能行 ——
+                # 要么写成几乎必然不达标的数（只能标 DEFERRED 走三条举证），
+                # 要么写成毫无约束力的数再配一个合法出处。
+                if isinstance(lines, list) and lines:
+                    out.append(Violation(
+                        "V5", f"{mid}.gate.{category}",
+                        "M0 不应有性能行：第一版能跑到哪里事先无法知道，"
+                        "设高了不可达、设低了没意义。架构是否生效由机制行"
+                        "（锚到参考的比率）判断",
+                    ))
+                continue
             if not isinstance(lines, list) or not lines:
                 out.append(Violation(
                     "V5", f"{mid}.gate.{category}",
@@ -441,6 +470,18 @@ def check_line_discharge(doc: Dict[str, Any]) -> List[Violation]:
     销账而不举证，等于把问题藏起来。
     """
     out: List[Violation] = []
+    milestones = [m for m in (doc.get("milestones") or [])
+                  if isinstance(m, dict)]
+    last_milestone_id = milestones[-1].get("id") if milestones else None
+    milestone_order = {}
+    all_decision_ids = set()
+    for index, milestone in enumerate(milestones):
+        milestone_order[milestone.get("id")] = index
+        for decision in milestone.get("decisions") or []:
+            if isinstance(decision, dict) and decision.get("id"):
+                all_decision_ids.add(decision["id"])
+                milestone_order[decision["id"]] = index
+
     for mid, category, line in _iter_gate_lines(doc):
         lid = line.get("id", "<无 id>")
         base = f"{mid}.{category}.{lid}"
@@ -462,6 +503,22 @@ def check_line_discharge(doc: Dict[str, Any]) -> List[Violation]:
                 "DEFERRED / INFEASIBLE / N/A 并附证据",
             ))
             continue
+        if status == "PASS":
+            # 干净的 PASS 也要说清是哪次测量把它关掉的。
+            #
+            # anchor.provenance 说的是**阈值**的来源，不是「关住这条行的那次
+            # 测量」。两者不是一回事：阈值可以来自参考实测，而这条行有没有
+            # 达标是本次 job 的事。不要求的话，PASS 是一个零举证的自述状态，
+            # 把所有行改成 PASS 就能让门禁僵持这个重入口消失。
+            if _is_blank(line.get("closed_by")):
+                out.append(Violation(
+                    "V6", f"{base}.closed_by",
+                    "PASS 必须写 closed_by，说明是哪次测量把它关掉的"
+                    "（如 \"[MEASURED, job 7]\"）。"
+                    "anchor.provenance 说的是阈值的来源，不是这次达标的证据",
+                ))
+            continue
+
         if status not in DISCHARGE_STATUSES:
             continue
 
@@ -473,6 +530,33 @@ def check_line_discharge(doc: Dict[str, Any]) -> List[Violation]:
             ))
 
         if status == "DEFERRED":
+            if category == "correctness_lines":
+                out.append(Violation(
+                    "V6", base,
+                    "正确性行不得推迟。算错的 kernel 再快也无意义，"
+                    "这类测试没有「交给下游手段」这个出口",
+                ))
+            if mid == last_milestone_id:
+                out.append(Violation(
+                    "V6", base,
+                    f"{mid} 是最后一个 milestone，它的门禁行不能是 DEFERRED —— "
+                    "没有更靠后的手段可以接手了。"
+                    "要么在本 milestone 内关掉，要么宣告 INFEASIBLE 并举证",
+                ))
+            lever = line.get("downstream_lever")
+            if lever and lever not in all_decision_ids:
+                out.append(Violation(
+                    "V6", f"{base}.downstream_lever",
+                    f"接手的下游手段 {lever!r} 在课程表里不存在 —— "
+                    "这条测试实际是被丢弃了，而不是推迟了",
+                ))
+            elif lever and milestone_order.get(lever, -1) <= \
+                    milestone_order.get(mid, 0):
+                out.append(Violation(
+                    "V6", f"{base}.downstream_lever",
+                    f"接手的 {lever!r} 不在更靠后的 milestone 里。"
+                    "手里已经握着手段还推迟，说明这个 milestone 没做完",
+                ))
             if _is_blank(line.get("downstream_lever")):
                 out.append(Violation(
                     "V6", f"{base}.downstream_lever",
@@ -565,23 +649,30 @@ def check_m0_no_absolute_threshold(doc: Dict[str, Any]) -> List[Violation]:
         gate = milestone.get("gate") or {}
         if not isinstance(gate, dict):
             continue
-        for line in gate.get("performance_lines", []) or []:
-            if not isinstance(line, dict):
-                continue
-            lid = line.get("id", "<无 id>")
-            anchor = line.get("anchor") or {}
-            expr = anchor.get("expr") if isinstance(anchor, dict) else None
-            haystack = " ".join(
-                str(x) for x in (line.get("statement"), expr) if x
-            )
-            match = RE_ABSOLUTE_TIME.search(haystack)
-            if match:
-                out.append(Violation(
-                    "V8", f"M0.performance_lines.{lid}",
-                    f"M0 性能行出现绝对时间阈值 '{match.group(0)}'；"
-                    "该阶段只能用相对参考的比率，架构尚未调优，"
-                    "绝对阈值会把正确架构误判为失败",
-                ))
+        # 扫 M0 的**全部**门禁行，不只性能行。
+        #
+        # V5 已经规定 M0 不该有性能行，所以只扫那一类等于这条规则作废 ——
+        # 而绝对时间阈值一样可以写进机制行或正确性行（「mte2 等待必须低于
+        # 20us」），危害完全相同：架构刚落地没调过，拿绝对时间卡它会把正确
+        # 的架构当失败砍掉。
+        for category in LINE_CATEGORIES:
+            for line in gate.get(category, []) or []:
+                if not isinstance(line, dict):
+                    continue
+                lid = line.get("id", "<无 id>")
+                anchor = line.get("anchor") or {}
+                expr = anchor.get("expr") if isinstance(anchor, dict) else None
+                haystack = " ".join(
+                    str(x) for x in (line.get("statement"), expr) if x
+                )
+                match = RE_ABSOLUTE_TIME.search(haystack)
+                if match:
+                    out.append(Violation(
+                        "V8", f"M0.{category}.{lid}",
+                        f"M0 门禁行出现绝对时间阈值 '{match.group(0)}'；"
+                        "该阶段只能用相对参考的比率，架构尚未调优，"
+                        "绝对阈值会把正确架构误判为失败",
+                    ))
     return out
 
 
@@ -828,6 +919,338 @@ def check_document_shape(doc: Dict[str, Any]) -> List[Violation]:
     return out
 
 
+
+# ---------------------------------------------------------------------------
+# V12 — 课程表不得含实现体
+# ---------------------------------------------------------------------------
+
+#: 实现体的痕迹。课程表写的是**决策与契约**，不是代码。
+#:
+#: 论文把三个产物的边界当成「保证参照的代码不会进入 kernel」的构件：
+#: milestone（决策、参数与契约，**从不含实现体**）/ 硬件知识库（唯一含代码的
+#: 产物）/ meta-milestone（蒸馏策略）。
+#:
+#: 为什么这条是承重墙：架构 agent 读过参考的硬件行为（在上游的 source 模式下
+#: 甚至读过源码），然后写课程表；而编码 agent 读课程表。所以 milestone 是
+#: 参考实现**唯一可能的泄漏通道** —— 它一旦能装代码，前面那道 no-code 边界
+#: 就有了一条绕过去的路（逃生舱一开、或封存漏挑了文件，它就是唯一的那道墙）。
+RE_IMPLEMENTATION_BODY = re.compile(
+    r"```"                                   # markdown 代码块
+    r"|__aicore__|__global__|__gm__|__ubuf__"  # AscendC/CUDA 的存储与函数限定
+    r"|\bAscendC\s*::"                       # 命名空间直接调用
+    r"|\bfor\s*\([^)]*;[^)]*;"                # 三段式 for
+    r"|\bwhile\s*\([^)]{0,80}\)\s*\{"        # while (...) {
+    r"|\bif\s*\([^)]{0,80}\)\s*\{"           # if (...) {
+    r"|\b(?:class|struct)\s+[A-Z]\w*\s*(?::\s*[^{]{0,60})?\{"
+)
+
+#: 允许出现代码形状的字段。契约本来就要写函数签名与表达式。
+IMPLEMENTATION_EXEMPT_KEYS = {
+    "expr", "verification_channel", "channel", "structural_anchor",
+    "derived_from", "signature", "provenance", "ref", "closed_by",
+}
+
+
+def _walk_strings(node: Any, path: str = "",
+                  exempt: Optional[set] = None):
+    """遍历文档里所有字符串，产出 (路径, 文本)。"""
+    exempt = exempt or set()
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key in exempt:
+                continue
+            yield from _walk_strings(value, f"{path}.{key}" if path else str(key),
+                                     exempt)
+    elif isinstance(node, list):
+        for index, value in enumerate(node):
+            yield from _walk_strings(value, f"{path}[{index}]", exempt)
+    elif isinstance(node, str):
+        yield path, node
+
+
+def check_no_implementation_body(doc: Dict[str, Any]) -> List[Violation]:
+    """课程表里不得出现实现体。
+
+    课程表写的是「做什么、为什么、什么观测触发它、代价是什么、依赖什么」。
+    一旦它开始装代码，它就成了参考实现绕过 no-code 边界的通道 —— 而那条边界
+    是整套方法的地基（架构结论必须是从硬件行为反推的）。
+    """
+    out: List[Violation] = []
+    for path, text in _walk_strings(doc, exempt=IMPLEMENTATION_EXEMPT_KEYS):
+        match = RE_IMPLEMENTATION_BODY.search(text)
+        if match:
+            snippet = match.group(0)[:40].replace("\n", " ")
+            out.append(Violation(
+                "V12", path,
+                f"出现实现体的痕迹 {snippet!r}。课程表写决策与契约，不写代码 —— "
+                "它是参考实现唯一可能的泄漏通道，一旦能装代码，"
+                "no-code 边界就有了一条绕过去的路。"
+                "代码放实现侧；可复用的机制放知识库卡片的「最小可运行例」",
+            ))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# V13 — 四条轴必须表态
+# ---------------------------------------------------------------------------
+
+#: 必须表态的结构轴，各自一张闭合词汇表。
+#:
+#: 上游有四条正交轴（同步 / 取数 / 相位 / 操作数源），每条**必须表态**，
+#: 哪怕表态为 `none`。差别在于：我们的 12 个机制标签是「写了才查」，
+#: 而这四条是「**不写就违规**」。
+#:
+#: 为什么要这一层：架构层只要**不写**某条机制行，那个维度就完全不受约束 ——
+#: V5 只要求每个 milestone 有至少一条机制行。上游记录的病例正是这个形状：
+#: 一个把流式交接裁定成全员集合的 kernel 以三联症通过 M0 并轮轮硬调，
+#: 而「对比同步签名」本应在第一个绿轮就拉响警报。
+ADJUDICATION_AXES: Dict[str, Dict[str, Any]] = {
+    "cv_handoff": {
+        "values": {"flag_pair", "queue", "none"},
+        "label": "Cube 与 Vector 的交接方式",
+        "requires_label": "CV_HANDOFF",
+    },
+    "supply": {
+        "values": {"double_buffer", "serial", "none"},
+        "label": "搬运供给的组织方式",
+        "requires_label": "SUPPLY_KEEPUP",
+    },
+    "consumer_phase": {
+        "values": {"ping_pong", "convoy", "none"},
+        "label": "消费侧的分阶段方式",
+        "requires_label": "CONSUMER_PHASING",
+    },
+    "operand_source": {
+        "values": {"l1_direct", "ub_roundtrip", "none"},
+        "label": "Cube 操作数的来源",
+        "requires_label": "L1_RESIDENCY",
+    },
+}
+
+
+def check_adjudications(doc: Dict[str, Any]) -> List[Violation]:
+    """四条结构轴必须表态，非 none 的轴要有对应机制行锚着。"""
+    out: List[Violation] = []
+    adjudications = doc.get("adjudications")
+    if not isinstance(adjudications, dict):
+        out.append(Violation(
+            "V13", "adjudications",
+            "缺少 adjudications。四条结构轴必须逐条表态"
+            f"（{sorted(ADJUDICATION_AXES)}），**哪怕表态为 none** —— "
+            "不写就意味着那个维度完全不受约束，而 V5 只要求有至少一条机制行",
+        ))
+        return out
+
+    labels_used = {
+        str(line.get("label", "")).strip().upper()
+        for _mid, category, line in _iter_gate_lines(doc)
+        if category == "mechanism_lines"
+    }
+
+    for axis, spec in ADJUDICATION_AXES.items():
+        if axis not in adjudications:
+            out.append(Violation(
+                "V13", f"adjudications.{axis}",
+                f"没有对 {spec['label']} 表态。"
+                f"可选: {sorted(spec['values'])}（确实不涉及就写 none）",
+            ))
+            continue
+        value = str(adjudications[axis]).strip()
+        if value not in spec["values"]:
+            # 刻意和「完全没裁定」分开报：词汇表外的值说明作者表过态但用词
+            # 不在表里，该做的是对齐用词，而不是补一次裁定。
+            out.append(Violation(
+                "V13", f"adjudications.{axis}",
+                f"未知取值 {value!r}（{spec['label']}）。"
+                f"闭合词汇表: {sorted(spec['values'])}",
+            ))
+            continue
+        if value != "none" and spec["requires_label"] not in labels_used:
+            out.append(Violation(
+                "V13", f"adjudications.{axis}",
+                f"裁定为 {value!r}（非 none），"
+                f"但没有任何 {spec['requires_label']} 机制行锚着它。"
+                "表了态就要有一条可核验的行 —— 否则这个裁定只是一句声明",
+            ))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# V14 — 结构类门禁行必须先定价
+# ---------------------------------------------------------------------------
+
+#: 带结构断言、但没说「没有它慢多少」的门禁行。
+#:
+#: 上游的规矩：SASS 形状说的是参考长什么样；**只有探针测出这个形状值多少钱，
+#: 它才成为门禁行**，否则它属于决策正文里的描述。实证：某版 M0 门禁带了
+#: 35 条未定价的形状行，把「长得像参考」变成学生必须用探针证明的契约 ——
+#: 八轮、两小时、零 kernel 工作；而唯一被定过价的那条是合法门禁行，
+#: 那条从未定价的寄存器切分**实际上比替代方案更慢**。
+def check_priced_structural_lines(doc: Dict[str, Any]) -> List[Violation]:
+    out: List[Violation] = []
+    for mid, category, line in _iter_gate_lines(doc):
+        if category != "mechanism_lines":
+            continue
+        anchor = line.get("structural_anchor")
+        if not anchor:
+            continue
+        lid = line.get("id", "<无 id>")
+        base = f"{mid}.mechanism_lines.{lid}"
+        priced = line.get("priced")
+        if not isinstance(priced, dict):
+            out.append(Violation(
+                "V14", f"{base}.priced",
+                "带 structural_anchor 的门禁行必须先定价："
+                "`priced: {delta_pct, source}`。"
+                "结构形状说的是参考长什么样 —— 只有测出「没有它慢多少」，"
+                "它才成为验收线，否则它属于决策正文里的描述",
+            ))
+            continue
+        delta = priced.get("delta_pct")
+        if not isinstance(delta, (int, float)) or delta <= 0:
+            out.append(Violation(
+                "V14", f"{base}.priced.delta_pct",
+                f"价格 {delta!r} 不是一个正数百分比。"
+                "没有它慢多少？这个数要来自消融或定价探针",
+            ))
+        if _is_blank(priced.get("source")):
+            out.append(Violation(
+                "V14", f"{base}.priced.source",
+                "价格必须说明出处（`job N` / `lever:<名字>` / `KB:<卡片 id>`）—— "
+                "一个没有出处的价格和没有价格一样",
+            ))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# V15 — 不得把参考的分配结果钉成验收线
+# ---------------------------------------------------------------------------
+
+#: 「指标 == 具体数值」这种形状。
+#:
+#: 上游机械拒绝把 `regs_per_thread == N` 这类**在参考上观测到的分配结果**
+#: 写成门禁行：那些是观测结果，不是要求。门禁只写上界与「溢出为零」，
+#: 切分数字留给实现自己选。
+#:
+#: 实证：某版钉死了一组切分数字，学生照做，它的 producer 装不下同一个
+#: milestone 要求的索引预取，首次跑绿就大量溢出；同算子的另一份课程表写明
+#: 「切分数字是编译器的分配结果、不是验收线」，学生选了别的切分、零溢出。
+RE_PINNED_ALLOCATION = re.compile(
+    r"(?P<field>[\w:.()%/\-]*(?:block_dim|regs?_per_thread|tile_num|"
+    r"block_num|core_num|buffer_num)[\w:.()%/\-]*)"
+    r"\s*==\s*(?P<value>\d+)",
+    re.IGNORECASE)
+
+
+def check_no_pinned_allocation(doc: Dict[str, Any]) -> List[Violation]:
+    out: List[Violation] = []
+    for mid, category, line in _iter_gate_lines(doc):
+        lid = line.get("id", "<无 id>")
+        anchor = line.get("anchor") or {}
+        expr = anchor.get("expr") if isinstance(anchor, dict) else None
+        if not isinstance(expr, str):
+            continue
+        match = RE_PINNED_ALLOCATION.search(expr)
+        if match:
+            field = match.group("field")
+            value = match.group("value")
+            out.append(Violation(
+                "V15", f"{mid}.{category}.{lid}.anchor.expr",
+                f"把 {field} == {value} 写成了验收线。"
+                "这是在参考上**观测到的分配结果**，不是要求 —— "
+                f"钉死它会让实现被绑在一组具体数字上，"
+                f"而那组数字在候选的资源预算下可能装不下。\n"
+                f"    改成上界 + 配对的溢出/冲突行，例如 "
+                f"`{field} <= {value}` 且「无溢出」，具体取值留给实现选",
+            ))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# V16 — 与上一版做差：阈值不得悄悄放宽
+# ---------------------------------------------------------------------------
+
+def _gate_line_index(doc: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    for mid, category, line in _iter_gate_lines(doc):
+        key = f"{mid}.{category}.{line.get('id', '<无 id>')}"
+        out[key] = line
+    return out
+
+
+def _threshold_of(line: Dict[str, Any]) -> Optional[Tuple[str, float]]:
+    anchor = line.get("anchor") or {}
+    expr = anchor.get("expr") if isinstance(anchor, dict) else None
+    if not isinstance(expr, str):
+        return None
+    match = re.search(r"(?P<op><=|>=|<|>)\s*(?P<value>-?\d+(?:\.\d+)?)", expr)
+    if not match:
+        return None
+    return match.group("op"), float(match.group("value"))
+
+
+def check_against_previous(doc: Dict[str, Any],
+                           previous: Optional[Dict[str, Any]]
+                           ) -> List[Violation]:
+    """补丁模式：和上一版做差，拦住「悄悄挪球门」。
+
+    不做差的话，两种改动完全无痕：
+      放宽阈值   把 `< 4.2` 改成 `< 6.0`，于是实现带着两倍于参考的等待量过关
+      删掉机制行 那条机制从此不被核验，而 record 会判「无法核验」后放过
+
+    上游的双模校验还把「只改数值的重调」与「换了 VERIFY 类别的新主张」分开
+    （原话：一条保留数字但换了类别的行，是旧主张的词穿着新衣服）。
+    """
+    out: List[Violation] = []
+    if previous is None:
+        return out
+
+    before = _gate_line_index(previous)
+    after = _gate_line_index(doc)
+
+    for key, old_line in before.items():
+        if key not in after:
+            if str(old_line.get("status")) == "PASS":
+                # 已经关掉的行被删掉是正常的收尾
+                continue
+            out.append(Violation(
+                "V16", key,
+                "这条门禁行在上一版里有、这一版没了，而它还没销账。"
+                "删掉一条机制行等于让那条机制从此不被核验 —— "
+                "要放弃它请显式销账为 INFEASIBLE 并举证",
+            ))
+            continue
+
+        new_line = after[key]
+        old_threshold = _threshold_of(old_line)
+        new_threshold = _threshold_of(new_line)
+        if not old_threshold or not new_threshold:
+            continue
+        old_op, old_value = old_threshold
+        new_op, new_value = new_threshold
+        if old_op != new_op:
+            out.append(Violation(
+                "V16", f"{key}.anchor.expr",
+                f"比较符从 {old_op} 改成了 {new_op}。"
+                "保留数字但换了方向的行，是旧主张穿着新衣服 —— "
+                "这是一个新主张，要重新举证",
+            ))
+            continue
+        looser = ((old_op in ("<", "<=") and new_value > old_value)
+                  or (old_op in (">", ">=") and new_value < old_value))
+        if looser and _is_blank(new_line.get("band_rationale")):
+            out.append(Violation(
+                "V16", f"{key}.anchor.expr",
+                f"阈值从 {old_value} 放宽到 {new_value}，而没有写 "
+                "band_rationale。\n"
+                "    放宽验收线是「挪球门」—— 实现没变而门禁过了，"
+                "增益的解释就是错的。\n"
+                "    确有理由（比如上一版那个数取自另一个 shape）请写明，"
+                "那样至少是一个有记录的决定",
+            ))
+    return out
+
+
 RULES = {
     "V0": ("课程表结构完整", check_document_shape),
     "V1": ("五元组完整", check_five_tuple),
@@ -841,22 +1264,58 @@ RULES = {
     "V9": ("原子组同批落地", check_atomic_groups),
     "V10": ("架构决策须命名验证通道", check_verification_channel),
     "V11": ("机制行须有标签与停顿锚点", check_mechanism_labels),
+    "V12": ("课程表不得含实现体", check_no_implementation_body),
+    "V13": ("四条结构轴必须表态", check_adjudications),
+    "V14": ("结构类门禁行必须先定价", check_priced_structural_lines),
+    "V15": ("不得把参考的分配结果钉成验收线", check_no_pinned_allocation),
+}
+
+#: 需要上一版才能跑的规则。单独列出来，因为它们在 authoring 模式下无从比较。
+PATCH_RULES = {
+    "V16": ("与上一版做差：阈值不得悄悄放宽", check_against_previous),
 }
 
 
 def validate(doc: Dict[str, Any],
-             rules: Optional[Iterable[str]] = None) -> List[Violation]:
-    """跑校验，返回全部违规。rules 为 None 时跑全部规则。"""
-    selected = list(rules) if rules else list(RULES)
+             rules: Optional[Iterable[str]] = None,
+             previous: Optional[Dict[str, Any]] = None) -> List[Violation]:
+    """跑校验，返回全部违规。
+
+    rules 为 None 时跑全部规则。给了 previous（上一版课程表）就额外跑补丁
+    规则 —— 它们在没有上一版时无从比较，所以不在默认集合里。
+
+    上游把这件事做成双模：新蒸馏的 v1 全量严格，补丁只约束它新增的门禁行。
+    我们这边的形态是「全量规则 + 给了上一版才跑的做差规则」，效果一样：
+    不做差的话，放宽阈值与删掉机制行这两种改动完全无痕。
+    """
+    known = dict(RULES)
+    known.update(PATCH_RULES)
+    if rules:
+        selected = list(rules)
+    else:
+        selected = list(RULES)
+        if previous is not None:
+            selected += list(PATCH_RULES)
+
     out: List[Violation] = []
     for rule in selected:
-        entry = RULES.get(rule)
+        entry = known.get(rule)
         if entry is None:
             out.append(Violation(
-                "ARG", "--rules", f"未知规则 '{rule}'；可选: {sorted(RULES)}",
+                "ARG", "--rules", f"未知规则 '{rule}'；可选: {sorted(known)}",
             ))
             continue
-        out.extend(entry[1](doc))
+        if rule in PATCH_RULES:
+            if previous is None:
+                out.append(Violation(
+                    "ARG", "--against",
+                    f"规则 {rule} 需要上一版课程表才能比较，"
+                    "请用 --against <上一版 milestone.json>",
+                ))
+                continue
+            out.extend(entry[1](doc, previous))
+        else:
+            out.extend(entry[1](doc))
     return out
 
 
@@ -889,6 +1348,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="以 JSON 输出结果，供脚本消费")
     parser.add_argument("--rules", type=str, default="",
                         help="只跑指定规则，逗号分隔，如 V2,V6")
+    parser.add_argument("--against", type=Path, default=None,
+                        help="上一版 milestone.json。给了它会额外跑做差规则："
+                             "拦住悄悄放宽阈值与删掉机制行 —— "
+                             "这两种改动不做差完全无痕")
     parser.add_argument("--list-rules", action="store_true",
                         help="列出全部规则后退出")
     return parser
@@ -901,6 +1364,8 @@ def main() -> int:
     if args.list_rules:
         for rule, (title, _fn) in RULES.items():
             print(f"{rule:<4} {title}")
+        for rule, (title, _fn) in PATCH_RULES.items():
+            print(f"{rule:<4} {title}（需要 --against）")
         return 0
 
     if args.milestone is None:
@@ -912,8 +1377,17 @@ def main() -> int:
         print(exc, file=sys.stderr)
         return 2
 
+    previous = None
+    if args.against is not None:
+        try:
+            previous = _load(args.against)
+        except SystemExit as exc:
+            print(f"错误: 读不到上一版课程表 {args.against}: {exc}",
+                  file=sys.stderr)
+            return 2
+
     rules = [r.strip() for r in args.rules.split(",") if r.strip()] or None
-    violations = validate(doc, rules)
+    violations = validate(doc, rules, previous)
 
     if args.as_json:
         print(json.dumps({

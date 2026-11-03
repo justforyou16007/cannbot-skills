@@ -64,6 +64,7 @@ import reference_adapter  # noqa: E402
 import reference_library  # noqa: E402
 import seal_reference  # noqa: E402
 import signature_probe  # noqa: E402
+import structure_probe  # noqa: E402
 
 #: 脚本名 → 它的 parser 工厂。
 PARSERS = {
@@ -75,6 +76,7 @@ PARSERS = {
     "fence_check.py": fence_check.build_parser,
     "lever_probe.py": lever_probe.build_parser,
     "signature_probe.py": signature_probe.build_parser,
+    "structure_probe.py": structure_probe.build_parser,
     "noise_floor.py": noise_floor.build_parser,
     "milestone_validate.py": milestone_validate.build_parser,
 }

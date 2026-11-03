@@ -165,6 +165,12 @@ msopprof_sim/OPPROF_<timestamp>/
 cat msopprof_sim/OPPROF_*/simulator/core0.veccore0/core0.veccore0_instr_exe.csv
 ```
 
+> 这个文件除了「找最耗时指令」，还有一个与耗时无关的用途：它的 `pipe` 与
+> `detail` 两列是**结构判据** —— `pipe` 区分搬运路径（MTE1 的 L1→L0A 直送
+> vs MTE2/MTE3 的 GM↔UB 往返），`detail` 给出源/目的地址、长度、步幅。
+> 用来判定「设计声称的结构到底有没有被构建出来」，见
+> `references/structural-verification.md`。
+
 ---
 
 ## 常见问题

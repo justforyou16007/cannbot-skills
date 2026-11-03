@@ -108,14 +108,18 @@ Campaign 编排者。你调度两个 Agent，监控状态机，汇总结果。
 步骤 6  产出课程表      调度 forge-arch
 步骤 7  逐行实现        调度 forge-coder
                         每行：fence_check → 评测 → signature_probe
-                        → record（带 --signature --milestone --symptom）
+                        → record（带 --signature --milestone --symptom
+                                  --fence-report）
+                        没有 --fence-report 的一轮不抬高 best
 步骤 8  停滞处理        三个口子任一触发 → 交回 forge-arch
                         必要时 campaign.py reopen 按依赖图作废下游
 步骤 9  达标            状态转 shipped → promote --library
                         产物复制进库 + 校验和 + 血统；只留路径等于没留
 步骤 10 重取基线        新参考换了，噪声底与参考签名都要重取
                         set-noise-floor + set-reference-signature
-步骤 11 知识沉淀        认证过的发现入库，证伪的方向进死路表
+步骤 11 知识沉淀        campaign.py harvest 列出本代的知识欠账
+                        认证过的发现入库，证伪的方向进重试前置条件表
+                        欠账未结时 promote 会拒绝 —— 这是最后一个还来得及的时刻
                         ledger --recipes 看知识库有没有在帮忙
 ```
 
@@ -167,8 +171,15 @@ campaign 在下列任一条件下结束，**不要越过它继续**：
 | 构建连续失败 ≥ 3 次 | 暂停上报 |
 | 内层连续无进展 / 决策图走穷 / 门禁僵持 | 交回 `forge-arch`，**不要**自己调 |
 | 连续精度或编译失败 | 实现问题，不消耗架构重入机会；查实现 |
+| 机制被证伪且归因 `implementation` | 课程表读对了参考、实现没做到。补一张 hwkb 卡片，**不要改课程表** |
+| 机制被证伪且归因 `curriculum` | 课程表声称的位置参考自己就不在。`reopen` 那条决策 |
 | 噪声底待重测 | 先 `noise_floor.py` 再 `set-noise-floor`，之前 record 会被拒 |
 | 取库锁超时 | 另一个任务正在写产物库。入库要复制产物，大目录会慢；确认无人在跑可删 `.lock` |
+| `promote` 报「知识欠账」 | 本代有该入库而没入库的经验。跑 `harvest` 看清单并写卡片；确实不值得入库时加 `--allow-unharvested`（会写进台账） |
+| `record` 报「围栏未查」 | 没传 `--fence-report`。围栏是静态扫描不花机时，补跑一次再 record —— 这一轮本来不会抬高 best |
+| `record` 报「围栏命中」 | 候选转发给了参考或厂商实现。这是实现问题，交回 `forge-coder`；**不要**豁免围栏 |
+| `record` 报「设备占比过低」 | `time_us` 量的主要是 host 开销，不是 kernel。加大 `num_trials` 重测 |
+| `record` 拒收「baseline 来自缓存」 | 去掉 `--baseline-cache` 重测。缓存的 baseline 让 burn-in 与 A-B-B-A 镜像同时失效 |
 | hook 拦截了读参考 | 这是预期行为，改用测量方式 |
 | 环境问题 | 告知用户并停止，不要绕过 |
 
@@ -195,3 +206,9 @@ campaign 在下列任一条件下结束，**不要越过它继续**：
 
 > **知识沉淀约定**：知识库卡片正文一律用中文（frontmatter 的结构化字段值
 > 除外）。准入要求目标架构上的探针实测背书，没有实测就不要写。
+>
+> 卡片正文**不写**：日期、第 N 轮、commit sha、算子名、「参考实现」这类词。
+> 这些会让卡片读起来是 campaign 日记，而日记对别的 campaign 没有用。
+> 参考侧的具体细节（哪个文件、哪个函数、第几行）写进
+> `<kb_root>/provenance/<卡片 id>.md`，卡片里用 `provenance_archive` 指向它 ——
+> 那个目录只有人能读，agent 读不到。

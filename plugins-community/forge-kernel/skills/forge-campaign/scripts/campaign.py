@@ -75,16 +75,31 @@ ForgeKernel 跑的是两层循环，这个脚本是两层的调度中枢。
 """
 
 import argparse
+import hashlib
 import json
 import math
 import os
 import re
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 SCHEMA_VERSION = "2.0"
+
+#: 评测次数的默认上限。
+#:
+#: 早先默认不限。不限的代价是循环没有任何出口：停滞计数只要被「超过噪声底」
+#: 清零就永远不转 stalled，而 status 每轮都说「继续实现」。论文实现同时卡
+#: 三个维度（墙钟 4 小时、60 轮、teacher 3 轮），我们至少要有轮数这一个。
+DEFAULT_BUDGET = 60
+
+#: 本轮实测抖动达到存量噪声底的多少倍时，判定「环境变了，旧判据不再可信」。
+#:
+#: 不用「超过就拒」：存量噪声底本身是从某一次 cv 量出来的，之后每轮在它
+#: 上下浮动是正常的。那样的门禁会天天响，然后被反射性豁免。
+STALE_FLOOR_FACTOR = 1.5
 
 #: 认得的架构串。
 #:
@@ -100,6 +115,7 @@ KNOWN_ARCHS = ("DAV_2201", "DAV_3510")
 #: reference_adapter.py。这里只用到两个常量，为此在模块顶层 import 整个脚本
 #: 不值得；一致性同样由 tests/test_campaign.py 的用例盯着。
 SPEC_FILENAME = "reference_spec.json"
+SEALED_PATHS_FILENAME = "sealed_paths.txt"
 KIND_BUILTIN = "builtin_aclnn"
 
 # 状态机
@@ -108,6 +124,7 @@ STATE_IMPLEMENT = "implement"  # 编码层在实现当前决策行
 STATE_STALLED = "stalled"      # 需要架构层重新进入
 STATE_SHIPPED = "shipped"      # 本代达标，可提升为下一代参考
 STATE_STOPPED = "stopped"      # 自我提升收敛或预算耗尽
+STATE_BLOCKED = "blocked"      # 连续实现失败，需要人介入（不消耗架构重入）
 
 #: 外层重入的口子（论文 §3.3 给了前三个；第四个是本实现补的，见下）。
 STALL_NO_IMPROVEMENT = "no_improvement"
@@ -137,6 +154,10 @@ STALL_GATE_IMPASSE = "gate_impasse"
 #: 混成一条会让架构层去补参数重跑，而真正该改的课程表没人碰。
 STALL_MECHANISM_UNVERIFIED = "mechanism_never_verified"
 STALL_MECHANISM_REFUTED = "mechanism_refuted"
+
+#: 连续实现失败。**不是**外层重入口 —— 实现 bug 不该花掉一次架构重入，
+#: 但它必须改变动作，否则同一个错会重复几十次把预算吃光。
+STALL_IMPL_FAILURE = "implementation_blocked"
 
 #: 内层连续多少轮「测出来了但增益不够」才交回架构层。
 DEFAULT_STAGNATION_THRESHOLD = 3
@@ -170,6 +191,8 @@ VERDICT_ACCEPT = "accept"
 VERDICT_ACCEPT_UNVERIFIED = "accept_unverified"
 VERDICT_REVERT = "revert"
 VERDICT_REGRESSION = "regression"
+#: 确认复测。不是一次候选裁决 —— 它回答「上次那个增益再测一次还在不在」。
+VERDICT_CONFIRM = "confirm"
 
 #: 对候选的裁决。台账里还有 reopen / promote / stop / noise_floor 这类
 #: **管理条目**，它们不代表「某条决策被试过」，统计时必须排除。
@@ -370,7 +393,8 @@ def _expected_direction(operator: str) -> Optional[int]:
 def verify_mechanism_line(line: Dict[str, Any],
                           signature: Dict[str, Any],
                           previous_snapshot: Optional[Dict[str, float]] = None,
-                          move_min_pct: float = MECHANISM_MOVE_MIN_PCT
+                          move_min_pct: float = MECHANISM_MOVE_MIN_PCT,
+                          reference_snapshot: Optional[Dict[str, float]] = None,
                           ) -> Dict[str, Any]:
     """核验一条机制行：阈值成立，**而且**那个字段确实因本次改动而移动。
 
@@ -432,6 +456,18 @@ def verify_mechanism_line(line: Dict[str, Any],
     threshold = float(match.group("value"))
     op = match.group("op")
 
+    # 阈值本身要受参考实测值约束。
+    #
+    # 不约束的后果是实测出来的：一条锚在参考值 1.6 的停顿行被写成 ≤6.0，
+    # 于是实现以**两倍于参考**的等待量舒舒服服坐在带内，轮轮过门禁。
+    # 带宽宽出参考几倍的验收线只剩仪式价值。
+    #
+    # 默认带宽取参考实测的 1.25 倍（比噪声底高一档）。要更宽必须在机制行里
+    # 写 band_rationale 说明理由 —— 那样至少是一个有记录的决定，而不是
+    # 一个随手写大的数字。
+    band = line.get("band_rationale")
+    out["band_rationale"] = band
+
     matches = lookup_signature_matches(signature, field)
     if len(matches) > 1:
         # 同名指标在 Cube 与 Vector 上各有一份。挑哪个都是蒙 ——
@@ -455,6 +491,32 @@ def verify_mechanism_line(line: Dict[str, Any],
     actual, hit_channel = matches[0]
     out.update(actual=actual, threshold=threshold, operator=op,
                channel=hit_channel)
+
+    # 带宽纪律：只对「越小越好」的上界型阈值判（< / <=）。
+    # 下界型（> / >=）的语义相反，参考值在它那一侧不构成同样的约束。
+    # 注意取的是**参考**快照，不是上一轮快照。
+    #
+    # 这条纪律问的是「这个验收线和参考实际做到的水平差多远」。拿上一轮的
+    # 读数当锚会让带宽随着实现一起漂：上一轮坐在 5.5（参考 1.6），下一轮
+    # 的带宽就变成 6.9 —— 参考从此退出判据。
+    reference_value = (reference_snapshot or {}).get(hit_channel)
+    if (op in ("<", "<=") and isinstance(reference_value, (int, float))
+            and reference_value > _MOVE_EPS):
+        cap = reference_value * MECHANISM_BAND_FACTOR
+        out["reference_value"] = reference_value
+        out["band_cap"] = cap
+        if threshold > cap and not band:
+            out.update(
+                verified=False,
+                reason=(f"机制行的阈值 {threshold} 宽出参考实测值 "
+                        f"{reference_value} 的 {threshold / reference_value:.1f} 倍"
+                        f"（默认带宽上限 {cap:.3f} = 参考 × "
+                        f"{MECHANISM_BAND_FACTOR}）。\n"
+                        "  这样的验收线只剩仪式价值：实现可以带着远高于参考的"
+                        "等待量坐在带内，轮轮过门禁。\n"
+                        "  要么把阈值收到带内，要么在机制行里写 "
+                        "band_rationale 说明为什么这个参考通道上更宽是合理的"))
+            return out
 
     threshold_ok = _COMPARATORS[op](actual, threshold)
     if not threshold_ok:
@@ -516,6 +578,22 @@ def verify_mechanism_line(line: Dict[str, Any],
     return out
 
 
+def _iter_all_gate_lines(doc: Dict[str, Any]):
+    """遍历 milestone 里所有门禁行，产出 (milestone_id, 类别, 行)。"""
+    for milestone in doc.get("milestones", []) or []:
+        if not isinstance(milestone, dict):
+            continue
+        mid = milestone.get("id", "<无 id>")
+        gate = milestone.get("gate") or {}
+        if not isinstance(gate, dict):
+            continue
+        for category in ("correctness_lines", "performance_lines",
+                         "mechanism_lines"):
+            for line in gate.get(category, []) or []:
+                if isinstance(line, dict):
+                    yield mid, category, line
+
+
 def collect_mechanism_lines(milestone_doc: Dict[str, Any],
                             decision_id: str) -> List[Dict[str, Any]]:
     """取出该决策所属 milestone 的机制行。
@@ -535,10 +613,300 @@ def collect_mechanism_lines(milestone_doc: Dict[str, Any],
     return []
 
 
+def judge_structure(structure_report: Optional[Dict[str, Any]]
+                    ) -> Dict[str, Any]:
+    """结构核验的裁决：声称的结构在不在。
+
+    这一关排在停顿核验**之前**，因为它能在任何性能数出来之前给出结论，
+    而且它的结论优先：**未落地的结构优先于改验收措辞** —— 把阈值改宽
+    不会让一个「不在」变成「在」。
+
+    三态，各自对应完全不同的下一步：
+      ok        结构都在，继续看停顿
+      absent    结构不在 → **实现退化**。该修实现、或给实现补一张经验卡片，
+                不该改课程表（归因错了会把改对的东西改坏）
+      unchecked 没查或查不了 —— 不构成任何结论
+    """
+    if not isinstance(structure_report, dict):
+        return {"status": "unchecked",
+                "reason": "没有结构核验报告（record 未传 --structure-report）"}
+    assertions = structure_report.get("assertions")
+    if not isinstance(assertions, list) or not assertions:
+        return {"status": "unchecked", "reason": "结构报告里没有任何断言"}
+
+    failed = [a for a in assertions if isinstance(a, dict)
+              and a.get("verdict") == "fail"]
+    unknown = [a for a in assertions if isinstance(a, dict)
+               and a.get("verdict") == "unknown"]
+    if failed:
+        names = [str(a.get("assertion")) for a in failed]
+        return {
+            "status": "absent",
+            "failed": names,
+            "reason": (f"{len(failed)} 条结构断言不成立（{names}）。"
+                       "声称的结构没有被构建出来 —— 这是实现问题，"
+                       "不是课程表对参考行为的解释错了"),
+        }
+    if unknown:
+        names = [str(a.get("assertion")) for a in unknown]
+        return {
+            "status": "unchecked",
+            "reason": (f"{len(unknown)} 条结构断言查不了（{names}）—— "
+                       "「查不了」不等于「通过」"),
+        }
+    return {"status": "ok",
+            "reason": f"{len(assertions)} 条结构断言全部成立"}
+
+
+def judge_fence(fence_report: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """转发围栏的裁决：这一轮到底有没有被查过「是不是转发给参考」。
+
+    围栏脚本本来就有（`fence_check.py`），文档也写明它排在任何计时之前 ——
+    但做裁决的 `record` 此前**完全不看它**。于是这道纪律是纯自愿的：
+    跑不跑、结果如何，对裁决没有任何影响。
+
+    这正是本轮一直在修的那种形态：**一道看起来在、但关不上的门**。而这道
+    门守的东西很具体 —— 候选直接调厂商实现时，加速比、精度、所有门禁全过，
+    一行 kernel 都没写。自我提升场景更隐蔽：第 n 代转发给第 n−1 代，链条
+    可以这样空转很多轮，每轮都「没有退化」。
+
+    三态：
+      clean      围栏跑过且干净
+      violated   围栏命中 —— 这一轮的数不能用，无论它多好看
+      unchecked  没传报告 —— 不构成结论，也不得抬高 best
+    """
+    if not isinstance(fence_report, dict):
+        return {"status": "unchecked",
+                "reason": "没有围栏报告（record 未传 --fence-report）"}
+    findings = fence_report.get("findings")
+    if findings is None:
+        # 工具的输出里一定有 findings 这个键（空表表示干净）。没有它说明
+        # 这不是一份 fence_check 的报告 —— 读成「干净」就是凭一份来源不明
+        # 的 JSON 放行。
+        return {"status": "unchecked",
+                "reason": ("这份报告里没有 findings 键，不像是 fence_check.py "
+                           "的输出。\n"
+                           "    拿一份认不出的 JSON 当围栏证据，"
+                           "和没有证据是同一件事")}
+    if not isinstance(findings, list):
+        return {"status": "unchecked",
+                "reason": f"报告里的 findings 不是数组（{type(findings).__name__}）"}
+    if findings:
+        rules = sorted({str(f.get("rule")) for f in findings
+                        if isinstance(f, dict)})
+        return {
+            "status": "violated",
+            "rules": rules,
+            "count": len(findings),
+            "reason": (f"围栏命中 {len(findings)} 处（规则 {rules}）。"
+                       "候选转发给了参考实现或厂商实现 —— "
+                       "这一轮的加速比不是它自己挣来的"),
+        }
+    return {"status": "clean",
+            "reason": f"围栏跑过且干净（扫了 "
+                      f"{fence_report.get('files_scanned', '?')} 个源文件）"}
+
+
+#: 设备执行至少要占到墙上时间的多少。
+#:
+#: 低于这个比例时，`time_us` 量的主要不是 kernel ——  是 host 侧的下发、
+#: 排队与同步。而机制核验读的是 msprof 的**设备侧**通道。两者量的东西
+#: 几乎不相交时，「增益超噪声底 + 机制已核实」就是两个互不相关的事实被
+#: 钉在了一起：那个百分比来自 host，那个机制结论来自 device。
+#:
+#: 20% 是本工具的工程判断，没有文档出处 —— 它只要能把「host 主导」这种
+#: 定性情形拦下来就够了，不需要精确。
+DEVICE_SHARE_MIN = 0.20
+
+
+def reconcile_device_share(doc: Dict[str, Any],
+                           signature: Optional[Dict[str, Any]]
+                           ) -> Optional[Dict[str, Any]]:
+    """把 msprof 的设备执行时长和评测的墙上时间对一次账。
+
+    两个数都早就在手：`signature.launch.task_duration_us` 来自 msprof，
+    `time_us` 来自评测的 NPU Event 计时。此前没有任何地方把它们放在一起看。
+
+    返回 None 表示这笔账对不了（缺数），否则返回一份对账结果。
+    对不了**不算通过** —— 调用方据此报告，不据此放行。
+    """
+    if not isinstance(signature, dict):
+        return None
+    launch = signature.get("launch")
+    if not isinstance(launch, dict):
+        return None
+    field = launch.get("task_duration_us")
+    device_us = field.get("value") if isinstance(field, dict) else field
+    if not isinstance(device_us, (int, float)) or device_us <= 0:
+        return None
+
+    wall_us = _evolved_time_us(doc)
+    if not isinstance(wall_us, (int, float)) or wall_us <= 0:
+        return None
+
+    share = float(device_us) / float(wall_us)
+    return {
+        "device_us": float(device_us),
+        "wall_us": float(wall_us),
+        "device_share": round(share, 4),
+        "threshold": DEVICE_SHARE_MIN,
+        "ok": share >= DEVICE_SHARE_MIN,
+        "reason": (
+            f"设备执行 {device_us:.1f}us / 墙上 {wall_us:.1f}us = "
+            f"{share * 100:.1f}%"
+            + ("" if share >= DEVICE_SHARE_MIN else
+               f"，低于 {DEVICE_SHARE_MIN * 100:.0f}%。\n"
+               "    这说明 time_us 量的主要不是 kernel，而是 host 侧的下发、"
+               "排队与同步；\n"
+               "    而机制核验读的是 msprof 的设备侧通道。两者量的东西几乎"
+               "不相交，\n"
+               "    「增益超噪声底 + 机制已核实」会变成两个互不相关的事实被"
+               "钉在一起。\n"
+               "    先把 host 开销摊掉（加大 num_trials、或一对 Event 套 N 次"
+               "连发）再测")),
+    }
+
+
+def _claimed_position_matches_reference(op: str, threshold: float,
+                                        reference_value: float) -> bool:
+    """这条机制行声称的位置，和参考**实际**坐的位置对得上吗。
+
+    这里刻意**不**用「参考是否满足这条行的阈值」来判。那个判法在最常见的
+    写法上就错：课程表写 `< 4.2`、参考读数正好 4.2（要求实现追平参考），
+    `4.2 < 4.2` 为假，于是一条完全正当的行会被判成「读错了参考」。
+
+    真正要问的是条件原文那句话 ——「参考侧该字段**本来就不在**声称的位置」。
+    也就是说，这是一个「差多远」的问题，不是一个「满不满足」的问题。
+    所以复用已有的带宽常数 MECHANISM_BAND_FACTOR（1.25，比噪声底高一档）：
+
+      上界型（< / <=）  阈值 ≥ 参考 / 1.25
+                        → 声称的位置就在参考附近（或更松），读法没问题
+                        → 阈值 < 参考 / 1.25 则是在说「参考坐得比它实际
+                          低得多」，那是读错了参考，而且会让实现去追一个
+                          参考自己都达不到的数
+
+      下界型（> / >=）  方向相反：阈值 ≤ 参考 × 1.25
+
+    `==` / `!=` 不蕴含方向，按「数量级对得上」处理。
+    """
+    if reference_value <= _MOVE_EPS:
+        # 参考侧本来就接近 0。这种通道上「声称的位置」无从比较 ——
+        # 任何上界都在它之上，任何下界都在它之下。
+        return True
+    if op in ("<", "<="):
+        return threshold >= reference_value / MECHANISM_BAND_FACTOR
+    if op in (">", ">="):
+        return threshold <= reference_value * MECHANISM_BAND_FACTOR
+    return (reference_value / MECHANISM_BAND_FACTOR <= threshold
+            <= reference_value * MECHANISM_BAND_FACTOR)
+
+
+def attribute_mechanism_failure(
+        results: List[Dict[str, Any]],
+        reference_snapshot: Optional[Dict[str, float]]) -> Dict[str, Any]:
+    """机制没落地时，该修的是实现还是课程表。
+
+    上游的分流规则写得很具体：
+
+      > 声称无冲突布局而冲突仍高 ⇒ **学生没做到（退化回退）⇒ 加知识库卡片，
+      > 不要改课程表**；只有「参考侧该字段本来就不在声称的位置」才是课程表缺陷
+
+    判据因此是**参考快照**，而不是本轮读数：
+
+      声称的位置与参考实际位置对得上（差在 1.25 倍带内）
+        → 课程表对参考的读法是对的；没做到的是实现
+        → `implementation`（补一张经验卡片，别动课程表）
+
+      对不上
+        → 课程表声称参考坐在一个它实际不在的位置上。这不只是记错一个数 ——
+          实现会被要求去追一个参考自己都达不到的目标
+        → `curriculum`（该重开那条决策）
+
+      参考侧没这个读数，或这条行本身解析不成一个可核验的断言
+        → 判不了。这里取 `implementation`，理由见下。
+
+    为什么判不了时偏向 implementation：两种误判的代价不对称。
+
+      判成 curriculum 而其实是实现  架构层被连续叫回来重写课程表，而下一轮
+                                    实现还是同一个退化回退 —— 改对的东西被
+                                    改坏、改坏的东西没人碰。这是实测观察到的
+                                    那条路。
+      判成 implementation 而其实是课程表  实现失败计数爬到阈值 → 状态转
+                                    `blocked` → **停下来交给人**。
+
+    后者是一个会响的失败，前者是一个不会响的失败。所以默认偏向前者。
+    """
+    offenders = [r for r in results
+                 if r.get("verified") is False or r.get("vacuous")]
+    if not offenders:
+        return {"attribution": None, "reason": "没有不成立的机制行"}
+
+    misread: List[str] = []
+    not_delivered: List[str] = []
+    untriageable: List[str] = []
+
+    for item in offenders:
+        channel = item.get("channel")
+        threshold = item.get("threshold")
+        op = item.get("operator")
+        line_id = str(item.get("id"))
+        if (not isinstance(channel, str) or op not in _COMPARATORS
+                or not isinstance(threshold, (int, float))):
+            # 连「这条行想断言什么」都没解析出来（表达式形状不对、多子句、
+            # 同名通道歧义）。分流不了 —— 归进 untriageable，不要当成
+            # 「读错了参考」：那会把一条写坏的行当成架构层的错。
+            untriageable.append(line_id)
+            continue
+        reference_value = (reference_snapshot or {}).get(channel)
+        if not isinstance(reference_value, (int, float)):
+            untriageable.append(line_id)
+            continue
+        if _claimed_position_matches_reference(op, float(threshold),
+                                               float(reference_value)):
+            not_delivered.append(line_id)
+        else:
+            misread.append(line_id)
+
+    if misread:
+        # 只要有一条是「读错了参考」，就该回架构层 —— 那条行的前提是错的，
+        # 在它底下调实现是白费。
+        return {
+            "attribution": "curriculum",
+            "misread_lines": misread,
+            "not_delivered_lines": not_delivered,
+            "untriageable_lines": untriageable,
+            "reason": (f"机制行 {misread} 声称的位置**参考自己就不在**"
+                       f"（差出 {MECHANISM_BAND_FACTOR} 倍带外）。\n"
+                       "    这不只是记错一个数：实现会被要求去追一个参考"
+                       "自己都达不到的目标。\n"
+                       "    这是课程表对参考行为的解释错了 —— 该重开那条决策，"
+                       "在一个错的前提底下调实现是白费。"),
+        }
+    return {
+        "attribution": "implementation",
+        "not_delivered_lines": not_delivered,
+        "untriageable_lines": untriageable,
+        "reason": (
+            (f"机制行 {not_delivered} 声称的位置与参考实际位置对得上 —— "
+             "课程表的读法没问题，没做到的是实现。\n"
+             if not_delivered else "")
+            + (f"机制行 {untriageable} 分流不了（参考侧没有同通道读数，"
+               "或这条行解析不成可核验的断言）；按实现失败处理。\n"
+               "    两种误判的代价不对称：判成课程表缺陷会让架构层连续重写"
+               "课程表，而实现\n"
+               "    还是同一个退化回退（一个不会响的失败）；判成实现失败"
+               "会把状态推到 blocked\n"
+               "    并交给人（一个会响的失败）。\n"
+               if untriageable else "")
+            + "    补一张经验卡片记下这个退化回退，**不要改课程表**。"),
+    }
+
+
 def judge_mechanism(milestone_doc: Optional[Dict[str, Any]],
                     signature: Optional[Dict[str, Any]],
                     decision_id: str,
                     previous_snapshot: Optional[Dict[str, float]] = None,
+                    reference_snapshot: Optional[Dict[str, float]] = None,
                     ) -> Dict[str, Any]:
     """机制裁决：本次改动有没有把它声称的机制做出来。
 
@@ -573,7 +941,8 @@ def judge_mechanism(milestone_doc: Optional[Dict[str, Any]],
             "reason": f"milestone 里找不到决策 {decision_id} 所属的机制行",
         }
 
-    results = [verify_mechanism_line(line, signature, previous_snapshot)
+    results = [verify_mechanism_line(line, signature, previous_snapshot,
+                                    reference_snapshot=reference_snapshot)
                for line in lines]
 
     if all(r["verified"] is True for r in results):
@@ -595,7 +964,28 @@ def judge_mechanism(milestone_doc: Optional[Dict[str, Any]],
         pending = [r["id"] for r in results if r["verified"] is None]
         reason = f"机制行 {pending} 无法求值，未构成验证"
 
-    return {"status": status, "lines": results, "reason": reason}
+    out: Dict[str, Any] = {"status": status, "lines": results,
+                           "reason": reason}
+
+    # 机制没落地时，把「该修实现」和「该改课程表」分开。
+    #
+    # 此前这里什么都不分 —— refuted / vacuous 一律落进 streak_refuted，
+    # 也就是默认判「课程表解释错」，于是架构层被连续叫回来重写课程表，
+    # 而下一轮实现还是同一个退化回退。structure_probe 这条路能分流，
+    # 但它要 --structure-report，是可选参数：没传时默认路径仍然走反。
+    #
+    # 现在分流不依赖任何可选输入 —— 判据是参考快照，而它在 init 就必填。
+    if status in ("refuted", "vacuous"):
+        triage = attribute_mechanism_failure(results, reference_snapshot)
+        if triage["attribution"] == "implementation":
+            out["attribution"] = "implementation"
+            out["reason"] = reason + "\n  " + triage["reason"]
+        elif triage["attribution"] == "curriculum":
+            out["attribution"] = "curriculum"
+            out["reason"] = reason + "\n  " + triage["reason"]
+        out["triage"] = triage
+
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -627,6 +1017,205 @@ def all_decisions(milestone_doc: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     return out
 
 
+#: 连续多少次无果的重开之后拒绝再开。
+#:
+#: 上游取 2（`reopen_max_fruitless`），并且**计数从磁盘读** —— 进程重启后
+#: 仍然有效。我们这边同理：计数存进 state，不随任何一次 reopen 归零。
+#: 不设上限的话「重开 → 几轮不够 → 停滞 → 再重开」可以永久循环，而每一轮的
+#: status 看起来都健康（三个计数器都是 0/3）。
+REOPEN_MAX_FRUITLESS = 2
+
+#: 重开定价的形状：`<Δ百分比> via <来源>`。
+#:
+#: 上游的规矩是「没有价格就没有重开」：`reopen_price: <Δ> via
+#: probe:<path>#<n> | lever:<name> | KB:<entry>`，拿它去比对本步探针读数、
+#: 定价表或知识库条目，对不上就拒绝、记 UNPRICED_REOPEN、课程表原样不动。
+#: 实证：一次审计凭「等待指令落在哪里」这种推断翻掉了分段切分轴，整组决策
+#: 重做，而那次重开本身从未被定价。
+RE_REOPEN_PRICE = re.compile(
+    r"^\s*(?P<delta>-?\d+(?:\.\d+)?)\s*%?\s*via\s+"
+    r"(?P<kind>lever|probe|kb|ablation)\s*[:：]\s*(?P<ref>\S.*?)\s*$",
+    re.IGNORECASE)
+
+
+def _load_hwkb():
+    """按路径装载 forge-hwkb 的 hwkb.py。
+
+    卡片的 frontmatter 解析、认证字段的判据都在那边。在这里重写一份的
+    代价不是多几十行，而是两份判据会分头漂移 —— 这类分头漂移正是 L-DENY
+    当初失效的形态（写方和读方各拼各的路径）。
+    """
+    path = (Path(__file__).resolve().parent.parent.parent
+            / "forge-hwkb" / "scripts" / "hwkb.py")
+    if not path.is_file():
+        raise CampaignError(f"找不到 {path}，无法核对知识库卡片")
+    import importlib.util  # noqa: PLC0415
+    spec = importlib.util.spec_from_file_location("hwkb", path)
+    if spec is None or spec.loader is None:
+        raise CampaignError(f"{path} 无法装载")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+#: 从 certified_by.delta 里抠出一个百分数。
+#:
+#: 卡片的 delta 是人写的自由文本（`"-24.3%"`、`"mte2_pct 61.2 -> 31.0"`、
+#: `"总时间 -24.3%"`），所以这里只认带百分号的那一种。抠不出来就当作
+#: 「这张卡片没有记下可比的量」—— 不是当作 0，也不是当作通过。
+RE_CARD_DELTA_PCT = re.compile(r"(-?\d+(?:\.\d+)?)\s*%")
+
+
+def find_kb_card(kb_root: Path, card_id: str,
+                 arch_dirs: List[str]) -> Optional[Path]:
+    """在知识库里按 id 找卡片。不猜架构 —— 挨个架构目录找。
+
+    目录名由调用方从 hwkb.ARCH_DIRS 取，不在这里再抄一份：抄一份就会有
+    两个「架构目录叫什么」的真源，而它们分头漂移时这里只会悄悄找不到卡片。
+    """
+    for sub in arch_dirs:
+        candidate = kb_root / sub / f"{card_id}.md"
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def verify_kb_price(ref: str, delta: float,
+                    kb_root: Optional[Path]) -> Tuple[bool, str]:
+    """知识库卡片能不能当一次重开的价格。
+
+    这是「读知识库能省一次 GPU job」那条经济激励的落点 —— 但它只有在
+    卡片真的被核对过时才成立。上游那句话说得很直接：**一条转述过来的
+    处方不是价格**。先前这里无条件返回通过，附一句「请确认该卡片确实带
+    探针认证」—— 把判定交给了那个正想重开的人，而他没有任何动机去查。
+
+    三件事都成立才通过：
+      卡片在        知识库里真有这个 id
+      带认证        certified_by 齐全，且该张卡片本身过准入校验
+      量对得上      卡片记下的实测变化量 ≥ 这次声称的 Δ
+                    （卡片只能为它测过的那个幅度背书）
+    """
+    if kb_root is None:
+        return False, (
+            f"引用了知识库条目 {ref}，但没给 --kb-root，无法核对。\n"
+            "    一条转述过来的处方不是价格 —— 它要么被核对过，"
+            "要么不算数。\n"
+            "    加 --kb-root <forge-hwkb/references>，"
+            "或改用一次 lever/probe 的实测读数。")
+    if not kb_root.is_dir():
+        return False, f"知识库根 {kb_root} 不存在"
+
+    try:
+        hwkb = _load_hwkb()
+    except CampaignError as exc:
+        return False, str(exc)
+
+    card_path = find_kb_card(kb_root, ref, list(hwkb.ARCH_DIRS.values()))
+    if card_path is None:
+        return False, (
+            f"知识库里没有卡片 {ref}（找过 "
+            f"{sorted(hwkb.ARCH_DIRS.values())} 各目录）。\n"
+            "    引用一张不存在的卡片，和没有价格是同一件事。")
+
+    try:
+        meta, body = hwkb.load_card(card_path)
+    except ValueError as exc:
+        return False, f"卡片 {card_path} 读不出来: {exc}"
+
+    issues = hwkb.check_admission(meta, body, kb_root)
+    issues += hwkb.check_certification_against_ledger(meta)[0]
+    if issues:
+        return False, (
+            f"卡片 {ref} 自己不过准入校验（{len(issues)} 项）：\n    "
+            + "\n    ".join(str(i) for i in issues[:4])
+            + "\n    不过准入的卡片不能当价格 —— 它背后那次测量是否成立"
+              "正是准入在查的事。")
+
+    recorded = str((meta.get("certified_by") or {}).get("delta", ""))
+    match = RE_CARD_DELTA_PCT.search(recorded)
+    if not match:
+        return False, (
+            f"卡片 {ref} 的 certified_by.delta 是 {recorded!r}，"
+            "里面没有百分数。\n"
+            "    它可能记了别的量（比如 'mte2_pct 61.2 -> 31.0'），"
+            "那是机制证据，不是时间增益。\n"
+            "    用它定价需要一个时间上的百分比；没有就得重新测一次。")
+
+    card_delta = abs(float(match.group(1)))
+    if delta > card_delta + 1e-9:
+        return False, (
+            f"声称 Δ {delta}%，但卡片 {ref} 记下的只有 {card_delta}%。\n"
+            "    卡片只能为它测过的那个幅度背书。要更大的数就得自己测。")
+
+    return True, (f"卡片 {ref} 带认证且过准入，记录幅度 {card_delta}% "
+                  f"≥ 声称的 {delta}% —— 这次重开不必另测一遍")
+
+
+def verify_reopen_price(price: str, state: str,
+                        lever_store: Optional[str] = None,
+                        kb_root: Optional[str] = None) -> Tuple[bool, str]:
+    """核对重开价格：这个 Δ 是测出来的，还是写上去的。
+
+    返回 (是否通过, 说明)。通过的条件是三件事都成立：
+      形状对  `<Δ%> via lever:<名字>` 这种形状，能解析出数值与来源
+      引用在  来源确实存在（定价表里有这个手段 / 知识库里有这条卡片）
+      超噪声  Δ 必须超过噪声底，否则这个「价格」本身就在噪声里
+    """
+    match = RE_REOPEN_PRICE.match(price or "")
+    if not match:
+        return False, (
+            f"价格 {price!r} 不是 `<Δ%> via <来源>` 的形状。\n"
+            "    来源只能是 lever:<手段名> / probe:<路径> / kb:<卡片 id> / "
+            "ablation:<消融名>。\n"
+            "    例：--price \"8.4% via lever:ub_resident\"")
+
+    delta = abs(float(match.group("delta")))
+    kind = match.group("kind").lower()
+    ref = match.group("ref")
+
+    state_path = Path(state)
+    noise = 0.0
+    try:
+        doc = json.loads(state_path.read_text(encoding="utf-8"))
+        noise = float(doc.get("noise_floor_pct", 0.0) or 0.0)
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        pass
+    if noise > 0 and delta <= noise:
+        return False, (
+            f"价格 {delta}% 没有超过噪声底 {noise}% —— "
+            "这个「价格」本身就落在测量抖动里。\n"
+            "    重开要花掉整条下游的实现，理由不能是一个测不出来的数。")
+
+    if kind == "lever":
+        store_path = (Path(lever_store) if lever_store
+                      else state_path.parent / "levers.json")
+        if not store_path.is_file():
+            return False, (
+                f"找不到定价表 {store_path} —— 无法核对手段 {ref!r} 的价格。\n"
+                "    先用 lever_probe.py 给现有手段定价（这也是停滞之后的"
+                "第一件事），\n"
+                "    或用 --lever-store 指定定价表位置。")
+        try:
+            store = json.loads(store_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            return False, f"定价表 {store_path} 读不出来: {exc}"
+        names: Set[str] = set()
+        for variant in store.get("variants") or []:
+            if isinstance(variant, dict):
+                for lever in variant.get("levers") or []:
+                    names.add(str(lever))
+        if ref not in names:
+            return False, (
+                f"定价表里没有手段 {ref!r}；已登记的是 {sorted(names)}。\n"
+                "    引用一个没测过的手段，等于把推断当价格用。")
+        return True, f"手段 {ref} 在定价表里，价格 {delta}% 超过噪声底 {noise}%"
+
+    if kind == "kb":
+        return verify_kb_price(ref, delta,
+                               Path(kb_root) if kb_root else None)
+    return True, f"引用 {kind}:{ref}（Δ {delta}%）"
+
+
 def dependents_closure(milestone_doc: Dict[str, Any], root: str) -> Set[str]:
     """算出（直接或间接）依赖 root 的所有决策。
 
@@ -648,6 +1237,26 @@ def dependents_closure(milestone_doc: Dict[str, Any], root: str) -> Set[str]:
         for dep in decision.get("depends_on") or []:
             if isinstance(dep, str) and dep in reverse:
                 reverse[dep].append(did)
+
+    # 原子组成员要互相牵连。
+    #
+    # `atomic_group` 标的是「必须一次提交落地」的决策集，V9 校验它们同属一个
+    # milestone，`forge-coder.md` 也明说任何真子集单独落地都会退化。但闭包
+    # 早先只走 depends_on —— 于是重开组里一个成员，兄弟成员的台账仍然有效，
+    # 树上留着一个原子组的真子集，而退化会被归因给刚重开的那条决策。
+    #
+    # 上游把 companions 与 depends_on 并列进不动点（invalidation.py），
+    # 理由写在注释里：companions 必须落在同一个 commit 里。
+    groups: Dict[str, List[str]] = {}
+    for did, decision in decisions.items():
+        group = decision.get("atomic_group")
+        if isinstance(group, str) and group.strip():
+            groups.setdefault(group.strip(), []).append(did)
+    for members in groups.values():
+        for a in members:
+            for b in members:
+                if a != b and b not in reverse[a]:
+                    reverse[a].append(b)
 
     out: Set[str] = set()
     stack = [root]
@@ -732,6 +1341,15 @@ def next_action(state: Dict[str, Any]) -> Dict[str, str]:
 
     理由会被写进 ledger，让「为什么当时这么走」可追溯。
     """
+    pending = state.get("pending_confirmation")
+    if pending:
+        return {
+            "action": "confirm-best",
+            "reason": (f"决策 {pending.get('decision')} 的增益 "
+                       f"{pending.get('gain')} 已达目标，但只测过一次。"
+                       + str(pending.get("reason", ""))),
+        }
+
     phase = state.get("state")
 
     if phase == STATE_STOPPED:
@@ -747,6 +1365,12 @@ def next_action(state: Dict[str, Any]) -> Dict[str, str]:
                                "新参考是另一个二进制，运行时特征不同")}
         return {"action": "analyze",
                 "reason": "等待架构层产出或修订 milestone 课程"}
+    if phase == STATE_BLOCKED:
+        return {
+            "action": "fix-implementation",
+            "reason": (state.get("stall_detail")
+                       or "连续实现失败，需要人介入；这不消耗架构重入机会"),
+        }
     if phase == STATE_STALLED:
         reasons = state.get("stall_reasons") or [{
             "kind": state.get("stall_reason", STALL_NO_IMPROVEMENT),
@@ -758,6 +1382,7 @@ def next_action(state: Dict[str, Any]) -> Dict[str, str]:
             STALL_GATE_IMPASSE: "门禁僵持",
             STALL_MECHANISM_UNVERIFIED: "机制无法核验",
             STALL_MECHANISM_REFUTED: "机制被证伪",
+            STALL_IMPL_FAILURE: "连续实现失败",
         }
         listed = "；".join(
             f"{titles.get(r['kind'], r['kind'])}（{r['detail']}）"
@@ -892,6 +1517,127 @@ def _extract_gain(doc: Dict[str, Any]) -> Optional[float]:
     return None
 
 
+#: 评测自己判定「这次跑成了」的 gating 取值。其余一律不接受。
+#:
+#: 这两个之外还有 failed / target_regression / generalization_regression。
+#: 不检查 gating 的后果很具体：泛化 shape 上算错或退化时，评测已经判了
+#: failed / generalization_regression，而 comparison.precision_passed 和
+#: comparison.speedup 都只覆盖 target shape —— 于是裁决照样 accept 并抬高 best。
+ACCEPTABLE_GATINGS = frozenset({"fully_passed", "partial_passed"})
+
+
+def check_result_admissible(doc: Dict[str, Any],
+                            state: Dict[str, Any]) -> List[str]:
+    """结果文件能不能进裁决。返回拒绝理由列表，空列表表示可以。
+
+    裁决权在脚本手里，但输入权在调用方手里。这三条查的是「这份结果是不是
+    本次 campaign 的、在对的卡上、跑成了的那一次测量」—— 不查的话，裁决
+    严格建立在一份没人验证过来源的 JSON 上。
+    """
+    problems: List[str] = []
+
+    gating = doc.get("gating")
+    if gating is not None and gating not in ACCEPTABLE_GATINGS:
+        problems.append(
+            f"评测自己判定 gating={gating!r}，不是 "
+            f"{sorted(ACCEPTABLE_GATINGS)} 之一。\n"
+            "    failed = 编译/精度/运行出错；*_regression = 某个 shape 退化。\n"
+            "    注意 comparison.precision_passed 与 comparison.speedup 只覆盖 "
+            "target shape，\n"
+            "    泛化 shape 上的算错与退化只体现在 gating 里 —— "
+            "不看它就会把这两种情况当成功收下")
+
+    result_device = _result_device_id(doc)
+    state_device = (state.get("device") or {}).get("device_id")
+    if result_device is not None and state_device is not None \
+            and int(result_device) != int(state_device):
+        problems.append(
+            f"这份结果测在 device {result_device}，而本 campaign 绑的是 "
+            f"device {state_device}。\n"
+            "    换卡之后参考签名、噪声底、绝对耗时全部不可比，"
+            "而这种不可比是静默的 —— 所以这里拒绝")
+
+    # baseline 不许来自缓存。
+    #
+    # 配对计时的全部纪律都建立在「两侧在同一个 job 里、位置互为镜像」之上：
+    # burn-in 把器件加热到稳态，A-B-B-A 抵掉位置偏置（实测 2.7%，方向恒定、
+    # 多测不收敛，而目标增益只有 5%）。
+    #
+    # baseline 一旦来自上一次 job 的缓存，这两个机制同时失效 —— 而且是静默
+    # 失效：结果文件的形状、字段、cv 都完全正常，只是那个 baseline 是在另一
+    # 个温度、另一个位置、可能另一个时间点测的。于是 2.7% 的偏置原封不动地
+    # 回到了一个 5% 的判据里。
+    measurement = doc.get("measurement")
+    if isinstance(measurement, dict) and measurement.get("baseline_from_cache"):
+        problems.append(
+            "这份结果的 baseline 来自缓存（measurement.baseline_from_cache "
+            "为真）。\n"
+            "    配对计时要求两侧在同一个 job 里、位置互为镜像 —— "
+            "缓存的 baseline 让 burn-in 与\n"
+            "    A-B-B-A 镜像同时失效，而失效是静默的：字段、cv 全都正常，"
+            "只是那个数来自\n"
+            "    另一个温度、另一个位置。实测位置偏置 2.7%（方向恒定、"
+            "多测不收敛），\n"
+            "    而目标增益只有 5% 这个量级。\n"
+            "    去掉 --baseline-cache 重测一次。")
+
+    return problems
+
+
+def _result_device_id(doc: Dict[str, Any]) -> Optional[int]:
+    for key in ("device_id", "device"):
+        value = doc.get(key)
+        if isinstance(value, int):
+            return value
+        if isinstance(value, dict) and isinstance(value.get("device_id"), int):
+            return value["device_id"]
+    return None
+
+
+def result_cv_values(doc: Dict[str, Any]) -> List[float]:
+    """这份结果里各 shape 的变异系数。用来复核存量噪声底还成不成立。"""
+    out: List[float] = []
+    shape_results = doc.get("shape_results")
+    if isinstance(shape_results, dict):
+        for group in shape_results.values():
+            if not isinstance(group, list):
+                continue
+            for item in group:
+                if isinstance(item, dict):
+                    value = item.get("cv_pct")
+                    if isinstance(value, (int, float)) and value > 0:
+                        out.append(float(value))
+    return out
+
+
+def precision_from_report(report: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """读误差比报告。
+
+    这条判据优先于评测结果里的容差比对，原因有两个：
+
+    1. 容差比对分不出「在参考舍入的地方舍入」和「用 bf16 累加 / tf32 相乘」
+       —— 1e-3 下两者都过。
+    2. 容差比对的锚是 baseline 的输出，而 promote 之后 baseline 变成上一代
+       产物，锚点跟着移动：**每代允许再漂 1e-3，N 代之后与数学真值的距离
+       无界，而每一代都显示「精度通过」**。误差比的锚是 float64 真值，
+       与代际无关。
+
+    `unavailable` 不是通过。没有参考语义时这一轮的精度**没有被判过**。
+    """
+    if not isinstance(report, dict):
+        return {"status": "absent",
+                "reason": "没有误差比报告（record 未传 --precision-report）"}
+    verdict = report.get("verdict")
+    if verdict not in ("pass", "fail", "unavailable"):
+        return {"status": "absent",
+                "reason": f"误差比报告里的 verdict 不认识: {verdict!r}"}
+    return {
+        "status": verdict,
+        "reason": str(report.get("reason", "")),
+        "anchor": report.get("anchor"),
+    }
+
+
 def _precision_passed(doc: Dict[str, Any]) -> Optional[bool]:
     comparison = doc.get("comparison")
     if isinstance(comparison, dict) and "precision_passed" in comparison:
@@ -970,6 +1716,9 @@ def previous_snapshot(state: Dict[str, Any]) -> Tuple[Optional[Dict[str, float]]
         snapshot = entry.get("signature_snapshot")
         if snapshot:
             label = f"上一轮（决策 {entry.get('decision')}）"
+            sha = entry.get("artifact_sha")
+            if sha:
+                label += f"，产物 {sha}"
             return snapshot, label
     reference = state.get("reference_snapshot")
     if reference:
@@ -977,9 +1726,53 @@ def previous_snapshot(state: Dict[str, Any]) -> Tuple[Optional[Dict[str, float]]
     return None, "无"
 
 
+def _milestone_fingerprint(milestone_doc: Optional[Dict[str, Any]]) -> Optional[str]:
+    """课程表的内容指纹。判据改了要能看出来。"""
+    if milestone_doc is None:
+        return None
+    body = json.dumps(milestone_doc, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()[:16]
+
+
+def directory_fingerprint(path: Path) -> str:
+    """一个候选目录的内容指纹。
+
+    用它代替 git sha：候选目录不一定在版本控制里（评测要的是装好的 OPP
+    安装路径），但「这一轮测的是哪一份代码」必须可核实。
+    按相对路径排序后把每个文件的路径与内容摘要串起来。
+    """
+    digest = hashlib.sha256()
+    if path.is_file():
+        files = [path]
+        root = path.parent
+    else:
+        files = [p for p in sorted(path.rglob("*")) if p.is_file()]
+        root = path
+    for item in files:
+        try:
+            relative = item.relative_to(root)
+        except ValueError:
+            relative = Path(item.name)
+        digest.update(str(relative).encode("utf-8"))
+        digest.update(b"\0")
+        try:
+            with item.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(65536), b""):
+                    digest.update(chunk)
+        except OSError:
+            digest.update(b"<unreadable>")
+    return digest.hexdigest()[:16]
+
+
 def apply_result(state: Dict[str, Any], doc: Dict[str, Any], decision: str,
                  milestone_doc: Optional[Dict[str, Any]] = None,
                  signature: Optional[Dict[str, Any]] = None,
+                 artifact_sha: str = "",
+                 base_sha: str = "",
+                 milestone_sha: str = "",
+                 structure_report: Optional[Dict[str, Any]] = None,
+                 precision_report: Optional[Dict[str, Any]] = None,
+                 fence_report: Optional[Dict[str, Any]] = None,
                  recipes_used: Optional[List[str]] = None,
                  recipes_invented: Optional[List[str]] = None,
                  symptom: str = "",
@@ -1025,14 +1818,61 @@ def apply_result(state: Dict[str, Any], doc: Dict[str, Any], decision: str,
         "signature_snapshot": (snapshot_signature(signature)
                                if signature else None),
         "signature_path": signature_path or None,
+        # 代码身份。没有它，`previous_snapshot` 的整个前提
+        # 「被保留下来的最后一条就是当前代码的样子」**无法核实** ——
+        # 编码层该回滚却没回滚、或在一棵更早的树上接着改，做差基线就是错的，
+        # 而算出来的百分比看着完全正常。这是机制核验链条上最底层的假设。
+        #
+        # 上游每轮记 sha（落地提交）与 base_sha（构建在哪个 HEAD 上，
+        # 原话：是血统不是顺序 —— reset / 重开之后下一轮的基是更早的树）。
+        "artifact_sha": artifact_sha or None,
+        "base_sha": base_sha or None,
+        # 判据用的是哪一份课程表。阈值被改宽、或机制行被删掉，
+        # 早先在台账里一点痕迹都没有 —— 配合阈值不绑参考，那是一条完整的
+        # 「挪球门」路径。
+        "milestone_sha256": milestone_sha or None,
     }
+
+    # 围栏与设备占比先算好、先记进台账，不管后面走哪条分支。
+    #
+    # 为什么不等到 accept 分支里才算：一条因精度回滚的记录，如果围栏也命中，
+    # 那两件事都该留在台账里 —— 只记前者的话，「这一轮其实是在转发」这个
+    # 事实会随着那条回滚记录一起被归档掉。
+    fence = judge_fence(fence_report)
+    entry["fence"] = fence
+    device_share = reconcile_device_share(doc, signature)
+    entry["device_share"] = device_share
 
     precision = _precision_passed(doc)
     measured = False
 
-    if precision is False:
+    # 误差比优先于容差比对。
+    ratio_verdict = precision_from_report(precision_report)
+    entry["precision"] = ratio_verdict
+    if ratio_verdict["status"] == "fail":
+        # 误差比说不过，容差说过 —— 这正是容差分不出的那一类（降精度换速度）。
+        precision = False
+    elif ratio_verdict["status"] == "pass":
+        precision = True
+
+    if precision is not True:
+        # 注意是 `is not True`，不是 `is False`。
+        #
+        # 字段缺失时 _precision_passed 返回 None，而早先只拦 False ——
+        # 于是一份没有精度字段的结果直接落到增益判据，精度门禁静默消失。
+        # 「没查」不等于「查过且通过」，这是整套判据里最不该含糊的一条。
         entry["verdict"] = VERDICT_REVERT
-        entry["reason"] = "精度不达标，回滚；算错的 kernel 再快也无意义"
+        if ratio_verdict["status"] == "fail":
+            entry["reason"] = (
+                "精度不达标（误差比判据），回滚；算错的 kernel 再快也无意义。"
+                + ratio_verdict["reason"])
+        elif precision is False:
+            entry["reason"] = "精度不达标，回滚；算错的 kernel 再快也无意义"
+        else:
+            entry["reason"] = (
+                "评测结果里没有精度字段（comparison.precision_passed / "
+                "evolved.precision_passed），无法确认算得对不对；"
+                "缺失不等于通过，回滚")
         entry["failure_kind"] = "precision"
     else:
         gain = _extract_gain(doc)
@@ -1049,18 +1889,87 @@ def apply_result(state: Dict[str, Any], doc: Dict[str, Any], decision: str,
             delta = (gain - 1.0) * 100.0
 
             if gain_verdict == VERDICT_ACCEPT:
+                # 结构先判，停顿后判。
+                #
+                # 为什么这个顺序：停顿比例能被别的改动顶下去（减小 tile、
+                # 改对齐都会让 mte2_wait 降），于是一个单缓冲回退的实现可以
+                # 凭一个恰好变好的停顿数拿到「机制已核实」，而双缓冲从未存在。
+                # 结构在不在是二值事实，顶不下去。
+                structure = judge_structure(structure_report)
+                entry["structure"] = structure
                 baseline, baseline_label = previous_snapshot(state)
                 mechanism = judge_mechanism(
-                    milestone_doc, signature, decision, baseline)
+                    milestone_doc, signature, decision, baseline,
+                    reference_snapshot=state.get("reference_snapshot"))
+                if structure["status"] == "absent":
+                    # 结构不在 —— 覆盖停顿的结论。
+                    #
+                    # 归因方向要紧：这是**实现没做到**，不是课程表解释错了。
+                    # 上游的分流规则很明确 ——「声称无冲突布局而冲突仍高 ⇒
+                    # 学生没产出无冲突版本（退化回退）⇒ 加一张经验卡片，
+                    # 不要改课程表」。把它归到课程表那一侧，结果是改对的
+                    # 东西被改坏、改坏的东西没人碰。
+                    mechanism = {
+                        "status": "refuted",
+                        "lines": mechanism.get("lines", []),
+                        "compared_against": baseline_label,
+                        "attribution": "implementation",
+                        "reason": (structure["reason"]
+                                   + "。停顿指标可能恰好变好（减小 tile、改"
+                                     "对齐都会让它降），但那不是这条机制"),
+                    }
                 mechanism["compared_against"] = baseline_label
                 entry["mechanism"] = mechanism
-                if mechanism["status"] == "verified":
+
+                # 围栏与设备占比：两道「这个数算不算数」的前置条件。
+                #
+                # 它们和机制核验是不同性质的东西。机制核验问「变快的原因是不是
+                # 设计的那个」；这两道问的是更靠前的问题 ——「这个百分比到底
+                # 是不是这份 kernel 在这张卡上挣来的」。所以它们不走
+                # accept_unverified 那条路（那条路的含义是「数是真的，解释
+                # 不清」），而是直接压住 counts_toward_best。
+                blockers: List[str] = []
+                if fence["status"] == "clean":
+                    pass
+                elif fence["status"] == "violated":
+                    # 转发是实现缺陷，不是课程表缺陷 —— 归因方向同结构核验。
+                    entry["verdict"] = VERDICT_REVERT
+                    entry["failure_kind"] = "fence"
+                    # 这一轮不算「测出来了」。
+                    #
+                    # measured 为真会走 `elif measured` 那条分支，而那条分支
+                    # 把实现失败计数**清零** —— 对一次转发来说方向正好相反。
+                    # 更根本的是：围栏命中意味着这次测量量的不是这份 kernel，
+                    # 所以「测出来了」这句话对它并不成立。
+                    measured = False
+                    entry["reason"] = (
+                        f"围栏命中，回滚：{fence['reason']}。\n"
+                        "  这一轮的加速比与精度都不作数 —— 它们不是这份 kernel "
+                        "挣来的。\n"
+                        "  这是实现问题（该修实现），不是课程表对参考行为的"
+                        "解释错了")
+                else:
+                    blockers.append(f"围栏未查（{fence['reason']}）")
+                if device_share is not None and not device_share["ok"]:
+                    blockers.append(f"设备占比过低（{device_share['reason']}）")
+
+                if entry.get("verdict") == VERDICT_REVERT:
+                    pass
+                elif mechanism["status"] == "verified" and not blockers:
                     entry["verdict"] = VERDICT_ACCEPT
                     entry["counts_toward_best"] = True
                     entry["kb_admissible"] = True
                     entry["reason"] = (
                         f"增益 {delta:+.2f}% 超过噪声底 {noise:.2f}%，"
                         f"且机制已核实（{mechanism['reason']}）")
+                elif mechanism["status"] == "verified":
+                    entry["verdict"] = VERDICT_ACCEPT_UNVERIFIED
+                    entry["reason"] = (
+                        f"增益 {delta:+.2f}% 超过噪声底 {noise:.2f}%、"
+                        f"机制也核实了，但这个数本身还不能用：\n  "
+                        + "\n  ".join(blockers)
+                        + "\n  保留该改动，但不计入 best —— "
+                          "「变快了」这件事本身尚未成立")
                 else:
                     entry["verdict"] = VERDICT_ACCEPT_UNVERIFIED
                     entry["reason"] = (
@@ -1068,6 +1977,8 @@ def apply_result(state: Dict[str, Any], doc: Dict[str, Any], decision: str,
                         f"但机制未核实：{mechanism['reason']}。"
                         "保留该改动，但不计入 best，也不得作为入库依据 —— "
                         "变快了不等于设计的机制落地了")
+                    if blockers:
+                        entry["reason"] += ("\n  另有：" + "；".join(blockers))
             elif gain_verdict == VERDICT_REGRESSION:
                 entry["verdict"] = VERDICT_REGRESSION
                 entry["reason"] = f"退化 {delta:+.2f}%，超出噪声范围，回滚"
@@ -1095,7 +2006,16 @@ def apply_result(state: Dict[str, Any], doc: Dict[str, Any], decision: str,
         "streak_refuted": 0, "streak_unknown": 0})
 
     if entry["verdict"] in (VERDICT_ACCEPT, VERDICT_ACCEPT_UNVERIFIED):
-        stag["since_improvement"] = 0
+        # 注意这里**不**清零停滞计数 —— 清零的条件在下面，是「抬高了 best」。
+        #
+        # 早先任何 accept / accept_unverified 都清零，而 best 只在
+        # `gain > best` 时才动。于是编码层每轮都交出 +3%（相对参考、不是
+        # 相对上一轮）时：每轮 accept → 停滞清零；best 第一轮停在 1.03 之后
+        # 再不动；状态**永远是 implement**，而 status 每轮都说「继续实现」。
+        # 循环就这么空转下去。
+        #
+        # 上游的判据是「窗口内有没有新的下界」（parse.py 的 detect_plateau）：
+        # 重复拿同样大小的增益也算停滞。这才是架构层该被叫回来的信号。
         impl["consecutive"] = 0
         if entry["verdict"] == VERDICT_ACCEPT:
             unver["consecutive"] = 0
@@ -1112,27 +2032,72 @@ def apply_result(state: Dict[str, Any], doc: Dict[str, Any], decision: str,
                       if isinstance(entry.get("mechanism"), dict) else None)
             # vacuous 与 refuted 同归一桶：两者都说明增益另有来源，
             # 都该把控制权交回架构层。成因差别在行级 reason 里说清。
-            key = ("streak_refuted" if status in ("refuted", "vacuous")
-                   else "streak_unknown")
-            unver[key] = int(unver.get(key, 0)) + 1
+            mech = entry.get("mechanism")
+            attribution = (mech.get("attribution")
+                           if isinstance(mech, dict) else None)
+            if attribution == "implementation":
+                # 归因到实现的 refuted **不走架构重入**。
+                #
+                # 上游的分流规则：课程表写对了、实现没做到 → 加一张经验卡片，
+                # 不要改课程表。把它算进 streak_refuted 会连续三次把架构层
+                # 叫回来重写课程表，而下一轮实现还是同一个退化回退 ——
+                # 改对的东西被改坏、改坏的东西没人碰。
+                impl["consecutive"] = int(impl.get("consecutive", 0)) + 1
+                unver["consecutive"] = max(
+                    0, int(unver.get("consecutive", 0)) - 1)
+            else:
+                key = ("streak_refuted" if status in ("refuted", "vacuous")
+                       else "streak_unknown")
+                unver[key] = int(unver.get(key, 0)) + 1
         # 只有机制核实过的改动才抬高 best。未核实的保留但不计入 ——
         # 否则 promote 时会把一个解释不清的结果封成下一代的参考。
+        raised_best = False
         if entry["counts_toward_best"] and entry["gain"] is not None:
             best = state.setdefault("best", {})
             if entry["gain"] > float(best.get("gain", 1.0)):
+                raised_best = True
                 best["gain"] = entry["gain"]
                 best["time_us"] = entry.get("time_us")
+                best["decision"] = decision
+                # 新高 = 第一次读数。确认读数由 `record --confirm` 追加 ——
+                # 它不能走这条路：确认复测的是**同一份代码**，机制必然
+                # 「没有因本次改动而移动」，于是会被判 vacuous、
+                # counts_toward_best=False，根本到不了这里。
+                best["readings"] = [entry["gain"]]
+        # 停滞 = 没有新的下界。抬高了 best 才清零。
+        if raised_best:
+            stag["since_improvement"] = 0
+            # 上一次重开带来了新下界 —— 它不是徒劳的。
+            state.setdefault("reopen", {})["fruitless"] = 0
+        else:
+            stag["since_improvement"] = int(stag.get("since_improvement", 0)) + 1
     elif measured:
-        # 测出来了但不够 —— 这才是架构层该关心的停滞
+        # 测出来了但不够 —— 同样是「没有新下界」
         stag["since_improvement"] = int(stag.get("since_improvement", 0)) + 1
         impl["consecutive"] = 0
     else:
-        # 精度不过 / 评测缺失是实现问题，不消耗架构重入机会
+        # 精度不过 / 评测缺失是实现问题，不消耗架构重入机会。
+        # 但它必须改变动作 —— 见 _advance_state 里的 STATE_BLOCKED。
         impl["consecutive"] = int(impl.get("consecutive", 0)) + 1
 
     state.setdefault("ledger", []).append(entry)
     _advance_state(state, milestone_doc)
     return entry
+
+
+def _best_is_confirmed(state: Dict[str, Any]) -> bool:
+    """best 是否经过独立复测。
+
+    判据：同一个决策至少两次读数，且**每一次**都达到目标。
+    取「每一次都要达标」而不是「平均达标」—— 后者会让一次偏高读数把一次
+    不达标的读数拉过线，而那正是要防的情形。
+    """
+    best = state.get("best") or {}
+    readings = best.get("readings")
+    if not isinstance(readings, list) or len(readings) < 2:
+        return False
+    target = float(state.get("target_gain", DEFAULT_PHASE_TARGET_GAIN))
+    return all(isinstance(r, (int, float)) and r >= target for r in readings)
 
 
 def _advance_state(state: Dict[str, Any],
@@ -1148,11 +2113,58 @@ def _advance_state(state: Dict[str, Any],
     来决定先动哪里。
     """
     best_gain = float(state.get("best", {}).get("gain", 1.0))
-    if best_gain >= float(state.get("target_gain", 1.0)):
+    target = float(state.get("target_gain", 1.0))
+    if best_gain >= target and not _best_is_confirmed(state):
+        # 看似达标不能直接收工。
+        #
+        # best 是历史最大值，而每次 record 都是一次抽样 —— 预算几十次的
+        # campaign 里「抽到一个偏高读数」是必然事件。拿它转 shipped 再
+        # promote，就把一次运气封成了下一代参考，且之后无法回溯：
+        # promote 会把 best 归零、噪声底置为待重测，那个虚高的数就消失了，
+        # 而后面每一代的增益都相对它算。
+        state["state"] = STATE_IMPLEMENT
+        state["pending_confirmation"] = {
+            "decision": (state.get("best") or {}).get("decision"),
+            "gain": best_gain,
+            "readings": list((state.get("best") or {}).get("readings") or []),
+            "reason": ("已达目标，但这个增益只测过一次。对同一份产物再测一次"
+                       "（同一个决策 id 再 record 一遍），两次都达标才收工。"),
+        }
+        state.pop("stall_reason", None)
+        state.pop("stall_reasons", None)
+        state.pop("stall_detail", None)
+        return
+    state.pop("pending_confirmation", None)
+    if best_gain >= target:
         state["state"] = STATE_SHIPPED
         state.pop("stall_reason", None)
         state.pop("stall_reasons", None)
         state.pop("stall_detail", None)
+        return
+
+    # 连续实现失败要**改变动作**。
+    #
+    # 早先 implementation_failures 只递增、只在 status 里打印，_advance_state
+    # 从不读它 —— 于是连续 30 次精度不过，next_action 每次都说 implement，
+    # 预算一条条被消耗，没有任何人被告知。
+    #
+    # 「不消耗架构重入机会」这个判断是对的（实现 bug 不该花掉一次架构重入），
+    # 但它被实现成了「什么都不触发」。上游的做法是连续 3 次 revert 就
+    # return "stuck" 并买一次 teacher step；我们没有常驻 driver，所以进一个
+    # 独立状态让人介入。
+    impl = state.get("implementation_failures", {})
+    impl_cap = int(impl.get("threshold", DEFAULT_IMPL_FAILURE_THRESHOLD))
+    if int(impl.get("consecutive", 0)) >= impl_cap:
+        state["state"] = STATE_BLOCKED
+        state["stall_reason"] = STALL_IMPL_FAILURE
+        state["stall_detail"] = (
+            f"连续 {impl.get('consecutive')} 次实现失败"
+            f"（精度不过 / 没测出数），已达阈值 {impl_cap}。\n"
+            "  这不是架构问题，所以不消耗架构重入机会 —— 但也不该继续"
+            "闷头实现：\n"
+            "  同一个错重复几十次会把预算吃光，而每轮状态都显示正常。\n"
+            "  先看最近几条台账的 failure_kind 与 reason，修对了再 record；\n"
+            "  确认是环境问题就停下来上报，不要绕过。")
         return
 
     budget = state.get("budget", {})
@@ -1421,6 +2433,26 @@ def _signature_blocking_reasons(doc: Dict[str, Any]) -> List[str]:
     return []
 
 
+def _find_sealed_list(explicit: Optional[str], state: str) -> Optional[Path]:
+    """找封存清单。与 hook 的查找顺序保持一致，否则自检测的不是同一个东西。"""
+    candidates: List[Path] = []
+    if explicit:
+        candidates.append(Path(explicit))
+    env_path = os.environ.get("FORGE_SEALED_PATHS")
+    if env_path:
+        candidates.append(Path(env_path))
+    work_dir = os.environ.get("FORGE_WORK_DIR")
+    if work_dir:
+        candidates.append(Path(work_dir) / SEALED_PATHS_FILENAME)
+    state_dir = Path(state).resolve().parent
+    candidates.append(state_dir / SEALED_PATHS_FILENAME)
+    candidates.append(Path("forge_work") / SEALED_PATHS_FILENAME)
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
 def _find_reference_spec(explicit: Optional[str], state: str,
                          reference_path: Optional[str]) -> Optional[Path]:
     """找出本次 campaign 对应的 reference_spec.json。
@@ -1525,6 +2557,58 @@ def _check_reference_spec(spec_path: Optional[Path], kind: str,
     return None, warnings
 
 
+HOOK_RELATIVE = Path("hooks") / "no-code-boundary.sh"
+
+
+def probe_boundary(sealed_list: Path) -> Tuple[bool, str]:
+    """真的过一遍 hook，确认边界此刻拦得住。
+
+    为什么要实测而不是查文件存在：边界由三样东西合起来生效 —— hook 脚本、
+    它在 agent 工具层的注册、以及封存清单。查前两样只能知道「文件在」，
+    而实际失效的方式恰恰是「文件都在但没被调用」或「清单是空的」。
+
+    做法：拿清单里第一条被封路径构造一次 Read 调用喂给 hook，期望它返回 2。
+    返回 0 说明这条路此刻是通的 —— 那么整个 campaign 都会在无防护下跑。
+    """
+    plugin_root = Path(__file__).resolve().parents[3]
+    hook = plugin_root / HOOK_RELATIVE
+    if not hook.is_file():
+        return False, f"找不到边界 hook 脚本：{hook}"
+
+    sealed: List[str] = []
+    try:
+        for line in sealed_list.read_text(encoding="utf-8").splitlines():
+            token = line.split("#", 1)[0].strip()
+            if token:
+                sealed.append(token)
+    except OSError as exc:
+        return False, f"读不到封存清单 {sealed_list}: {exc}"
+    if not sealed:
+        return False, f"封存清单 {sealed_list} 是空的 —— 没有任何路径被保护"
+
+    # 挑一个具体文件而不是目录：目录可能恰好不存在，而 hook 对 Read 走的是
+    # 路径归一化那条分支。
+    target = next((p for p in sealed if Path(p).is_file()), sealed[-1])
+    payload = json.dumps({"tool_name": "Read",
+                          "tool_input": {"file_path": target}})
+    env = dict(os.environ)
+    env["FORGE_SEALED_PATHS"] = str(sealed_list)
+    env.pop("FORGE_BOUNDARY_HOOK_DISABLE", None)
+    try:
+        proc = subprocess.run(["bash", str(hook)], input=payload, text=True,
+                              capture_output=True, timeout=30, env=env,
+                              check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, f"执行 hook 失败: {exc}"
+    if proc.returncode == 2:
+        return True, f"实测拦住了对 {target} 的读取（hook 返回 2）"
+    return False, (
+        f"hook 对一条**已封存**的路径返回了 {proc.returncode}，期望 2。\n"
+        f"    被测路径: {target}\n"
+        f"    hook: {hook}\n"
+        f"    stderr: {(proc.stderr or '').strip()[:300]}")
+
+
 def cmd_init(args: argparse.Namespace) -> int:
     path = Path(args.state)
     if path.exists() and not args.force:
@@ -1576,6 +2660,44 @@ def cmd_init(args: argparse.Namespace) -> int:
     for warning in spec_warnings:
         print(f"警告: {warning}", file=sys.stderr)
 
+    # 边界自检。整套方法建立在「参考只能测不能读」上，而这件事此前从没在
+    # 开 campaign 时验证过 —— 默认安装不注册 hook、清单被清理、路径拼错，
+    # 三种情况都会让整个 campaign 在无防护下跑完，而所有文档都说边界生效。
+    sealed_list = _find_sealed_list(args.sealed_paths, args.state)
+    if sealed_list is None:
+        if not args.allow_no_boundary:
+            print("错误: 找不到封存清单（sealed_paths.txt），"
+                  "无法确认 no-code 边界是否生效。", file=sys.stderr)
+            print("  先封存参考：", file=sys.stderr)
+            print("    python3 seal_reference.py seal --artifact <中转目录> \\",
+                  file=sys.stderr)
+            print("        --op-name <算子> --work-dir <工作目录>", file=sys.stderr)
+            print("  或用 --sealed-paths 指定清单位置。", file=sys.stderr)
+            print("  参考确实是不可读的二进制、无需封存时加 --allow-no-boundary。",
+                  file=sys.stderr)
+            return 2
+        print("警告: 未封存任何参考，no-code 边界不生效。"
+              "架构结论将无法证明是从硬件行为反推的。", file=sys.stderr)
+    else:
+        ok, detail = probe_boundary(sealed_list)
+        if ok:
+            print(f"边界自检通过：{detail}")
+        elif args.allow_no_boundary:
+            print(f"警告: 边界自检未通过：{detail}", file=sys.stderr)
+            print("  已按 --allow-no-boundary 继续。本次 campaign 的架构结论"
+                  "无法证明不是抄的。", file=sys.stderr)
+        else:
+            print(f"错误: 边界自检未通过：{detail}", file=sys.stderr)
+            print("  边界此刻拦不住读参考源码。整套方法的前提是"
+                  "「架构决策从硬件行为反推」——", file=sys.stderr)
+            print("  这个前提破了，结论就无法迁移到没有开源实现的算子上，"
+                  "而那正是它最有价值的场景。", file=sys.stderr)
+            print("  常见成因：init.sh 没有为当前工具注册 PreToolUse hook"
+                  "（默认工具就不注册）、", file=sys.stderr)
+            print("  清单被清理、或 FORGE_SEALED_PATHS 指错。",
+                  file=sys.stderr)
+            return 2
+
     reference_snapshot = (snapshot_signature(reference_signature)
                           if reference_signature else None)
 
@@ -1590,6 +2712,10 @@ def cmd_init(args: argparse.Namespace) -> int:
         reference_snapshot=reference_snapshot,
         device={"device_id": args.device_id},
     )
+    if args.milestone_path:
+        state["milestone_path"] = str(Path(args.milestone_path).resolve())
+    if sealed_list is not None:
+        state["sealed_paths"] = str(sealed_list.resolve())
     save_state(path, state)
     print(f"已创建 campaign: {args.operator} @ {args.arch}")
     print(f"  输入形状  {args.input_shape}")
@@ -1600,7 +2726,252 @@ def cmd_init(args: argparse.Namespace) -> int:
     print(f"  目标增益  {args.target_gain}")
     if args.budget:
         print(f"  预算      {args.budget} 次评测")
+    else:
+        print("  预算      不限（循环没有次数出口，"
+              "停滞判据失效时会一直跑）", file=sys.stderr)
     print(f"  设备      device {args.device_id}")
+    action = next_action(state)
+    print(f"\n下一步: {action['action']} — {action['reason']}")
+    return 0
+
+
+def _evolved_time_us(doc: Dict[str, Any]) -> Optional[float]:
+    """取候选侧耗时。与 apply_result 用同一个口径。"""
+    evolved = doc.get("evolved")
+    if isinstance(evolved, dict):
+        value = evolved.get("time_us")
+        if isinstance(value, (int, float)):
+            return float(value)
+    return None
+
+
+def confirm_best(state: Dict[str, Any], doc: Dict[str, Any],
+                 decision: str) -> Dict[str, Any]:
+    """并入一次**确认复测**的读数。
+
+    为什么不能复用 record：确认复测跑的是同一份产物，代码一个字没改。
+    于是机制核验必然判「那个字段并非因本次改动而变化」（vacuous），
+    这一轮会被记成 accept_unverified、不计入 best —— 确认永远无法完成。
+
+    确认读数的语义也不同：它不是一个新候选。它不该推进停滞计数、不该
+    消耗实现失败计数、不该登记死路，只回答一件事 ——「上次那个增益，
+    再测一次还在不在」。
+    """
+    best = state.setdefault("best", {})
+    if best.get("decision") != decision:
+        raise CampaignError(
+            f"best 当前记的是决策 {best.get('decision')!r}，不是 {decision!r}。"
+            "确认复测必须针对拿到 best 的那个决策、那份产物。")
+
+    gain = _extract_gain(doc)
+    if gain is None:
+        raise CampaignError("确认复测的结果里取不到增益")
+    precision = _precision_passed(doc)
+    if precision is not True:
+        raise CampaignError(
+            "确认复测的精度没过（或结果里没有精度字段）——"
+            "这说明上次那轮的精度结论本身不可靠")
+
+    readings = best.setdefault("readings", [])
+    readings.append(gain)
+    target = float(state.get("target_gain", DEFAULT_PHASE_TARGET_GAIN))
+    entry = {
+        "at": _now(), "generation": state.get("generation", 0),
+        "input_shape": state.get("input_shape"), "decision": decision,
+        "gain": gain, "time_us": _evolved_time_us(doc),
+        "verdict": VERDICT_CONFIRM,
+        # 明确记下「这是对哪一轮读数的复测」，而不是一次新候选。
+        "reading_of": decision,
+        "reason": (f"确认复测：增益 {(gain - 1) * 100:+.2f}%"
+                   f"（目标 {target}）。该决策累计读数 {readings}"),
+        "counts_toward_best": False,
+        "kb_admissible": False,
+    }
+    state.setdefault("ledger", []).append(entry)
+    # best 的 gain 取**最小**的那次读数，不是最大。
+    #
+    # 多次抽样取最大就是让运气决定 best；取最小是保守方向 —— 我们要的是
+    # 「至少能稳定做到多少」，而不是「最好的一次是多少」。
+    best["gain"] = min(r for r in readings if isinstance(r, (int, float)))
+    _advance_state(state, None)
+    return entry
+
+
+#: 停顿类机制行的默认带宽：参考实测值的多少倍。
+#:
+#: 取 1.25 —— 比噪声底高一档，但不足以让「两倍于参考的等待量」过关。
+#: 这个数来自论文实现的「机制行带宽纪律」，它的理由是实证：一条锚在参考值
+#: 1.6 的行被写成 ≤6.0，病灶最后是靠并排读源码才暴露的。
+MECHANISM_BAND_FACTOR = 1.25
+
+#: 本轮读数与参考差到多少倍，就必须被显式裁定。
+#:
+#: 论文实现取 2×，理由是实证：一个 stall 指标 12.7 倍于参考而其余全部在带内，
+#: 因为课程表没写那条机制行，整段预算花在了无辜的嫌疑人上。
+M0_AUDIT_FACTOR = 2.0
+
+
+def audit_against_reference(state: Dict[str, Any],
+                            signature: Dict[str, Any],
+                            factor: float = M0_AUDIT_FACTOR
+                            ) -> List[Dict[str, Any]]:
+    """把本轮签名与参考签名逐通道并排，找出差得最多的那些。
+
+    为什么需要这一步：门禁验的是「实现有没有建出课程表说的东西」，它**只拿
+    课程表自己声明的值**做比较。于是整个门禁体系里没有任何地方回答
+    「课程表本身画对了吗」—— 课程表没写到的通道可以是参考的任意倍数而不
+    触发任何东西，而机制核验只看课程表挑出来写的那几条。
+
+    具体形态：参考的某个等待占比是 0.3、候选是 6.0（20 倍），只要课程表没写
+    这条机制行，候选照样 accept、入知识库、封成下一代参考。
+    """
+    reference = state.get("reference_snapshot") or {}
+    current = snapshot_signature(signature) if signature else {}
+    findings: List[Dict[str, Any]] = []
+    for channel, ref_value in sorted(reference.items()):
+        cur_value = current.get(channel)
+        if not isinstance(ref_value, (int, float)) \
+                or not isinstance(cur_value, (int, float)):
+            continue
+        # 两边都接近 0 时倍数没有意义（0.01 vs 0.03 是 3 倍但无关紧要）
+        if abs(ref_value) < _MOVE_EPS and abs(cur_value) < _MOVE_EPS:
+            continue
+        denominator = max(abs(ref_value), _MOVE_EPS)
+        ratio = abs(cur_value) / denominator
+        if ratio >= factor:
+            findings.append({
+                "channel": channel,
+                "reference": ref_value,
+                "current": cur_value,
+                "ratio": round(ratio, 2),
+            })
+    findings.sort(key=lambda f: -f["ratio"])
+    return findings
+
+
+def cmd_audit(args: argparse.Namespace) -> int:
+    """M0 对账：本轮读数与参考并排，每个差 ≥N 倍的通道都要有人认领。"""
+    path = Path(args.state)
+    try:
+        state = load_state(path)
+        signature = _load_signature(args.signature)
+    except CampaignError as exc:
+        print(f"错误: {exc}", file=sys.stderr)
+        return 2
+    if signature is None:
+        print("错误: 需要 --signature（本轮的 signature_probe 输出）",
+              file=sys.stderr)
+        return 2
+    if not state.get("reference_snapshot"):
+        print("错误: state 里没有参考签名快照，无法对账。\n"
+              "  先 campaign.py set-reference-signature --signature <参考签名>",
+              file=sys.stderr)
+        return 2
+
+    milestone_doc = None
+    milestone_path = args.milestone or state.get("milestone_path")
+    if milestone_path:
+        try:
+            milestone_doc = load_milestone(Path(milestone_path))
+        except CampaignError as exc:
+            print(f"错误: {exc}", file=sys.stderr)
+            return 2
+
+    findings = audit_against_reference(state, signature, args.factor)
+    # 课程表里已经有机制行锚着的通道，算「已被认领」
+    claimed: Set[str] = set()
+    if milestone_doc is not None:
+        for _mid, category, line in _iter_all_gate_lines(milestone_doc):
+            if category != "mechanism_lines":
+                continue
+            anchor = line.get("anchor") or {}
+            expr = anchor.get("expr") if isinstance(anchor, dict) else None
+            if not isinstance(expr, str):
+                continue
+            for finding in findings:
+                field = finding["channel"].rsplit(":", 1)[-1]
+                if field and field in expr:
+                    claimed.add(finding["channel"])
+
+    unclaimed = [f for f in findings if f["channel"] not in claimed]
+
+    if args.as_json:
+        print(json.dumps({
+            "factor": args.factor,
+            "findings": findings,
+            "claimed": sorted(claimed),
+            "unclaimed": unclaimed,
+            "passed": not unclaimed,
+        }, ensure_ascii=False, indent=2))
+        return 0 if not unclaimed else 1
+
+    sys.stdout.flush()
+    print(f"M0 对账：与参考相差 ≥{args.factor}× 的通道 {len(findings)} 个")
+    for finding in findings:
+        mark = "已认领" if finding["channel"] in claimed else "**无人认领**"
+        print(f"  [{mark}] {finding['channel']}")
+        print(f"      参考 {finding['reference']} → 本轮 "
+              f"{finding['current']}（{finding['ratio']}×）")
+    if not findings:
+        print("  （无）所有参考通道都在 "
+              f"{args.factor}× 带内。")
+        return 0
+    if not unclaimed:
+        print("\n对账通过：每个超带通道都有机制行锚着。")
+        return 0
+
+    sys.stdout.flush()
+    print(f"\n对账未通过：{len(unclaimed)} 个通道差了 {args.factor} 倍以上，"
+          "而课程表里没有任何机制行锚着它们。", file=sys.stderr)
+    print("  门禁只拿课程表自己声明的值做比较，所以课程表没写到的通道"
+          "不会触发任何东西。", file=sys.stderr)
+    print("  对每一个无人认领的通道三择一：", file=sys.stderr)
+    print("    (a) M0 里已有具名决策接手 → 补一条机制行锚住它",
+          file=sys.stderr)
+    print("    (b) 实现缺陷（课程表写对了、实现没做到）→ 补一张 hwkb 卡片，"
+          "不要改课程表", file=sys.stderr)
+    print("    (c) 课程表缺陷（没写/写错）→ 走 reopen 修订课程表",
+          file=sys.stderr)
+    return 1
+
+
+def cmd_confirm(args: argparse.Namespace) -> int:
+    path = Path(args.state)
+    try:
+        state = load_state(path)
+        doc = json.loads(Path(args.result).read_text(encoding="utf-8"))
+    except CampaignError as exc:
+        print(f"错误: {exc}", file=sys.stderr)
+        return 2
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"错误: 无法读取 {args.result}: {exc}", file=sys.stderr)
+        return 2
+
+    problems = check_result_admissible(doc, state)
+    if problems:
+        print("错误: 这份结果不能用于确认复测：", file=sys.stderr)
+        for problem in problems:
+            print(f"  - {problem}", file=sys.stderr)
+        return 1
+
+    try:
+        entry = confirm_best(state, doc, args.decision)
+    except CampaignError as exc:
+        print(f"错误: {exc}", file=sys.stderr)
+        return 1
+    save_state(path, state)
+
+    best = state.get("best", {})
+    readings = best.get("readings", [])
+    print(f"确认复测记录：{entry['reason']}")
+    if _best_is_confirmed(state):
+        print(f"  已确认：{len(readings)} 次读数全部达标，"
+              f"best 取最小值 {best.get('gain')}")
+    else:
+        target = float(state.get("target_gain", DEFAULT_PHASE_TARGET_GAIN))
+        low = [r for r in readings if r < target]
+        print(f"  未确认：{len(low)} 次读数低于目标 {target}（{low}）。")
+        print("  上次那个达标读数是一次偏高抽样 —— 这正是复测要查出来的。")
     action = next_action(state)
     print(f"\n下一步: {action['action']} — {action['reason']}")
     return 0
@@ -1637,29 +3008,247 @@ def cmd_record(args: argparse.Namespace) -> int:
         print(f"错误: {args.result} 不是合法 JSON: {exc}", file=sys.stderr)
         return 2
 
+    problems = check_result_admissible(doc, state)
+    if problems and not args.allow_unverified_result:
+        print(f"错误: 这份评测结果不能用于裁决（{len(problems)} 项）：",
+              file=sys.stderr)
+        for problem in problems:
+            print(f"  - {problem}", file=sys.stderr)
+        print("  确认要据此裁决时加 --allow-unverified-result，"
+              "并在 milestone 里写明理由。", file=sys.stderr)
+        return 1
+    for problem in problems:
+        print(f"警告: {problem}", file=sys.stderr)
+
+    # 噪声底是 init 时量一次存进 state 的，之后整个 campaign 复用。
+    # 环境会变（同卡来了别的进程、发生降频），所以每轮拿本次结果的 cv
+    # 复核一次：实测抖动已经高过存量噪声底时，这一轮的判据是失准的。
+    stored_floor = float(state.get("noise_floor_pct", 0.0) or 0.0)
+    cv_values = result_cv_values(doc)
+    if cv_values and stored_floor > 0:
+        worst = max(cv_values)
+        # 按**倍数**判，不按「超过一点」判。
+        #
+        # 存量噪声底本来就是从某一次的 cv 量出来的，之后每轮的 cv 在它上下
+        # 浮动是正常抽样波动。只要高一点就拒绝，这道门会天天响，然后被
+        # 反射性豁免 —— 那就回到了静默放行。
+        # 要拦的是「环境真的变了」：抖动高到让存量噪声底不再是个可信的界。
+        if worst > stored_floor * STALE_FLOOR_FACTOR:
+            if args.allow_stale_noise_floor:
+                print(f"警告: 本次实测抖动 {worst:.2f}% 高于存量噪声底 "
+                      f"{stored_floor:.2f}%，已按 --allow-stale-noise-floor 放行。",
+                      file=sys.stderr)
+            else:
+                print(f"错误: 本次实测抖动 {worst:.2f}% 已达存量噪声底 "
+                      f"{stored_floor:.2f}% 的 {worst / stored_floor:.1f} 倍。",
+                      file=sys.stderr)
+                print("  噪声底是 init 时量的，这一轮的环境比那时吵 —— "
+                      "按旧判据裁决会把抖动当成真实改进。", file=sys.stderr)
+                print("  先查环境（同卡有没有别的进程、是否降频），"
+                      "再重量并 set-noise-floor；", file=sys.stderr)
+                print("  确认这次抖动是偶发、不代表环境变化时加 "
+                      "--allow-stale-noise-floor。", file=sys.stderr)
+                return 1
+        elif worst > stored_floor:
+            print(f"提示: 本次实测抖动 {worst:.2f}% 略高于存量噪声底 "
+                  f"{stored_floor:.2f}%（正常抽样波动范围内）。"
+                  "连续多轮如此就该重量一次。", file=sys.stderr)
+
     try:
         signature = _load_signature(args.signature)
     except CampaignError as exc:
         print(f"错误: {exc}", file=sys.stderr)
         return 2
 
+    # milestone 路径优先用命令行，其次用 init 时记在 state 里的那个。
+    #
+    # 为什么要有后备：漏传 --milestone 会同时关掉「决策图走穷」和「门禁僵持」
+    # 两个外层重入口（两个函数在 milestone_doc 为 None 时直接返回"没问题"），
+    # 并把本轮降级为 accept_unverified。一个可选参数静默关掉两道闸，
+    # 而最该触发重入的那种调用方式恰恰就是漏传它。
+    milestone_path = args.milestone or state.get("milestone_path")
+    if not milestone_path:
+        # 不拒绝，但必须说出来、而且要留痕。
+        #
+        # 缺了课程表，「决策图走穷」和「门禁僵持」两个外层重入口都会静默
+        # 返回「没问题」（两个函数在 milestone_doc 为 None 时直接早退），
+        # 机制也一律判为无法核验。三个重入口只剩一个。
+        #
+        # 早先这里是直接拒绝的，但那样会把 record 的其他正当用法一起卡住，
+        # 结果是人反射性地加豁免参数 —— 那和静默失效是同一件事，只是多敲几个字。
+        # 真正的缺陷是「失效了没人知道」，所以改成告警 + 在台账里标记本轮
+        # 哪两道闸没被评估过。
+        print("警告: 本轮没有 milestone。两个外层重入口（决策图走穷 / 门禁僵持）"
+              "不会被评估，", file=sys.stderr)
+        print("      机制也一律判为无法核验（不计入 best）。"
+              "台账里会标记这一轮。", file=sys.stderr)
+        print("      用 --milestone <路径>，或在 init 时 --milestone-path "
+              "记进 state 以免每次都要传。", file=sys.stderr)
     try:
         milestone_doc = load_milestone(
-            Path(args.milestone) if args.milestone else None)
+            Path(milestone_path) if milestone_path else None)
     except CampaignError as exc:
         print(f"错误: {exc}", file=sys.stderr)
         return 2
+
+    # 这一轮测的是哪一份代码。
+    #
+    # 不记的话，「被保留下来的最后一条就是当前代码的样子」这个前提无法核实，
+    # 而机制做差整个建立在它上面。候选目录不一定在版本控制里（评测要的是
+    # 装好的 OPP 安装路径），所以用内容指纹代替 git sha。
+    artifact_sha = args.artifact_sha or ""
+    if not artifact_sha and args.artifact:
+        artifact_path = Path(args.artifact)
+        if artifact_path.exists():
+            artifact_sha = directory_fingerprint(artifact_path)
+        else:
+            print(f"警告: --artifact 指向的 {artifact_path} 不存在，"
+                  "本轮没有代码身份记录。", file=sys.stderr)
+    if not artifact_sha:
+        print("警告: 本轮没有记录代码身份（--artifact 或 --artifact-sha）。",
+              file=sys.stderr)
+        print("      机制做差假设「上一条保留下来的就是当前代码」—— "
+              "没有指纹这件事无法核实：", file=sys.stderr)
+        print("      该回滚却没回滚、或在更早的树上接着改，"
+              "基线就是错的而百分比看着正常。", file=sys.stderr)
+
+    previous_sha = None
+    for entry_before in reversed(generation_entries(state)):
+        if entry_before.get("artifact_sha"):
+            previous_sha = entry_before["artifact_sha"]
+            break
+    if artifact_sha and previous_sha and artifact_sha == previous_sha:
+        print(f"警告: 本轮产物指纹与上一轮相同（{artifact_sha}）—— "
+              "代码没有变化。", file=sys.stderr)
+        print("      对未改动的树重测只是多抽一次噪声；"
+              "当成新候选保留会让 best 由运气决定。", file=sys.stderr)
+        print("      要记一次确认读数请用 campaign.py confirm。",
+              file=sys.stderr)
+
+    precision_report = None
+    if args.precision_report:
+        try:
+            precision_report = json.loads(
+                Path(args.precision_report).read_text(encoding="utf-8"))
+        except OSError as exc:
+            print(f"错误: 无法读取精度报告 {args.precision_report}: {exc}",
+                  file=sys.stderr)
+            return 2
+        except json.JSONDecodeError as exc:
+            print(f"错误: {args.precision_report} 不是合法 JSON: {exc}",
+                  file=sys.stderr)
+            return 2
+        if precision_report.get("verdict") == "unavailable":
+            print("警告: 精度误差比判不了（缺参考语义）。本轮只有容差比对，",
+                  file=sys.stderr)
+            print("      而容差分不出「在参考舍入的地方舍入」和"
+                  "「用 bf16 累加 / tf32 相乘」。", file=sys.stderr)
+            print("      另外容差的锚是 baseline 的输出 —— promote 之后它变成"
+                  "上一代产物，", file=sys.stderr)
+            print("      于是每代允许再漂一个容差，N 代之后与真值的距离无界。",
+                  file=sys.stderr)
+    else:
+        print("提示: 本轮没有误差比报告。容差比对的锚会随代际漂移 ——",
+              file=sys.stderr)
+        print("      先跑 precision_gate.py --output <报告>，"
+              "再 record --precision-report <报告>。", file=sys.stderr)
+
+    structure_report = None
+    if args.structure_report:
+        try:
+            structure_report = json.loads(
+                Path(args.structure_report).read_text(encoding="utf-8"))
+        except OSError as exc:
+            print(f"错误: 无法读取结构报告 {args.structure_report}: {exc}",
+                  file=sys.stderr)
+            return 2
+        except json.JSONDecodeError as exc:
+            print(f"错误: {args.structure_report} 不是合法 JSON: {exc}",
+                  file=sys.stderr)
+            return 2
+    else:
+        print("提示: 本轮没有结构核验报告。机制核验只能靠停顿指标反驳，",
+              file=sys.stderr)
+        print("      而停顿能被别的改动顶下去（减小 tile、改对齐都会让它降）",
+              file=sys.stderr)
+        print("      —— 一个退化回退的实现可以凭一个恰好变好的停顿数拿到"
+              "「机制已核实」。", file=sys.stderr)
+        print("      先跑 structure_probe.py --output <报告>，"
+              "再 record --structure-report <报告>。", file=sys.stderr)
+
+    fence_report = None
+    if args.fence_report:
+        try:
+            fence_report = json.loads(
+                Path(args.fence_report).read_text(encoding="utf-8"))
+        except OSError as exc:
+            print(f"错误: 无法读取围栏报告 {args.fence_report}: {exc}",
+                  file=sys.stderr)
+            return 2
+        except json.JSONDecodeError as exc:
+            print(f"错误: {args.fence_report} 不是合法 JSON: {exc}",
+                  file=sys.stderr)
+            return 2
+    else:
+        print("提示: 本轮没有围栏报告 —— 这一轮没有被查过"
+              "「是不是转发给了参考实现」。", file=sys.stderr)
+        print("      候选直接调厂商实现时，加速比、精度、所有门禁全过，"
+              "而一行 kernel 都没写；", file=sys.stderr)
+        print("      自我提升场景更隐蔽：第 n 代转发给第 n−1 代，"
+              "链条可以空转很多轮，", file=sys.stderr)
+        print("      每轮都「没有退化」。", file=sys.stderr)
+        print("      围栏是静态扫描，不花机时：", file=sys.stderr)
+        print("        python3 <forge-probes>/scripts/fence_check.py "
+              "--candidate <候选> \\", file=sys.stderr)
+        print("            --op-name <算子> --json > fence.json",
+              file=sys.stderr)
+        print("      然后 record --fence-report fence.json。"
+              "没有它这一轮不会抬高 best。", file=sys.stderr)
 
     entry = apply_result(
         state, doc, args.decision, milestone_doc=milestone_doc,
         signature=signature, recipes_used=args.recipe,
         recipes_invented=args.invented, symptom=args.symptom,
         signature_path=args.signature or "",
+        artifact_sha=artifact_sha,
+        base_sha=args.base_sha or previous_sha or "",
+        milestone_sha=_milestone_fingerprint(milestone_doc) or "",
+        structure_report=structure_report,
+        precision_report=precision_report,
+        fence_report=fence_report,
     )
+    if milestone_doc is None:
+        # 让「这一轮是在没有课程表的情况下裁决的」可查，否则事后无法区分
+        # 「重入口没触发」和「重入口根本没被评估」。
+        entry["gates_not_evaluated"] = ["graph_exhausted", "gate_impasse"]
+    else:
+        # 判据换过没有。阈值被改宽、或机制行被删掉，早先在台账里一点痕迹
+        # 都没有 —— 那是一条完整的「挪球门」路径。
+        current_ms = entry.get("milestone_sha256")
+        previous_ms = None
+        for before in reversed(generation_entries(state)[:-1]):
+            if before.get("milestone_sha256"):
+                previous_ms = before["milestone_sha256"]
+                break
+        if previous_ms and current_ms and previous_ms != current_ms:
+            print(f"注意: 本轮的判据与上一轮不是同一份课程表"
+                  f"（{previous_ms} → {current_ms}）。", file=sys.stderr)
+            print("      两轮的裁决不可直接相比；"
+                  "若这是一次修订，请确认它走过 reopen。", file=sys.stderr)
     save_state(path, state)
 
     print(f"决策 {args.decision}: {entry['verdict']}")
     print(f"  {entry['reason']}")
+
+    structure = entry.get("structure")
+    if isinstance(structure, dict) and structure.get("status") != "unchecked":
+        marks = {"ok": "结构成立", "absent": "结构不在"}
+        print(f"\n  结构核验（{marks.get(structure['status'], structure['status'])}）："
+              f"{structure['reason']}")
+        if structure["status"] == "absent":
+            print("        这是实现问题 —— 该修实现或给实现补一张经验卡片，")
+            print("        **不要**改课程表：改措辞不会让一个「不在」"
+                  "变成「在」。")
 
     mechanism = entry.get("mechanism")
     if isinstance(mechanism, dict) and mechanism.get("lines"):
@@ -1721,6 +3310,49 @@ def cmd_reopen(args: argparse.Namespace) -> int:
         print(f"错误: {exc}", file=sys.stderr)
         return 2
 
+    # 徒劳重开上限。计数**不随任何一次 reopen 归零** —— 下面那三个计数器
+    # 归零是对的（新架构假设要给足机会），但「重开了几次、几次白干」必须
+    # 跨重开存活，否则「重开 → 几轮不够 → 停滞 → 再重开」可以永久循环，
+    # 而每一轮的 status 看起来都健康。
+    reopen_stats = state.setdefault("reopen", {"total": 0, "fruitless": 0})
+    if int(reopen_stats.get("fruitless", 0)) >= REOPEN_MAX_FRUITLESS \
+            and not args.force:
+        print(f"错误: 已连续 {reopen_stats['fruitless']} 次重开没有带来新的"
+              f"下界（上限 {REOPEN_MAX_FRUITLESS}）。", file=sys.stderr)
+        print("  再开一次很可能还是原地打转 —— 每次重开都会作废整条下游的"
+              "实现、把 best 归零。", file=sys.stderr)
+        print("  该做的是换一件事：调低目标增益、换 shape、"
+              "或者承认这个方向到此为止。", file=sys.stderr)
+        print("  确实要再开一次时加 --force（会重置这个计数）。",
+              file=sys.stderr)
+        return 1
+
+    # 重开定价。没有价格就没有重开。
+    if not args.price and not args.force:
+        print("错误: 重开必须定价。", file=sys.stderr)
+        print("  重开会按依赖反向闭包作废整条下游的实现、把 best 归零、"
+              "三个计数器清零 ——", file=sys.stderr)
+        print("  这是整套流程里代价最大的单个动作，理由不能是一句自由文本。",
+              file=sys.stderr)
+        print("  形状：--price \"<Δ%> via lever:<手段名>\"", file=sys.stderr)
+        print("        来源也可以是 probe:<路径> / kb:<卡片 id> / "
+              "ablation:<消融名>", file=sys.stderr)
+        print("  停滞之后的第一件事本来就是用 lever_probe.py 给现有手段定价，"
+              "拿那个数填进来。", file=sys.stderr)
+        return 2
+    if args.price:
+        ok, detail = verify_reopen_price(args.price, args.state,
+                                         args.lever_store, args.kb_root)
+        if not ok:
+            if args.force:
+                print(f"警告: 价格核对未通过：{detail}", file=sys.stderr)
+                print("  已按 --force 继续。", file=sys.stderr)
+            else:
+                print(f"错误: 价格核对未通过：{detail}", file=sys.stderr)
+                return 1
+        else:
+            print(f"价格已核对：{detail}")
+
     invalidated = {args.decision} | affected
     count = 0
     for entry in state.get("ledger", []):
@@ -1769,9 +3401,16 @@ def cmd_reopen(args: argparse.Namespace) -> int:
                    f"{len(affected)} 条下游决策的 {count} 条台账记录。"
                    f"理由：{args.reason or '未填'}"),
         "invalidated_decisions": sorted(invalidated),
+        "price": args.price or None,
         "counts_toward_best": False,
         "kb_admissible": False,
     })
+    reopen_stats["total"] = int(reopen_stats.get("total", 0)) + 1
+    # 本次重开先按「无果」计入；下一次抬高 best 时由 apply_result 清零。
+    # 方向取保守侧：没有证据说明它有用之前，就当它没用。
+    reopen_stats["fruitless"] = (0 if args.force
+                                 else int(reopen_stats.get("fruitless", 0)) + 1)
+    reopen_stats["last_price"] = args.price or None
     save_state(path, state)
 
     print(f"已重开 {args.decision}")
@@ -1936,7 +3575,50 @@ def cmd_promote(args: argparse.Namespace) -> int:
         save_state(path, state)
         print("自我提升收敛：本代增益未超过噪声底，链条终止。")
         print("这个停点是对上限的估计，不是证明。如确需继续请加 --force。")
+        debts = harvest_debt(state)
+        if debts:
+            # 这条分支只告警，不拦。拦了的话，一个该停的 campaign 连
+            # 「我收敛了」都没法记下来 —— 状态机会卡在 implement，而那
+            # 比丢几条经验更糟：之后所有停止条件的判断都从一个错的状态出发。
+            print(f"\n注意: 本代还有 {len(debts)} 笔未结的知识欠账。"
+                  "链条到此为止，但这些结论仍然值得入库 ——")
+            print("      它们是这一代唯一留得下来的东西。"
+                  "跑 `campaign.py harvest` 看清单。")
         return 0
+
+    if not _best_is_confirmed(state) and not args.force:
+        readings = (state.get("best") or {}).get("readings") or []
+        print(f"错误: best 只有 {len(readings)} 次读数（{readings}），"
+              "没有经过独立复测。", file=sys.stderr)
+        print("  promote 会把这份产物复制进库、带上校验和与血统、"
+              "成为下一代的参考，", file=sys.stderr)
+        print("  而之后每一代的增益都相对它算。同时 promote 会把 best 归零、"
+              "噪声底置为待重测 ——", file=sys.stderr)
+        print("  也就是说那个读数本身从此消失，一次运气好的抽样封进去之后"
+              "无法回溯。", file=sys.stderr)
+        print("  对同一份产物再 record 一次（同一个决策 id），"
+              "两次都达标后再 promote；", file=sys.stderr)
+        print("  确认要据单次读数提升时加 --force。", file=sys.stderr)
+        return 1
+
+    # 知识欠账必须先结清。
+    #
+    # 这道闸的位置是算过的：排在确认复测**之后**、正式封存**之前**。
+    #
+    #   在确认之后 —— 读数本身不可信时，先让人去写一张以它为据的卡片
+    #                  比不写更糟：那张卡片会被别的 campaign 当成已核实的
+    #                  经验用。所以先确认数，再谈入库。
+    #   在封存之前 —— promote 把 best 归零、噪声底置为待重测、产物封成下一代
+    #                  的参考。台账还在，但产出这些结论的会话上下文已经没了：
+    #                  「增益超噪声底且机制已核实」背后的推理过程，过了这一刻
+    #                  就只剩一行 reason。这是最后一个还来得及的时刻。
+    debts = harvest_debt(state)
+    if debts and not args.allow_unharvested and not args.force:
+        print(f"错误: 本代有 {len(debts)} 笔未结的知识欠账，先结清再 promote。",
+              file=sys.stderr)
+        print("", file=sys.stderr)
+        print(render_harvest(debts), file=sys.stderr)
+        return 1
 
     # 封存进库：产物复制进去 + 校验和 + 血统。
     # 只记路径是不够的 —— 那个目录被清掉、被覆盖，第 n 代就对不上
@@ -1978,12 +3660,47 @@ def cmd_promote(args: argparse.Namespace) -> int:
                   file=sys.stderr)
             return 2
 
+    # 新参考必须真的被封存，`sealed: True` 不能只是个字段。
+    #
+    # promote 之前这里只写一个标志位，而全仓只有 reference_library.ingest
+    # 会调 seal_reference.seal —— promote 走的是 add_generation，不封。
+    # 于是第 1 代起，编码 agent 可以直接 Read 第 0 代那份自己写的 kernel
+    # （它就是新参考），而台账里写着「源码不跨代边界」。
+    #
+    # 另外参考路径要指向**库里的只读拷贝**，不是工作区里那个候选目录 ——
+    # 后者可读可写，改动它会直接改掉下一代的计时基线。
     generation = int(state.get("generation", 0)) + 1
+    sealed_source = args.artifact
+    if library_record and library_record.get("artifact_dir"):
+        candidate = Path(args.library) / library_record["artifact_dir"]
+        if candidate.is_dir():
+            sealed_source = str(candidate)
+
+    reseal_note = None
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import seal_reference as sealer  # noqa: PLC0415
+
+        work_dir = Path(args.state).resolve().parent
+        manifest = sealer.seal(
+            Path(sealed_source),
+            f"{state.get('operator')}_gen{generation - 1}",
+            work_dir,
+        )
+        reseal_note = (f"已封存新参考：{manifest['sealed_file_count']} 个文件"
+                       f"（{sealed_source}）")
+    except Exception as exc:  # noqa: BLE001 - 封存失败不能让 promote 悄悄过去
+        print(f"错误: 新参考封存失败: {exc}", file=sys.stderr)
+        print("  promote 未完成。不封存就提升，下一代可以直接读上一代的源码，", 
+              file=sys.stderr)
+        print("  而「架构结论从硬件行为反推」这个前提就破了。", file=sys.stderr)
+        return 2
+
     state["generation"] = generation
     state["reference"] = {
         "kind": "sealed_kernel",
         "id": f"{state.get('operator')}_gen{generation - 1}",
-        "path": args.artifact, "sealed": True,
+        "path": sealed_source, "sealed": True,
         "generation": generation - 1, "promoted_gain": gain,
         "library_dir": (str(Path(args.library)
                             / f"{state.get('arch')}")
@@ -2017,6 +3734,8 @@ def cmd_promote(args: argparse.Namespace) -> int:
     save_state(path, state)
 
     print(f"已提升到第 {generation} 代")
+    if reseal_note:
+        print(f"  {reseal_note}")
     if library_record:
         if library_seeded:
             print(f"  补登参考  gen{library_seeded['generation']} "
@@ -2117,6 +3836,148 @@ def summarise_recipes(state: Dict[str, Any]) -> Dict[str, Any]:
         "foreign_assist_rate": (accepted_with_foreign / accepted_total
                                 if accepted_total else 0.0),
     }
+
+
+#: 一个决策烧掉多少轮评测之后，它的过程本身就值得入库。
+#:
+#: 上游叫 `kb_tripwire_rounds`，默认 6。理由不是「花得多就该记」，而是
+#: **花得多说明那一轮有东西没被预见到** —— 课程表以为一步能到，实际走了
+#: 六步。中间那五次失败里藏着一条硬件事实，而它只存在于那次会话的上下文里。
+KB_TRIPWIRE_ROUNDS = 6
+
+
+def harvest_debt(state: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """算出「该入库而还没入库」的欠账。
+
+    为什么要自动算：知识沉淀排在流程第 11 步，也就是一次长 campaign 的
+    末尾 —— 正是上下文最紧、最容易被跳过的时刻。本仓就是证据：整套
+    dav2201 流程建完，库里 1 张卡。靠提示词提醒的事，到那个时刻不会发生。
+
+    两类欠账，各自对应一类「已经付过代价、但结论没留下」的情形：
+
+      admissible   台账判了 kb_admissible（增益超噪声底**且**机制已核实），
+                   却没有任何 recipes_invented。这是一条已经被证实的
+                   硬件经验，代价已经付了，只差写下来。
+
+      tripwire     一个决策烧掉 ≥ KB_TRIPWIRE_ROUNDS 轮才拿到接受判定。
+                   花得多说明有东西没被预见到，而那个发现只存在于
+                   那次会话里 —— 这一代一结束就没了。
+
+    只看本代。上一代的欠账在上一次 promote 时就该结清，再算一遍只会让
+    列表永远非空，然后 promote 那道闸被反射性豁免掉。
+    """
+    entries = [e for e in generation_entries(state) if not e.get("invalidated")]
+    debts: List[Dict[str, Any]] = []
+
+    # 本代一共写下了哪些卡片。按决策分不开 —— 一张卡片常常是几轮的合并
+    # 结论，所以这里只问「这一代到底写了没有」。
+    invented_anywhere = any(e.get("recipes_invented") for e in entries)
+
+    for entry in entries:
+        if not entry.get("kb_admissible"):
+            continue
+        if entry.get("recipes_invented"):
+            continue
+        mechanism = entry.get("mechanism") or {}
+        debts.append({
+            "kind": "admissible",
+            "decision": entry.get("decision"),
+            "gain": entry.get("gain"),
+            "symptom": entry.get("symptom") or "",
+            "mechanism_reason": mechanism.get("reason") or "",
+            "mechanism_lines": mechanism.get("lines") or [],
+            "signature_path": entry.get("signature_path"),
+            "why": ("台账判了 kb_admissible —— 增益超噪声底且机制已核实。"
+                    "这条经验的代价已经付过了，只差写下来"),
+        })
+
+    attempts: Dict[str, int] = {}
+    accepted_at: Dict[str, int] = {}
+    for entry in entries:
+        decision = entry.get("decision")
+        if not decision:
+            continue
+        attempts[decision] = attempts.get(decision, 0) + 1
+        if (entry.get("verdict") in (VERDICT_ACCEPT, VERDICT_ACCEPT_UNVERIFIED)
+                and decision not in accepted_at):
+            accepted_at[decision] = attempts[decision]
+    for decision, rounds in sorted(accepted_at.items()):
+        if rounds < KB_TRIPWIRE_ROUNDS:
+            continue
+        if invented_anywhere:
+            # 这一代确实写了卡片，就不再为「花得多」单独记一笔欠账。
+            # 这类欠账的目的是让人去写，写过了就不必再催。
+            continue
+        debts.append({
+            "kind": "tripwire",
+            "decision": decision,
+            "rounds": rounds,
+            "why": (f"这个决策烧掉 {rounds} 轮才拿到接受判定（阈值 "
+                    f"{KB_TRIPWIRE_ROUNDS}）。花得多说明有东西没被预见到，"
+                    "而那个发现只存在于那次会话的上下文里"),
+        })
+    return debts
+
+
+def render_harvest(debts: List[Dict[str, Any]]) -> str:
+    """把欠账渲染成「照着它就能写卡片」的样子。
+
+    不只列条目号。欠账清单要是还得让人回头翻台账找读数，到那一步就没人写了 ——
+    所以把症状、机制结论、机制行、签名文件路径都带上。
+    """
+    if not debts:
+        return "没有未结的知识欠账。"
+    lines = [f"{len(debts)} 笔未结的知识欠账：", ""]
+    for index, debt in enumerate(debts, 1):
+        lines.append(f"[{index}] {debt['kind']}  决策 {debt.get('decision')}")
+        lines.append(f"    为什么: {debt['why']}")
+        if debt.get("gain") is not None:
+            lines.append(f"    增益:   {(float(debt['gain']) - 1) * 100:+.2f}%")
+        if debt.get("symptom"):
+            lines.append(f"    症状:   {debt['symptom']}")
+        if debt.get("mechanism_reason"):
+            lines.append(f"    机制:   {debt['mechanism_reason']}")
+        for line in debt.get("mechanism_lines") or []:
+            anchor = (line.get("anchor") or {}) if isinstance(line, dict) else {}
+            label = line.get("label") if isinstance(line, dict) else line
+            lines.append(f"    机制行: {label}  "
+                         f"{anchor.get('expr', '')}")
+        if debt.get("signature_path"):
+            lines.append(f"    签名:   {debt['signature_path']}"
+                         "（前后通道读数在这里）")
+        lines.append("")
+    lines += [
+        "怎么结清：",
+        "  1. 按上面的读数起草卡片（正文中文，四小节：机制/触发症状/"
+        "最小可运行例/已知坑）",
+        "  2. 参考侧细节写进 <kb_root>/provenance/<卡片 id>.md，"
+        "卡片里写 provenance_archive 指针",
+        "  3. python3 <forge-hwkb>/scripts/hwkb.py validate --card draft.md",
+        "  4. python3 <forge-hwkb>/scripts/hwkb.py add --card draft.md",
+        "  5. record 时带 --invented <卡片 id>，这笔欠账才算结清",
+        "",
+        "确实不值得入库时（比如那条增益来自一次纯参数调整，没有可复用的"
+        "硬件事实），",
+        "promote 加 --allow-unharvested 显式放过 —— 它会写进台账，"
+        "而不是悄悄消失。",
+    ]
+    return "\n".join(lines)
+
+
+def cmd_harvest(args: argparse.Namespace) -> int:
+    path = Path(args.state)
+    try:
+        state = load_state(path)
+    except CampaignError as exc:
+        print(f"错误: {exc}", file=sys.stderr)
+        return 2
+    debts = harvest_debt(state)
+    if args.as_json:
+        print(json.dumps({"debt_count": len(debts), "debts": debts},
+                         ensure_ascii=False, indent=2))
+    else:
+        print(render_harvest(debts))
+    return 1 if debts else 0
 
 
 def cmd_ledger(args: argparse.Namespace) -> int:
@@ -2223,8 +4084,10 @@ def build_parser() -> argparse.ArgumentParser:
                         default=DEFAULT_PHASE_TARGET_GAIN)
     p_init.add_argument("--stagnation-threshold", type=int,
                         default=DEFAULT_STAGNATION_THRESHOLD)
-    p_init.add_argument("--budget", type=int, default=None,
-                        help="评测次数上限；不给则不限")
+    p_init.add_argument("--budget", type=int, default=DEFAULT_BUDGET,
+                        help=f"评测次数上限（默认 {DEFAULT_BUDGET}）。"
+                             "传 0 表示不限 —— 但不限意味着循环没有任何出口，"
+                             "停滞判据失效时会一直跑下去")
     p_init.add_argument("--device-id", type=int, required=True,
                         help="本 campaign 使用的卡号。一个任务一张卡；"
                              "代际之间不换卡 —— 换了之后参考签名、噪声底、"
@@ -2244,6 +4107,15 @@ def build_parser() -> argparse.ArgumentParser:
                              "这会让后续所有机制做差建立在错的起点上")
     p_init.add_argument("--allow-unverified-dispatch", action="store_true",
                         help="参考声明为内置实现但派发未确认时仍然开 campaign")
+    p_init.add_argument("--sealed-paths", default=None,
+                        help="封存清单位置。不给则在工作目录与 "
+                             "FORGE_SEALED_PATHS 里找")
+    p_init.add_argument("--allow-no-boundary", action="store_true",
+                        help="边界自检不通过时仍然开 campaign。"
+                             "架构结论将无法证明不是抄的")
+    p_init.add_argument("--milestone-path", default=None,
+                        help="课程表路径，记进 state。record 不传 --milestone "
+                             "时用它 —— 漏传会静默关掉两个外层重入口")
     p_init.add_argument("--force", action="store_true")
     p_init.set_defaults(func=cmd_init)
 
@@ -2257,6 +4129,33 @@ def build_parser() -> argparse.ArgumentParser:
     p_record.add_argument("--decision", required=True, help="本次实现的决策行 id")
     p_record.add_argument("--signature", default=None,
                           help="signature_probe.py 的输出；机制核验需要它")
+    p_record.add_argument("--precision-report", default=None,
+                          help="precision_gate.py 的输出（对 float64 真值的"
+                               "误差比）。它优先于评测结果里的容差比对 —— "
+                               "容差分不出降精度换速度，而且锚点会随代际漂移")
+    p_record.add_argument("--structure-report", default=None,
+                          help="structure_probe.py 的输出。结构断言不成立时"
+                               "直接判机制被证伪并归因到实现 —— "
+                               "这一关在任何性能数之前就能给出结论")
+    p_record.add_argument("--fence-report", default=None,
+                          help="fence_check.py --json 的输出。围栏命中直接回滚"
+                               "并归因到实现；**没有它这一轮不会抬高 best** —— "
+                               "转发给参考实现时所有门禁都会过，"
+                               "而一行 kernel 都没写")
+    p_record.add_argument("--artifact", default=None,
+                          help="本轮候选的目录（已装好的 OPP 路径）。"
+                               "用来算内容指纹，记进台账作代码身份 —— "
+                               "机制做差的基线靠它才可核实")
+    p_record.add_argument("--artifact-sha", default=None,
+                          help="直接给代码身份指纹（有 git sha 时可用它）")
+    p_record.add_argument("--base-sha", default=None,
+                          help="本轮构建在哪个版本之上。不给则取上一轮的指纹；"
+                               "reopen 之后应显式给更早那个")
+    p_record.add_argument("--allow-unverified-result", action="store_true",
+                          help="接受 gating 不合格或卡号不符的结果。"
+                               "裁决会建立在一份来源未核实的测量上")
+    p_record.add_argument("--allow-stale-noise-floor", action="store_true",
+                          help="本次实测抖动高于存量噪声底时仍然裁决")
     p_record.add_argument("--milestone", default=None,
                           help="milestone.json；机制核验与走穷/僵持判定需要它")
     p_record.add_argument("--recipe", action="append", default=[],
@@ -2272,10 +4171,43 @@ def build_parser() -> argparse.ArgumentParser:
                                "不能指望调用方传对路径")
     p_record.set_defaults(func=cmd_record)
 
+    p_audit = sub.add_parser(
+        "audit", help="M0 对账：本轮读数与参考逐通道并排", parents=[common])
+    p_audit.add_argument("--signature", required=True,
+                         help="本轮的 signature_probe 输出")
+    p_audit.add_argument("--milestone", default=None,
+                         help="课程表；不给则用 init 记进 state 的那个")
+    p_audit.add_argument("--factor", type=float, default=M0_AUDIT_FACTOR,
+                         help=f"差到多少倍就必须被裁定（默认 {M0_AUDIT_FACTOR}）")
+    p_audit.set_defaults(func=cmd_audit)
+
+    p_confirm = sub.add_parser(
+        "confirm", help="并入一次确认复测（同一份产物再测一次）",
+        parents=[common])
+    p_confirm.add_argument("--result", required=True,
+                           help="对同一份产物重新评测的结果")
+    p_confirm.add_argument("--decision", required=True,
+                           help="拿到 best 的那个决策 id")
+    p_confirm.set_defaults(func=cmd_confirm)
+
     p_reopen = sub.add_parser("reopen", help="重开架构决策并作废下游实现",
                               parents=[common])
     p_reopen.add_argument("--milestone", required=True)
     p_reopen.add_argument("--decision", required=True, help="要重开的决策 id")
+    p_reopen.add_argument("--price", default=None,
+                          help="重开的价格：`<Δ%%> via lever:<手段名>`。"
+                               "来源也可以是 probe:<路径> / kb:<卡片 id> / "
+                               "ablation:<消融名>。"
+                               "会去定价表核对引用存在且 Δ 超过噪声底")
+    p_reopen.add_argument("--kb-root", default=None,
+                          help="知识库根（forge-hwkb/references）。"
+                               "用 kb:<卡片 id> 定价时必填 —— "
+                               "一条转述过来的处方不是价格，要核对才算数")
+    p_reopen.add_argument("--lever-store", default=None,
+                          help="定价表位置，默认取 state 同目录的 levers.json")
+    p_reopen.add_argument("--force", action="store_true",
+                          help="跳过定价与徒劳上限。每次重开都作废整条下游，"
+                               "用它之前请在 milestone 里写明理由")
     p_reopen.add_argument("--reason", default="")
     p_reopen.set_defaults(func=cmd_reopen)
 
@@ -2314,7 +4246,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_promote.add_argument("--note", default="")
     p_promote.add_argument("--force", action="store_true",
                            help="即使增益未超噪声底也强行提升")
+    p_promote.add_argument("--allow-unharvested", action="store_true",
+                           help="带着未结的知识欠账提升。"
+                                "欠账确实不值得入库时用它 —— "
+                                "它会写进台账，而不是悄悄消失")
     p_promote.set_defaults(func=cmd_promote)
+
+    p_harvest = sub.add_parser(
+        "harvest", help="列出「该入库而还没入库」的欠账", parents=[common])
+    p_harvest.set_defaults(func=cmd_harvest)
 
     p_ledger = sub.add_parser("ledger", help="查看裁决台账", parents=[common])
     p_ledger.add_argument("--recipes", action="store_true",

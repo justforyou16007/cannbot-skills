@@ -31,6 +31,54 @@
 
 ---
 
+## 两层证据：结构 + 停顿
+
+停顿锚点有一个结构性弱点：**它能被别的改动顶下去**。
+
+减小 tile、改对齐、换 block 映射，都会让 `mte2_wait_ratio` 降。于是一个
+写成单缓冲回退的实现，可能因为本轮顺手改了 tile 而让停顿恰好落进带内 →
+判「机制已核实」→ 这个解释被封进产物库和知识库，**而双缓冲从未存在**。
+
+反方向同样会错：机制确实建出来了，但当前 shape 下它不是瓶颈，停顿不动 →
+判「平凡通过」→ 一个正确的架构决策被当成「增益另有来源」。
+
+所以每个标签除了停顿锚点，还可以给一条 **`structural_anchor`** —— 候选
+源码或编译产物里**必须出现的构造**。它是二值事实，顶不下去：
+
+```json
+{
+  "id": "M1",
+  "label": "SUPPLY_KEEPUP",
+  "anchor": { "expr": "...aiv_mte2_wait_ratio <= 2.0" },
+  "structural_anchor": ["buffer_depth:2", "flag_paired"]
+}
+```
+
+核验顺序是**结构先、停顿后**：
+
+| 结构 | 停顿 | 裁决 | 该做什么 |
+|---|---|---|---|
+| 不在 | 任意 | `refuted`，归因 **implementation** | 修实现，或给实现补一张经验卡片。**不要改课程表** |
+| 在 | 成立且移动 | `verified` | 继续 |
+| 在 | 成立但没动 | `vacuous` | 增益另有来源 |
+| 在 | 不成立 | `refuted`，归因 curriculum | 对参考行为的解释错了，改课程表 |
+| 查不了 | 任意 | 不构成结论 | 先把通道补上 |
+
+**归因方向要紧。** 「声称无冲突布局而冲突仍高」是实现没做到，不是课程表
+解释错了。归到课程表那一侧的后果很具体：连续三次把架构层叫回来重写课程表，
+而下一轮实现还是同一个退化回退 —— 改对的东西被改坏、改坏的东西没人碰。
+
+**工具**：`forge-probes` 的 `structure_probe.py`。两层通道 ——
+源码层（`buffer_depth` / `flag_paired` / `has` / `absent`，不需要工具链）
+与 IR 层（`operand_space:addrspace(N)`，需要 `ccec`，`1`=GM、`6`=UB）。
+产物传给 `campaign.py record --structure-report`。
+
+> 最终指令助记符反汇编在昇腾上不可用（厂商三处同时关闭），所以结构核验
+> 追求的是「结构在不在」这个二值事实，不是「最终指令序列长什么样」。
+> 详见 `forge-probes/references/instrument-map.md` 的 waiver 一节。
+
+---
+
 ## 词汇表
 
 所有停顿字段来自 `ResourceConflictRatio.csv`，占比字段来自
@@ -38,6 +86,22 @@
 [`ops/ops-profiling/references/csv_fields_reference.md`](../../../../../ops/ops-profiling/references/csv_fields_reference.md)。
 
 ### 核间与流水
+
+| 标签 | 机制 | 必需停顿锚点 |
+|---|---|---|
+| 标签 | 必需停顿锚点 | 建议的 `structural_anchor` |
+|---|---|---|
+| `CV_HANDOFF` | `aic_cube_wait_ratio` 或 `aiv_vec_wait_ratio` | `flag_paired`（跨核交接必须有成对同步） |
+| `SUPPLY_KEEPUP` | `aiv_mte2_wait_ratio` 或 `aic_mte2_wait_ratio` | `buffer_depth:2`（供给跟上的前提是多缓冲） |
+| `WRITEBACK_OVERLAP` | `aiv_mte3_wait_ratio` 或 `aic_mte3_wait_ratio` | `buffer_depth:2` + `flag_paired` |
+| `CONSUMER_PHASING` | `aiv_vec_wait_ratio` | `flag_paired`（分阶段靠同步错开） |
+| `L1_RESIDENCY` | `aic_mte1_wait_ratio` 或 `aic_mte1_ratio` | `has:TPipe` + IR 层 `operand_space:addrspace(6)` |
+
+（上表第二列是 V11 强制要求的；第三列是建议 —— 写上它这条机制行就多一道
+顶不下去的判据。IR 层那条需要 `ccec`，拿不到工具链时不要写，否则会判
+「查不了」而不是通过。）
+
+原表（标签 → 机制）：
 
 | 标签 | 机制 | 必需停顿锚点 |
 |---|---|---|

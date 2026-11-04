@@ -798,3 +798,158 @@ def test_unknown_ratio_scale_is_blocking(tmp_path):
     assert scale_checks and scale_checks[0]["verdict"] == "fail"
     assert sig["trust"]["trustworthy"] is False
     assert sig["architectural_hypotheses"] == []
+
+
+# ===========================================================================
+# 角色暴露账
+#
+# exposure 只给「有多少时间没被计算覆盖」的总量，most_blocked 只给一个名字。
+# 而架构层决定「先攻哪条决策」要的是「每个单元各吃掉多少 µs」。
+#
+# 论文的读法规则是硬的：暴露时间最多的那个角色拥有残差，诊断的 locus 必须
+# 落在该角色治下的决策上。
+#
+# 昇腾这边三个因子都现成，而且有一处比上游干净：AIC 与 AIV 是物理分离的核、
+# 各有独立 PMU，所以每个角色的闲置比例能单独算；上游的 tensor_active 是一个
+# 标量，所有角色共用。
+# ===========================================================================
+
+MIX_PIPE = dict(PIPE_DEFAULTS)
+MIX_PIPE.update({
+    "Mix Block Dim": "24",
+    "aic_time(us)": "400.0", "aiv_time(us)": "300.0",
+    "aic_cube_ratio": "80.0", "aiv_vec_ratio": "30.0",
+    "Task Duration(us)": "500.0",
+})
+
+
+def test_role_exposure_splits_by_core_type(tmp_path):
+    root = write_archive(tmp_path / "r", pipe=MIX_PIPE)
+    sig = sp.build_signature(None, root, "AddLayerNorm", None)
+    roles = sig["role_exposure"]["roles"]
+
+    # AIC: 400us × (1 − 0.80) = 80us；AIV: 300us × (1 − 0.30) = 210us
+    assert roles["aic"]["exposed_us"] == pytest.approx(80.0, abs=0.5)
+    assert roles["aiv"]["exposed_us"] == pytest.approx(210.0, abs=0.5)
+
+
+def test_role_exposure_names_the_owner_of_the_residual(tmp_path):
+    """这条规则决定下一条决策落在哪个角色治下。"""
+    root = write_archive(tmp_path / "r", pipe=MIX_PIPE)
+    sig = sp.build_signature(None, root, "AddLayerNorm", None)
+    assert sig["role_exposure"]["owner"] == "aiv"
+    assert "aiv" in sig["role_exposure"]["note"]
+
+
+def test_role_exposure_becomes_a_hypothesis(tmp_path):
+    """它要进架构假设，否则这个数走不到课程表。"""
+    root = write_archive(tmp_path / "r", pipe=MIX_PIPE)
+    sig = sp.build_signature(None, root, "AddLayerNorm", None)
+    claims = " ".join(h["claim"] for h in sig["architectural_hypotheses"])
+    assert "残差归 aiv 所有" in claims
+
+
+def test_role_exposure_not_applicable_for_single_role(tmp_path):
+    """纯 Vector / 纯 Cube 算子下这一段不产生信息。
+
+    残差必然 100% 落在那一个角色上，而那不是一条新结论 —— 如实标成
+    不适用，而不是算出一个平凡结果。
+    """
+    pure = dict(PIPE_DEFAULTS)
+    pure.update({"aic_time(us)": "0", "aiv_time(us)": "300.0",
+                 "Mix Block Dim": "N/A"})
+    root = write_archive(tmp_path / "r", pipe=pure)
+    sig = sp.build_signature(None, root, "AddLayerNorm", None)
+    assert sig["role_exposure"]["available"] is False
+    assert "单角色" in sig["role_exposure"]["reason"]
+
+
+def test_role_exposure_carries_its_caveat(tmp_path):
+    """它是估计不是测量 —— 一个角色在另一类核忙时等待，是被隐藏而非暴露。"""
+    root = write_archive(tmp_path / "r", pipe=MIX_PIPE)
+    sig = sp.build_signature(None, root, "AddLayerNorm", None)
+    assert "估计不是测量" in sig["role_exposure"]["caveat"]
+
+
+def test_role_exposure_marks_a_missing_ratio(tmp_path):
+    pipe = dict(MIX_PIPE)
+    pipe["aiv_vec_ratio"] = "N/A"
+    root = write_archive(tmp_path / "r", pipe=pipe)
+    sig = sp.build_signature(None, root, "AddLayerNorm", None)
+    assert sig["role_exposure"]["roles"]["aiv"]["present"] is False
+
+
+# ===========================================================================
+# 逐核负载：「尾部收敛」这一个分量的直接测量
+#
+# exposure 把启动开销、核间等待、尾部收敛混在一个标量里，输出里明说
+# 「不告诉你暴露在哪一段」。而尾部收敛是可以直接测的：Task Duration 必然
+# ≥ 最慢那个核的时长。数据 ops-profiling 已经归档成 per_core_cycles.csv。
+# ===========================================================================
+
+def write_per_core(root: Path, rows):
+    root.mkdir(parents=True, exist_ok=True)
+    lines = ["coreid,task_cycles"]
+    lines += [f"{cid},{cyc}" for cid, cyc in rows]
+    (root / "per_core_cycles.csv").write_text("\n".join(lines) + "\n",
+                                              encoding="utf-8")
+    return root
+
+
+def test_core_balance_reads_the_archived_csv(tmp_path):
+    root = write_archive(tmp_path / "r")
+    write_per_core(root, [(0, 1000), (1, 1100), (2, 1050)])
+    sig = sp.build_signature(None, root, "AddLayerNorm", None)
+    balance = sig["core_balance"]
+    assert balance["available"] is True
+    assert balance["cores"] == 3
+    assert balance["spread_pct"] == pytest.approx(9.09, abs=0.05)
+
+
+def test_core_balance_flags_a_straggler(tmp_path):
+    """最慢核是最快核的 2 倍以上 —— 该改划分方式，不是改流水重叠。"""
+    root = write_archive(tmp_path / "r")
+    write_per_core(root, [(0, 1000), (1, 1000), (7, 2500)])
+    sig = sp.build_signature(None, root, "AddLayerNorm", None)
+    balance = sig["core_balance"]
+    assert balance["flags"], "应当报掉队核"
+    assert balance["slowest"][0]["core"] == 7
+    assert "尾部收敛" in balance["flags"][0]["detail"]
+
+
+def test_core_balance_is_computed_on_cycles_not_time(tmp_path):
+    """比例直接在 cycle 上算 —— 不做频率换算。
+
+    aicore_time 的官方定义预设了「所有 Block 同时调度且执行时长相等」，
+    拿它反推主频再去度量逐核**不等**时长，口径自相矛盾，而且官方写明 DVFS
+    下该字段不准确。而 (max−min)/max 是个比值，不需要知道频率。
+    """
+    root = write_archive(tmp_path / "r")
+    write_per_core(root, [(0, 1000), (1, 2000)])
+    sig = sp.build_signature(None, root, "AddLayerNorm", None)
+    assert sig["core_balance"]["max_over_min"] == pytest.approx(2.0)
+    assert "cycle" in sig["core_balance"]["unit"]
+
+
+def test_core_balance_absent_says_how_to_get_it(tmp_path):
+    root = write_archive(tmp_path / "r")
+    sig = sp.build_signature(None, root, "AddLayerNorm", None)
+    assert sig["core_balance"]["available"] is False
+    assert "sample-based" in sig["core_balance"]["reason"]
+
+
+def test_open_question_narrows_once_cores_are_measured(tmp_path):
+    """能答的那一半不该还列成「答不了」。
+
+    上游的规矩：合法的 waiver 要带理由和已试通道清单，不能把能答的一起
+    waive 掉。逐核测过之后，留作开放问题的只有启动开销与核间等待。
+    """
+    pipe = dict(PIPE_DEFAULTS)
+    pipe.update({"Task Duration(us)": "1000.0", "aiv_time(us)": "100.0"})
+    root = write_archive(tmp_path / "r", pipe=pipe)
+    write_per_core(root, [(0, 1000), (1, 1020)])
+    sig = sp.build_signature(None, root, "AddLayerNorm", None)
+    questions = " ".join(q["question"] for q in sig["open_questions"])
+    assert "启动开销与核间等待各占多少" in questions
+    whys = " ".join(q["why_unresolvable"] for q in sig["open_questions"])
+    assert "逐核分布已测" in whys

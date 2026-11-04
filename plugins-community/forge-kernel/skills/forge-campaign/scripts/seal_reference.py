@@ -70,6 +70,11 @@ MANIFEST_FILENAME = "sealed_manifest.json"
 SEALED_PATHS_FILENAME = "sealed_paths.txt"
 DENYLIST_FILENAME = "denylist.txt"
 
+#: 算子名清单的文件名。和 hwkb.py 的同名常量必须一致 —— 一处是写方，
+#: 一处是读方，拼错不会报错，只会让 L-NARRATIVE 的算子名那半条静默失效。
+#: tests/test_hwkb.py 有一条用例盯住两个常量相等。
+OPERATOR_NAMES_FILENAME = "operator_names.txt"
+
 #: 会被当作源码的扩展名：既禁读，也要从里面抽专有名词。
 SOURCE_SUFFIXES = {
     ".cpp", ".cc", ".cxx", ".c", ".h", ".hpp", ".hxx",
@@ -289,10 +294,22 @@ def load_public_api_allowlist(work_dir: Path,
     }
 
 
+#: 知识库根目录的默认位置（相对本脚本）。封存时把名词清单一并写到那里。
+#:
+#: 为什么要写两份：`fence_check` 读工作目录里那份（候选围栏），而知识库
+#: lint 读 `<kb_root>/denylist.txt`。早先只写工作目录那份，于是 hwkb 侧
+#: `load_denylist` 永远返回空表、`L-DENY` 一条都不报 —— 一张整段抄了参考
+#: 内部符号名的卡片可以入库，而 lint 打印「通过」。
+#: 两个消费方、两个路径，接线必须由封存这一步做掉，不能指望有人记得拷。
+DEFAULT_KB_ROOT = (Path(__file__).resolve().parent.parent.parent
+                   / "forge-hwkb" / "references")
+
+
 def seal(artifact: Path, op_name: str, work_dir: Path,
          public_header_dirs: Optional[Iterable[str]] = None,
          use_public_api_filter: bool = True,
-         refresh_public_api: bool = False) -> Dict[str, Any]:
+         refresh_public_api: bool = False,
+         kb_root: Optional[Path] = None) -> Dict[str, Any]:
     """封存一份参考产物，产出禁读清单、专有名词清单与 manifest。"""
     if not artifact.exists():
         raise SealError(f"待封存路径不存在: {artifact}")
@@ -398,13 +415,67 @@ def seal(artifact: Path, op_name: str, work_dir: Path,
         encoding="utf-8",
     )
 
-    denylist_path.write_text(
+    denylist_body = (
         "# ForgeKernel 参考实现专有名词（自动生成 + 可手工追加）\n"
         "# 知识库 lint 依据本清单阻止这些名词进入可复用经验卡片。\n"
         "# 经验要能被只共享硬件的其他 campaign 读懂，就不能留参考的痕迹。\n"
-        + "\n".join(merged) + "\n",
-        encoding="utf-8",
-    )
+        + "\n".join(merged) + "\n")
+    denylist_path.write_text(denylist_body, encoding="utf-8")
+
+    # 同一份清单写进知识库根。两个消费方各读一个路径，接线在这里做掉。
+    kb_target = Path(kb_root) if kb_root is not None else DEFAULT_KB_ROOT
+    kb_written: Optional[str] = None
+    kb_error: Optional[str] = None
+    kb_operators: Optional[str] = None
+    try:
+        kb_target.mkdir(parents=True, exist_ok=True)
+        kb_denylist = kb_target / DENYLIST_FILENAME
+        # 知识库那份也是合并写入：多个 campaign、多个参考的名词要并存，
+        # 而公开接口名同样要从旧条目里剔掉（理由见上面那段）。
+        kb_existing = (_read_token_file(kb_denylist)
+                       if kb_denylist.exists() else set())
+        kb_merged = sorted((kb_existing - allowlist) | set(identifiers))
+        kb_denylist.write_text(
+            "# ForgeKernel 参考实现专有名词（由 seal_reference.py 写入）\n"
+            "# hwkb.py 的 L-DENY 检查读本文件。为空或缺失时 lint 会报错而不是放行。\n"
+            + "\n".join(kb_merged) + "\n",
+            encoding="utf-8")
+        kb_written = str(kb_denylist)
+
+        # 算子名清单，和 denylist 同一次写入。
+        #
+        # 为什么不放在 denylist 里：两者要的结论不同。denylist 装参考的
+        # **私有符号名**，命中报 L-DENY（泄漏了不该读的东西）；算子名是
+        # **公开的**，命中报 L-NARRATIVE（把一条硬件机制绑死在一个算子上，
+        # 而跨算子复用正是知识库存在的理由）。混在一起，前一类的措辞会把
+        # 后一类说成泄漏，人会据此去改豁免而不是去改写卡片。
+        #
+        # 为什么和 denylist 同一次写入而不另开一处：L-DENY 失效过一次，
+        # 原因就是 seal 写一处、hwkb 读另一处，中间没人搬运。多一个独立的
+        # 写入点就是多一条可能断掉的线。
+        kb_operator_file = kb_target / OPERATOR_NAMES_FILENAME
+        op_existing = (_read_token_file(kb_operator_file)
+                       if kb_operator_file.exists() else set())
+        op_merged = sorted(op_existing | {op_name})
+        kb_operator_file.write_text(
+            "# 已封存过的算子名（由 seal_reference.py 写入）\n"
+            "# hwkb.py 的 L-NARRATIVE 用它阻止卡片把硬件机制绑死在某个算子上。\n"
+            + "\n".join(op_merged) + "\n",
+            encoding="utf-8")
+        kb_operators = str(kb_operator_file)
+    except OSError as exc:
+        kb_error = str(exc)
+
+    manifest["denylist"] = {
+        "work_dir_copy": str(denylist_path),
+        "kb_copy": kb_written,
+        "kb_operator_names": kb_operators,
+        "kb_error": kb_error,
+        "token_count": len(merged),
+    }
+    (work_dir / MANIFEST_FILENAME).write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8")
 
     return manifest
 
@@ -416,6 +487,7 @@ def cmd_seal(args: argparse.Namespace) -> int:
             public_header_dirs=args.public_headers or None,
             use_public_api_filter=not args.no_public_api_filter,
             refresh_public_api=args.refresh_public_api,
+            kb_root=Path(args.kb_root) if args.kb_root else None,
         )
     except SealError as exc:
         print(f"错误: {exc}", file=sys.stderr)
@@ -436,6 +508,19 @@ def cmd_seal(args: argparse.Namespace) -> int:
               "公开接口名（上次封存留下的误伤源）")
     print(f"  禁读清单  {work_dir / SEALED_PATHS_FILENAME}")
     print(f"  名词清单  {work_dir / DENYLIST_FILENAME}")
+    deny = manifest.get("denylist") or {}
+    if deny.get("kb_copy"):
+        print(f"  已同步至  {deny['kb_copy']}（hwkb 的 L-DENY 读这一份）")
+    if deny.get("kb_operator_names"):
+        print(f"  算子名表  {deny['kb_operator_names']}"
+              "（hwkb 的 L-NARRATIVE 读这一份）")
+    if deny.get("kb_error"):
+        print(f"\n警告: 清单没能写进知识库根：{deny['kb_error']}",
+              file=sys.stderr)
+        print("      hwkb 的 L-DENY 读 <kb_root>/denylist.txt、"
+              "L-NARRATIVE 读 <kb_root>/operator_names.txt，",
+              file=sys.stderr)
+        print("      写不进去这两道闸就是空的。", file=sys.stderr)
     if manifest["source_file_count"] == 0:
         print()
         print("提示: 未发现源码文件。若参考本就是二进制（如 CANN 内置实现），")
@@ -602,6 +687,10 @@ def build_parser() -> argparse.ArgumentParser:
                              "不给则自动在 ASCEND_HOME_PATH 等位置查找")
     p_seal.add_argument("--refresh-public-api", action="store_true",
                         help="重新扫描公开头文件，覆盖已缓存的白名单")
+    p_seal.add_argument("--kb-root", default=None,
+                        help="知识库根目录，名词清单会一并写进去供 hwkb 的 "
+                             "L-DENY 使用。默认是本插件的 "
+                             "skills/forge-hwkb/references")
     p_seal.add_argument("--no-public-api-filter", action="store_true",
                         help="不按公开接口过滤专有名词。"
                              "会让 DataCopyPad 这类公开接口名进入禁用名单，"

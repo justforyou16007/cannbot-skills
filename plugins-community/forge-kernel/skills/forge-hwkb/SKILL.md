@@ -1,6 +1,6 @@
 ---
 name: forge-hwkb
-description: Ascend NPU 算子性能经验知识库的准入、检索、no-code 边界 lint 与死路表，按芯片架构分区存放经硬件探针实测认证的可复用经验。当需要查询某个 profiler 症状下已有哪些 kernel 优化经验、登记一条新经验、检查经验卡片是否越过参考边界、或在重试前确认某方向是否已被证伪时使用。
+description: Ascend NPU 算子性能经验知识库的准入、检索、no-code 边界 lint、隔离区与重试前置条件表，按芯片架构分区存放经硬件探针实测认证的可复用经验。当需要查询某个 profiler 症状下已有哪些 kernel 优化经验、登记一条新经验、检查经验卡片是否越过参考边界或读起来像 campaign 日记、把不合规卡片移出 agent 读集、或在重试前确认某方向是否已被证伪时使用。
 ---
 
 # 硬件知识库
@@ -34,8 +34,60 @@ GEMM campaign 可以直接拿来用。
 这不是洁癖。一条带着某个参考内部命名的经验，换个 campaign 就看不懂了，
 跨算子复用无从谈起 —— 而跨算子复用正是这个知识库存在的全部理由。
 
-禁用名单由 `seal_reference.py` 在封存参考时自动抽取并写入 `denylist.txt`，
-本技能的 lint 直接读它。两段是接上的。
+禁用名单由 `seal_reference.py` 在封存参考时自动抽取并写入知识库根的
+`denylist.txt`，本技能的 lint 直接读它。两段是接上的。
+
+边界闸实际分四条，判据各不相同：
+
+| 规则 | 抓什么 | 靠什么驱动 |
+|---|---|---|
+| `L-DENY` | 参考的**私有符号名** | `denylist.txt`（封存时写入） |
+| `L-SRC` | 出处里的源码路径 | 无，始终生效 |
+| `L-BANNED` | `oracle` / `teacher` / `参考实现` 这类词 | 无，始终生效 |
+| `L-NARRATIVE` | 日期 / 轮次 / commit sha / 算子名 | 前三条始终生效；算子名靠 `operator_names.txt` |
+
+`L-BANNED` 是独立一条而不是 `L-DENY` 的扩展：这些词**不是任何源码里的
+标识符**，所以从参考里机械抽取名词的那条路永远抓不到它们 —— 而它们一样
+把卡片钉死在一次具体的逆向上。读到「比参考实现慢 20%」的人无从判断那个
+参考是什么，这句话对他没有信息量。
+
+### 为什么词边界只认 ASCII
+
+这是整组规则里最容易写错的一处。Python 正则的 `\w`（因而 `\b`）**把 CJK
+当词字符**，所以 `\boracle\b` 对「oracle的实现」**不匹配** —— `e` 是词字符、
+`的` 也是词字符，两者之间没有边界。
+
+而卡片正文强制中文，「英文词紧跟一个汉字」不是边角情形，是**默认情形**。
+用 `\b` 写这条规则，等于它基本不生效。所以边界改成 ASCII 字符类的前后
+否定环视（`(?<![A-Za-z0-9_])` / `(?![A-Za-z0-9_])`），同时仍然挡住
+`DataCopyEx` 吃掉 `DataCopyExtParams` 那类误报。
+
+### L-NARRATIVE：卡片不是 campaign 日记
+
+| 抓什么 | 为什么 |
+|---|---|
+| 运行日期 | 「2026-11-03 那次」说的是那天发生了什么，不是这个硬件在什么条件下会这样 |
+| 第 N 轮 / `iter N` | 指向一份读者拿不到的台账 |
+| commit sha | 指向一个仓库状态，而卡片要跨仓库、跨代际活下去 |
+| 算子名 | 把一条**硬件**机制绑死在一个算子上；适用范围有 `operator_families` 这个结构化字段承载，正文里重提只剩「这条是从哪个算子的逆向里来的」这层含义 |
+
+**`certified_by` 与 `provenance` 不在扫描范围内。** 那两处的职责恰恰是
+指向一次具体的测量，日期和 job 号写得越具体越好。叙事规则管结论的表述，
+不管证据的指针。
+
+### 闸没生效时会说出来
+
+`L-DENY` 和 `L-NARRATIVE` 的算子名那半条都靠外部文件驱动，文件不在时它们
+是空操作。空操作本身不要紧 —— **空操作加一句「通过」**才要紧。所以
+`validate` / `add` / `lint` 的结论行会点名哪道闸没生效：
+
+```
+通过：1 张卡片 满足边界与准入要求（但 L-DENY、L-NARRATIVE 的算子名 未生效，这句话不覆盖它们）
+```
+
+这是本轮修掉的一个真实缺陷：`seal` 写工作目录、`hwkb` 读知识库根，中间
+没人搬运，于是 `L-DENY` 一条都不报，而 `lint` 照样打印「通过」。一道关不上
+的门比没有门更糟 —— 它会让人以为查过了。
 
 ## 卡片结构
 
@@ -54,6 +106,35 @@ DAV_3510 的 BufferID 同步上是错的。
 
 卡片正文一律用中文（frontmatter 的结构化字段值除外），与仓内约定一致。
 
+### 人类专用归档：`provenance_archive`
+
+frontmatter 必填一个指针，形如 `provenance/R-2201-001.md`，指向
+`references/provenance/` 下的同名文件。那个目录放**参考侧的具体细节**：
+哪个文件、哪个函数、第几行、转述内容。
+
+为什么要有它 —— 它补的是一个漏洞，不是加一道形式要求。真从参考行为反推出
+结论的 agent 手上握着那些细节，而卡片里不许写。不给合法去处，它只有两条路：
+
+| 路 | 结果 |
+|---|---|
+| 写进卡片 | 被 lint 拦住 → 改成模糊表述绕过去，细节丢了 |
+| 直接丢掉 | 零成本、零报错 → 结论从此不可复核 |
+
+两条都通向「结论不可复核」，而它会选第二条，因为那是免费的。
+
+**agent 能写、不能读。** 写的是刚推出这个细节的那个 agent（它本来就有）；
+读的是人。另一个 agent 不得把它拉回来 —— 由两样东西保证：
+
+- `query` 只遍历架构目录下的 `*.md`，不扫这个目录
+- `hooks/hooks.json` 的 `permissions.deny` 里有
+  `Read/Grep/Glob(//**/forge-hwkb/references/provenance/**)`
+
+少了布局，`query` 会把归档当卡片吐出来；少了 deny，一次 `Read` 就绕过去 ——
+而这个目录比卡片更危险：卡片至少过 lint。
+
+确实没有参考侧细节（结论纯粹来自公开文档与自家探针）时，就在归档里写这一句。
+空文件和「没有细节」是两件事，后者要写出来。
+
 ## 脚本工具
 
 ```bash
@@ -66,13 +147,52 @@ python3 scripts/hwkb.py add --card draft.md
 # 按症状检索（arch agent 的主要入口）
 python3 scripts/hwkb.py query --symptom "mte2 占比高" --arch DAV_2201
 
-# 边界检查
+# 边界 + 准入检查（整库）
 python3 scripts/hwkb.py lint --all
 
-# 死路表
-python3 scripts/hwkb.py nogo add --symptom "..." --tried "..." --evidence "[MEASURED, job 9]"
-python3 scripts/hwkb.py nogo check --symptom "..."
+# 不过检的卡片移出 agent 读集（移动，不删除）
+python3 scripts/hwkb.py lint --all --quarantine
+
+# 重建 INDEX.md 的自动段（手工动过目录之后用它）
+python3 scripts/hwkb.py reindex --arch DAV_2201
+
+# 重试前置条件表
+python3 scripts/hwkb.py nogo add --symptom "MTE2 占比高" \
+    --tried "加大 double buffer 深度" \
+    --evidence "[MEASURED, job 9] 无改善，UB 被挤爆" \
+    --arch DAV_2201 --operator layer_norm \
+    --input-shape "B=8,S=4096,H=1024" \
+    --retry-precondition "常驻块缩小、UB 余量 > 64KB 时重试"
+python3 scripts/hwkb.py nogo check --symptom "MTE2" --arch DAV_2201 \
+    --operator layer_norm --input-shape "B=8,S=4096,H=1024"
 ```
+
+### `lint --all` 跑的是准入 + 边界两套
+
+准入只在 `add` 那一刻执行过一次，而卡片此后会被手工编辑、被 git 合并、
+被直接丢进目录。只查边界的 lint 对这些情况会说「通过」，而那句话并不包含
+「这张卡片仍然带着可核验的认证」。
+
+### 隔离区不是删除
+
+`--quarantine` 把不过检的卡片移到 `references/quarantine/<arch>/`。
+
+不删，是因为越界的卡片里往往有真经验，只是写法不合规 —— 删掉等于连经验
+一起丢。留在原处也不行：它越界的那部分恰恰是最可能被照抄的部分。移走是
+第三条路，修好之后用 `add` 重新入库。
+
+### INDEX.md 的自动段
+
+`add` 会顺手重写 `INDEX.md` 里标记之间那一段（`<!-- hwkb:index:begin -->`
+… `<!-- hwkb:index:end -->`），生成一张按**症状**排的密集表。手写的导读
+原样保留 —— 生成器的需要不是删掉一段有用文档的理由。
+
+为什么要这张表：`query` 是拉取式的，agent 得先怀疑「这个现象别人遇到过」
+才会去查，而它通常不会怀疑。一张随输入一起到达的密集表把这一步从
+「想起来」变成「看见」。
+
+`lint --all` 会比对自动段与目录内容。对不上多半是有人直接往架构目录里丢了
+卡片 —— 那张卡片从此只能靠 `query` 的关键词碰巧命中，而密集表里没有它。
 
 ## 检索以症状为主键
 
@@ -82,17 +202,44 @@ python3 scripts/hwkb.py nogo check --symptom "..."
 `operator_families` 留空表示**算子无关**，对任何算子族都命中 —— 这正是
 跨算子复用的体现。只有确实绑定某个算子族的经验才填它。
 
-## 死路表
+## 死路表是重试前置条件表，不是禁令表
 
-记录试过且被证伪的方向，以症状为 key，作为**重试前置条件**。
+记录试过且被证伪的方向，以症状为 key。
 
 死路和正向经验一样要带证据：未经测量的放弃不构成死路。否则死路表会把
 从没真正试过的方向也堵死，比没有这张表更糟。
 
-`nogo check` 命中时退出码为 `1`，调用方应据此避开，而不是再试一遍。
+每条还必填 `--retry-precondition`：**什么变了才值得再试一次**。只说
+「别试了」的记录会把一个条件变了就该重试的方向永久封死，而条件确实会变 ——
+换形状、换 tiling、上游决策改了，同一个方向可能就成立了。确实在任何条件下
+都不成立时，写「无（机制上不可能）」并在证据里说明为什么。
+
+`--arch` 必填。「不填 = 对所有架构成立」是这张表上最贵的默认值：一条在
+DAV_2201 上测出来的死路会把 DAV_3510 上同一个方向一并封死，而那两颗芯片
+的 UB 容量和流水结构都不一样。
+
+### 命中分两档
+
+| 档 | 条件 | 退出码 | 含义 |
+|---|---|---|---|
+| 有约束力 | 算子与形状都对得上（或条目没记算子，即算子无关的硬件结论） | `1` | 别再试了 |
+| 仅参考 | 算子或形状不同，或条目记了形状而这次没给 | `0` | 有人在别的条件下试过且无效，先读一遍，再自己决定 |
+
+为什么要分：一条死路记的是「在那个算子、那个形状下无效」。双缓冲在
+H=1024 下挤爆 UB，在 H=256 下不会。一律当禁令用，会把一堆本该成立的方向
+永久封死，而且封得毫无痕迹 —— 调用方只看到 exit 1。
+
+反过来，条件完全相同的那次命中必须有约束力，否则这张表只是一份读物，而它
+存在的理由正是省下重走一遍的预算。
 
 ## 参考资料
 
-- `references/dav2201/`、`references/dav3510/` — 按架构分区的经验卡片
-- `references/denylist.txt` — 参考专有名词（由 `seal_reference.py` 生成，可手工追加）
-- `references/nogo.json` — 死路表
+| 路径 | 是什么 | 谁读 |
+|---|---|---|
+| `references/dav2201/`、`references/dav3510/` | 按架构分区的经验卡片 | agent + 人 |
+| `references/<arch>/INDEX.md` | 症状密集表（自动段由 `add` / `reindex` 重写） | agent + 人 |
+| `references/provenance/` | 人类专用归档 | **只有人**（`permissions.deny` 挡住 agent） |
+| `references/quarantine/` | 不过检的卡片 | 人（修好后重新 `add`） |
+| `references/denylist.txt` | 参考专有名词（`seal_reference.py` 写入，可手工追加） | `L-DENY` |
+| `references/operator_names.txt` | 已封存过的算子名（同一次写入） | `L-NARRATIVE` |
+| `references/nogo.json` | 重试前置条件表 | `nogo check` |

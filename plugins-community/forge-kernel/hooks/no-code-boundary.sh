@@ -60,7 +60,27 @@ resolve_sealed_list() {
 }
 
 SEALED_LIST="$(resolve_sealed_list)" || {
-    # 还没封存任何参考，放行
+    # 三处都没有清单。这有两种成因，必须分开处理：
+    #
+    #   还没封存任何参考   正常起步状态，放行
+    #   清单被删/工作目录被清理/路径拼错   边界已经没了，而调用方不知道
+    #
+    # 区分方式：显式声明过位置（FORGE_SEALED_PATHS 或 FORGE_WORK_DIR）就说明
+    # 调用方认为边界是开着的 —— 那种情况下读不到清单必须拦，不能放行。
+    # 「声明了但读不出来」是典型的打包/清理事故，静默放行会让整个 campaign
+    # 在无防护状态下跑完，而所有文档都说边界生效。
+    if [[ -n "${FORGE_SEALED_PATHS:-}" || -n "${FORGE_WORK_DIR:-}" ]]; then
+        echo "[${HOOK_NAME}] 声明了封存清单的位置，但读不到它：" >&2
+        [[ -n "${FORGE_SEALED_PATHS:-}" ]] && \
+            echo "  FORGE_SEALED_PATHS=${FORGE_SEALED_PATHS}" >&2
+        [[ -n "${FORGE_WORK_DIR:-}" ]] && \
+            echo "  FORGE_WORK_DIR=${FORGE_WORK_DIR}（期望 .../sealed_paths.txt）" >&2
+        echo "" >&2
+        echo "边界此刻是无效的。放行会让整个 campaign 在无防护状态下跑完，" >&2
+        echo "而所有文档、提示词和测试都在说边界生效 —— 所以这里拦住。" >&2
+        echo "若确实尚未封存任何参考，请不要设这两个环境变量。" >&2
+        exit 2
+    fi
     exit 0
 }
 
@@ -106,6 +126,27 @@ for key in ("file_path", "path", "notebook_path"):
         forms = {os.path.abspath(value), os.path.realpath(value)}
         targets.append((value, forms))
 
+# 写类工具：拦住对**策略载体**的改写。
+#
+# 封存清单、hook 脚本、hooks.json 三者任一被改写，边界就静默消失了：
+# 清空 sealed_paths.txt 之后所有读参考源码的调用全部放行，而 hook 一个字
+# 都不打印。被管的对象不该能改管它的东西 —— 这条和「不能读参考」同等重要，
+# 否则前者只是一道可以自己拆掉的门。
+#
+# 两个 agent 都是 bypassPermissions 且带 Write/Edit，所以这件事必须在
+# 工具调用层拦，不能只写在提示词里。
+PROTECTED_BASENAMES = {
+    "sealed_paths.txt", "sealed_manifest.json", "denylist.txt",
+    "no-code-boundary.sh", "hooks.json", "reference_spec.json",
+}
+if tool in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
+    for shown, forms in targets:
+        for form in forms:
+            if os.path.basename(form) in PROTECTED_BASENAMES:
+                print("这是边界的策略载体，不能由被它管辖的 agent 改写: "
+                      + shown)
+                sys.exit(0)
+
 # Grep/Glob 不给 path 时默认搜当前目录，也要算进来 —— 否则「不写 path
 # 的一次 grep」就是条绕过去的路。
 if tool in ("Grep", "Glob") and not targets:
@@ -113,14 +154,49 @@ if tool in ("Grep", "Glob") and not targets:
     targets.append((cwd + "（未指定 path，默认搜这里）",
                     {os.path.abspath(cwd), os.path.realpath(cwd)}))
 
-# Bash：命令文本里可能直接写了封存路径，只能做子串匹配。
+# Bash：命令文本里可能直接写了封存路径。
+#
+# 只做「封存路径的字面子串匹配」是不够的 —— 清单里装的是中转目录和
+# resolve() 之后的真实**文件**路径，真实参考的**父目录**一个都没有。于是
+# 这些写法全都溜过去（实测）：
+#     grep -rn class /path/to/ref/      目录级，命令里没有任何被封文件名
+#     cd /path/to/ref && cat k.cpp      相对路径
+#     cat /path/to/ref/*.cpp            通配符
+# 所以这里把命令里长得像路径的 token 抽出来，按文件路径同样的规则
+# （归一化 + 内/上层双向判）过一遍。
 command = None
+bash_tokens = []
 if tool == "Bash":
     value = data.get("command")
     if isinstance(value, str) and value:
         command = value
+        # 抽 token：空白与 shell 元字符切开，留下含 / 或看着像路径的片段。
+        # 通配符里的 * ? [ ] 去掉，取到它所在的目录为止 —— 判目录就够了，
+        # 因为父目录命中同样算越界。
+        import re as _re
+        # 先把引号换成空白，再按 shell 元字符切 —— 这段代码整体被包在外层的
+        # shell 单引号里，所以这里一个引号字符都不能直接写出来。
+        _flat = command.replace(chr(34), " ").replace(chr(39), " ")
+        for raw in _re.split(r"[\s;|&()<>]+", _flat):
+            if not raw or raw.startswith("-"):
+                continue
+            # 去掉 shell 通配符之后的尾段
+            cut = len(raw)
+            for ch in "*?[":
+                idx = raw.find(ch)
+                if idx >= 0:
+                    cut = min(cut, idx)
+            frag = raw[:cut]
+            if not frag:
+                continue
+            if "/" not in frag and frag not in (".", ".."):
+                continue
+            # 通配符被切掉后可能只剩到一半的名字，退到它的目录
+            if cut < len(raw):
+                frag = os.path.dirname(frag) or frag
+            bash_tokens.append((raw, frag))
 
-if not targets and command is None:
+if not targets and command is None and not bash_tokens:
     sys.exit(0)
 
 # Grep/Glob 会递归向下搜。所以「目标是封存目录的上层」同样能读到封存内容，
@@ -148,6 +224,21 @@ for raw in lines:
             if recursive and prefix.startswith(form.rstrip("/") + "/"):
                 print("递归搜索的起点是封存参考的上层目录: " + shown
                       + "\n它会读到: " + sealed)
+                sys.exit(0)
+
+    # Bash 命令里的路径 token：和文件路径同一套判据。
+    # cd 之后的相对路径按当前工作目录解析 —— 这正是 `cd ref && cat k.cpp`
+    # 那条路要走的归一化。
+    for shown, frag in bash_tokens:
+        for form in {os.path.abspath(frag), os.path.realpath(frag)}:
+            if form == sealed or form.startswith(prefix):
+                print("命令里的路径落在封存的参考实现内: " + shown)
+                sys.exit(0)
+            # 命令可以递归向下（grep -r、find、tar、cp -r…），所以
+            # 「token 是封存目录的上层」同样能读到内容。
+            if prefix.startswith(form.rstrip("/") + "/"):
+                print("命令里的路径是封存参考的上层目录: " + shown
+                      + "\n它可以读到: " + sealed)
                 sys.exit(0)
 
     if command is not None and sealed in command:
@@ -178,6 +269,10 @@ MESSAGE="[${HOOK_NAME}] ${VIOLATION}
 若是递归搜索被拦：把搜索起点收窄到你自己的候选目录即可。被拦说明封存的
 参考就在这个起点之下 —— 中转目录应当放在工作区之外（见 quickstart 步骤 1），
 放在工作区里会让针对自己代码的 grep 一并被拦。
+
+若是改写封存清单 / hook 脚本 / hooks.json 被拦：这是设计如此。这三个文件是
+边界本身的载体，改掉任一个都会让边界静默消失。要调整封存范围，重新跑
+seal_reference.py seal，不要手改清单。
 
 如确属误判（例如这个路径并非参考实现），请修正清单后重试。"
 

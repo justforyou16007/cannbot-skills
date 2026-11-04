@@ -198,6 +198,8 @@ def select_row(rows: List[Dict[str, str]], op_name: Optional[str],
         # 能不能按耗时排序。排不出来时「丢冷启动 + 取中位数」两道防线都失效，
         # 这件事必须说出来，否则可信度检查会报一个并不存在的稳态选择。
         "duration_ranked": False,
+        # 供跨 metric 一致性检查用
+        "picked_op_name": None, "picked_block_dim": None,
         "note": "",
     }
     if not rows:
@@ -271,6 +273,10 @@ def select_row(rows: List[Dict[str, str]], op_name: Optional[str],
 
     info["picked_task_id"] = _row_task_id(picked)
     info["picked_duration_us"] = row_duration(picked)
+    info["picked_op_name"] = (picked.get("Op Name")
+                              or picked.get("op_name") or "").strip() or None
+    block_dim = safe_float(picked.get("Block Dim") or picked.get("block_dim"))
+    info["picked_block_dim"] = block_dim
     return picked, info
 
 
@@ -527,7 +533,9 @@ def field(value: Optional[float], channel: Optional[str],
 # ---------------------------------------------------------------------------
 
 def check_trust(reader: Reader, missing_metrics: List[str],
-                selection: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                selection: Optional[Dict[str, Any]] = None,
+                stalls: Optional[Dict[str, Any]] = None,
+                assume_no_dvfs: bool = False) -> Dict[str, Any]:
     """架构推断之前必过的一关。
 
     这一步不是形式检查。降频会把计算段和搬运段按不同比例拉长，于是一个
@@ -540,11 +548,43 @@ def check_trust(reader: Reader, missing_metrics: List[str],
     current, cur_ch = reader.number("Current Freq", "current_freq")
     rated, rated_ch = reader.number("Rated Freq", "rated_freq")
     if current is None or rated is None:
-        checks.append({
-            "name": "frequency", "verdict": "unknown",
-            "detail": "未采到 Current Freq / Rated Freq，无法确认是否降频",
-            "channel": cur_ch or rated_ch,
-        })
+        # 取不到频率**必须**阻塞，不能判 unknown 放行。
+        #
+        # 这条检查是扣留架构假设的第一道闸：降频会把各流水段按不同比例拉长，
+        # 于是一个计算受限的 kernel 可以看起来像搬运受限。放行等于让这道闸
+        # 在「数据缺失」这种最常见的情形下消失，而输出看着完全正常。
+        #
+        # 而且本机就是会缺：ops-profiling 的 msprof-guide 写明
+        # `op_summary.csv` 不含 Current Freq / Rated Freq 两列，频率要从
+        # PROF_Sample 下的 aicore.db 反推。所以这不是罕见情形，是**默认**情形 ——
+        # 必须显式补采或显式豁免，不能靠「判不了就算过」糊过去。
+        if assume_no_dvfs:
+            checks.append({
+                "name": "frequency", "verdict": "warn",
+                "detail": ("未采到频率字段，但已用 --assume-no-dvfs 声明本机锁频。"
+                           "这是一句人工声明，不是测量 —— 若实际发生了降频，"
+                           "本次签名推出的架构结论是错的"),
+                "channel": None,
+            })
+        else:
+            blocking = True
+            checks.append({
+                "name": "frequency", "verdict": "fail",
+                "detail": ("未采到频率字段（Current Freq / Rated Freq），"
+                           "无法判断是否发生 DVFS 降频。"
+                           "op_summary.csv 本来就不含这两列（见 ops-profiling 的 "
+                           "msprof-guide）。"
+                           "正解是导出 msprof_<时间戳>.db 并读其中的 AICORE_FREQ 表"
+                           "（timestampNs + freq，无需额外开关，导出 db 时默认生成），"
+                           "它给的是频率变化点的真实序列。"
+                           "**不要**用 aicore_time/max_cycles 反推主频："
+                           "aicore_time 的定义预设了「所有 Block 同时调度且执行时长"
+                           "相等」，官方也写明 DVFS 下该字段不准确、不建议参考 —— "
+                           "拿它反推频率再去度量逐核不等时长，口径自相矛盾。"
+                           "降频会把各流水段按不同比例拉长，据此反推的架构是错的，"
+                           "所以这里不放行 —— 确认本机锁频后可用 --assume-no-dvfs 豁免"),
+                "channel": cur_ch or rated_ch,
+            })
     elif rated > 0 and current < rated * 0.99:
         blocking = True
         checks.append({
@@ -563,9 +603,14 @@ def check_trust(reader: Reader, missing_metrics: List[str],
     icache, icache_ch = reader.ratio(
         "aiv_icache_miss_rate", "aic_icache_miss_rate", "icache_miss_rate")
     if icache is None:
+        # 同理：取不到不等于没问题。取指开销会混进各段占比。
+        blocking = True
         checks.append({
-            "name": "icache", "verdict": "unknown",
-            "detail": "未采到 ICache 缺失率", "channel": None,
+            "name": "icache", "verdict": "fail",
+            "detail": ("未采到 ICache 缺失率（aiv_icache_miss_rate）。"
+                       "取指开销会混进各流水段占比，取不到就无法排除这个干扰 —— "
+                       "缺失不等于通过。请确认采集了 PipeUtilization 这一组"),
+            "channel": None,
         })
     elif icache > THRESHOLDS["icache_miss_warn"]:
         blocking = True
@@ -634,6 +679,81 @@ def check_trust(reader: Reader, missing_metrics: List[str],
                        "看着像一切正常。请补采 PipeUtilization 后重做"),
             "channel": None,
         })
+
+    # 停顿数据：此前只检查「文件在不在」和「目标行在不在」，**不检查列**。
+    # 于是列名在这版 CANN 上改了、或采到一份全 N/A 的占位文件，
+    # missing_metrics 是空的 → metric_coverage 通过 → 架构假设照出，
+    # 而输出里 most_blocked 显示「未采到停顿数据，无法判断谁在等谁」。
+    # 停顿是架构判断的一半依据，这一半静默消失是最坏的情形。
+    if stalls is not None and "ResourceConflictRatio" not in missing_metrics:
+        # 只在那份 CSV 确实存在时才查列。整份文件缺失由 metric_coverage 负责，
+        # 在这里重复报一遍、还说成「文件在但列不在」，反而把人指错方向。
+        waits = stalls.get("wait") or {}
+        conflicts = stalls.get("conflict") or {}
+        wait_present = sum(1 for e in waits.values() if e.get("present"))
+        cflt_present = sum(1 for e in conflicts.values() if e.get("present"))
+        if wait_present == 0 and cflt_present == 0:
+            blocking = True
+            checks.append({
+                "name": "stall_data", "verdict": "fail",
+                "detail": ("ResourceConflictRatio 的文件和目标行都在，但十个停顿列"
+                           "（5 个 wait + 5 个 cflt）一个都没取到值。"
+                           "多半是列名在这版 CANN 上变了，或采到的是一份全 N/A 的"
+                           "占位文件。停顿是架构判断的一半依据 —— "
+                           "「文件在」不等于「数据在」"),
+                "channel": None,
+            })
+        elif wait_present == 0 or cflt_present == 0:
+            checks.append({
+                "name": "stall_data", "verdict": "warn",
+                "detail": (f"停顿数据只取到一半（wait {wait_present}/5，"
+                           f"冲突 {cflt_present}/5）。缺的那半在输出里标 "
+                           "present=false，不要当成 0"),
+                "channel": None,
+            })
+        else:
+            checks.append({
+                "name": "stall_data", "verdict": "pass",
+                "detail": f"停顿列齐（wait {wait_present}/5，冲突 {cflt_present}/5）",
+                "channel": None,
+            })
+
+    # 七份 metric 来自**七次独立的程序运行**（msprof 每次只支持一个
+    # --aic-metrics 组）。合并成一份签名时，若各份挑中的行其实是不同算子、
+    # 或不同的 dispatch 路径，那么签名里的每个数单独都对、合起来是拼的 ——
+    # 而架构假设恰恰建立在跨份的乘法上（如「搬运占比高但带宽利用率低」
+    # 把 PipeUtilization 的占比和 Memory 的带宽放在一起比）。
+    # Op Name 和 Block Dim 是最便宜的两个交叉校验。
+    if selection:
+        names = {i.get("picked_op_name") for i in selection.values()
+                 if i.get("picked_op_name")}
+        dims = {i.get("picked_block_dim") for i in selection.values()
+                if i.get("picked_block_dim") is not None}
+        if len(names) > 1:
+            blocking = True
+            checks.append({
+                "name": "cross_metric", "verdict": "fail",
+                "detail": (f"各份 metric 挑中的算子不是同一个：{sorted(names)}。"
+                           "七份 CSV 来自七次独立运行，合并出的签名是拼的 —— "
+                           "请给 --op-name 一个精确的算子名"),
+                "channel": None,
+            })
+        elif len(dims) > 1:
+            blocking = True
+            checks.append({
+                "name": "cross_metric", "verdict": "fail",
+                "detail": (f"各份 metric 挑中的行 Block Dim 不一致：{sorted(dims)}。"
+                           "说明合并的是两条不同的 dispatch 路径，"
+                           "跨份相乘得出的结论不成立"),
+                "channel": None,
+            })
+        else:
+            checks.append({
+                "name": "cross_metric", "verdict": "pass",
+                "detail": (f"各份 metric 挑中的是同一个算子"
+                           + (f"（Block Dim {dims.pop()}）" if dims else "")),
+                "channel": None,
+            })
 
     if missing_metrics:
         severity = "fail" if "ResourceConflictRatio" in missing_metrics else "warn"
@@ -910,6 +1030,175 @@ def extract_cache(reader: Reader) -> Dict[str, Any]:
 # 三、暴露时间（timeline probe 的昇腾替代）
 # ---------------------------------------------------------------------------
 
+#: 逐核耗时差到多少倍算「有掉队核」。
+#:
+#: 上游 timeline 探针的判据是「同角色的执行跨度差 >2× 即告警」。
+#: 这里是同一条判据的无时间轴版本。
+UNEVEN_SPAN_FACTOR = 2.0
+
+#: 逐核归档文件名。由 ops-profiling 的 msprof_perf_summary.py 产出，
+#: 和七份 op_summary CSV 并排放在归档目录里。
+PER_CORE_FILENAME = "per_core_cycles.csv"
+
+
+def load_per_core_cycles(archive_dir: Optional[Path]) -> List[Tuple[int, int]]:
+    """读逐核 cycle。空列表表示这一轮没采到。"""
+    if archive_dir is None:
+        return []
+    path = archive_dir / PER_CORE_FILENAME
+    if not path.is_file():
+        return []
+    out: List[Tuple[int, int]] = []
+    try:
+        for row in read_csv_rows(path):
+            core = safe_float(row.get("coreid"))
+            cycles = safe_float(row.get("task_cycles"))
+            if core is not None and cycles is not None and cycles > 0:
+                out.append((int(core), int(cycles)))
+    except OSError:
+        return []
+    return out
+
+
+def compute_core_balance(archive_dir: Optional[Path]) -> Dict[str, Any]:
+    """逐核负载是否均衡 —— 「尾部收敛」这一个分量的直接测量。
+
+    为什么值得单独做：`exposure` 把启动开销、核间等待、尾部收敛三件事混在
+    一个标量里，输出里明说「不告诉你暴露在哪一段」。而尾部收敛这一段是
+    **可以直接测的**：Task Duration 必然 ≥ 最慢那个核的时长，所以逐核分布
+    的离散度就是它的下界。
+
+    数据来源是 ops-profiling 已经归档的 `per_core_cycles.csv`
+    （`coreid, task_cycles` 两列），和七份 op_summary 并排放着。
+
+    **比例直接在 cycle 上算，不做频率换算** —— 这一点要紧：
+    `aicore_time(us)` 的官方定义预设了「所有 Block 同时调度且执行时长相等」，
+    拿它反推主频再去度量逐核**不等**时长，口径自相矛盾，而且官方写明
+    DVFS 下该字段不准确。而 (max−min)/max 是个比值，分子分母同单位，
+    根本不需要知道频率。
+    """
+    rows = load_per_core_cycles(archive_dir)
+    if not rows:
+        return {
+            "available": False,
+            "reason": (f"归档目录里没有 {PER_CORE_FILENAME}。"
+                       "它由 ops-profiling 的 msprof_perf_summary.py 从 "
+                       "PROF_Sample 下的 aicore.db 产出 —— "
+                       "采集时要带 --aic-mode=sample-based"),
+        }
+    cycles = [c for _, c in rows]
+    lo, hi = min(cycles), max(cycles)
+    spread_pct = (hi - lo) / hi * 100.0 if hi > 0 else 0.0
+    ratio = (hi / lo) if lo > 0 else None
+    ordered = sorted(rows, key=lambda item: -item[1])
+    out: Dict[str, Any] = {
+        "available": True,
+        "cores": len(rows),
+        "min_cycles": lo,
+        "max_cycles": hi,
+        "spread_pct": round(spread_pct, 2),
+        "max_over_min": round(ratio, 2) if ratio else None,
+        "slowest": [{"core": c, "cycles": v} for c, v in ordered[:3]],
+        "fastest": [{"core": c, "cycles": v} for c, v in ordered[-3:][::-1]],
+        "unit": "cycle（不做频率换算：比值不需要知道频率，"
+                "而 aicore_time 反推主频的口径在 DVFS 下不成立）",
+        "flags": [],
+    }
+    if ratio and ratio >= UNEVEN_SPAN_FACTOR:
+        out["flags"].append({
+            "flag": "有掉队核",
+            "value": out["max_over_min"],
+            "threshold": UNEVEN_SPAN_FACTOR,
+            "detail": (f"最慢核 {ordered[0][0]} 是最快核的 "
+                       f"{out['max_over_min']} 倍。Task Duration 由最慢那个核"
+                       "定义，所以这部分暴露时间是尾部收敛而不是核间等待 —— "
+                       "该改的是划分方式（block 映射 / 尾轮均衡），"
+                       "不是流水重叠"),
+        })
+    return out
+
+
+def compute_role_exposure(launch: Dict[str, Any],
+                          pipeline: Dict[str, Any],
+                          exposure: Dict[str, Any]) -> Dict[str, Any]:
+    """按角色（AIC / AIV）把暴露时间分摊开。
+
+    为什么要这一段：`exposure` 只说「有多少时间没被计算覆盖」，`most_blocked`
+    只说「谁等得最久」的名字 —— 而架构层要决定**先攻哪条决策**时，需要的是
+    「每个单元各吃掉多少 µs」。论文实现的角色账给的就是这个数，它的读法规则
+    是硬的：**暴露时间最多的那个角色拥有残差，诊断的 locus 必须落在该角色
+    治下的决策上**。
+
+    论文的算法是 `exposed = duration × share × (1 − tensor_active)`。
+    昇腾这边三个因子都是现成的，而且有一处比上游干净：
+
+      duration       aic_time_us / aiv_time_us 分别给（上游只有一个标量）
+      tensor_active  aic_cube_ratio / aiv_vec_ratio **按角色分开**
+                     —— AIC 与 AIV 是物理分离的核、各有独立 PMU 计数器，
+                     所以每个角色的「闲置比例」能单独算，角色之间不互相污染。
+                     上游的 tensor_active 是一个标量，所有角色共用它。
+
+    映射的边界要说清（会写进输出的 caveat）：CUDA 的 producer/consumer
+    warp group 是同一个 SM 内的**软件**角色，数量由 kernel 自己定；A2 的
+    AIC/AIV 是两类**物理**核，配比由 SoC 固定。所以这里的「角色」只有两个，
+    不是 N 个；纯 Vector 或纯 Cube 算子退化成单角色，此时这一段不产生信息，
+    如实标成 not_applicable 而不是算出一个 100% 的平凡结论。
+    """
+    roles = (("aic", "aic_time_us", "cube"), ("aiv", "aiv_time_us", "vec"))
+    present = [name for name, time_key, _ in roles
+               if isinstance(launch.get(time_key, {}).get("value"), (int, float))
+               and launch[time_key]["value"] > 0]
+    if len(present) < 2:
+        return {
+            "available": False,
+            "reason": ("只有一类核在工作（"
+                       + (present[0] if present else "两类都没采到")
+                       + "）。角色账在单角色下不产生信息：残差必然 100% 落在"
+                         "那一个角色上，而那不是一条新结论"),
+            "roles": {},
+        }
+
+    out: Dict[str, Any] = {"available": True, "roles": {}}
+    for name, time_key, ratio_key in roles:
+        duration = launch[time_key]["value"]
+        entry = pipeline.get(ratio_key) or {}
+        active_pct = entry.get("value") if entry.get("present") else None
+        if not isinstance(active_pct, (int, float)):
+            out["roles"][name] = {
+                "exposed_us": None, "present": False,
+                "reason": f"没采到 {ratio_key}，无法算这个角色的闲置比例",
+            }
+            continue
+        idle_frac = max(0.0, 1.0 - active_pct / 100.0)
+        out["roles"][name] = {
+            "present": True,
+            "duration_us": duration,
+            "active_pct": active_pct,
+            "idle_frac": round(idle_frac, 4),
+            "exposed_us": round(duration * idle_frac, 3),
+            "channel": entry.get("channel"),
+        }
+
+    scored = [(name, info["exposed_us"]) for name, info in out["roles"].items()
+              if info.get("present") and info.get("exposed_us") is not None]
+    if scored:
+        scored.sort(key=lambda item: -item[1])
+        out["owner"] = scored[0][0]
+        out["owner_exposed_us"] = scored[0][1]
+        out["note"] = (
+            f"暴露时间最多的是 {scored[0][0]}（{scored[0][1]} us）。"
+            "按论文的读法，残差归它所有 —— 课程表的下一条决策应当落在"
+            "这个角色治下，而不是另一个角色上")
+    out["caveat"] = (
+        "这是估计不是测量：一个角色在另一类核忙的时候等待，是被隐藏而不是"
+        "被暴露。另外昇腾的角色是两类物理核（配比由 SoC 固定），"
+        "不是 CUDA 那种数量可由 kernel 自定的软件角色"
+    )
+    out["derived_from"] = ("launch.aic_time_us / aiv_time_us × "
+                           "(1 − pipeline.cube/vec 占比)")
+    return out
+
+
 def compute_exposure(launch: Dict[str, Any]) -> Dict[str, Any]:
     """推导暴露时间：Task Duration 中没有被任何核的执行时间覆盖的部分。
 
@@ -974,7 +1263,7 @@ def compute_exposure(launch: Dict[str, Any]) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def derive_hypotheses(launch, pipeline, stalls, memory, cache,
-                      exposure) -> List[Dict[str, Any]]:
+                      exposure, role_exposure=None) -> List[Dict[str, Any]]:
     """把观测翻译成**带证据的架构假设**。
 
     这里产出的每一条都是「假设」而不是「结论」。它们的用途是喂给
@@ -1061,10 +1350,26 @@ def derive_hypotheses(launch, pipeline, stalls, memory, cache,
             "暴露时间说明有多少时间闲置，不说明闲置在哪一段；"
             "需用 lever_probe.py 做消融定位")
 
+    # 角色归属。这是论文里一条硬的读法规则：暴露时间最多的那个角色拥有
+    # 残差，课程表的下一条决策必须落在它治下 —— 而不是落在另一个角色上。
+    # 有了这条，arch agent 在「vec_wait 和 mte2_wait 同时偏高」时就有了
+    # 量化依据，不必凭 most_blocked 那一个名字猜。
+    if role_exposure and role_exposure.get("available") and \
+            role_exposure.get("owner"):
+        owner = role_exposure["owner"]
+        others = {n: i.get("exposed_us") for n, i in
+                  (role_exposure.get("roles") or {}).items() if n != owner}
+        add(f"残差归 {owner} 所有：它的暴露时间 "
+            f"{role_exposure['owner_exposed_us']} us 高于另一角色（{others}）。"
+            f"下一条决策应落在 {owner} 治下",
+            role_exposure.get("derived_from", "derived:role exposure"),
+            "weak", role_exposure.get("caveat"))
+
     return out
 
 
-def collect_open_questions(stalls, memory, exposure) -> List[Dict[str, Any]]:
+def collect_open_questions(stalls, memory, exposure,
+                           core_balance=None) -> List[Dict[str, Any]]:
     """列出本次采集回答不了的问题。
 
     论文 §3.2：仪器分辨不了的，留作显式的开放问题。诚实标注的开放问题
@@ -1092,9 +1397,32 @@ def collect_open_questions(stalls, memory, exposure) -> List[Dict[str, Any]]:
             exposure.get("reason", "缺少推导所需字段"),
             "补采 PipeUtilization 与 OpBasicInfo 后重跑")
     elif exposure.get("serial_latency_bound"):
-        add("暴露的时间具体花在哪一段？",
-            "msprof 算子级数据没有时间线视图，只能给出暴露总量",
-            "用 lever_probe.py 逐项消融：去掉某个环节看暴露时间如何变化")
+        # 这个问题现在只剩一半答不了。
+        #
+        # 暴露时间混着三件事：启动开销、核间等待、尾部收敛。其中**尾部收敛
+        # 是可测的** —— 逐核 cycle 分布已经归档，而 Task Duration 必然
+        # ≥ 最慢那个核的时长。所以逐核测过之后，要留作开放问题的只有
+        # 前两项，不该把整个问题都说成「答不了」（上游的规矩：合法的 waiver
+        # 要带理由和已试通道清单，不能把能答的一起 waive 掉）。
+        balanced = core_balance or {}
+        if balanced.get("available"):
+            uneven = bool(balanced.get("flags"))
+            add("暴露的时间里，启动开销与核间等待各占多少？",
+                ("逐核分布已测（"
+                 + ("发现掉队核，尾部收敛是其中一个分量"
+                    if uneven else
+                    f"逐核离散只有 {balanced.get('spread_pct')}%，"
+                    "尾部收敛不是主要分量")
+                 + "），但启动开销与核间等待这两项 msprof 算子级无法分离 —— "
+                   "PM 采样最细 10ms，而 kernel 是百微秒级，差约 50 倍"),
+                "用 lever_probe.py 逐项消融：去掉某个环节看暴露时间如何变化")
+        else:
+            add("暴露的时间具体花在哪一段？",
+                ("msprof 算子级数据没有时间线视图，只能给出暴露总量。"
+                 "逐核分布本可切出「尾部收敛」这一个分量，但本次没采到 "
+                 f"{PER_CORE_FILENAME}"),
+                "采集时带 --aic-mode=sample-based 产出逐核 cycle；"
+                "剩余部分用 lever_probe.py 逐项消融")
 
     if stalls["most_blocked"]["value"] is not None:
         add(f"{stalls['most_blocked']['value']} 在等谁？",
@@ -1120,7 +1448,8 @@ def build_signature(prof_dir: Optional[Path], archive_dir: Optional[Path],
                     op_name: Optional[str],
                     min_gm_bytes: Optional[int],
                     group: Optional[str] = None,
-                    steady_from: Optional[int] = None) -> Dict[str, Any]:
+                    steady_from: Optional[int] = None,
+                    assume_no_dvfs: bool = False) -> Dict[str, Any]:
     found, missing = locate_metric_csvs(prof_dir, archive_dir, group)
     if not found:
         searched = []
@@ -1148,13 +1477,16 @@ def build_signature(prof_dir: Optional[Path], archive_dir: Optional[Path],
     reader = Reader(merged, origin)
     all_missing = sorted(set(missing) | set(row_missing))
 
-    trust = check_trust(reader, all_missing, selection)
     launch = extract_launch(reader)
     pipeline = extract_pipeline(reader)
     stalls = extract_stalls(reader)
+    # 可信度检查要看停顿列取到没有，所以必须排在 extract_stalls 之后
+    trust = check_trust(reader, all_missing, selection, stalls, assume_no_dvfs)
     memory = extract_memory(reader, min_gm_bytes)
     cache = extract_cache(reader)
     exposure = compute_exposure(launch)
+    role_exposure = compute_role_exposure(launch, pipeline, exposure)
+    core_balance = compute_core_balance(archive_dir)
 
     resolved_name, name_channel = reader.text("Op Name", "op_name")
 
@@ -1182,11 +1514,17 @@ def build_signature(prof_dir: Optional[Path], archive_dir: Optional[Path],
         "memory": memory,
         "cache": cache,
         "exposure": exposure,
+        # 按角色分摊的暴露时间。决定「先攻哪条决策」要的是这个数，
+        # 而 exposure 只给总量、most_blocked 只给名字。
+        "role_exposure": role_exposure,
+        # 逐核分布。exposure 把启动开销、核间等待、尾部收敛混在一个标量里，
+        # 这一段把「尾部收敛」那个分量单独测出来。
+        "core_balance": core_balance,
     }
 
     if trust["trustworthy"]:
         signature["architectural_hypotheses"] = derive_hypotheses(
-            launch, pipeline, stalls, memory, cache, exposure)
+            launch, pipeline, stalls, memory, cache, exposure, role_exposure)
     else:
         signature["architectural_hypotheses"] = []
         signature["hypotheses_withheld"] = (
@@ -1196,7 +1534,7 @@ def build_signature(prof_dir: Optional[Path], archive_dir: Optional[Path],
         )
 
     signature["open_questions"] = collect_open_questions(
-        stalls, memory, exposure)
+        stalls, memory, exposure, core_balance)
     return signature
 
 
@@ -1306,6 +1644,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--group", default=None, metavar="DIR_NAME",
                         help="采集态下指定用哪一次采集（PROF_GROUP_* 的目录名）。"
                              "多次采集并存且未指定时会报错，不会替你挑一次")
+    parser.add_argument("--assume-no-dvfs", action="store_true",
+                        help="声明本机已锁频，容忍频率字段缺失。"
+                             "这是一句人工声明不是测量 —— 实际降频时"
+                             "本次签名推出的架构结论是错的")
     parser.add_argument("--steady-from", type=int, default=None, metavar="TASK_ID",
                         help="只用 Task ID 不小于该值的行。"
                              "默认已自动丢弃冷启动行（核执行时间 > 任务时长），"
@@ -1325,7 +1667,8 @@ def main() -> int:
     try:
         sig = build_signature(args.prof_dir, args.archive_dir,
                               args.op_name, args.min_gm_bytes,
-                              args.group, args.steady_from)
+                              args.group, args.steady_from,
+                              args.assume_no_dvfs)
     except ProbeError as exc:
         print(f"错误: {exc}", file=sys.stderr)
         return 2

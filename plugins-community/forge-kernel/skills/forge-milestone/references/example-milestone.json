@@ -13,6 +13,13 @@
     "target_gain": 1.05,
     "noise_floor_pct": 2.3
   },
+  "adjudications": {
+    "supply": "double_buffer",
+    "cv_handoff": "none",
+    "consumer_phase": "none",
+    "operand_source": "none",
+    "_why": "四条轴逐条表态，哪怕表态为 none —— 不写就意味着那个维度完全不受约束。本例是纯 Vector 的 add_layer_norm：没有 Cube，所以交接与操作数来源都是 none；单一消费侧，不分阶段；supply 裁定为双缓冲，由 M0 的 SUPPLY_KEEPUP 机制行锚着。"
+  },
   "_channel_convention": [
     "性能与精度类指标写评测产物: evaluation_results.json:<字段路径>",
     "架构签名类指标写 msprof 产物: msprof:<CSV 文件>:<列名>",
@@ -104,20 +111,9 @@
               "kind": "reference_measurement",
               "expr": "evaluation_results.json:aggregate.target.precision_passed == true",
               "provenance": "[MEASURED, job 2]"
-            }
-          }
-        ],
-        "performance_lines": [
-          {
-            "id": "P1",
-            "statement": "相对参考不出现退化，比率不低于 0.95",
-            "status": "PASS",
-            "anchor": {
-              "kind": "derived",
-              "expr": "evaluation_results.json:comparison.speedup >= 0.95",
-              "derived_from": "resource_topology_contract.baseline_time_us",
-              "provenance": "[MEASURED, job 2]"
-            }
+            },
+            "closed_by": "[MEASURED, job 7]",
+            "closed_value": "见 anchor.expr；本次实测值记在台账该轮条目里"
           }
         ],
         "mechanism_lines": [
@@ -131,7 +127,9 @@
               "expr": "msprof:ResourceConflictRatio.csv:aiv_mte2_wait_ratio < 4.2",
               "provenance": "[MEASURED, job 2]"
             },
-            "ordering_evidence": "参考 job 1 的 aiv_mte2_wait_ratio 为 4.2，本实现 job 2 降至 0.9；两次采集除本决策外配置相同"
+            "ordering_evidence": "参考 job 1 的 aiv_mte2_wait_ratio 为 4.2，本实现 job 2 降至 0.9；两次采集除本决策外配置相同",
+            "closed_by": "[MEASURED, job 7]",
+            "closed_value": "见 anchor.expr；本次实测值记在台账该轮条目里"
           }
         ]
       }
@@ -171,7 +169,9 @@
               "kind": "reference_measurement",
               "expr": "evaluation_results.json:aggregate.target.precision_passed == true",
               "provenance": "[MEASURED, job 3]"
-            }
+            },
+            "closed_by": "[MEASURED, job 7]",
+            "closed_value": "见 anchor.expr；本次实测值记在台账该轮条目里"
           }
         ],
         "performance_lines": [
@@ -184,7 +184,9 @@
               "expr": "(evaluation_results.json:comparison.speedup - 1) * 100 > campaign.noise_floor_pct",
               "derived_from": "campaign.noise_floor_pct（由 evaluation_results.json:cv_pct 实测而来）",
               "provenance": "[MEASURED, job 3]"
-            }
+            },
+            "closed_by": "[MEASURED, job 7]",
+            "closed_value": "见 anchor.expr；本次实测值记在台账该轮条目里"
           }
         ],
         "mechanism_lines": [
@@ -203,6 +205,73 @@
               "expr": "msprof:ResourceConflictRatio.csv:aiv_mte3_wait_ratio <= 0.3",
               "provenance": "[MEASURED, job 3]"
             }
+          }
+        ]
+      }
+    },
+    {
+      "id": "M2",
+      "title": "写回与搬出重叠",
+      "decisions": [
+        {
+          "id": "D2.1",
+          "action": "把结果写回拆成双缓冲，使 MTE3 搬出与 VEC 计算重叠",
+          "purpose": "消除尾部写回暴露在关键路径上的那一段",
+          "trigger": {
+            "symptom": "MTE3 等待占比高于参考，且暴露时间集中在尾部",
+            "channel": "msprof:ResourceConflictRatio.csv:aiv_mte3_wait_ratio"
+          },
+          "cost": "多一块 UB 缓冲；若 UB 已紧张需要先缩小 tile",
+          "dependence": "依赖 M1 的 UB 常驻布局已落地（否则没有余量开双缓冲）",
+          "depends_on": [
+            "D1.1"
+          ]
+        }
+      ],
+      "gate": {
+        "correctness_lines": [
+          {
+            "id": "C1",
+            "statement": "全部 target shape 精度通过",
+            "status": "PASS",
+            "anchor": {
+              "kind": "reference_measurement",
+              "expr": "evaluation_results.json:aggregate.target.precision_passed == true",
+              "provenance": "[MEASURED, job 11]"
+            },
+            "closed_by": "[MEASURED, job 11]",
+            "closed_value": "见 anchor.expr；本次实测值记在台账该轮条目里"
+          }
+        ],
+        "performance_lines": [
+          {
+            "id": "P1",
+            "statement": "相对参考的增益超过噪声底",
+            "status": "PASS",
+            "anchor": {
+              "kind": "derived",
+              "derived_from": "campaign_state.json 的 noise_floor_pct 实测值",
+              "expr": "(evaluation_results.json:comparison.speedup - 1) * 100 > campaign.noise_floor_pct",
+              "provenance": "[MEASURED, job 11]"
+            },
+            "closed_by": "[MEASURED, job 11]",
+            "closed_value": "见 anchor.expr；本次实测值记在台账该轮条目里"
+          }
+        ],
+        "mechanism_lines": [
+          {
+            "id": "M1",
+            "label": "WRITEBACK_OVERLAP",
+            "statement": "MTE3 不再是阻塞最重的单元：写回与计算重叠之后它的等待占比落入参考带内",
+            "status": "PASS",
+            "anchor": {
+              "kind": "reference_measurement",
+              "expr": "msprof:ResourceConflictRatio.csv:aiv_mte3_wait_ratio <= 0.3",
+              "provenance": "[MEASURED, job 11]"
+            },
+            "ordering_evidence": "改动前 6.0（job 7）→ 改动后 0.28（job 11）；两次读数取自同一 shape、同一张卡",
+            "closed_by": "[MEASURED, job 11]",
+            "closed_value": "见 anchor.expr；本次实测值记在台账该轮条目里"
           }
         ]
       }

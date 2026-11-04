@@ -567,6 +567,12 @@ def _add_generation_locked(library: Path, *, operator: str, arch: str,
     manifest = {
         "schema_version": SCHEMA_VERSION,
         "key": key, "generation": gen, "kind": kind, "id": identifier,
+        # 相对库根的目录。索引里一直有这个字段，manifest 里没有 ——
+        # 于是拿到 manifest 的调用方（如 campaign promote 要把参考指到库里的
+        # 只读拷贝）只能自己拼目录名，拼错就静默退回候选目录。
+        "dir": str(gen_dir.relative_to(library)),
+        "artifact_dir": (str((gen_dir / ARTIFACT_DIRNAME).relative_to(library))
+                         if files else None),
         "sealed_at": _now(),
         "environment": detect_environment(),
         "device_id": device_id,

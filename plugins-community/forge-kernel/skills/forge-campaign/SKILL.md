@@ -242,11 +242,82 @@ python3 scripts/campaign.py set-reference-signature \
 前两类分开计是因为编译/精度 bug 是实现问题，不是架构问题。混在一起算，
 连续三个编译错误就会白白消耗一次架构重入机会。
 
+### 机制没落地时，该修的是实现还是课程表
+
+上游的分流规则：
+
+> 声称无冲突布局而冲突仍高 ⇒ **学生没做到（退化回退）⇒ 加知识库卡片，
+> 不要改课程表**；只有「参考侧该字段本来就不在声称的位置」才是课程表缺陷
+
+判据是**参考快照**，不是本轮读数。问的是「这条行声称的位置，和参考实际坐
+的位置差多远」—— 而不是「参考满不满足这条行的阈值」。后者在最常见的写法上
+就错：课程表写 `< 4.2`、参考实测正好 4.2（要求实现追平参考），`4.2 < 4.2`
+为假，于是一条完全正当的行会被判成「读错了参考」。
+
+| 情况 | 归因 | 下一步 |
+|---|---|---|
+| 声称的位置在参考附近（差在 1.25 倍带内） | `implementation` | 补一张经验卡片，**不要改课程表** |
+| 声称的位置落在带外 | `curriculum` | 重开那条决策 —— 实现正被要求去追一个参考自己都达不到的数 |
+| 参考侧没这个读数，或这条行解析不成可核验的断言 | `implementation` | 见下 |
+
+带宽用的是 `MECHANISM_BAND_FACTOR`（1.25），和验收线的带宽纪律**同一个
+常数** —— 两处对「差多远算差太远」的判断不该各有一套。
+
+**判不了时为什么偏向实现失败**：两种误判的代价不对称。
+
+| 误判 | 后果 |
+|---|---|
+| 判成课程表缺陷，其实是实现 | 架构层被连续叫回来重写课程表，而下一轮实现还是同一个退化回退 —— 改对的东西被改坏、改坏的东西没人碰。**这是一个不会响的失败** |
+| 判成实现失败，其实是课程表 | 实现失败计数爬到阈值 → 状态转 `blocked` → **停下来交给人**。这是一个会响的失败 |
+
+这条分流**不依赖任何可选输入**。此前只有 `structure_probe` 能分流，而
+`--structure-report` 是可选参数 —— 没传时 `refuted` / `vacuous` 一律落进
+`streak_refuted`，也就是默认判「课程表解释错」，正是这条规则要防的方向。
+参考快照在 `init` 就必填，所以分流总能做。
+
+### 三道「这个数算不算数」的前置条件
+
+它们和机制核验是不同性质的东西。机制核验问「变快的原因是不是设计的那个」；
+这三道问的是更靠前的问题 —— **这个百分比到底是不是这份 kernel 在这张卡上
+挣来的**。所以它们不走 `accept_unverified` 那条路（那条路的含义是「数是真的、
+解释不清」），而是直接压住 `counts_toward_best`。
+
+| 前置条件 | 怎么查 | 不过时 |
+|---|---|---|
+| 没有转发给参考 | `--fence-report`（`fence_check.py --json` 的输出） | 命中 → 回滚 + 归因实现；**没传报告 → 不抬高 best** |
+| 设备执行占得住墙上时间 | `signature.launch.task_duration_us` ÷ 结果的 `time_us` ≥ 20% | 不抬高 best |
+| baseline 不是缓存的 | 结果的 `measurement.baseline_from_cache` | 直接拒收这份结果 |
+
+**围栏为什么要有牙齿**：脚本本来就有，文档也写明它排在任何计时之前 ——
+但做裁决的 `record` 此前完全不看它。于是这道纪律是纯自愿的。而它守的东西
+很具体：候选直接调厂商实现时，加速比、精度、所有门禁全过，一行 kernel 都
+没写；自我提升场景更隐蔽 —— 第 n 代转发给第 n−1 代，链条可以空转很多轮，
+每轮都「没有退化」。围栏是静态扫描，不花机时，所以每轮都该跑。
+
+**设备占比为什么要对账**：两个数早就都在手，但此前没有任何地方把它们放在
+一起看过。设备执行只占墙上时间一小部分时，那个百分比量的主要是 host 侧的
+下发、排队与同步；而机制核验读的是 msprof 的**设备侧**通道。两者量的东西
+几乎不相交时，「增益超噪声底 + 机制已核实」就是两个互不相关的事实被钉在
+一起 —— 那个百分比来自 host，那个机制结论来自 device。
+
+**缓存的 baseline 为什么直接拒**：配对计时的全部纪律建立在「两侧在同一个
+job 里、位置互为镜像」之上 —— burn-in 把器件加热到稳态，A-B-B-A 抵掉位置
+偏置（实测 **2.7%**，方向恒定、多测不收敛）。baseline 一旦来自上一次 job
+的缓存，这两个机制同时失效，而且是**静默**失效：字段、cv 全都正常，只是
+那个数来自另一个温度、另一个位置。而目标增益只有 5% 这个量级。
+
 ## 重开架构决策
 
 ```bash
 python3 scripts/campaign.py reopen --state ./forge_work/campaign_state.json \
-    --milestone milestone.json --decision D0.1 --reason "拓扑决策有缺陷"
+    --milestone milestone.json --decision D0.1 --reason "拓扑决策有缺陷" \
+    --price "8.4% via lever:ub_resident" --lever-store ./forge_work/levers.json
+
+# 价格也可以来自一张已认证的知识库卡片 —— 那就省掉一次实测
+python3 scripts/campaign.py reopen --state ./forge_work/campaign_state.json \
+    --milestone milestone.json --decision D0.1 --reason "拓扑决策有缺陷" \
+    --price "8.4% via kb:R-2201-001" \
+    --kb-root ../forge-hwkb/references
 ```
 
 论文 §3.3：追加型补丁原地恢复，**基础型补丁从最早的依赖决策重启** ——
@@ -257,6 +328,26 @@ python3 scripts/campaign.py reopen --state ./forge_work/campaign_state.json \
 
 靠人记哪些要作废是不牢的。漏掉一条，新 M0 上就还挂着建立在旧假设上的
 实现，归因直接错掉 —— 而这恰恰发生在整个流程最关键的那一步上。
+
+### 没有价格就没有重开
+
+重开要作废整条下游的实现、把 `best` 归零、三个计数器清零 —— 这是整套流程
+里代价最大的单个动作，理由不能是一句自由文本。`--price` 的形状是
+`<Δ%> via <来源>`，来源四种：
+
+| 来源 | 核对方式 |
+|---|---|
+| `lever:<手段名>` | 去 `levers.json` 里找这个手段的实测价格 |
+| `kb:<卡片 id>` | 去知识库找那张卡片，**并要求它自己过准入校验**，且记录幅度 ≥ 声称的 Δ |
+| `probe:<路径>` | 探针读数 |
+| `ablation:<名字>` | 消融实验 |
+
+`kb:` 这条路是「读知识库能省一次评测」的落点 —— 但它只在卡片真被核对过
+时才成立。上游那句话很直接：**一条转述过来的处方不是价格**。这里曾经无
+条件放行，附一句「请确认该卡片确实带探针认证」—— 把判定交给了那个正想
+重开的人，而他没有任何动机去查。
+
+四种来源都要先过噪声底：Δ 落在测量抖动里的「价格」不算价格。
 
 ## 死路表自动登记
 
@@ -283,6 +374,40 @@ python3 scripts/campaign.py ledger --recipes
 `ledger --recipes` 给出自产/外来两列，以及「接受的改动里有多少用到了外来
 经验」。这个比例是判断知识库值不值得继续投入的依据 —— 没有它，你无法
 回答「知识库到底有没有在帮忙」，也发现不了某张卡片其实一直在误导。
+
+### 知识欠账是自动算的，`promote` 会拦
+
+```bash
+python3 scripts/campaign.py harvest --state ./forge_work/campaign_state.json
+```
+
+列出本代「该入库而还没入库」的条目。两类：
+
+| 类 | 判据 | 为什么它欠一笔 |
+|---|---|---|
+| `admissible` | 台账判了 `kb_admissible`（增益超噪声底**且**机制已核实）而没有任何 `recipes_invented` | 这条经验的代价已经付过了，只差写下来 |
+| `tripwire` | 一个决策烧掉 ≥ 6 轮才拿到接受判定 | 花得多说明有东西没被预见到，而那个发现只存在于那次会话的上下文里 |
+
+为什么要自动算：知识沉淀排在流程第 11 步，也就是一次长 campaign 的末尾 ——
+正是上下文最紧、最容易被跳过的时刻。靠提示词提醒的事，到那个时刻不会发生。
+**本仓就是证据**：整套 dav2201 流程建完，库里 1 张卡。
+
+`harvest` 的输出带着写卡片要用的读数（症状、机制结论、机制行、签名文件
+路径）。清单要是还得让人回头翻台账找数，到那一步就没人写了。
+
+欠账未结时 `promote` 拒绝执行。这道闸的位置是算过的：
+
+- 排在**确认复测之后** —— 读数本身不可信时，先让人写一张以它为据的卡片
+  比不写更糟：那张卡片会被别的 campaign 当成已核实的经验用
+- 排在**正式封存之前** —— promote 把 `best` 归零、噪声底置为待重测、产物
+  封成下一代的参考。台账还在，但产出这些结论的会话上下文已经没了，
+  「增益超噪声底且机制已核实」背后的推理过程过了这一刻只剩一行 `reason`
+
+确实不值得入库时加 `--allow-unharvested`：它会写进台账，而不是悄悄消失。
+
+**收敛那条分支只告警，不拦。** 一个该停的 campaign 必须能记下「我收敛了」——
+拦住它的后果比丢几条经验更糟：状态机会卡在 `implement`，之后所有停止条件
+的判断都从一个错的状态出发。
 
 ## 指定设备
 
@@ -496,7 +621,7 @@ python3 scripts/campaign.py set-noise-floor --state <state> --value <实测值>
 
 | 脚本 | 用途 |
 |---|---|
-| `scripts/campaign.py` | 状态机：init / record / reopen / set-reference-signature / set-noise-floor / set-budget / promote / status / ledger |
+| `scripts/campaign.py` | 状态机：init / record / confirm / audit / reopen / set-reference-signature / set-noise-floor / set-budget / harvest / promote / status / ledger |
 | `scripts/reference_library.py` | 封存产物库：ingest / register / promote / resolve / find / lineage / list / verify / drift |
 | `scripts/noise_floor.py` | 实测噪声底 |
 | `scripts/seal_reference.py` | 封存参考，产出禁读与禁词清单 |

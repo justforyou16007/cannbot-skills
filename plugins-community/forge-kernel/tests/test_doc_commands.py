@@ -50,6 +50,7 @@ SCRIPT_DIRS = [
     PLUGIN_ROOT / "skills" / "forge-hwkb" / "scripts",
     PLUGIN_ROOT / "skills" / "forge-probes" / "scripts",
     PLUGIN_ROOT / "skills" / "forge-milestone" / "scripts",
+    PLUGIN_ROOT / "skills" / "forge-evaluation" / "scripts",
 ]
 for _directory in SCRIPT_DIRS:
     sys.path.insert(0, str(_directory))
@@ -64,6 +65,8 @@ import reference_adapter  # noqa: E402
 import reference_library  # noqa: E402
 import seal_reference  # noqa: E402
 import signature_probe  # noqa: E402
+import precision_gate  # noqa: E402
+import structure_probe  # noqa: E402
 
 #: 脚本名 → 它的 parser 工厂。
 PARSERS = {
@@ -75,6 +78,8 @@ PARSERS = {
     "fence_check.py": fence_check.build_parser,
     "lever_probe.py": lever_probe.build_parser,
     "signature_probe.py": signature_probe.build_parser,
+    "structure_probe.py": structure_probe.build_parser,
+    "precision_gate.py": precision_gate.build_parser,
     "noise_floor.py": noise_floor.build_parser,
     "milestone_validate.py": milestone_validate.build_parser,
 }
@@ -233,6 +238,17 @@ def extract_commands():
         script = match.group(1)
         argline = match.group(2)
         argline = argline.split("#", 1)[0].strip().rstrip("`\"')")
+        # 剥掉行尾的 shell 重定向。
+        #
+        # `> out.json` 是 shell 的构件，不是脚本的参数 —— argparse 看到它只会
+        # 报 unrecognized arguments。不剥的话，这道门禁会把「把输出存下来」
+        # 这种本来就该写进文档的用法判成错误，于是作者被推着去写不带重定向的
+        # 命令。而下游要拿这份报告喂给 record，文档里不写存哪儿才是真的坑。
+        #
+        # 两处收紧，都是为了不误伤占位符：**锚在行尾**，且 `>` 前必须是空白。
+        # 不收紧的话 `--state <state 文件>` 里那个收尾的尖括号会被当成重定向，
+        # 把后面的参数一起吃掉 —— 文档里的占位符本来就常写成 `<...>`。
+        argline = re.sub(r"\s+\d?>>?\s*\S+\s*$", "", argline).strip()
         if not argline or _looks_like_prose(argline):
             continue
         try:
@@ -365,3 +381,35 @@ def test_every_gated_script_is_covered_from_each_source(source):
     assert not missing, (
         f"这些脚本在「{source}」这一侧零覆盖: {sorted(missing)}。"
         "合计不为零不代表两边都扫到了 —— 抽取规则可能只对另一侧生效")
+
+
+# ---------------------------------------------------------------------------
+# 门禁自己的解析规则
+# ---------------------------------------------------------------------------
+
+def test_trailing_redirection_is_stripped():
+    """`> out.json` 是 shell 构件，不该被当成脚本参数。
+
+    不剥的话，这道门禁会把「把输出存下来」判成错误，于是作者被推着去写
+    不带重定向的命令 —— 而下游要拿这份报告喂给 record，文档里不写存哪儿
+    才是真的坑。
+    """
+    commands = {(path.name, script, argline)
+                for path, script, argline, _ in extract_commands()}
+    assert any(script == "fence_check.py" and ">" not in argline
+               and "--json" in argline
+               for _name, script, argline in commands), \
+        "quickstart 里那条带 > 的 fence_check 命令没有被收进门禁"
+
+
+def test_angle_bracket_placeholder_is_not_mistaken_for_redirection():
+    """`--state <state 文件>` 里那个收尾的尖括号不是重定向。
+
+    把它当重定向会把后面的参数一起吃掉，而文档里的占位符本来就常写成
+    `<...>` —— 这条规则一误伤，就会有一批正当命令被判成解析失败。
+    """
+    for path, script, argline, argv in extract_commands():
+        if script == "campaign.py" and argline.startswith("reopen"):
+            # 占位符后面的参数要还在
+            assert "--decision" in argv or "--milestone" in argv, \
+                f"{path.name} 的 reopen 命令被重定向规则截断了: {argline}"

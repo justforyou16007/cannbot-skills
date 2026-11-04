@@ -15,12 +15,71 @@ description: ForgeKernel 探针套件，把论文用到的 NCU pass、timeline p
 | 论文的仪器 | 这里的工具 | 对应程度 |
 |---|---|---|
 | NCU pass | `signature_probe.py` | 完整（且 msprof 多给了搬运量与 L2 命中率）|
-| timeline probe | `signature_probe.py` 的暴露时间段 | **部分** —— 只知道闲了多少，不知道闲在哪 |
-| 手段定价 / 裁决探针 | `lever_probe.py` | 完整 |
+| 角色暴露账 | `signature_probe.py` 的 `role_exposure` | 完整，且比上游干净（AIC/AIV 各有独立 PMU，闲置比例能按角色分开算）|
+| 逐核负载 / 掉队核 | `signature_probe.py` 的 `core_balance` | 完整（`per_core_cycles.csv`，2× 判据对齐上游 `uneven_spans`）|
+| 结构核验（声称的结构有没有建出来）| `ops/ops-simulator` 的 `structural-verification.md` | 部分 —— 静态 IR 与仿真指令表可判搬运路径与同步成对，**最终助记符反汇编不可用**（厂商关闭，见 waiver）|
+| timeline probe | `signature_probe.py` 的 `exposure` + `core_balance` + `role_exposure` | **部分** —— 四个子能力里三个可答（总暴露量 / 掉队核 / 残差归谁）；**ramp-plateau-drain 是真盲区**（PM 采样上限 100 Hz = 10ms，而 kernel 是百微秒级，差约 50 倍），已按 waiver 格式写明八条已试通道 |
+| 手段定价 / 裁决探针 | `lever_probe.py` | **部分** —— 只有「单项加上」这条腿，没有「全上各减一项」那条。于是上游的 `coupled` 类（单独无用但别人依赖它）读不出来，还会被判成「不要再投」。见 `references/instrument-map.md` |
 | 转发围栏 | `fence_check.py` | 完整 |
-| CUDA-graph replay、指令级时间线 | 无 | **没有对应物**，作开放问题处理 |
+| CUDA-graph replay、指令级时间线、最终助记符反汇编 | 无 | **没有对应物**。前两项作开放问题处理；第三项是厂商主动关闭（`llvm-objdump` 缺指令表、设备侧 `-S` 被拒、管线无 `.s` 阶段），已写 waiver 并给出替代通道 |
 
 完整对照见 [`references/instrument-map.md`](references/instrument-map.md)。
+
+## 四、结构核验：`structure_probe.py`
+
+回答一个和性能无关的问题：**声称的结构到底有没有被构建出来** —— 而且在
+任何性能数出来之前就能答。
+
+```bash
+# 源码层（不需要 CANN 工具链）
+python3 scripts/structure_probe.py --candidate ./cand \
+    --assert "buffer_depth:2" --assert "flag_paired" \
+    --output ./forge_work/structure.json
+
+# 连 IR 层一起查（需要 ccec；1=GM、6=UB）
+python3 scripts/structure_probe.py --candidate ./cand \
+    --assert "operand_space:addrspace(6)" --arch dav-c220-vec
+
+# 看支持哪些断言
+python3 scripts/structure_probe.py --list-assertions
+```
+
+报告传给 `campaign.py record --structure-report`。
+
+### 为什么需要它
+
+停顿锚点有个结构性弱点：**它能被别的改动顶下去**。减小 tile、改对齐、换
+block 映射都会让 `mte2_wait_ratio` 降。于是一个写成单缓冲回退的实现，可能
+因为本轮顺手改了 tile 而让停顿恰好落进带内 → 判「机制已核实」→ 这个解释
+被封进产物库和知识库，**而双缓冲从未存在**。
+
+反方向同样会错：机制确实建出来了，但当前 shape 下它不是瓶颈，停顿不动 →
+判「平凡通过」→ 一个正确的架构决策被当成「增益另有来源」。
+
+结构在不在是二值事实，顶不下去。所以核验顺序是**结构先、停顿后**，而且
+结构的结论优先 —— 上游那条规则：**未落地的结构优先于改验收措辞**，
+把阈值改宽不会让一个「不在」变成「在」。
+
+### 归因方向
+
+结构不在 ⇒ 判 `refuted` 且归因 **implementation**：该修实现、或给实现补一张
+经验卡片，**不要改课程表**。归到课程表那一侧的后果很具体：连续三次把架构层
+叫回来重写课程表，而下一轮实现还是同一个退化回退。
+
+### 两层通道与各自的边界
+
+| 层 | 能判什么 | 需要什么 |
+|---|---|---|
+| 源码层 | 缓冲深度、同步成对、某个构造在不在 | 无 —— 候选自己的源码完全可读（封存 hook 只拦参考） |
+| IR 层 | 操作数所在存储（`addrspace(1)`=GM、`addrspace(6)`=UB） | `ccec` + `llvm-dis` |
+
+IR 在指令选择与寄存器分配**之前**，所以证不了「寄存器没溢出」「调度深度
+是多少」。那些要走仿真通道，见 `ops/ops-simulator` 的
+`structural-verification.md`。
+
+> **拿不到工具链时报错，不放行。** 「查不了」不等于「查过且通过」——
+> 一条查不了的结构断言被当成通过，比没有这条断言更糟：它会让人以为
+> 核验过了。要显式接受这个缺口才用 `--allow-missing-toolchain`。
 
 ## 贯穿三个探针的一条原则
 

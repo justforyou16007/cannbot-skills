@@ -84,7 +84,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 SCHEMA_VERSION = "2.0"
 
@@ -194,11 +194,31 @@ VERDICT_REGRESSION = "regression"
 #: 确认复测。不是一次候选裁决 —— 它回答「上次那个增益再测一次还在不在」。
 VERDICT_CONFIRM = "confirm"
 
+#: 中性记录：这一轮改了代码，但**没有测**。
+#:
+#: 为什么需要这个裁决：有些改动不产生可测的时间变化 —— 重命名、拆函数、
+#: 补注释、把一个常量提成 tiling 参数而取值不变。它们仍然改变了**代码身份**
+#: （artifact_sha），而机制做差的全部前提是「被保留下来的最后一条台账记录
+#: 就是当前代码的样子」。
+#:
+#: 没有这个裁决，这类改动只有两条路：
+#:   跑一次完整评测   为一个必然无变化的改动花掉一次机时与一次预算
+#:   不记             台账里的 sha 从此对不上工作树 —— 而下一轮的做差基线
+#:                    就是据此取的，于是那一轮算出来的「因本次改动而移动」
+#:                    其实混着这次没记的改动
+#:
+#: 第二条是会实际发生的那条（因为它免费）。所以要有一条「记代码身份、
+#: 不记性能」的路。
+VERDICT_NEUTRAL = "neutral"
+
 #: 对候选的裁决。台账里还有 reopen / promote / stop / noise_floor 这类
 #: **管理条目**，它们不代表「某条决策被试过」，统计时必须排除。
 CANDIDATE_VERDICTS = frozenset({
     VERDICT_ACCEPT, VERDICT_ACCEPT_UNVERIFIED,
     VERDICT_REVERT, VERDICT_REGRESSION,
+    # neutral 算候选条目：它确实是「某条决策被动过一次」，只是没测性能。
+    # 不算的话，`graph_exhausted` 会以为这条决策还没试过。
+    VERDICT_NEUTRAL,
 })
 
 #: 噪声底状态。参考换了之后必须重测 —— 新参考是另一个二进制，
@@ -2370,19 +2390,85 @@ def apply_result(state: Dict[str, Any], doc: Dict[str, Any], decision: str,
     return entry
 
 
+#: 确认一个 best 需要几次读数。
+#:
+#: 上游取 3 并以中位数作最终 claim。本仓此前取 2 —— 两读时只能「两次都要
+#: 达标」，而那条判据对一次偏低抽样没有抵抗力：偏低和偏高一样常见，于是一个
+#: 真达标的结果会被一次运气差的复测否掉，然后再测一次，机时反而更费。
+#:
+#: 三读 + 中位数同时解决两个方向：一次偏高进不来，一次偏低也拉不下去。
+CONFIRM_READINGS = 3
+
+#: 三次读数之间允许差多少（相对噪声底的倍数）。
+#:
+#: 上游在这个位置查的是「三个样本是不是都落在同一台机器上 —— 那是一次抽样
+#: 不是三次」。这条在我们这里**无法照搬**：本仓按设计单卡（`--device-id`
+#: 必填、代际之间不换卡），跨机器采样会直接破坏可比性，所以样本必然同机。
+#:
+#: 它想防的事可以换一个量来查：三次读数彼此的离散度。如果三读之间差得比
+#: 噪声底允许的还多，那它们不是同一个量的三次抽样 —— 中位数对它们没有意义，
+#: 该先去查环境而不是取中位数。
+CONFIRM_SPREAD_FACTOR = 3.0
+
+
+def confirmation_spread_ok(readings: Sequence[Any],
+                           noise_floor_pct: float) -> Tuple[bool, str]:
+    """三次读数彼此够接近吗。
+
+    返回 (是否够接近, 说明)。噪声底为 0（还没量）时不判 —— 没有判据可用，
+    而编一个出来比不判更糟。
+    """
+    numeric = [r for r in readings if isinstance(r, (int, float))]
+    if len(numeric) < 2 or noise_floor_pct <= 0:
+        return True, "读数不足或噪声底未量，离散度不判"
+    low, high = min(numeric), max(numeric)
+    if low <= 0:
+        return True, "读数里有非正值，离散度不判"
+    spread_pct = (high - low) / low * 100.0
+    cap = noise_floor_pct * CONFIRM_SPREAD_FACTOR
+    if spread_pct <= cap:
+        return True, (f"读数离散度 {spread_pct:.2f}%，在 "
+                      f"{cap:.2f}%（噪声底 ×{CONFIRM_SPREAD_FACTOR}）以内")
+    return False, (
+        f"读数离散度 {spread_pct:.2f}% 超出 {cap:.2f}%"
+        f"（噪声底 {noise_floor_pct:.2f}% × {CONFIRM_SPREAD_FACTOR}）。\n"
+        f"    读数：{numeric}\n"
+        "    差这么多说明它们不是同一个量的几次抽样 —— 中位数对它们没有"
+        "意义。\n"
+        "    先查环境（别的进程占卡、降频、散热），而不是取中位数收工。")
+
+
 def _best_is_confirmed(state: Dict[str, Any]) -> bool:
     """best 是否经过独立复测。
 
-    判据：同一个决策至少两次读数，且**每一次**都达到目标。
-    取「每一次都要达标」而不是「平均达标」—— 后者会让一次偏高读数把一次
-    不达标的读数拉过线，而那正是要防的情形。
+    三个条件：
+      够次数     至少 CONFIRM_READINGS 次读数
+      中位达标   中位数达到目标（不是「每一次都达标」—— 见下）
+      够集中     读数彼此的离散度在噪声底的几倍以内
+
+    为什么从「每一次都达标」改成「中位达标」：前者对一次**偏低**抽样没有
+    抵抗力，而偏低和偏高一样常见。于是一个真达标的结果会被一次运气差的
+    复测否掉，然后再测一次 —— 机时反而更费，而且那次否决本身没有信息量。
+
+    离散度那一条补的是前者被拿掉之后留下的口子：中位数只在三读确实是同一个
+    量的三次抽样时才有意义。
     """
     best = state.get("best") or {}
     readings = best.get("readings")
-    if not isinstance(readings, list) or len(readings) < 2:
+    if not isinstance(readings, list) or len(readings) < CONFIRM_READINGS:
+        return False
+    numeric = sorted(r for r in readings if isinstance(r, (int, float)))
+    if len(numeric) < CONFIRM_READINGS:
         return False
     target = float(state.get("target_gain", DEFAULT_PHASE_TARGET_GAIN))
-    return all(isinstance(r, (int, float)) and r >= target for r in readings)
+    median = (numeric[len(numeric) // 2] if len(numeric) % 2
+              else (numeric[len(numeric) // 2 - 1]
+                    + numeric[len(numeric) // 2]) / 2)
+    if median < target:
+        return False
+    ok, _detail = confirmation_spread_ok(
+        numeric, float(state.get("noise_floor_pct", 0.0) or 0.0))
+    return ok
 
 
 def _advance_state(state: Dict[str, Any],
@@ -2916,6 +3002,60 @@ def probe_boundary(sealed_list: Path) -> Tuple[bool, str]:
         f"    stderr: {(proc.stderr or '').strip()[:300]}")
 
 
+def lint_knowledge_base(kb_root: Optional[str]) -> List[str]:
+    """开跑之前把知识库整棵树过一遍 lint。返回问题列表，空表示干净。
+
+    为什么放在 init 这一刻：知识库是**唯一跨 campaign 存活**的东西，而它被
+    读的时机是架构层写课程表的时候 —— 那时一张越界的卡片（留着参考的专有
+    符号名、或读起来像上一次的 campaign 日记）会直接进到架构层的输入里。
+
+    此时拦下来的代价是最小的：还没有花任何机时。跑到中途才发现，意味着那张
+    卡片已经参与过几轮决策，而哪几轮受了影响已经无从分辨。
+
+    拿不到 hwkb 或知识库根时返回空表 —— 这一条不硬拒（知识库是可选的，
+    一个全新环境里它本来就是空的）。缺失由调用方告警。
+    """
+    if not kb_root:
+        return []
+    root = Path(kb_root)
+    if not root.is_dir():
+        return [f"知识库根 {root} 不存在 —— 开跑之前的 lint 跳过了"]
+    try:
+        hwkb = _load_hwkb()
+    except CampaignError as exc:
+        return [f"装载不了 hwkb，开跑之前的 lint 跳过了：{exc}"]
+
+    denylist = hwkb.load_denylist(root)
+    operator_names = hwkb.load_operator_names(root)
+    problems: List[str] = []
+    unreadable: List[Any] = []
+    count = 0
+    for path, meta, body in hwkb.iter_cards(root, None, unreadable):
+        count += 1
+        issues = hwkb.check_no_code_boundary(
+            meta, body, denylist, operator_names)
+        for issue in issues:
+            problems.append(f"{path.name}: {issue}")
+    for path, reason in unreadable:
+        problems.append(f"{path.name}: 无法解析（{reason}）")
+    if not problems:
+        return []
+    return [
+        f"知识库有 {len(problems)} 项问题（共 {count} 张卡片），"
+        "开跑之前先修掉：\n    "
+        + "\n    ".join(problems[:8])
+        + ("\n    ……" if len(problems) > 8 else "")
+        + "\n    知识库是唯一跨 campaign 存活的东西，而它被读的时机是架构层"
+          "写课程表的时候 ——\n"
+          "    一张越界的卡片会直接进到架构层的输入里。此时拦下来还没花"
+          "任何机时；\n"
+          "    跑到中途才发现，那张卡片已经参与过几轮决策，而哪几轮受了影响"
+          "无从分辨。\n"
+          "    修法：hwkb.py lint --all（--quarantine 可把屡次不过检的移出"
+          "读集）。"
+    ]
+
+
 def cmd_init(args: argparse.Namespace) -> int:
     path = Path(args.state)
     if path.exists() and not args.force:
@@ -3008,6 +3148,17 @@ def cmd_init(args: argparse.Namespace) -> int:
     reference_snapshot = (snapshot_signature(reference_signature)
                           if reference_signature else None)
 
+    # 开跑之前把知识库过一遍。此时拦下来还没花任何机时。
+    kb_problems = lint_knowledge_base(args.kb_root)
+    if kb_problems and not args.allow_dirty_kb:
+        for problem in kb_problems:
+            print(f"错误: {problem}", file=sys.stderr)
+        print("  确认要带着这些问题开跑时加 --allow-dirty-kb。",
+              file=sys.stderr)
+        return 1
+    for problem in kb_problems:
+        print(f"警告: {problem}", file=sys.stderr)
+
     state = new_state(
         operator=args.operator, input_shape=args.input_shape, arch=args.arch,
         reference={
@@ -3096,11 +3247,16 @@ def confirm_best(state: Dict[str, Any], doc: Dict[str, Any],
         "kb_admissible": False,
     }
     state.setdefault("ledger", []).append(entry)
-    # best 的 gain 取**最小**的那次读数，不是最大。
+    # best 的 gain 取**中位数**。
     #
-    # 多次抽样取最大就是让运气决定 best；取最小是保守方向 —— 我们要的是
-    # 「至少能稳定做到多少」，而不是「最好的一次是多少」。
-    best["gain"] = min(r for r in readings if isinstance(r, (int, float)))
+    # 三个读数下中位数同时丢掉一个偏高和一个偏低的离群点，这正是它存在的
+    # 理由。此前取最小值，那是两读时的保守选择 —— 但三读时取最小意味着
+    # 一次偏低抽样就能把结论拉下来，而偏低抽样和偏高抽样一样常见。
+    #
+    # 不取最大：那是让运气决定 best。不取平均：一个离群值会按权重渗进来。
+    numeric = sorted(r for r in readings if isinstance(r, (int, float)))
+    best["gain"] = numeric[len(numeric) // 2] if len(numeric) % 2 \
+        else (numeric[len(numeric) // 2 - 1] + numeric[len(numeric) // 2]) / 2
     _advance_state(state, None)
     return entry
 
@@ -3267,6 +3423,83 @@ def cmd_audit(args: argparse.Namespace) -> int:
     print("    (c) 课程表缺陷（没写/写错）→ 走 reopen 修订课程表",
           file=sys.stderr)
     return 1
+
+
+def cmd_neutral(args: argparse.Namespace) -> int:
+    """记一条「改了代码但没测」的条目。
+
+    它要 `--sha` 而**不要** `--result`：没有结果可读，这正是这条命令存在的
+    理由。它做的唯一一件事是把当前的代码身份接到台账末尾，让下一轮的做差
+    基线仍然指得对。
+
+    不消耗评测预算（没评测），不动停滞计数（没有新下界也没有失败），
+    不抬高 best（没有增益）。
+    """
+    path = Path(args.state)
+    try:
+        state = load_state(path)
+    except CampaignError as exc:
+        print(f"错误: {exc}", file=sys.stderr)
+        return 2
+
+    sha = (args.sha or "").strip()
+    if not sha and args.artifact:
+        try:
+            sha = directory_fingerprint(Path(args.artifact))
+        except OSError as exc:
+            print(f"错误: 算不出 {args.artifact} 的内容指纹: {exc}",
+                  file=sys.stderr)
+            return 2
+    if not sha:
+        print("错误: 需要 --sha 或 --artifact 之一。\n"
+              "  这条命令的全部作用就是把**当前的代码身份**接到台账末尾 ——"
+              "没有身份就没有意义。", file=sys.stderr)
+        return 2
+
+    previous = previous_artifact_sha(state)
+    if previous and previous == sha:
+        print(f"错误: 指纹与台账里上一条相同（{sha[:12]}）—— 代码没有变过。\n"
+              "  那么不需要记这一条：做差基线本来就指着它。\n"
+              "  如果你以为改过了，先确认改动真的落到了被测的那份产物上"
+              "（常见原因：改完忘了重装 OPP）。", file=sys.stderr)
+        return 1
+
+    entry = {
+        "at": _now(),
+        "generation": state.get("generation", 0),
+        "input_shape": state.get("input_shape"),
+        "decision": args.decision,
+        "gain": None,
+        "time_us": None,
+        "verdict": VERDICT_NEUTRAL,
+        "artifact_sha": sha,
+        "base_sha": previous or None,
+        "reason": (f"中性记录：{args.reason or '改动不产生可测的时间变化'}。"
+                   "只记代码身份，不记性能 —— 下一轮的做差基线据此取"),
+        "counts_toward_best": False,
+        "kb_admissible": False,
+    }
+    state.setdefault("ledger", []).append(entry)
+    save_state(path, state)
+    print(f"已记中性条目：决策 {args.decision}，指纹 {sha[:12]}")
+    print(f"  上一条指纹 {(previous or '无')[:12]} → 做差基线已接到这一条")
+    print("  不消耗评测预算，不动停滞计数，不抬高 best。")
+    return 0
+
+
+def previous_artifact_sha(state: Dict[str, Any]) -> Optional[str]:
+    """台账里最后一条有代码身份的记录的指纹。
+
+    只看本代、只看未作废 —— 作废的那些建立在旧架构假设上，拿它们当基线会把
+    两套假设之间的差异算到本次改动头上。
+    """
+    for entry in reversed(generation_entries(state)):
+        if entry.get("invalidated"):
+            continue
+        sha = entry.get("artifact_sha")
+        if isinstance(sha, str) and sha.strip():
+            return sha
+    return None
 
 
 def cmd_confirm(args: argparse.Namespace) -> int:
@@ -4503,6 +4736,13 @@ def build_parser() -> argparse.ArgumentParser:
                         default=DEFAULT_PHASE_TARGET_GAIN)
     p_init.add_argument("--stagnation-threshold", type=int,
                         default=DEFAULT_STAGNATION_THRESHOLD)
+    p_init.add_argument("--kb-root", default=None,
+                        help="知识库根（forge-hwkb/references）。给了就在开跑"
+                             "之前把整棵树过一遍 lint —— 知识库是唯一跨 "
+                             "campaign 存活的东西，而一张越界的卡片会直接进到"
+                             "架构层的输入里")
+    p_init.add_argument("--allow-dirty-kb", action="store_true",
+                        help="带着知识库的 lint 问题开跑")
     p_init.add_argument("--wall-hours", type=float, default=None,
                         help="墙钟预算（小时，自 init 起算）。不给则不限。"
                              "次数预算挡不住「每轮都很快但时间在走」那种"
@@ -4613,6 +4853,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_confirm.add_argument("--decision", required=True,
                            help="拿到 best 的那个决策 id")
     p_confirm.set_defaults(func=cmd_confirm)
+
+    p_neutral = sub.add_parser(
+        "neutral", help="记一条「改了代码但没测」的条目", parents=[common])
+    p_neutral.add_argument("--decision", required=True)
+    p_neutral.add_argument("--sha", default=None,
+                           help="当前代码身份。与 --artifact 二选一")
+    p_neutral.add_argument("--artifact", default=None,
+                           help="候选目录，由它算内容指纹")
+    p_neutral.add_argument("--reason", default="",
+                           help="为什么这次改动不需要测（重命名、拆函数、"
+                                "补注释、提常量而取值不变……）")
+    p_neutral.set_defaults(func=cmd_neutral)
 
     p_reopen = sub.add_parser("reopen", help="重开架构决策并作废下游实现",
                               parents=[common])

@@ -507,9 +507,11 @@ def test_promote_clears_reference_snapshot(tmp_path):
          # 同理：没有围栏证据的一轮不抬高 best，promote 会先被「best 未复测」
          # 拦住。围栏是静态扫描，真实流程里每轮都跑。
          "--fence-report", str(write_clean_fence(tmp_path))])
-    # 确认复测：promote 要求 best 经过独立复测，而确认走单独的子命令
-    run(["--state", str(state_file), "confirm", "--result", str(res),
-         "--decision", "D0.1"])
+    # 确认复测：promote 要求 best 经过三次读数（CONFIRM_READINGS），
+    # 最终 claim 取中位数。首轮 record 算第一次读数，这里再补两次。
+    for _ in range(campaign.CONFIRM_READINGS - 1):
+        run(["--state", str(state_file), "confirm", "--result", str(res),
+             "--decision", "D0.1"])
     artifact = tmp_path / "b"
     (artifact / "op_kernel").mkdir(parents=True)
     (artifact / "op_kernel" / "k.cpp").write_text("// k\n", encoding="utf-8")
@@ -609,8 +611,8 @@ def test_single_reading_does_not_ship(tmp_path=None):
     assert campaign.next_action(state)["action"] == "confirm-best"
 
 
-def test_second_matching_reading_ships(tmp_path=None):
-    """同一个决策再测一次、仍然达标 —— 这才收工。"""
+def test_three_matching_readings_ship(tmp_path=None):
+    """同一个决策再测两次、中位数仍然达标 —— 这才收工。"""
     state = fresh_state(target=1.05)
     ms = milestone()
     apply(state, result(1.20), "D0.1", milestone_doc=ms,
@@ -619,37 +621,84 @@ def test_second_matching_reading_ships(tmp_path=None):
 
     # 确认复测走独立入口：它跑的是同一份代码，机制必然「没动」——
     # 再走一次 record 会被判 vacuous、不计入 best，确认永远无法完成。
+    #
+    # 要三次读数（CONFIRM_READINGS），最终 claim 取中位数。
     campaign.confirm_best(state, result(1.18), "D0.1")
+    assert state["state"] != campaign.STATE_SHIPPED      # 两读还不够
+    campaign.confirm_best(state, result(1.19), "D0.1")
     assert state["state"] == campaign.STATE_SHIPPED
     assert state.get("pending_confirmation") is None
-    # best 取最小那次读数：多次抽样取最大就是让运气决定 best
-    assert state["best"]["gain"] == pytest.approx(1.18)
+    # 三读 [1.20, 1.18, 1.19] → 中位 1.19
+    assert state["best"]["gain"] == pytest.approx(1.19)
 
 
-def test_confirmation_requires_every_reading_to_clear_target():
-    """两次都要达标，不是平均达标。
+def test_confirmation_needs_three_readings():
+    """两次不够。
 
-    平均会让一次偏高读数把一次不达标的拉过线 —— 那正是要防的情形。
+    这条原先断言「两次都要达标」。改掉的理由：那条判据对一次**偏低**抽样
+    没有抵抗力，而偏低和偏高一样常见 —— 于是一个真达标的结果会被一次运气差
+    的复测否掉，然后再测一次。机时反而更费，而那次否决本身没有信息量。
+
+    三读 + 中位数同时解决两个方向：一次偏高进不来，一次偏低也拉不下去。
     """
-    state = fresh_state(target=1.10)
+    state = fresh_state(target=1.10, noise=2.0)
     state["best"] = {"gain": 1.20, "decision": "D0.1",
-                     "readings": [1.20, 1.02]}
-    assert campaign._best_is_confirmed(state) is False
-    state["best"]["readings"] = [1.20, 1.12]
+                     "readings": [1.20, 1.12]}
+    assert campaign._best_is_confirmed(state) is False      # 只有两读
+    state["best"]["readings"] = [1.20, 1.21, 1.22]
     assert campaign._best_is_confirmed(state) is True
 
 
-def test_verified_triggers_ship():
-    """机制核实 + 达标 + **两次读数都达标** → shipped。
+def test_median_not_every_reading_decides_confirmation():
+    """一次偏低抽样不该否掉结论，一次偏高也不该成就结论。"""
+    state = fresh_state(target=1.10, noise=20.0)   # 放宽离散度以单测中位数
+    # 中位 1.20 达标，尽管有一次 1.02
+    state["best"] = {"gain": 1.20, "decision": "D0.1",
+                     "readings": [1.02, 1.20, 1.21]}
+    assert campaign._best_is_confirmed(state) is True
+    # 中位 1.02 不达标，尽管有一次 1.30
+    state["best"]["readings"] = [1.01, 1.02, 1.30]
+    assert campaign._best_is_confirmed(state) is False
 
-    第二次 record 是确认复测；单次读数只会转 pending_confirmation，
-    见 test_single_reading_does_not_ship。
+
+def test_scattered_readings_are_not_three_samples_of_one_quantity():
+    """离散度那一条补的是「每次都达标」被拿掉之后留下的口子。
+
+    中位数只在三读确实是同一个量的三次抽样时才有意义。差得比噪声底允许的
+    还多，说明该先去查环境而不是取中位数收工。
+
+    上游在这个位置查的是「三个样本是不是都落在同一台机器上」—— 那条在我们
+    这里无法照搬：本仓按设计单卡（--device-id 必填、代际之间不换卡），
+    跨机器采样会直接破坏可比性，所以样本必然同机。换成查离散度。
+    """
+    state = fresh_state(target=1.10, noise=2.0)
+    state["best"] = {"gain": 1.20, "decision": "D0.1",
+                     "readings": [1.12, 1.20, 1.60]}
+    assert campaign._best_is_confirmed(state) is False
+    ok, detail = campaign.confirmation_spread_ok([1.12, 1.20, 1.60], 2.0)
+    assert ok is False
+    assert "先查环境" in detail
+
+
+def test_spread_is_not_judged_without_a_noise_floor():
+    """没有判据可用时不判 —— 编一个出来比不判更糟。"""
+    ok, detail = campaign.confirmation_spread_ok([1.0, 2.0], 0.0)
+    assert ok is True
+    assert "不判" in detail
+
+
+def test_verified_triggers_ship():
+    """机制核实 + 达标 + **三次读数的中位数达标** → shipped。
+
+    首轮 record 算第一次读数，之后两次走 confirm；单次读数只会转
+    pending_confirmation，见 test_single_reading_does_not_ship。
     """
     state = fresh_state(target=1.1)
     ms = milestone()
     apply(state, result(speedup=1.50), "D0.1",
                           milestone_doc=ms, signature=signature(0.9))
     campaign.confirm_best(state, result(speedup=1.45), "D0.1")
+    campaign.confirm_best(state, result(speedup=1.47), "D0.1")
     assert state["state"] == campaign.STATE_SHIPPED
 
 
@@ -1112,6 +1161,7 @@ def test_target_reached_wins_over_stall():
     apply(state, result(speedup=1.50), "D0.1",
                           milestone_doc=doc, signature=signature(0.9))
     campaign.confirm_best(state, result(speedup=1.48), "D0.1")
+    campaign.confirm_best(state, result(speedup=1.49), "D0.1")
     assert state["state"] == campaign.STATE_SHIPPED
 
 
@@ -1614,9 +1664,11 @@ def test_cli_promote_marks_noise_floor_pending(tmp_path):
          # 同理：没有围栏证据的一轮不抬高 best，promote 会先被「best 未复测」
          # 拦住。围栏是静态扫描，真实流程里每轮都跑。
          "--fence-report", str(write_clean_fence(tmp_path))])
-    # 确认复测：promote 要求 best 经过独立复测，而确认走单独的子命令
-    run(["--state", str(state_file), "confirm", "--result", str(res),
-         "--decision", "D0.1"])
+    # 确认复测：promote 要求 best 经过三次读数（CONFIRM_READINGS），
+    # 最终 claim 取中位数。首轮 record 算第一次读数，这里再补两次。
+    for _ in range(campaign.CONFIRM_READINGS - 1):
+        run(["--state", str(state_file), "confirm", "--result", str(res),
+             "--decision", "D0.1"])
 
     artifact = tmp_path / "best"
     (artifact / "op_kernel").mkdir(parents=True)
@@ -2591,9 +2643,9 @@ def shipped_state(tmp_path, artifact):
                       "generation": 0},
         "state": campaign.STATE_SHIPPED, "generation": 0,
         "noise_floor_pct": 2.0, "target_gain": 1.05,
-        # 两次读数都达标 —— promote 要求 best 经过独立复测
-        "best": {"gain": 1.30, "time_us": 210.0, "artifact": str(artifact),
-                 "decision": "D0.1", "readings": [1.30, 1.28]},
+        # 三次读数，中位数达标 —— promote 要求 best 经过独立复测
+        "best": {"gain": 1.29, "time_us": 210.0, "artifact": str(artifact),
+                 "decision": "D0.1", "readings": [1.30, 1.28, 1.29]},
         "budget": {"max_records": 60, "used": 3},
         "stagnation": {"since_improvement": 0},
         "cursor": {"milestone": None, "decision": None, "iteration": 0},
@@ -2695,14 +2747,22 @@ def test_confirm_does_not_count_toward_best_or_kb():
     assert entry["reading_of"] == "D0.1"
 
 
-def test_confirm_takes_the_minimum_reading():
-    """多次抽样取最大就是让运气决定 best；取最小才是「至少能稳定做到多少」。"""
+def test_confirm_takes_the_median_reading():
+    """取中位数：一次偏高进不来，一次偏低也拉不下去。
+
+    原先取最小 —— 那是两读时的保守选择，但三读时取最小意味着一次偏低抽样
+    就能把结论拉下来。不取最大：那是让运气决定 best。不取平均：一个离群值
+    会按权重渗进来。
+    """
     state = fresh_state(target=1.05)
     apply(state, result(1.30), "D0.1",
                           milestone_doc=milestone(), signature=signature(0.9))
     assert state["best"]["gain"] == pytest.approx(1.30)
     campaign.confirm_best(state, result(1.12), "D0.1")
-    assert state["best"]["gain"] == pytest.approx(1.12)
+    assert state["best"]["gain"] == pytest.approx(1.21)   # 两读取中点
+    campaign.confirm_best(state, result(1.28), "D0.1")
+    # 三读 [1.30, 1.12, 1.28] → 中位 1.28
+    assert state["best"]["gain"] == pytest.approx(1.28)
 
 
 def test_confirm_that_falls_short_does_not_ship():
@@ -4323,3 +4383,194 @@ def test_work_dir_is_resolved_the_same_way_as_the_hook(tmp_path):
     state["sealed_paths"] = str(tmp_path / "w" / "sealed_paths.txt")
     resolved = campaign._work_dir_from_state(state, tmp_path / "s.json")
     assert resolved == str((tmp_path / "w").resolve())
+
+
+# ---------------------------------------------------------------------------
+# 中性记录：改了代码但没测
+#
+# 有些改动不产生可测的时间变化 —— 重命名、拆函数、补注释、把一个常量提成
+# tiling 参数而取值不变。它们仍然改变了**代码身份**，而机制做差的全部前提
+# 是「被保留下来的最后一条台账记录就是当前代码的样子」。
+#
+# 没有这条路，这类改动只有两条选择：为一个必然无变化的改动花掉一次机时，
+# 或者不记 —— 而不记是免费的，所以它是会实际发生的那条。
+# ---------------------------------------------------------------------------
+
+def _neutral(state_file, **kw):
+    import argparse  # noqa: PLC0415
+    base = dict(state=str(state_file), decision="D0.1", sha="abc123def456",
+                artifact=None, reason="", as_json=False)
+    base.update(kw)
+    return campaign.cmd_neutral(argparse.Namespace(**base))
+
+
+def test_neutral_records_the_code_identity(tmp_path):
+    state_file = tmp_path / "s.json"
+    campaign.save_state(state_file, fresh_state())
+    assert _neutral(state_file, reason="把 tileNum 提成参数，取值不变") == 0
+    entry = json.loads(state_file.read_text())["ledger"][-1]
+    assert entry["verdict"] == campaign.VERDICT_NEUTRAL
+    assert entry["artifact_sha"] == "abc123def456"
+    assert entry["gain"] is None
+
+
+def test_neutral_does_not_consume_budget(tmp_path):
+    """没评测就不该花预算 —— 这正是这条路存在的理由之一。"""
+    state_file = tmp_path / "s.json"
+    campaign.save_state(state_file, fresh_state())
+    before = json.loads(state_file.read_text())["budget"]["used"]
+    _neutral(state_file)
+    after = json.loads(state_file.read_text())["budget"]["used"]
+    assert after == before
+
+
+def test_neutral_does_not_touch_stagnation_or_best(tmp_path):
+    state_file = tmp_path / "s.json"
+    state = fresh_state()
+    state["stagnation"]["since_improvement"] = 1
+    campaign.save_state(state_file, state)
+    _neutral(state_file)
+    after = json.loads(state_file.read_text())
+    assert after["stagnation"]["since_improvement"] == 1
+    assert float(after.get("best", {}).get("gain", 1.0)) == 1.0
+
+
+def test_neutral_chains_the_diff_baseline(tmp_path):
+    """它做的唯一一件事：让下一轮的做差基线仍然指得对。"""
+    state_file = tmp_path / "s.json"
+    state = fresh_state()
+    state["ledger"] = [{"generation": 0, "decision": "D0.1",
+                        "verdict": "accept", "gain": 1.1,
+                        "counts_toward_best": True,
+                        "artifact_sha": "old111"}]
+    campaign.save_state(state_file, state)
+    _neutral(state_file, sha="new222")
+    entry = json.loads(state_file.read_text())["ledger"][-1]
+    assert entry["base_sha"] == "old111"
+    assert entry["artifact_sha"] == "new222"
+
+
+def test_neutral_refuses_an_unchanged_fingerprint(tmp_path):
+    """指纹没变就不需要记这一条 —— 做差基线本来就指着它。
+
+    而且这常常意味着改动没落到被测的那份产物上（改完忘了重装 OPP）。
+    """
+    state_file = tmp_path / "s.json"
+    state = fresh_state()
+    state["ledger"] = [{"generation": 0, "decision": "D0.1",
+                        "verdict": "accept", "gain": 1.1,
+                        "counts_toward_best": True, "artifact_sha": "same"}]
+    campaign.save_state(state_file, state)
+    assert _neutral(state_file, sha="same") == 1
+
+
+def test_neutral_needs_an_identity(tmp_path):
+    state_file = tmp_path / "s.json"
+    campaign.save_state(state_file, fresh_state())
+    assert _neutral(state_file, sha=None, artifact=None) == 2
+
+
+def test_neutral_can_compute_the_fingerprint_from_a_directory(tmp_path):
+    state_file = tmp_path / "s.json"
+    campaign.save_state(state_file, fresh_state())
+    artifact = tmp_path / "cand"
+    artifact.mkdir()
+    (artifact / "k.cpp").write_text("void f() {}\n", encoding="utf-8")
+    assert _neutral(state_file, sha=None, artifact=str(artifact)) == 0
+    entry = json.loads(state_file.read_text())["ledger"][-1]
+    assert entry["artifact_sha"]
+
+
+def test_neutral_counts_as_a_tried_decision():
+    """它确实是「某条决策被动过一次」，只是没测性能。
+
+    不算的话 graph_exhausted 会以为这条决策还没试过。
+    """
+    assert campaign.VERDICT_NEUTRAL in campaign.CANDIDATE_VERDICTS
+
+
+def test_previous_artifact_sha_skips_invalidated_rounds():
+    """作废的记录建立在旧架构假设上，拿它当基线会把两套假设之间的差异
+    算到本次改动头上。"""
+    state = fresh_state()
+    state["ledger"] = [
+        {"generation": 0, "decision": "D0.1", "artifact_sha": "good111"},
+        {"generation": 0, "decision": "D0.2", "artifact_sha": "bad222",
+         "invalidated": True},
+    ]
+    assert campaign.previous_artifact_sha(state) == "good111"
+
+
+# ---------------------------------------------------------------------------
+# 开跑之前的知识库门禁
+#
+# 知识库是唯一跨 campaign 存活的东西，而它被读的时机是架构层写课程表的时候
+# —— 一张越界的卡片会直接进到架构层的输入里。此时拦下来还没花任何机时；
+# 跑到中途才发现，那张卡片已经参与过几轮决策，而哪几轮受了影响无从分辨。
+# ---------------------------------------------------------------------------
+
+def _kb_with(tmp_path, body, denylist=None):
+    import yaml  # noqa: PLC0415
+    root = tmp_path / "kb"
+    (root / "dav2201").mkdir(parents=True)
+    (root / "provenance").mkdir(parents=True)
+    (root / "provenance" / "R-2201-900.md").write_text("归档", encoding="utf-8")
+    if denylist:
+        (root / "denylist.txt").write_text("\n".join(denylist) + "\n",
+                                           encoding="utf-8")
+    meta = {
+        "id": "R-2201-900", "arch": "DAV_2201", "mechanism": "m",
+        "symptom": "s",
+        "symptom_channel": "evaluation_results.json:baseline.pipeline.mte2_pct",
+        "operator_families": [],
+        "provenance": [{"kind": "public_doc", "ref": "ops/npu-arch/SKILL.md"}],
+        "certified_by": {"job": "job 1", "arch": "DAV_2201", "delta": "-10%"},
+        "provenance_archive": "provenance/R-2201-900.md", "status": "active",
+    }
+    (root / "dav2201" / "R-2201-900.md").write_text(
+        "---\n" + yaml.safe_dump(meta, allow_unicode=True) + "---\n" + body,
+        encoding="utf-8")
+    return root
+
+
+def test_clean_knowledge_base_passes_the_startup_lint(tmp_path):
+    root = _kb_with(tmp_path, "## 机制\nMTE2 占比高时把数据常驻 UB。\n")
+    assert campaign.lint_knowledge_base(str(root)) == []
+
+
+def test_banned_term_in_the_knowledge_base_blocks_startup(tmp_path):
+    root = _kb_with(tmp_path, "## 机制\n比参考实现快 20%。\n")
+    problems = campaign.lint_knowledge_base(str(root))
+    assert problems
+    assert "L-BANNED" in problems[0]
+
+
+def test_denylisted_symbol_in_the_knowledge_base_blocks_startup(tmp_path):
+    root = _kb_with(tmp_path, "## 机制\n照搬 KernelSecret 的编排。\n",
+                    denylist=["KernelSecret"])
+    problems = campaign.lint_knowledge_base(str(root))
+    assert problems and "L-DENY" in problems[0]
+
+
+def test_unparseable_card_blocks_startup(tmp_path):
+    root = tmp_path / "kb"
+    (root / "dav2201").mkdir(parents=True)
+    (root / "dav2201" / "R-2201-901.md").write_text(
+        "没有 frontmatter\nvoid Kernel() {}\n", encoding="utf-8")
+    problems = campaign.lint_knowledge_base(str(root))
+    assert problems and "无法解析" in problems[0]
+
+
+def test_startup_lint_explains_why_it_is_at_init(tmp_path):
+    """理由要进报错，否则这道闸会被当成开跑前的障碍而绕过去。"""
+    root = _kb_with(tmp_path, "## 机制\n比参考实现快 20%。\n")
+    problems = campaign.lint_knowledge_base(str(root))
+    assert "还没花任何机时" in problems[0]
+    assert "hwkb.py lint --all" in problems[0]
+
+
+def test_missing_knowledge_base_is_not_a_blocker(tmp_path):
+    """知识库是可选的 —— 一个全新环境里它本来就是空的。"""
+    assert campaign.lint_knowledge_base(None) == []
+    problems = campaign.lint_knowledge_base(str(tmp_path / "nope"))
+    assert problems and "跳过" in problems[0]

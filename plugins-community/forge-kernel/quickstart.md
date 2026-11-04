@@ -25,7 +25,7 @@ CANN 算子库里的内置实现、别人写的自定义算子，或者你自己
 步骤 4  采参考签名    msprof → signature_probe.py 提结构化签名
 步骤 5  产出课程表    arch agent 反推架构，写 milestone
 步骤 6  逐行实现      coder agent 一次一行
-                      围栏 → 评测 → 签名 → record（机制进裁决）
+                      围栏 → 评测 → 签名 → record（围栏与机制都进裁决）
 步骤 7  停滞 → 定价 → reopen 重开架构（自动作废下游）
 步骤 8  达标 → 封存为下一代参考 → 重测噪声底 → 继续
 ```
@@ -270,6 +270,58 @@ python3 $SK/campaign.py init \
 > 绑定 —— 同一个 tiling 决策在不同 shape 下的 trigger 完全不同。一份
 > state 跨 shape 复用会把不同 shape 的结果混进同一个 `best`，promote 时
 > 封存的参考与锚定的目标就对不上了。每个 shape 开一份 state。
+
+### 步骤 5.5：开跑之后的两道新门禁
+
+**`record` 会拒掉四类结果**，不是挑剔，每一类都对应一种「看起来正常的错结论」：
+
+| 拒绝 | 为什么 |
+|---|---|
+| `gating` 不是 `fully_passed` / `partial_passed` | 泛化 shape 上算错或退化只体现在 `gating` 里 —— `comparison.precision_passed` 和 `comparison.speedup` 都只覆盖 target shape |
+| 结果里的 `device_id` 与 campaign 不符 | 换卡之后参考签名、噪声底、绝对耗时全部不可比，而这种不可比是静默的 |
+| 本次抖动达到存量噪声底的 1.5 倍 | 噪声底是 init 时量的；环境变吵之后旧判据就失准了 |
+| `measurement.baseline_from_cache` 为真 | 缓存的 baseline 让 burn-in 与 A-B-B-A 镜像同时失效，而失效是静默的：字段、cv 全都正常，只是那个数来自另一个温度、另一个位置。实测位置偏置 2.7%，而目标增益只有 5% 量级 |
+
+**另有两件事不拒收，但这一轮不会抬高 `best`**：
+
+| 情况 | 为什么不算数 |
+|---|---|
+| 没传 `--fence-report` | 这一轮没被查过「是不是转发给了参考」。转发时加速比、精度、所有门禁全过，而一行 kernel 都没写 |
+| 设备执行 ÷ 墙上时间 < 20% | `time_us` 量的主要是 host 下发与同步，而机制核验读的是 msprof 的设备侧通道 —— 两者几乎不相交 |
+
+围栏是静态扫描，不花机时：
+
+```bash
+python3 $PROBES/fence_check.py --candidate ./my_kernel \
+    --op-name add_layer_norm --json > fence.json
+# 然后 record 时带 --fence-report fence.json
+```
+
+**达标之后还要确认复测。** `status` 会说 `confirm-best`：
+
+```bash
+# 对同一份产物重新评测一次，然后
+python3 $SK/campaign.py confirm --state ./forge_work/campaign_state.json \
+    --result evaluation_results_2.json --decision D1.2
+```
+
+两次都达标才转 `shipped`，而且 `best` 取**较小**的那次读数。道理是：`best`
+是历史最大值，每次评测是一次抽样，预算几十次的 campaign 里「抽到一个偏高
+读数」是必然事件。拿它 promote 就把一次运气封成了下一代参考 —— 而 promote
+会把 best 归零、噪声底置为待重测，那个读数本身从此消失，无法回溯。
+
+**M0 跑绿之后做一次对账**（可选但强烈建议）：
+
+```bash
+python3 $SK/campaign.py audit --state ./forge_work/campaign_state.json \
+    --signature ./forge_work/round_1_signature.json
+```
+
+它把本轮读数与参考签名逐通道并排，列出**所有差 ≥2 倍**的通道，并检查每个
+超带通道是否有机制行锚着。为什么需要这一步：门禁验的是「实现有没有建出
+课程表说的东西」，它只拿课程表自己声明的值做比较 —— 整个门禁体系里没有
+任何地方回答「课程表本身画对了吗」。课程表没写到的通道可以是参考的任意
+倍数而不触发任何东西。
 
 ### 步骤 6：交给 Agent
 

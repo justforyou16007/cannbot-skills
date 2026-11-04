@@ -66,6 +66,19 @@ MIN_SAMPLES = 3
 #: 论文观测到的区间，仅用于在结果明显偏离时提醒，不用于裁剪结果。
 PAPER_RANGE_PCT = (1.0, 5.0)
 
+#: 噪声底的硬下限。低于它一律按它算。
+#:
+#: 这不是「论文的经验值」，而是论文实现里一行代码：它的自我提升脚本把
+#: 每代的噪声底取成 `max(0.015, spread)`，注释称之为「循环的平台期地板」。
+#: 道理是：重复测量算出来的离散度本身也是个估计，样本少时它可以偶然很小。
+#: 用一个偶然很小的数当判据，等于把「这一轮运气好」当成「环境干净」，
+#: 之后任何微小正增益都会被收下。
+#:
+#: 我们这边尤其需要它：评测总是先跑 baseline 再跑 evolved，位置偏置实测
+#: 约 2.7%，方向恒定、多测不收敛。一个低于 1.5% 的噪声底在这个偏置面前
+#: 没有任何意义。
+NOISE_FLOOR_MIN_PCT = 1.5
+
 #: 评测自己判定「没跑成」的 gating 取值。
 GATING_FAILED = "failed"
 
@@ -226,8 +239,9 @@ def compute_from_cv(cv_values: List[float]) -> Dict[str, Any]:
     if not clean:
         raise NoiseFloorError("评测结果中没有 cv_pct")
 
-    floor_pct = max(clean)
-    if floor_pct == 0.0:
+    measured = max(clean)
+    floor_pct = max(measured, NOISE_FLOOR_MIN_PCT)
+    if measured == 0.0:
         # 恰好 0 不可能是真实的事件计时结果：多次计时完全一致意味着根本没有
         # 重复测量。真实来源是「崩溃时把 cv_pct 填成了 0.0」或「子进程没上报
         # 这个字段」。放过去就等于把噪声底定成 0。
@@ -244,24 +258,26 @@ def compute_from_cv(cv_values: List[float]) -> Dict[str, Any]:
         warnings.append(
             f"噪声底 {floor_pct:.2f}% 高于论文观测区间上限 {PAPER_RANGE_PCT[1]}%。"
             "测量环境可能不稳定：检查是否有其他进程占用同一张卡、"
-            "是否发生 DVFS 降频（对比 msprof 的 Current Freq 与 Rated Freq）、"
-            "num_trials 是否够大。在这个噪声水平下，小于它的真实改进无法被识别"
+            "是否发生 DVFS 降频、num_trials 是否够大。"
+            "在这个噪声水平下，小于它的真实改进无法被识别"
         )
-    if floor_pct < PAPER_RANGE_PCT[0]:
-        # 与 compute() 对称。早先只有上限告警，下限这条缺着 —— 而危险的恰恰是
-        # 偏低那一侧：偏高只是让判据变严，偏低会把抖动当成改进收下。
+    clamped = measured < NOISE_FLOOR_MIN_PCT
+    if clamped:
         warnings.append(
-            f"噪声底 {floor_pct:.2f}% 低于论文观测区间下限 {PAPER_RANGE_PCT[0]}%。"
-            "偏低比偏高危险：判据会把测量抖动当成真实改进收下。"
-            "请确认重复次数（num_trials）足够、每次确实重新执行了 kernel，"
-            "而不是复用了上一次的结果"
+            f"实测变异系数只有 {measured:.2f}%，低于硬下限 "
+            f"{NOISE_FLOOR_MIN_PCT}%，已按下限取值。"
+            "cv 量的是同进程内重复计时的抖动，不含跨进程的位置偏置"
+            "（先跑 baseline 后跑 evolved，实测约 2.7%、方向恒定）——"
+            "所以一个很小的 cv 不代表判据可以定得很低"
         )
 
     return {
         "method": "cv_pct",
         "samples": len(clean),
         "cv_values": clean,
+        "measured_pct": measured,
         "floor_pct": floor_pct,
+        "floor_clamped": clamped,
         "warnings": warnings,
     }
 
@@ -288,21 +304,31 @@ def compute(ratios: List[float]) -> Dict[str, Any]:
     stdev = statistics.stdev(clean) if len(clean) > 1 else 0.0
     cv_pct = (stdev / mean * 100.0) if mean > 0 else 0.0
 
-    # 半极差相对中位数：对偶发离群更敏感
-    half_range_pct = (max(clean) - min(clean)) / 2.0 / median * 100.0
+    # 全极差相对最小值：对偶发离群更敏感。
+    #
+    # 口径按论文实现对齐（`spread = (max - min) / min`）。早先写的是
+    # 「半极差比中位数」—— 比值都在 1.0 附近时 median ≈ min，那个 /2.0
+    # 让同一批数据算出的噪声底只有论文的一半，判据系统性偏松一倍。
+    spread_pct = (max(clean) - min(clean)) / min(clean) * 100.0
 
-    # 取大者，保守
-    floor_pct = max(cv_pct, half_range_pct)
-    if floor_pct == 0.0:
-        # 和 compute_from_cv 同一条判据：重复测量得到**完全相同**的比值，
-        # 不是环境干净，是这些数不是独立测出来的（最典型的是自评场景下
-        # speedup 被钉成常数 1.0）。噪声底 0 意味着任何正增益都算真实改进。
+    # 「实测离散为 0」这件事必须在钳位**之前**判。
+    #
+    # 钳位会把 0 抬到 1.5%，于是「读数完全相同」这个信号就被盖住了 ——
+    # 而那恰恰不是「环境干净」，是这些数不是独立测出来的（最典型的是自评
+    # 场景下 speedup 被钉成常数 1.0）。拿一个被钳位救回来的 1.5% 继续跑，
+    # 等于用一个合法外观掩盖了一份无效输入。
+    measured_pct = max(cv_pct, spread_pct)
+    if measured_pct == 0.0:
         raise NoiseFloorError(
             "这些比值完全相同，离散度为 0。重复测量不可能给出一模一样的比值，"
             "所以这不是「环境干净」，而是这些数并非独立测出来的。\n"
             "最常见的原因是自评场景（baseline 与 evolved 指向同一处）：评测会"
             "把每个 shape 的 speedup 直接钉成 1.0。改用 --method cv。"
         )
+
+    # 取两个统计量的大者，保守；再按硬下限抬一次
+    floor_pct = max(measured_pct, NOISE_FLOOR_MIN_PCT)
+    clamped = measured_pct < NOISE_FLOOR_MIN_PCT
 
     warnings: List[str] = []
     if floor_pct > PAPER_RANGE_PCT[1]:
@@ -312,11 +338,13 @@ def compute(ratios: List[float]) -> Dict[str, Any]:
             "是否开启了频率调节、重复次数是否够。"
             "在这个噪声水平下，小于它的真实改进无法被识别"
         )
-    if floor_pct < PAPER_RANGE_PCT[0]:
+    if clamped:
         warnings.append(
-            f"噪声底 {floor_pct:.2f}% 低于论文观测区间下限 {PAPER_RANGE_PCT[0]}%。"
-            "环境很干净，但请确认重复测量之间确实重新执行了 kernel，"
-            "而不是复用了缓存结果 —— 那会让噪声假性偏低"
+            f"实测离散只有 {measured_pct:.2f}%，低于硬下限 "
+            f"{NOISE_FLOOR_MIN_PCT}%，已按下限取值。"
+            "样本少时离散度本身就是个不稳的估计；而且评测的位置偏置"
+            "（先跑 baseline 后跑 evolved）实测约 2.7%，方向恒定，"
+            "低于下限的噪声底在它面前没有意义"
         )
 
     return {
@@ -327,8 +355,10 @@ def compute(ratios: List[float]) -> Dict[str, Any]:
         "mean": mean,
         "stdev": stdev,
         "cv_pct": cv_pct,
-        "half_range_pct": half_range_pct,
+        "spread_pct": spread_pct,
+        "measured_pct": measured_pct,
         "floor_pct": floor_pct,
+        "floor_clamped": clamped,
         "warnings": warnings,
     }
 
@@ -482,8 +512,9 @@ def main() -> int:
         if result["method"] == "ratio_spread":
             print(f"中位数      {result['median']:.4f}")
             print(f"变异系数    {result['cv_pct']:.2f}%")
-            print(f"半极差      {result['half_range_pct']:.2f}%")
-        print(f"噪声底      {result['floor_pct']:.2f}%")
+            print(f"全极差/最小 {result['spread_pct']:.2f}%")
+        print(f"噪声底      {result['floor_pct']:.2f}%"
+              + ("（已按硬下限抬高）" if result.get("floor_clamped") else ""))
         print()
         print(f"含义: 增益小于 {result['floor_pct']:.2f}% 的候选无法与测量抖动区分，")
         print("      按论文的接受判据应当拒绝并记为 no-go。")

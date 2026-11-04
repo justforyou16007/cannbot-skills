@@ -1141,6 +1141,66 @@ RE_REOPEN_PRICE = re.compile(
     re.IGNORECASE)
 
 
+#: 封存清单的文件名。由 seal_reference.py 定义，两边必须一致。
+MANIFEST_FILENAME = "sealed_manifest.json"
+
+
+def _work_dir_from_state(state: Dict[str, Any],
+                         state_path: Path) -> Optional[str]:
+    """封存工作目录在哪。顺序与 _find_sealed_list 一致 —— 两处找的必须是
+    同一个目录，否则自检校验的和 hook 拦的不是同一份封存。"""
+    recorded = state.get("sealed_paths")
+    if isinstance(recorded, str) and recorded.strip():
+        return str(Path(recorded).resolve().parent)
+    env_dir = os.environ.get("FORGE_WORK_DIR")
+    if env_dir:
+        return env_dir
+    return str(state_path.resolve().parent)
+
+
+def check_reference_unchanged(work_dir: Optional[str]) -> List[str]:
+    """裁决之前确认参考没变过。返回问题列表，空表示没变。
+
+    为什么要在 record 这一刻查：**本轮的加速比是相对参考算的**。参考变了，
+    这个百分比就不再是它声称的那个意思 —— 而变化是静默的：结果文件的形状、
+    字段、cv 全都正常。
+
+    三种变化里，「新增文件」那一种最不像问题却最危险：新文件没进封存清单，
+    于是 hook **不会拦**对它的读取 —— 参考树上多出一个 agent 可以随便读的
+    源文件，而所有「比对已记录的那些」的校验全绿。`opp_install` 那类来源
+    尤其容易碰上：那是一个活的安装目录，另一个任务重装一次算子包就会往里
+    加文件。
+
+    拿不到工作目录或清单时返回空表 —— 这一条不硬拒。封存清单是 `seal` 的
+    产物，而有些正当路径（内置实现作参考、老 state）本来就没有它。硬拒会
+    把那些用法一起卡住，而人会反射性地去绕过参数。缺失由调用方告警。
+    """
+    if not work_dir:
+        return []
+    manifest_path = Path(work_dir) / MANIFEST_FILENAME
+    if not manifest_path.is_file():
+        return []
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return [f"封存清单 {manifest_path} 读不出来：{exc}。"
+                "读不出来就无法确认参考没变过，而本轮的加速比是相对它算的"]
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import seal_reference as _seal  # noqa: PLC0415
+
+    drifted = _seal.verify_manifest(manifest)
+    if not drifted:
+        return []
+    lines = [f"参考已发生 {len(drifted)} 处变化，本轮裁决不成立："]
+    for item in drifted[:6]:
+        lines.append(f"    {item['relative']}: {item['reason']}")
+    lines.append("    本轮的加速比是相对参考算的 —— 参考变了，"
+                 "这个百分比就不再是它声称的那个意思。")
+    lines.append("    重新跑一次 seal，并重测噪声底与参考签名。")
+    return ["\n".join(lines)]
+
+
 def _load_hwkb():
     """按路径装载 forge-hwkb 的 hwkb.py。
 
@@ -3283,6 +3343,10 @@ def cmd_record(args: argparse.Namespace) -> int:
         return 2
 
     problems = check_result_admissible(doc, state)
+    # 参考变了就不裁决。本轮的加速比是相对参考算的 —— 参考变了，这个百分比
+    # 就不再是它声称的那个意思，而变化是静默的（结果文件一切正常）。
+    problems += check_reference_unchanged(
+        _work_dir_from_state(state, path))
     if problems and not args.allow_unverified_result:
         print(f"错误: 这份评测结果不能用于裁决（{len(problems)} 项）：",
               file=sys.stderr)

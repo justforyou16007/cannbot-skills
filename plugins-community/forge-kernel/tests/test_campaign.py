@@ -4234,3 +4234,92 @@ def test_audit_stamps_the_state_so_it_leaves_a_trace(tmp_path):
     assert stamped["generation"] == 0
     assert stamped["passed"] is (rc == 0)
     assert "at" in stamped
+
+
+# ---------------------------------------------------------------------------
+# record 之前确认参考没变过
+#
+# 本轮的加速比**是相对参考算的**。参考变了，这个百分比就不再是它声称的那个
+# 意思 —— 而变化是静默的：结果文件的形状、字段、cv 全都正常。
+# ---------------------------------------------------------------------------
+
+def _work_dir_with_manifest(tmp_path, mutate=None):
+    import importlib.util  # noqa: PLC0415
+    spec = importlib.util.spec_from_file_location(
+        "seal_reference",
+        Path(__file__).resolve().parent.parent / "skills" / "forge-campaign"
+        / "scripts" / "seal_reference.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    artifact = tmp_path / "ref"
+    artifact.mkdir()
+    (artifact / "kernel.cpp").write_text("class KernelSecret {};\n",
+                                         encoding="utf-8")
+    work_dir = tmp_path / "w"
+    module.seal(artifact, "demo", work_dir, use_public_api_filter=False,
+                kb_root=tmp_path / "kb")
+    if mutate is not None:
+        mutate(artifact)
+    return work_dir
+
+
+def test_unchanged_reference_raises_no_problem(tmp_path):
+    work_dir = _work_dir_with_manifest(tmp_path)
+    assert campaign.check_reference_unchanged(str(work_dir)) == []
+
+
+def test_modified_reference_blocks_the_verdict(tmp_path):
+    work_dir = _work_dir_with_manifest(
+        tmp_path,
+        lambda art: (art / "kernel.cpp").write_text("class X {};\n",
+                                                    encoding="utf-8"))
+    problems = campaign.check_reference_unchanged(str(work_dir))
+    assert problems
+    assert "本轮的加速比是相对参考算的" in problems[0]
+
+
+def test_added_reference_file_blocks_the_verdict(tmp_path):
+    work_dir = _work_dir_with_manifest(
+        tmp_path,
+        lambda art: (art / "new.cpp").write_text("class Y {};\n",
+                                                 encoding="utf-8"))
+    assert campaign.check_reference_unchanged(str(work_dir))
+
+
+def test_missing_manifest_is_not_a_problem(tmp_path):
+    """这一条不硬拒。
+
+    封存清单是 seal 的产物，而有些正当路径（内置实现作参考、老 state）
+    本来就没有它。硬拒会把那些用法一起卡住，而人会反射性地去绕过参数。
+    """
+    assert campaign.check_reference_unchanged(str(tmp_path)) == []
+    assert campaign.check_reference_unchanged(None) == []
+
+
+def test_corrupt_manifest_is_reported(tmp_path):
+    """读不出来就无法确认参考没变过 —— 不能当成「没变」。"""
+    (tmp_path / campaign.MANIFEST_FILENAME).write_text("不是 JSON",
+                                                       encoding="utf-8")
+    problems = campaign.check_reference_unchanged(str(tmp_path))
+    assert problems and "读不出来" in problems[0]
+
+
+def test_manifest_filename_matches_seal_reference():
+    """两边拼的是同一个文件名。拼错不会报错，只会让这道校验静默失效。"""
+    import importlib.util  # noqa: PLC0415
+    spec = importlib.util.spec_from_file_location(
+        "seal_reference",
+        Path(__file__).resolve().parent.parent / "skills" / "forge-campaign"
+        / "scripts" / "seal_reference.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert module.MANIFEST_FILENAME == campaign.MANIFEST_FILENAME
+
+
+def test_work_dir_is_resolved_the_same_way_as_the_hook(tmp_path):
+    """自检校验的和 hook 拦的必须是同一份封存。"""
+    state = fresh_state()
+    state["sealed_paths"] = str(tmp_path / "w" / "sealed_paths.txt")
+    resolved = campaign._work_dir_from_state(state, tmp_path / "s.json")
+    assert resolved == str((tmp_path / "w").resolve())

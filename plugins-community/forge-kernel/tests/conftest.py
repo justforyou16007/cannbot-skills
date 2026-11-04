@@ -29,6 +29,7 @@
 并指名哪个文件变了。要写就传 `kb_root=tmp_path`。
 """
 
+import importlib.util
 import sys
 from pathlib import Path
 
@@ -37,8 +38,8 @@ import pytest
 #: 随包发布的知识库根。和 seal_reference.DEFAULT_KB_ROOT、
 #: hwkb.DEFAULT_KB_ROOT 指向同一处 —— 三者一致由
 #: test_seal_and_boundary.py 的用例盯着。
-SHIPPED_KB = (Path(__file__).resolve().parent.parent
-              / "skills" / "forge-hwkb" / "references")
+SKILLS = Path(__file__).resolve().parent.parent / "skills"
+SHIPPED_KB = SKILLS / "forge-hwkb" / "references"
 
 
 def _snapshot() -> dict:
@@ -82,17 +83,37 @@ def _redirect_default_kb_root(tmp_path_factory):
     同级夹具，所以这个定义在前面。
     """
     stand_in = tmp_path_factory.mktemp("shipped_kb_stand_in")
+
+    # 两个模块都**主动装载**，不靠 sys.modules 里碰巧已经有。
+    #
+    # 原来写的是 `sys.modules.get(name)`，于是生效范围取决于**import 顺序**：
+    # 只跑 test_seal_and_boundary.py 时 hwkb 还没被 import，补丁只打到
+    # seal_reference 一侧 —— 两个常量从此不相等，而正好有一条用例在断言
+    # 它们相等。单跑红、全量跑绿，这种差异最难查。
+    targets = (
+        ("seal_reference", SKILLS / "forge-campaign" / "scripts"
+         / "seal_reference.py"),
+        ("hwkb", SKILLS / "forge-hwkb" / "scripts" / "hwkb.py"),
+    )
     patched = []
-    for module_name, attr in (("seal_reference", "DEFAULT_KB_ROOT"),
-                              ("hwkb", "DEFAULT_KB_ROOT")):
+    for module_name, path in targets:
         module = sys.modules.get(module_name)
-        if module is None or not hasattr(module, attr):
+        if module is None:
+            if not path.is_file():
+                continue
+            spec = importlib.util.spec_from_file_location(module_name, path)
+            if spec is None or spec.loader is None:
+                continue
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = module
+            spec.loader.exec_module(module)
+        if not hasattr(module, "DEFAULT_KB_ROOT"):
             continue
-        patched.append((module, attr, getattr(module, attr)))
-        setattr(module, attr, stand_in)
+        patched.append((module, getattr(module, "DEFAULT_KB_ROOT")))
+        module.DEFAULT_KB_ROOT = stand_in
     yield stand_in
-    for module, attr, original in patched:
-        setattr(module, attr, original)
+    for module, original in patched:
+        module.DEFAULT_KB_ROOT = original
 
 
 @pytest.fixture(scope="session", autouse=True)

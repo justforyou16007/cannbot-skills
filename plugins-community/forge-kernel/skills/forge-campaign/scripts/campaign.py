@@ -842,6 +842,57 @@ def judge_fence(fence_report: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 DEVICE_SHARE_MIN = 0.20
 
 
+#: host 下发时间占设备执行时间的多少，就算 host 受限。
+#:
+#: 取 0.5：host 下发一次要用掉设备执行一次的一半时间时，设备已经有相当一段
+#: 时间在等下发。再往上（接近 1）设备就基本在空转等 host 了。
+#:
+#: 这个数是本工具的工程判断，没有文档出处 —— 它只需要把「host 主导」这种
+#: 定性情形拦下来，不需要精确。
+HOST_BOUND_RATIO_MAX = 0.5
+
+
+def judge_host_bound(doc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """评测的两个计量窗口一比：这个时间主要花在哪一侧。
+
+    `device_amortized_us` 是「一对 Event 套 N 次连发」除以 N —— 同步开销被
+    摊掉；`host_enqueue_us` 是「只下发不等」的墙上时间除以 N。
+
+    返回 None 表示这两个数不在（老结果文件、或那段附加测量失败了）。
+    **None 不等于通过** —— 调用方据此报告，而不是据此放行。
+
+    为什么这件事要紧：机制核验读的是 msprof 的**设备侧**通道。如果 `time_us`
+    主要由 host 决定，那「增益超噪声底 + 机制已核实」就是两个互不相关的事实
+    被钉在一起 —— 百分比来自 host，机制结论来自 device。而这个错很难自己
+    暴露：两个数都正常，只是它们量的不是同一件事。
+    """
+    device_us = doc.get("device_amortized_us")
+    host_us = doc.get("host_enqueue_us")
+    if not isinstance(device_us, (int, float)) or device_us <= 0:
+        return None
+    if not isinstance(host_us, (int, float)) or host_us < 0:
+        return None
+    ratio = float(host_us) / float(device_us)
+    return {
+        "device_amortized_us": float(device_us),
+        "host_enqueue_us": float(host_us),
+        "host_bound_ratio": round(ratio, 4),
+        "threshold": HOST_BOUND_RATIO_MAX,
+        "ok": ratio <= HOST_BOUND_RATIO_MAX,
+        "reason": (
+            f"host 下发 {host_us:.2f}us / 设备摊销执行 {device_us:.2f}us = "
+            f"{ratio:.2f}"
+            + ("" if ratio <= HOST_BOUND_RATIO_MAX else
+               f"，超过 {HOST_BOUND_RATIO_MAX}。\n"
+               "    设备有相当一段时间在等 host 下发 —— 这次测到的差异里"
+               "有多少来自 kernel 本身，\n"
+               "    从这两个数看不出来。而机制核验读的是设备侧通道，"
+               "两者量的不是同一件事。\n"
+               "    加大 num_trials、或把输入做大一档，让设备侧的时间"
+               "盖过下发开销。")),
+    }
+
+
 def reconcile_device_share(doc: Dict[str, Any],
                            signature: Optional[Dict[str, Any]]
                            ) -> Optional[Dict[str, Any]]:
@@ -1848,6 +1899,24 @@ def check_result_admissible(doc: Dict[str, Any],
     # 失效：结果文件的形状、字段、cv 都完全正常，只是那个 baseline 是在另一
     # 个温度、另一个位置、可能另一个时间点测的。于是 2.7% 的偏置原封不动地
     # 回到了一个 5% 的判据里。
+    # 输入在计时过程中被原地改过 —— 这一份结果不能用于裁决。
+    #
+    # 两层后果，第二层更隐蔽：
+    #   后面每个 trial 测的不是同一份工作（第 2 次起输入已被第 1 次改过），
+    #   而 cv 看起来完全正常 —— 它量的是耗时的离散度，不是输入的一致性
+    #   精度比对拿的是**改过之后**的输入重算真值，于是一个会改输入的实现
+    #   在精度上也显得正确
+    if doc.get("inputs_mutated") is True:
+        problems.append(
+            "输入在计时过程中被原地修改了（measurement 的 inputs_mutated "
+            "为真）。\n"
+            "    后面每个 trial 测的不是同一份工作，而 cv 看起来完全正常 ——"
+            "它量的是耗时的离散度，\n"
+            "    不是输入的一致性。更隐蔽的是精度：比对拿的是改过之后的输入"
+            "重算真值，\n"
+            "    于是一个会改输入的实现在精度上也显得正确。\n"
+            "    先修实现（kernel 不该写输入缓冲），再重测。")
+
     measurement = doc.get("measurement")
     if isinstance(measurement, dict) and measurement.get("baseline_from_cache"):
         problems.append(
@@ -2123,6 +2192,8 @@ def apply_result(state: Dict[str, Any], doc: Dict[str, Any], decision: str,
     entry["fence"] = fence
     device_share = reconcile_device_share(doc, signature)
     entry["device_share"] = device_share
+    host_bound = judge_host_bound(doc)
+    entry["host_bound"] = host_bound
 
     precision = _precision_passed(doc)
     measured = False
@@ -2242,6 +2313,8 @@ def apply_result(state: Dict[str, Any], doc: Dict[str, Any], decision: str,
                     blockers.append(f"围栏未查（{fence['reason']}）")
                 if device_share is not None and not device_share["ok"]:
                     blockers.append(f"设备占比过低（{device_share['reason']}）")
+                if host_bound is not None and not host_bound["ok"]:
+                    blockers.append(f"host 受限（{host_bound['reason']}）")
 
                 if entry.get("verdict") == VERDICT_REVERT:
                     pass
@@ -2438,6 +2511,42 @@ def confirmation_spread_ok(readings: Sequence[Any],
         "    先查环境（别的进程占卡、降频、散热），而不是取中位数收工。")
 
 
+def _unconfirmed_best_note(state: Dict[str, Any]) -> str:
+    """这一代停下来时，best 有没有被确认过。
+
+    为什么要在**停机那一刻**说：此前这件事只在 `promote` 那一刻报错，而那
+    时候人已经在收工了 —— 结论是「还得再测一次」，而测一次要重新把环境、
+    产物、形状都对回去。更糟的情形是这一代就此结束（预算/墙钟耗尽），
+    那个未经确认的读数成了这一代唯一的产出，而它**不能**被 promote。
+
+    也就是说：没有这句话，一个本来可以在还有预算时花一次机时补上的确认，
+    会变成一个无法补救的空结果。
+    """
+    best = state.get("best") or {}
+    gain = float(best.get("gain", 1.0) or 1.0)
+    noise = float(state.get("noise_floor_pct", 0.0) or 0.0)
+    # 增益没超过噪声底时不提这件事。
+    #
+    # 那种情形下「去补一次确认」是一句没有意义的建议：要确认的那个数本身
+    # 落在测量抖动里。收敛停机正好是这种情形（增益 1.005、噪声底 2%），
+    # 提示会变成纯噪声 —— 而噪声提示会让人把所有提示一起忽略。
+    if (gain - 1.0) * 100.0 <= noise:
+        return ""
+    if _best_is_confirmed(state):
+        return ""
+    readings = best.get("readings") or []
+    return (
+        f"\n  **这一代的 best（{gain:.4f}）没有被确认过** —— 只有 "
+        f"{len(readings)} 次读数（{readings}），需要 {CONFIRM_READINGS} 次。\n"
+        "  未经确认的 best 不能 promote：它可能只是一次偏高抽样，而 promote "
+        "会把它封成下一代的参考，\n"
+        "  同时把 best 归零、噪声底置为待重测 —— 那个读数本身从此消失，"
+        "无法回溯。\n"
+        f"  现在补确认还来得及：set-budget 放开额度，再跑 "
+        f"{CONFIRM_READINGS - len(readings)} 次 `confirm`。\n"
+        "  不补的话，这一代的产出是不可用的。")
+
+
 def _best_is_confirmed(state: Dict[str, Any]) -> bool:
     """best 是否经过独立复测。
 
@@ -2493,13 +2602,53 @@ def _advance_state(state: Dict[str, Any],
         # promote，就把一次运气封成了下一代参考，且之后无法回溯：
         # promote 会把 best 归零、噪声底置为待重测，那个虚高的数就消失了，
         # 而后面每一代的增益都相对它算。
+        readings = list((state.get("best") or {}).get("readings") or [])
+        still_needed = max(0, CONFIRM_READINGS - len(readings))
+        reason = (f"已达目标，但这个增益只测过 {len(readings)} 次，"
+                  f"需要 {CONFIRM_READINGS} 次。对同一份产物再测 "
+                  f"{still_needed} 次（`campaign.py confirm`），"
+                  "中位数达标才收工。")
+
+        # 预算够不够把确认做完 —— 这件事必须在这里说。
+        #
+        # 否则会出现一个闭死的局面：状态说「去补确认」，而预算或墙钟已经不
+        # 允许再跑。那时这一代的产出是**不可用的**（未经确认的 best 不能
+        # promote），但状态看起来只是「还差一步」。
+        #
+        # 两个额度分开查：次数预算挡不住时间走掉，墙钟挡不住次数用完。
+        blocked: List[str] = []
+        cap_now = (state.get("budget") or {}).get("max_records")
+        used_now = int((state.get("budget") or {}).get("used", 0))
+        if isinstance(cap_now, int) and cap_now > 0 \
+                and cap_now - used_now < still_needed:
+            blocked.append(
+                f"评测预算只剩 {cap_now - used_now} 次，不够做完 "
+                f"{still_needed} 次确认")
+        wall_cap_now = (state.get("budget") or {}).get("max_wall_hours")
+        elapsed_now = _elapsed_hours(state)
+        if (isinstance(wall_cap_now, (int, float)) and wall_cap_now > 0
+                and elapsed_now is not None and elapsed_now >= wall_cap_now):
+            blocked.append(
+                f"墙钟已过 {elapsed_now:.1f}/{wall_cap_now} 小时")
+        if blocked:
+            state["state"] = STATE_STOPPED
+            state["stop_reason"] = (
+                "额度不足，确认做不完："
+                + "；".join(blocked)
+                + _unconfirmed_best_note(state))
+            state.pop("pending_confirmation", None)
+            state.pop("stall_reason", None)
+            state.pop("stall_reasons", None)
+            state.pop("stall_detail", None)
+            return
+
         state["state"] = STATE_IMPLEMENT
         state["pending_confirmation"] = {
             "decision": (state.get("best") or {}).get("decision"),
             "gain": best_gain,
-            "readings": list((state.get("best") or {}).get("readings") or []),
-            "reason": ("已达目标，但这个增益只测过一次。对同一份产物再测一次"
-                       "（同一个决策 id 再 record 一遍），两次都达标才收工。"),
+            "readings": readings,
+            "still_needed": still_needed,
+            "reason": reason,
         }
         state.pop("stall_reason", None)
         state.pop("stall_reasons", None)
@@ -2544,7 +2693,8 @@ def _advance_state(state: Dict[str, Any],
         state["state"] = STATE_STOPPED
         state["stop_reason"] = (
             f"预算耗尽：已用 {budget['used']}/{cap} 次评测。"
-            "继续请用 set-budget 提高上限")
+            "继续请用 set-budget 提高上限"
+            + _unconfirmed_best_note(state))
         return
 
     # 墙钟预算。
@@ -2566,7 +2716,8 @@ def _advance_state(state: Dict[str, Any],
             f"（上限 {wall_cap}）。\n"
             "  注意这个数按 created_at 算差，含中间停机的时间 —— "
             "它是机时的上界，不是机时本身。\n"
-            "  继续请用 set-budget --max-wall-hours 提高上限")
+            "  继续请用 set-budget --max-wall-hours 提高上限"
+            + _unconfirmed_best_note(state))
         return
 
     reasons: List[Dict[str, str]] = []

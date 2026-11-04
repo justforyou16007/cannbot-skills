@@ -1522,6 +1522,116 @@ def collect_open_questions(stalls, memory, exposure,
 # 组装
 # ---------------------------------------------------------------------------
 
+#: 本探针**依赖**的列，按 metric 分组。
+#:
+#: 为什么要显式列出来：探针的所有判定都建立在这些列上，而「某个 metric 组
+#: 采到了」不等于「组里那几列都在」。CANN 版本之间列名改过（带不带 aiv_/aic_
+#: 前缀、ratio 后缀），改过之后探针不会报错 —— 它只会在那个字段上返回
+#: 「没采到」，而一个缺失字段看起来完全正常。
+#:
+#: 于是整条链上最危险的那种失效出现了：停顿分解里少了一项，而架构假设照样
+#: 输出，读起来也合理。`probe_env` 就是为了在开跑之前把这件事查掉。
+REQUIRED_COLUMNS: Dict[str, Tuple[str, ...]] = {
+    "PipeUtilization": ("aiv_vec_ratio", "aiv_mte2_ratio", "aiv_mte3_ratio"),
+    "ResourceConflictRatio": (
+        "aiv_mte2_wait_ratio",
+        "aiv_vec_bank_cflt_ratio",
+        "aiv_vec_bankgroup_cflt_ratio",
+    ),
+    "Memory": ("aiv_read_bw_gm", "aiv_write_bw_gm"),
+    "L2Cache": ("aiv_hit_rate",),
+}
+
+
+def check_environment(prof_dir: Optional[Path], archive_dir: Optional[Path],
+                      group: Optional[str] = None) -> Dict[str, Any]:
+    """这套 msprof 真的采到了探针需要的那些列吗。
+
+    这个检查**不判断数值**，只回答一个结构问题：那些列在不在。它要在开跑
+    之前跑一次，因为一个缺失的列在签名里和「这个算子没有这个单元」长得
+    一模一样 —— 而两者该做的事完全不同（换采集参数 vs 接受这个事实）。
+
+    注意本函数**不自己跑 msprof**：它只读一次已有的采集。让它去起采集会
+    把「探针」和「采集驱动」两件事混在一起，而采集参数在不同环境下差别很大
+    （ops-profiling 那边有专门的脚本）。所以用法是：先按 ops-profiling 的
+    方式采一次最小算子，再把目录交给这个检查。
+    """
+    found, missing_metrics = locate_metric_csvs(prof_dir, archive_dir, group)
+    if not found:
+        raise ProbeError(
+            "未找到任何 msprof metric CSV —— 这个检查要读一次**已有的**采集。\n"
+            "  先按 ops/ops-profiling 的 msprof_profile_run.sh 采一次最小算子，\n"
+            "  再把输出目录交给 probe-env。")
+
+    present: Dict[str, List[str]] = {}
+    absent: Dict[str, List[str]] = {}
+    for metric, path in sorted(found.items()):
+        wanted = REQUIRED_COLUMNS.get(metric)
+        if not wanted:
+            continue
+        try:
+            rows = read_csv_rows(path)
+        except OSError as exc:
+            absent[metric] = [f"<读不出来: {exc}>"]
+            continue
+        columns = set(rows[0].keys()) if rows else set()
+        here = [c for c in wanted if c in columns]
+        gone = [c for c in wanted if c not in columns]
+        if here:
+            present[metric] = here
+        if gone:
+            absent[metric] = gone
+
+    missing_groups = [m for m in REQUIRED_COLUMNS if m in missing_metrics]
+    ok = not absent and not missing_groups
+    return {
+        "schema_version": "1.0",
+        "metrics_found": sorted(found),
+        "required_groups_missing": missing_groups,
+        "columns_present": present,
+        "columns_absent": absent,
+        "passed": ok,
+        "reason": (
+            "探针依赖的列都在。"
+            if ok else
+            "探针依赖的列有缺口。**缺列不会让探针报错** —— 它只会在那个字段上"
+            "返回「没采到」，\n"
+            "  而一个缺失字段看起来完全正常。于是停顿分解里少了一项，"
+            "架构假设照样输出，读起来也合理。\n"
+            "  列名在 CANN 版本之间改过（带不带 aiv_/aic_ 前缀、ratio 后缀）。"
+            "对照 ops/ops-profiling 的\n"
+            "  csv_fields_reference.md 确认本版的列名，必要时在 "
+            "REQUIRED_COLUMNS 里更新。"),
+    }
+
+
+def cmd_probe_env(args: argparse.Namespace) -> int:
+    """`--check-env` 的入口。"""
+    try:
+        report = check_environment(args.prof_dir, args.archive_dir, args.group)
+    except ProbeError as exc:
+        print(f"错误: {exc}", file=sys.stderr)
+        return 2
+
+    if args.as_json:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0 if report["passed"] else 1
+
+    print(f"采到的 metric 组: {report['metrics_found']}")
+    for metric, columns in sorted(report["columns_present"].items()):
+        print(f"  [在]   {metric}: {columns}")
+    for metric, columns in sorted(report["columns_absent"].items()):
+        print(f"  [缺]   {metric}: {columns}")
+    if report["required_groups_missing"]:
+        print(f"  [缺组] {report['required_groups_missing']}")
+    print()
+    if report["passed"]:
+        print(report["reason"])
+        return 0
+    print(report["reason"], file=sys.stderr)
+    return 1
+
+
 def build_signature(prof_dir: Optional[Path], archive_dir: Optional[Path],
                     op_name: Optional[str],
                     min_gm_bytes: Optional[int],
@@ -1742,6 +1852,11 @@ def build_parser() -> argparse.ArgumentParser:
                         help="理论最小 GM 读取字节数，给了才能算数据复用倍数")
     parser.add_argument("--output", type=Path, default=None,
                         help="把签名 JSON 写到文件")
+    parser.add_argument("--check-env", action="store_true",
+                        help="只检查这套 msprof 采到了探针依赖的那些列，"
+                             "不出签名。**缺列不会让探针报错** —— 它只会在"
+                             "那个字段上返回「没采到」，而缺失字段看起来"
+                             "完全正常。开跑之前查一次")
     parser.add_argument("--json", action="store_true", dest="as_json",
                         help="标准输出用 JSON")
     return parser
@@ -1749,6 +1864,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
+
+    if args.check_env:
+        return cmd_probe_env(args)
 
     try:
         sig = build_signature(args.prof_dir, args.archive_dir,

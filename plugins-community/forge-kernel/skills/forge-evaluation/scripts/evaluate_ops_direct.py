@@ -286,6 +286,68 @@ def _shape_input_dir(work_root: str, shape_name: str) -> str:
     return os.path.join(work_root, f"shape_{shape_name}")
 
 
+#: 三种输入压力分布。
+#:
+#: 为什么需要它们：误差比判据（precision_gate.py）是**检测**降精度的机制，
+#: 而压力分布是让它**触发**的条件。一个用 bf16 累加的 kernel 在
+#: `randn` 这种良性输入上完全可能过关 —— 那些值都在 1 附近，累加误差没有
+#: 机会堆积起来。
+#:
+#: 三种分布各针对一类降精度：
+#:
+#:   normal     默认，randn。它测的是「常规输入下对不对」
+#:   wide       量级跨若干个数量级。大值小值混在一起时，低精度累加器会把
+#:              小值整个吃掉（大数吃小数），而这正是 bf16/fp16 累加的特征
+#:   extreme    贴近该 dtype 表示范围的边界，外加 0 与极小值。它测的是
+#:              中间量被砍到更低精度时会不会溢出/下溢 —— fp32 中间量砍成
+#:              fp16 时，一个 70000 的中间结果直接变成 inf
+#:
+#: **本机无法验证这三种分布的实际效果**（没有 torch，也没有 NPU）。它们的
+#: 构造方式有依据（上面每一条都对应一个具体的降精度形态），但「它们确实能
+#: 把降精度实现抓出来」这件事需要一次硬件标定 —— 做法同 precision_gate 的
+#: calibration_note：拿一批已知降精度的实现测一遍，看这三种分布下误差比
+#: 是否真的越线。
+STRESS_PROFILES = {
+    "normal": "标准正态。常规输入下的正确性",
+    "wide": "量级跨 6 个数量级。大数吃小数会暴露低精度累加器",
+    "extreme": "贴近 dtype 边界 + 0 + 极小值。暴露中间量被砍精度后的溢出/下溢",
+}
+
+
+def _apply_stress(tensor, profile: str, dtype):
+    """按压力分布改造一个已生成的浮点张量。
+
+    只动浮点：整型与 bool 没有「量级跨度」这回事，硬改只会把它们改成非法
+    索引或越界值 —— 那测的是错误处理，不是精度。
+    """
+    import torch
+    if profile == "normal" or tensor is None:
+        return tensor
+    if not tensor.dtype.is_floating_point:
+        return tensor
+
+    if profile == "wide":
+        # 量级在 10^-3 ~ 10^3 之间随机散开，符号保留。
+        exponent = torch.randint(-3, 4, tensor.shape, device=tensor.device)
+        return (tensor * (10.0 ** exponent.to(torch.float32))).to(dtype)
+
+    if profile == "extreme":
+        finfo = torch.finfo(dtype)
+        # 四档混合：接近最大值、接近最小正规数、0、常规值。
+        # 用 where 而不是逐元素赋值 —— 后者在大张量上慢得离谱。
+        bucket = torch.randint(0, 4, tensor.shape, device=tensor.device)
+        big = torch.full_like(tensor, finfo.max / 4.0)
+        tiny = torch.full_like(tensor, finfo.tiny)
+        zero = torch.zeros_like(tensor)
+        out = torch.where(bucket == 0, big, tensor)
+        out = torch.where(bucket == 1, tiny, out)
+        out = torch.where(bucket == 2, zero, out)
+        return out.to(dtype)
+
+    raise ValueError(
+        f"不认识的压力分布 {profile!r}；已知：{sorted(STRESS_PROFILES)}")
+
+
 def _make_input_tensor(inp: dict, dtype_map: dict):
     """按输入规格生成单个张量。
 
@@ -331,17 +393,48 @@ def _gen_tensor_kwargs(tensor_kwargs: dict, dtype_map: dict, out_dir: str):
         torch.save(t, os.path.join(out_dir, f"kwarg_{kwarg_name}.pt"))
 
 
-def generate_inputs(call_spec: dict, work_root: str,
+#: 每个 shape 生成几份输入，轮换使用。
+#:
+#: 为什么不止一份：一份输入反复用在所有 trial 上，有两个具体后果。
+#:
+#:   缓存命中被烘进读数   那一块 buffer 在第一次之后一直是热的。两侧都热，
+#:                        所以比值不一定偏，但**绝对耗时**偏低 —— 而绝对
+#:                        耗时是噪声底、设备占比、host 受限这几个判据的分母
+#:   按输入身份记忆的实现 一个按 data_ptr + shape 做 memoize 的实现会在
+#:                        第二个 trial 起直接返回上次结果。它的 cv 会极低、
+#:                        加速比极高，而所有门禁都过
+#:
+#: 轮换两份就能同时破掉这两件事。取 2 而不是更多是机时考虑 —— 份数越多，
+#: 生成与落盘的开销越大，而破掉上面两件事只需要「不止一份」。
+INPUT_ROTATION = 2
 
-                     shapes_to_run: dict) -> dict:
+
+def generate_inputs(call_spec: dict, work_root: str,
+                     shapes_to_run: dict,
+                     stress_profile: str = "normal",
+                     rotation: int = INPUT_ROTATION) -> dict:
     """为所有要跑的 shape 生成输入张量，每个 shape 一个独立子目录。
+
+    `rotation` 份输入放在 `<shape_dir>/r<N>/` 下，第 0 份同时平铺在
+    `<shape_dir>/` 里 —— 后者是为了不破坏既有消费方（precision_gate 读
+    `input_*.pt`、老的结果目录布局）。
 
     Returns:
         {shape_name: input_dir_path} 映射
     """
+    # 参数校验排在 import torch **之前**。
+    #
+    # 一个拼错的 --stress-profile 应该立刻失败，而不是先去 import 一个在
+    # 开发机上根本不存在的模块 —— 那样报出来的是 ModuleNotFoundError，
+    # 把「参数写错了」说成「环境不对」。
+    if stress_profile not in STRESS_PROFILES:
+        raise ValueError(
+            f"不认识的压力分布 {stress_profile!r}；"
+            f"已知：{sorted(STRESS_PROFILES)}")
+    rotation = max(1, int(rotation))
+
     import torch
     os.makedirs(work_root, exist_ok=True)
-
     torch.manual_seed(42)
 
     dtype_map = {
@@ -358,12 +451,24 @@ def generate_inputs(call_spec: dict, work_root: str,
         out_dir = _shape_input_dir(work_root, name)
         os.makedirs(out_dir, exist_ok=True)
 
-        for i, inp in enumerate(entry.get("inputs", [])):
-            t = _make_input_tensor(inp, dtype_map)
-            torch.save(t, os.path.join(out_dir, f"input_{i}.pt"))
-
-        # tensor_kwargs（可能在 shape entry 或 call_spec 顶层）
         tensor_kwargs = entry.get("tensor_kwargs", call_spec.get("tensor_kwargs", {}))
+
+        for draw in range(rotation):
+            draw_dir = os.path.join(out_dir, f"r{draw}")
+            os.makedirs(draw_dir, exist_ok=True)
+            for i, inp in enumerate(entry.get("inputs", [])):
+                tensor = _make_input_tensor(inp, dtype_map)
+                tensor = _apply_stress(
+                    tensor, stress_profile,
+                    dtype_map.get(inp.get("dtype", ""), torch.float16))
+                torch.save(tensor, os.path.join(draw_dir, f"input_{i}.pt"))
+                if draw == 0:
+                    # 第 0 份同时平铺在 shape 目录下：precision_gate 与
+                    # 既有的结果目录布局都读那个位置。不平铺的话这次改动会
+                    # 悄悄断掉精度判据的输入 —— 而它只会报「找不到输入」，
+                    # 看起来像是没生成。
+                    torch.save(tensor, os.path.join(out_dir, f"input_{i}.pt"))
+            _gen_tensor_kwargs(tensor_kwargs, dtype_map, draw_dir)
         _gen_tensor_kwargs(tensor_kwargs, dtype_map, out_dir)
 
         input_dirs[name] = out_dir
@@ -543,6 +648,64 @@ def _dscript_perf_measure(cfg: DirectVersionConfig) -> str:
                     cv = std / mean * 100.0 if mean > 0 else 0.0
                     return median, cv
 
+                def _measure_amortized(model, inputs, num_trials):
+                    # 第二个计量窗口：一对 Event 套 N 次连发，中间不 sync。
+                    #
+                    # 上面那个窗口每次都 sync，所以它量到的是「一次下发 + 一次
+                    # 执行 + 一次同步」。这里把 N 次连发包在一对 Event 里再除以
+                    # N —— 同步开销被摊掉，剩下的更接近设备自己的执行时间。
+                    #
+                    # 再单独量一次**只下发不等**的墙上时间，得到 host 侧下发
+                    # 一次要多久。两个数一比就能回答一件此前答不了的事：
+                    # time_us 量的主要是 kernel，还是 host 的下发与排队。
+                    #
+                    # 为什么这件事要紧：机制核验读的是 msprof 的**设备侧**通道。
+                    # 如果 time_us 主要由 host 决定，那「增益超噪声底 + 机制已
+                    # 核实」就是两个互不相关的事实被钉在一起 —— 百分比来自
+                    # host，机制结论来自 device。
+                    import time as _t
+                    torch.npu.synchronize()
+                    _start = torch.npu.Event(enable_timing=True)
+                    _end = torch.npu.Event(enable_timing=True)
+                    _start.record()
+                    _host_t0 = _t.perf_counter()
+                    for _ in range(num_trials):
+                        model(*inputs)
+                    _host_t1 = _t.perf_counter()   # 只下发完，没等执行
+                    _end.record()
+                    torch.npu.synchronize()
+                    device_us = _start.elapsed_time(_end) * 1000.0 / num_trials
+                    host_us = (_host_t1 - _host_t0) * 1e6 / num_trials
+                    return device_us, host_us
+
+                # 计时前后对每个输入张量取摘要，比一次。
+                #
+                # 它抓的是「kernel 原地改了输入」。那件事有两层后果：
+                #   后面每个 trial 测的不是同一份工作 —— 第 2 次起输入已经
+                #   被第 1 次改过，而 cv 看起来完全正常（它量的是耗时的离散度，
+                #   不是输入的一致性）
+                #   精度比对拿的是**改过之后**的输入重算真值 —— 于是一个会改
+                #   输入的实现在精度上也显得正确
+                #
+                # 摘要只取每个张量的形状、dtype、以及几个采样点的和 ——
+                # 全量 hash 在大张量上太贵，而我们要查的是「变过没有」，
+                # 不是「变成了什么」。
+                def _input_digest(tensors):
+                    parts = []
+                    for item in tensors:
+                        if item is None or not hasattr(item, "shape"):
+                            parts.append("none")
+                            continue
+                        flat = item.reshape(-1)
+                        step = max(1, flat.numel() // 64)
+                        sample = flat[::step].to(torch.float64).sum().item()
+                        parts.append(
+                            f"{{tuple(item.shape)}}|{{item.dtype}}"
+                            f"|{{sample:.12e}}")
+                    return ";".join(parts)
+
+                _digest_before = _input_digest(inputs)
+
                 median_time, cv_pct = _measure_events(model, inputs, {num_trials})
                 result["time_us"] = median_time
                 result["cv_pct"] = cv_pct
@@ -550,6 +713,38 @@ def _dscript_perf_measure(cfg: DirectVersionConfig) -> str:
                 result["warmup"] = {warmup}
                 result["pipeline"] = {{}}
                 result["bottleneck"] = "unknown"
+
+                # 第二个窗口是**附加**的：它失败不影响上面那个主读数。
+                #
+                # 这段代码只能在真设备上跑过才算验证过，而本机没有 torch_npu。
+                # 所以它包在 try 里，失败时把原因记下来而不是让整次评测挂掉 ——
+                # 一个新加的诊断量不该有能力毁掉一次已经排到的机时窗口。
+                try:
+                    _dev_us, _host_us = _measure_amortized(
+                        model, inputs, {num_trials})
+                    result["device_amortized_us"] = _dev_us
+                    result["host_enqueue_us"] = _host_us
+                    result["host_bound_ratio"] = (
+                        _host_us / _dev_us if _dev_us > 0 else None)
+                except Exception as _amortized_exc:
+                    result["device_amortized_us"] = None
+                    result["host_enqueue_us"] = None
+                    result["host_bound_ratio"] = None
+                    result["amortized_error"] = str(_amortized_exc)
+
+                try:
+                    _digest_after = _input_digest(inputs)
+                    result["inputs_mutated"] = (
+                        _digest_after != _digest_before)
+                    if result["inputs_mutated"]:
+                        result["correctness_message"] = (
+                            (result.get("correctness_message") or "")
+                            + " [输入在计时过程中被原地修改了 —— "
+                              "后面每个 trial 测的不是同一份工作，"
+                              "而精度比对也会拿改过之后的输入重算真值]")
+                except Exception as _digest_exc:
+                    result["inputs_mutated"] = None
+                    result["digest_error"] = str(_digest_exc)
 """
 
 
@@ -917,6 +1112,9 @@ class DirectEvalConfig:
     shapes_mode: str = SHAPES_MODE_ALL
     target_speedup: Optional[float] = None
     eval_backend: str = "default"
+    #: 输入压力分布与轮换份数。见 STRESS_PROFILES / INPUT_ROTATION。
+    stress_profile: str = "normal"
+    input_rotation: int = INPUT_ROTATION
 
 
 def _load_baseline_shape_cache(baseline_cache: str, shape_plan: list):
@@ -1080,7 +1278,10 @@ def _load_call_spec_and_plan(cfg: DirectEvalConfig, work_dir: str) -> tuple:
     logging.info("生成输入张量: %s（shapes_mode=%s, target=%d, generalization=%d）",
                  input_root, cfg.shapes_mode,
                  len(shapes_to_run['target']), len(shapes_to_run['generalization']))
-    input_dirs = generate_inputs(call_spec, input_root, shapes_to_run)
+    input_dirs = generate_inputs(
+        call_spec, input_root, shapes_to_run,
+        stress_profile=getattr(cfg, "stress_profile", "normal"),
+        rotation=getattr(cfg, "input_rotation", INPUT_ROTATION))
     shape_plan = _build_shape_plan(shapes_to_run, input_dirs, call_spec)
     return call_spec, shape_plan
 
@@ -1132,6 +1333,11 @@ def _build_final_result(cfg: DirectEvalConfig, shape_results: dict,
             "warmup": cfg.warmup,
             "num_trials": cfg.num_trials,
             "baseline_from_cache": cfg.baseline_cache is not None,
+            # 压力分布与轮换份数要写进结果：它们改变**测的是什么**。
+            # 不写出来的话，一份 normal 分布下的精度结论和一份 extreme 分布
+            # 下的看起来一模一样，而两者的强度差很远。
+            "stress_profile": getattr(cfg, "stress_profile", "normal"),
+            "input_rotation": getattr(cfg, "input_rotation", INPUT_ROTATION),
         },
         "shapes_mode": cfg.shapes_mode,
         "shape_results": shape_results,
@@ -1241,6 +1447,17 @@ def main():
     parser.add_argument("--eval-lock-timeout", type=float, default=300)
     parser.add_argument("--baseline-cache", type=str, default=None,
                         help="baseline 评估结果缓存文件路径")
+    parser.add_argument("--stress-profile", default="normal",
+                        choices=sorted(STRESS_PROFILES),
+                        help="输入压力分布。误差比判据是**检测**降精度的机制，"
+                             "压力分布是让它**触发**的条件 —— 一个用 bf16 "
+                             "累加的 kernel 在 randn 这种良性输入上完全可能"
+                             "过关（那些值都在 1 附近，累加误差没机会堆积）")
+    parser.add_argument("--input-rotation", type=int, default=INPUT_ROTATION,
+                        help="每个 shape 生成几份输入轮换使用。一份输入反复用"
+                             "会把缓存命中烘进绝对耗时，也会让一个按输入身份"
+                             "做 memoize 的实现从第二个 trial 起直接返回"
+                             "上次结果")
     parser.add_argument("--shapes-mode", choices=[SHAPES_MODE_TARGET, SHAPES_MODE_GENERALIZATION, SHAPES_MODE_ALL],
                         default=SHAPES_MODE_ALL,
                         help="跑哪些 shape：target / generalization / all（默认 all）")
@@ -1270,6 +1487,8 @@ def main():
         shapes_mode=args.shapes_mode,
         target_speedup=args.target_speedup,
         eval_backend=args.eval_backend,
+        stress_profile=args.stress_profile,
+        input_rotation=args.input_rotation,
     ))
 
 

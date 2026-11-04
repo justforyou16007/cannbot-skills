@@ -4574,3 +4574,161 @@ def test_missing_knowledge_base_is_not_a_blocker(tmp_path):
     assert campaign.lint_knowledge_base(None) == []
     problems = campaign.lint_knowledge_base(str(tmp_path / "nope"))
     assert problems and "跳过" in problems[0]
+
+
+# ---------------------------------------------------------------------------
+# 停机那一刻说清「best 没被确认过」
+#
+# 此前这件事只在 promote 那一刻报错，而那时人已经在收工了 —— 结论是「还得
+# 再测一次」，而测一次要重新把环境、产物、形状都对回去。更糟的情形是这一代
+# 就此结束（预算/墙钟耗尽），那个未经确认的读数成了这一代唯一的产出，
+# 而它**不能**被 promote。
+# ---------------------------------------------------------------------------
+
+def _exhausted(gain, readings, noise=2.0, target=1.05):
+    state = fresh_state(noise=noise, target=target)
+    state["state"] = campaign.STATE_IMPLEMENT
+    state["best"] = {"gain": gain, "decision": "D0.1", "readings": readings}
+    state["budget"] = {"max_records": 3, "used": 3}
+    campaign._advance_state(state, None)
+    return state
+
+
+def test_budget_exhaustion_flags_an_unconfirmed_best():
+    state = _exhausted(1.30, [1.30])
+    assert state["state"] == campaign.STATE_STOPPED
+    assert "没有被确认过" in state["stop_reason"]
+    assert "现在补确认还来得及" in state["stop_reason"]
+
+
+def test_confirmed_best_ships_instead_of_stopping():
+    """确认过就直接收工 —— 根本走不到停机那条路。"""
+    state = _exhausted(1.30, [1.30, 1.29, 1.31])
+    assert state["state"] == campaign.STATE_SHIPPED
+    assert "stop_reason" not in state
+
+
+def test_note_is_empty_for_a_confirmed_best():
+    state = fresh_state(noise=2.0, target=1.05)
+    state["best"] = {"gain": 1.30, "decision": "D0.1",
+                     "readings": [1.30, 1.29, 1.31]}
+    assert campaign._unconfirmed_best_note(state) == ""
+
+
+def test_exhausted_budget_stops_instead_of_asking_for_confirmation():
+    """闭死的局面要说出来：状态说「去补确认」而预算已经不允许再跑。
+
+    那时这一代的产出是**不可用的**（未经确认的 best 不能 promote），
+    但状态看起来只是「还差一步」。
+    """
+    state = _exhausted(1.30, [1.30])
+    assert state["state"] == campaign.STATE_STOPPED
+    assert "额度不足" in state["stop_reason"]
+    assert state.get("pending_confirmation") is None
+
+
+def test_sufficient_budget_still_asks_for_confirmation():
+    state = fresh_state(noise=2.0, target=1.05)
+    state["state"] = campaign.STATE_IMPLEMENT
+    state["best"] = {"gain": 1.30, "decision": "D0.1", "readings": [1.30]}
+    state["budget"] = {"max_records": 60, "used": 3}
+    campaign._advance_state(state, None)
+    assert state["state"] == campaign.STATE_IMPLEMENT
+    assert state["pending_confirmation"]["still_needed"] == 2
+
+
+def test_sub_noise_gain_gets_no_such_note():
+    """收敛停机正好是这种情形（增益 1.005、噪声底 2%）。
+
+    那时「去补一次确认」是一句没有意义的建议 —— 要确认的那个数本身落在
+    测量抖动里。而噪声提示会让人把所有提示一起忽略。
+    """
+    state = _exhausted(1.005, [1.005], noise=2.0)
+    assert "没有被确认过" not in state["stop_reason"]
+
+
+def test_note_says_how_many_more_readings_are_needed():
+    state = _exhausted(1.30, [1.30])
+    assert f"{campaign.CONFIRM_READINGS - 1} 次" in state["stop_reason"]
+
+
+def test_note_explains_why_it_cannot_be_fixed_later():
+    """promote 会把 best 归零、噪声底置为待重测 —— 那个读数从此消失。"""
+    state = _exhausted(1.30, [1.30])
+    assert "无法回溯" in state["stop_reason"]
+    assert "不可用" in state["stop_reason"]
+
+
+def test_wall_clock_exhaustion_flags_it_too():
+    state = _state_started_hours_ago(5.0, wall_cap=4.0)
+    state["best"] = {"gain": 1.30, "decision": "D0.1", "readings": [1.30]}
+    campaign._advance_state(state, None)
+    assert state["state"] == campaign.STATE_STOPPED
+    assert "没有被确认过" in state["stop_reason"]
+
+
+# ---------------------------------------------------------------------------
+# host 受限判定
+#
+# 评测现在有两个计量窗口：device_amortized_us（一对 Event 套 N 次连发除以 N，
+# 同步开销被摊掉）与 host_enqueue_us（只下发不等的墙上时间除以 N）。
+#
+# 两个数一比回答一件此前答不了的事：time_us 量的主要是 kernel，还是 host 的
+# 下发与排队。这件事要紧，因为机制核验读的是 msprof 的**设备侧**通道 ——
+# 如果 time_us 主要由 host 决定，那「增益超噪声底 + 机制已核实」就是两个
+# 互不相关的事实被钉在一起。
+# ---------------------------------------------------------------------------
+
+def _with_windows(device_us, host_us, **kw):
+    doc = result(**kw) if kw else result(speedup=1.30)
+    doc["device_amortized_us"] = device_us
+    doc["host_enqueue_us"] = host_us
+    return doc
+
+
+def test_device_dominated_round_passes():
+    verdict = campaign.judge_host_bound(_with_windows(200.0, 20.0))
+    assert verdict is not None and verdict["ok"] is True
+    assert verdict["host_bound_ratio"] == pytest.approx(0.1)
+
+
+def test_host_dominated_round_does_not_raise_best():
+    state = fresh_state()
+    entry = campaign.apply_result(
+        state, _with_windows(100.0, 90.0), "D0.1",
+        milestone_doc=milestone(), signature=signature(0.1),
+        fence_report=clean_fence())
+    assert entry["host_bound"]["ok"] is False
+    assert entry["counts_toward_best"] is not True
+    assert "host 受限" in entry["reason"]
+
+
+def test_missing_windows_are_not_a_pass_and_not_a_fail():
+    """老结果文件没有这两个字段，那段附加测量也可能失败。
+
+    None 不等于通过 —— 调用方据此报告，而不是据此放行；但也不该把一轮
+    本来合格的记录压下去。
+    """
+    assert campaign.judge_host_bound(result(speedup=1.30)) is None
+    state = fresh_state()
+    entry = apply(state, result(speedup=1.30), "D0.1",
+                  milestone_doc=milestone(), signature=signature(0.1))
+    assert entry["host_bound"] is None
+    assert entry["counts_toward_best"] is True
+
+
+def test_zero_device_time_is_not_divided_by():
+    assert campaign.judge_host_bound(_with_windows(0.0, 10.0)) is None
+
+
+def test_threshold_boundary_is_inclusive():
+    cap = campaign.HOST_BOUND_RATIO_MAX
+    verdict = campaign.judge_host_bound(_with_windows(100.0, 100.0 * cap))
+    assert verdict is not None and verdict["ok"] is True
+
+
+def test_reason_says_what_to_do_about_it():
+    verdict = campaign.judge_host_bound(_with_windows(100.0, 95.0))
+    assert verdict is not None
+    assert "num_trials" in verdict["reason"]
+    assert "不是同一件事" in verdict["reason"]

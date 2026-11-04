@@ -2043,7 +2043,8 @@ def generation_entries(state: Dict[str, Any]) -> List[Dict[str, Any]]:
 KEPT_VERDICTS = frozenset({VERDICT_ACCEPT, VERDICT_ACCEPT_UNVERIFIED})
 
 
-def previous_snapshot(state: Dict[str, Any]) -> Tuple[Optional[Dict[str, float]], str]:
+def previous_snapshot(state: Dict[str, Any],
+                      current_sha: str = "") -> Tuple[Optional[Dict[str, float]], str]:
     """取做差用的「上一轮」快照，并说明它是哪一轮。
 
     「上一轮」指的是**当前代码所处的状态**，所以只有被保留下来的改动才算：
@@ -2056,6 +2057,17 @@ def previous_snapshot(state: Dict[str, Any]) -> Tuple[Optional[Dict[str, float]]
     某个停顿压到了低位；下一轮真的把那个停顿从高位压下来时，会拿已撤回
     那轮的低位值当基线，算出「没动」，于是一个真实的机制被判成平凡通过。
 
+    还要跳过**同一份代码的重测**（`current_sha` 给了才能判）。
+
+    这一条是实跑一遍流程时发现的。场景很常见：忘了传 `--fence-report`，
+    那一轮被判 accept_unverified（保留但不计入 best）；补上参数把**同一份
+    结果**重跑一遍 —— 于是第二次拿第一次当做差基线，而两次是同一份代码，
+    「字段有没有因本次改动而移动」必然答「没动」。结果是一个完全合格的轮次
+    被判成平凡通过，状态掉进 re-analyze，而人会以为是机制真的不成立。
+
+    判据是代码指纹相同。相同就说明那不是「上一轮」，是「这一轮的另一次
+    测量」—— 该跳过它、拿它之前的那一轮做基线。
+
     都没有就退回参考自己的签名 —— 那就是第 0 轮。
     """
     for entry in reversed(generation_entries(state)):
@@ -2063,6 +2075,8 @@ def previous_snapshot(state: Dict[str, Any]) -> Tuple[Optional[Dict[str, float]]
             continue
         if entry.get("verdict") not in KEPT_VERDICTS:
             continue
+        if current_sha and entry.get("artifact_sha") == current_sha:
+            continue   # 同一份代码的另一次测量，不是上一轮
         snapshot = entry.get("signature_snapshot")
         if snapshot:
             label = f"上一轮（决策 {entry.get('decision')}）"
@@ -2249,7 +2263,8 @@ def apply_result(state: Dict[str, Any], doc: Dict[str, Any], decision: str,
                 # 结构在不在是二值事实，顶不下去。
                 structure = judge_structure(structure_report)
                 entry["structure"] = structure
-                baseline, baseline_label = previous_snapshot(state)
+                baseline, baseline_label = previous_snapshot(
+                    state, artifact_sha)
                 mechanism = judge_mechanism(
                     milestone_doc, signature, decision, baseline,
                     reference_snapshot=state.get("reference_snapshot"))
@@ -3681,15 +3696,31 @@ def cmd_confirm(args: argparse.Namespace) -> int:
 
     best = state.get("best", {})
     readings = best.get("readings", [])
+    target = float(state.get("target_gain", DEFAULT_PHASE_TARGET_GAIN))
+    noise = float(state.get("noise_floor_pct", 0.0) or 0.0)
     print(f"确认复测记录：{entry['reason']}")
     if _best_is_confirmed(state):
-        print(f"  已确认：{len(readings)} 次读数全部达标，"
-              f"best 取最小值 {best.get('gain')}")
+        print(f"  已确认：{len(readings)} 次读数的中位数 {best.get('gain')} "
+              f"达到目标 {target}")
+    elif len(readings) < CONFIRM_READINGS:
+        print(f"  还差 {CONFIRM_READINGS - len(readings)} 次读数"
+              f"（已有 {len(readings)}/{CONFIRM_READINGS}）。")
     else:
-        target = float(state.get("target_gain", DEFAULT_PHASE_TARGET_GAIN))
-        low = [r for r in readings if r < target]
-        print(f"  未确认：{len(low)} 次读数低于目标 {target}（{low}）。")
-        print("  上次那个达标读数是一次偏高抽样 —— 这正是复测要查出来的。")
+        spread_ok, spread_detail = confirmation_spread_ok(readings, noise)
+        if not spread_ok:
+            # 离散度不过时**不要**说「上次那个是偏高抽样」—— 那是一个具体的
+            # 结论，而这里的事实是「这几次读数彼此都对不上」。说错方向会把人
+            # 引去改实现，而该做的是查环境。
+            print(f"  未确认：{spread_detail}")
+        else:
+            numeric = sorted(r for r in readings
+                             if isinstance(r, (int, float)))
+            median = (numeric[len(numeric) // 2] if len(numeric) % 2
+                      else (numeric[len(numeric) // 2 - 1]
+                            + numeric[len(numeric) // 2]) / 2)
+            print(f"  未确认：{len(readings)} 次读数的中位数 {median} "
+                  f"低于目标 {target}（读数 {readings}）。")
+            print("  上次那个达标读数是一次偏高抽样 —— 这正是复测要查出来的。")
     action = next_action(state)
     print(f"\n下一步: {action['action']} — {action['reason']}")
     return 0
@@ -4741,10 +4772,22 @@ def render_harvest(debts: List[Dict[str, Any]]) -> str:
         if debt.get("mechanism_reason"):
             lines.append(f"    机制:   {debt['mechanism_reason']}")
         for line in debt.get("mechanism_lines") or []:
-            anchor = (line.get("anchor") or {}) if isinstance(line, dict) else {}
-            label = line.get("label") if isinstance(line, dict) else line
-            lines.append(f"    机制行: {label}  "
-                         f"{anchor.get('expr', '')}")
+            if not isinstance(line, dict):
+                lines.append(f"    机制行: {line}")
+                continue
+            # 台账里存的是**核验结果**（verify_mechanism_line 的输出），
+            # 它把锚点摊平成 expr / channel / actual / previous 几个键 ——
+            # 不是课程表里那个嵌套的 anchor 对象。
+            #
+            # 原来这里读 anchor.get("expr")，于是锚点永远是空的。而锚点
+            # 与前后读数正是写卡片最需要的两样东西：症状写在哪个通道上、
+            # 它从多少变到了多少。少了它们，这张清单又变回「回去翻台账」。
+            lines.append(f"    机制行: {line.get('label')}  "
+                         f"{line.get('expr', '')}")
+            before, after = line.get("previous"), line.get("actual")
+            if before is not None or after is not None:
+                lines.append(f"            通道 {line.get('channel', '?')}："
+                             f"{before} → {after}")
         if debt.get("signature_path"):
             lines.append(f"    签名:   {debt['signature_path']}"
                          "（前后通道读数在这里）")

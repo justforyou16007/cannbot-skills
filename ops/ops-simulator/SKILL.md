@@ -111,6 +111,33 @@ cannsim 生成的 `trace_core*.json` 是 Chrome Trace Format，包含每个 core
 3. **周期性模式检测**：判断空泡是系统性（每个 tile 重复）还是偶发
 4. **重叠度判定**：验证双缓冲是否生效（MTE2 与 VECTOR/CUBE 时间重叠比例）
 
+### 5. 结构核验（声称的结构有没有被构建出来）
+
+与上面几步正交：空泡分析回答「性能**为什么**差」，结构核验回答「这份实现有没有
+按设计建出那个结构」—— 而且**在任何性能数出来之前**就能判。
+
+需要它的场合：设计里写了「A 操作数走寄存器源」「双缓冲深度 2」「同步成对」这类
+**结构性断言**。性能计数器看不到这类事实，于是一个「预算留出来了、路径没建起来」
+的退化实现会在聚合指标上表现正常。
+
+三条通道，按代价从低到高：
+
+| 通道 | 能判什么 | 代价 |
+|---|---|---|
+| `ccec -emit-llvm` + `llvm-dis` | 操作数在哪一级存储（看 IR 的 address space）、同步 intrinsic 是否成对 | 秒级，**无硬件无仿真器** |
+| `instr_exe.csv` 的 `pipe` / `detail` 两列 | 搬运的源与目的、走了哪条 pipe（MTE1 直送 vs MTE2/MTE3 往返） | 跟仿真同价（本 skill 已在采） |
+| `ub.{rd,wr}_log.dump` / `instr_log.dump` | UB 逐条读写地址；带 cycle 与 PC，可算发射间隔 | 同上，文件更大 |
+
+判据要写成**二值**（某条指令在不在、条数是几、同一地址被搬入几次），不要写成程度。
+仿真产物适合承载结构判定（二值事实），不适合承载数值主张（耗时多少要上板数据）。
+
+> **最终助记符反汇编不可用**：毕昇工具链没有反汇编器，`llvm-objdump` 缺指令表、
+> 设备侧 `-S` 被拒、编译管线无 `.s` 阶段。所以「结构有没有建出来」可判，
+> 「最终指令序列长什么样」不可判。
+
+详见 `references/structural-verification.md`（含判据表、命令、以及每条结论的
+证据来源与未验证项）。
+
 ## 命令参考
 
 ### cannsim record - 执行仿真
@@ -172,6 +199,7 @@ cannsim report -e ./cannsim_Ascend950_* -n all -o ./report_output
 | `references/simulator-advanced.md` | 仿真进阶命令参考 | 需要高级参数或批量仿真时 |
 | `references/troubleshooting.md` | 问题排查指南 | 仿真失败或报告未生成时 |
 | `references/pipeline-bubble-analysis.md` | 指令流水空泡分类、因果归因、周期性模式检测 | 生成 trace 后，定位性能瓶颈根因时 |
+| `references/structural-verification.md` | 结构核验：从 IR 的 address space、`instr_exe.csv` 的 `pipe`/`detail`、UB 读写日志判定「声称的结构有没有被构建出来」 | 设计含结构性断言（操作数来源 / 缓冲深度 / 同步成对）需在上板前确认时；或性能不达标而聚合指标全在正常带内时 |
 | `scripts/trace_bubble_analyzer.py` | 自动化空泡分析脚本（兼容 msprof/cannsim 双格式） | 批量分析多核 trace 或获取预分析报告时 |
 | `references/performance-metrics-reference.md` | summary.json 字段、阈值、Analysis Priority | 分析 summary.json 时 |
 | `references/performance-issues-general.md` | 多核负载不均衡 + Kernel 利用率不足 | 分析 summary.json 时 |

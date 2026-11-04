@@ -4148,3 +4148,89 @@ def test_no_wall_cap_means_no_wall_limit():
     state = _state_started_hours_ago(1000.0)
     campaign._advance_state(state, None)
     assert state["state"] != campaign.STATE_STOPPED
+
+
+# ---------------------------------------------------------------------------
+# M0 对账强制化
+#
+# audit 查的是整个 campaign 里最容易悄悄出错的那件事：课程表漏掉了某个超带
+# 通道。漏掉的后果不是少一条门禁，而是**门禁永远不会因它触发** —— 门禁只拿
+# 课程表自己声明的值做比较。于是那个通道上的问题可以一路活到 promote，
+# 而每一轮的数都正常。
+#
+# 做成「下一步动作」而不是硬停机：硬停会在 M0 还没跑完任何一轮时就把流程
+# 卡住（那时还没有本轮签名可对账），而一个在正当起点上就报错的门禁会被
+# 反射性绕过。
+# ---------------------------------------------------------------------------
+
+def _implementing(audit=None, generation=0, accepted_gen=0):
+    state = fresh_state()
+    state["state"] = campaign.STATE_IMPLEMENT
+    state["generation"] = generation
+    state["ledger"] = [{"generation": accepted_gen, "decision": "D0.1",
+                        "verdict": "accept", "gain": 1.2,
+                        "counts_toward_best": True}]
+    if audit is not None:
+        state["m0_audit"] = audit
+    return state
+
+
+def test_next_action_asks_for_audit_when_it_never_ran():
+    action = campaign.next_action(_implementing())
+    assert action["action"] == "audit"
+    assert "不会触发任何东西" in action["reason"]
+
+
+def test_next_action_proceeds_once_audit_passed():
+    state = _implementing({"generation": 0, "passed": True, "unclaimed": []})
+    assert campaign.next_action(state)["action"] == "implement"
+
+
+def test_next_action_asks_again_when_audit_did_not_pass():
+    state = _implementing({"generation": 0, "passed": False,
+                           "unclaimed": ["msprof:X.csv:y"]})
+    action = campaign.next_action(state)
+    assert action["action"] == "audit"
+    assert "msprof:X.csv:y" in action["reason"]
+    assert "三择一" in action["reason"]
+
+
+def test_audit_from_a_previous_generation_does_not_count():
+    """新参考是另一个二进制，上一代的对账结论对本代不成立。"""
+    state = _implementing({"generation": 0, "passed": True, "unclaimed": []},
+                          generation=1, accepted_gen=1)
+    assert campaign.next_action(state)["action"] == "audit"
+
+
+def test_audit_is_not_demanded_before_there_is_anything_to_audit():
+    """本代还没有机制已核实的读数时，对不了账 —— 这时要求 audit 是在
+    一个正当起点上报错，而那种门禁会被反射性绕过。"""
+    state = _implementing(generation=1, accepted_gen=0)
+    assert campaign.next_action(state)["action"] != "audit"
+
+
+def test_audit_is_not_demanded_during_analysis():
+    """架构层还在写课程表时没有本轮签名。"""
+    state = _implementing()
+    state["state"] = campaign.STATE_ANALYZE
+    assert campaign.next_action(state)["action"] != "audit"
+
+
+def test_audit_stamps_the_state_so_it_leaves_a_trace(tmp_path):
+    """audit 是个纯读命令，不记的话「这一代到底对过账没有」无从得知。"""
+    import argparse  # noqa: PLC0415
+    state = fresh_state()
+    state_file = tmp_path / "s.json"
+    campaign.save_state(state_file, state)
+    sig = tmp_path / "sig.json"
+    sig.write_text(json.dumps(signature(4.2)), encoding="utf-8")
+    mil = tmp_path / "m.json"
+    mil.write_text(json.dumps(milestone()), encoding="utf-8")
+
+    rc = campaign.cmd_audit(argparse.Namespace(
+        state=str(state_file), signature=str(sig), milestone=str(mil),
+        factor=campaign.M0_AUDIT_FACTOR, as_json=False))
+    stamped = json.loads(state_file.read_text())["m0_audit"]
+    assert stamped["generation"] == 0
+    assert stamped["passed"] is (rc == 0)
+    assert "at" in stamped

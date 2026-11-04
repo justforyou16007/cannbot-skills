@@ -1494,6 +1494,41 @@ def next_action(state: Dict[str, Any]) -> Dict[str, str]:
                        + str(pending.get("reason", ""))),
         }
 
+    # M0 对账没做过 / 没通过 → 先把它做完。
+    #
+    # 为什么排在这么前面：它查的是整个 campaign 里最容易悄悄出错的那件事 ——
+    # 课程表漏掉了某个超带通道。漏掉的后果不是少一条门禁，而是**门禁永远
+    # 不会因它触发**：门禁只拿课程表自己声明的值做比较。于是那个通道上的
+    # 问题可以一路活到 promote，而每一轮的数都正常。
+    #
+    # 做成「下一步动作」而不是硬停机：硬停会在 M0 还没跑完任何一轮时就把
+    # 流程卡住（那时还没有本轮签名可对账），而一个在正当起点上就报错的
+    # 门禁会被反射性绕过。
+    audit = state.get("m0_audit")
+    phase_now = state.get("state")
+    if phase_now in (STATE_IMPLEMENT, STATE_SHIPPED) and (
+            not isinstance(audit, dict)
+            or int(audit.get("generation", -1)) != int(
+                state.get("generation", 0))):
+        if any(e.get("counts_toward_best") for e in generation_entries(state)):
+            return {
+                "action": "audit",
+                "reason": ("本代还没做过 M0 对账。门禁只拿课程表自己声明的"
+                           "值做比较 —— 课程表漏掉的通道不会触发任何东西，"
+                           "而那种漏可以一路活到 promote，每轮的数都正常。"
+                           "跑 `campaign.py audit --signature <本轮签名>`。"),
+            }
+    if isinstance(audit, dict) and audit.get("passed") is False \
+            and int(audit.get("generation", -1)) == int(
+                state.get("generation", 0)):
+        return {
+            "action": "audit",
+            "reason": (f"M0 对账未通过：{len(audit.get('unclaimed') or [])} "
+                       "个通道差了带外而课程表里没有机制行锚着它们"
+                       f"（{audit.get('unclaimed')}）。"
+                       "三择一：补机制行 / 补 hwkb 卡片 / reopen。"),
+        }
+
     phase = state.get("state")
 
     if phase == STATE_STOPPED:
@@ -3125,13 +3160,39 @@ def cmd_audit(args: argparse.Namespace) -> int:
         print(f"  [{mark}] {finding['channel']}")
         print(f"      参考 {finding['reference']} → 本轮 "
               f"{finding['current']}（{finding['ratio']}×）")
-    if not findings:
-        print("  （无）所有参考通道都在 "
-              f"{args.factor}× 带内。")
+    if not findings or not unclaimed:
+        # 把结果记进 state。
+        #
+        # 不记的话，「这一代到底有没有做过 M0 对账」无从得知 —— audit 是个
+        # 纯读的命令，跑完什么痕迹都不留。而它查的是整个 campaign 里最容易
+        # 悄悄出错的那件事：课程表漏掉了某个超带通道，于是门禁永远不会因它
+        # 触发，而所有数看起来都正常。
+        state.setdefault("m0_audit", {})
+        state["m0_audit"] = {
+            "at": _now(),
+            "generation": state.get("generation", 0),
+            "factor": args.factor,
+            "finding_count": len(findings),
+            "unclaimed": [],
+            "passed": True,
+        }
+        save_state(path, state)
+        if not findings:
+            print("  （无）所有参考通道都在 "
+                  f"{args.factor}× 带内。")
+        else:
+            print("\n对账通过：每个超带通道都有机制行锚着。")
         return 0
-    if not unclaimed:
-        print("\n对账通过：每个超带通道都有机制行锚着。")
-        return 0
+
+    state["m0_audit"] = {
+        "at": _now(),
+        "generation": state.get("generation", 0),
+        "factor": args.factor,
+        "finding_count": len(findings),
+        "unclaimed": [f["channel"] for f in unclaimed],
+        "passed": False,
+    }
+    save_state(path, state)
 
     sys.stdout.flush()
     print(f"\n对账未通过：{len(unclaimed)} 个通道差了 {args.factor} 倍以上，"

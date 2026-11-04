@@ -111,6 +111,21 @@ PROVENANCE_DIRNAME = "provenance"
 #: 删掉等于连经验一起丢，而留在原处等于继续供给 —— 隔离是第三条路。
 QUARANTINE_DIRNAME = "quarantine"
 
+#: 隔离之前先给几次返修机会。
+#:
+#: 上游的做法是「不过先返修两轮，仍不过才移出学生可读的树」。直接隔离的
+#: 问题不在于严格，而在于**第一次失败往往是形式问题**：少了一个小节、
+#: provenance 的 kind 写错、归档指针拼错。这些改一行就好，而隔离会让这张
+#: 卡片离开 agent 的视野 —— 于是那条真经验也跟着离开，直到有人想起来去
+#: quarantine 目录里翻。
+#:
+#: 计数记在卡片的 frontmatter 里（`lint_failures`），所以它跨进程存活 ——
+#: 记在内存里的话，每次 lint 都是第一次，这条规则等于不存在。
+QUARANTINE_AFTER_FAILURES = 2
+
+#: 返修计数字段名。
+LINT_FAILURES_FIELD = "lint_failures"
+
 #: 禁用词。这些词把「这条经验是从哪来的」带进了可复用经验里。
 #:
 #: 前一半是上游明确列出的三个（`oracle` / `teacher` / `reference
@@ -988,6 +1003,53 @@ def check_index_fresh(kb_root: Path, arch: str) -> List[Issue]:
     return []
 
 
+def bump_lint_failures(card_path: Path) -> Optional[int]:
+    """给卡片的不过检计数加一，返回加完之后的值。
+
+    计数写进 frontmatter 而不是记在内存里：记在内存里的话，每次 lint 都是
+    第一次，「返修两轮再隔离」这条规则等于不存在。
+
+    frontmatter 读不动时返回 None —— 调用方据此直接隔离。那类卡片最常见的
+    成因恰恰是正文里粘了大段源码把 frontmatter 撑坏了，而它也无处记计数。
+    """
+    try:
+        meta, body = load_card(card_path)
+    except (ValueError, OSError):
+        return None
+    count = int(meta.get(LINT_FAILURES_FIELD) or 0) + 1
+    meta[LINT_FAILURES_FIELD] = count
+    try:
+        card_path.write_text(
+            "---\n" + yaml.safe_dump(meta, allow_unicode=True, sort_keys=False)
+            + "---\n" + body,
+            encoding="utf-8")
+    except OSError:
+        return None
+    return count
+
+
+def clear_lint_failures(card_path: Path) -> None:
+    """卡片过检之后清掉计数。
+
+    不清的话，一张修好又改坏的卡片会带着历史计数直接被隔离 —— 而它这次
+    只错了一处。计数要衡量的是「连续不过检」，不是「一辈子不过检过几次」。
+    """
+    try:
+        meta, body = load_card(card_path)
+    except (ValueError, OSError):
+        return
+    if LINT_FAILURES_FIELD not in meta:
+        return
+    meta.pop(LINT_FAILURES_FIELD, None)
+    try:
+        card_path.write_text(
+            "---\n" + yaml.safe_dump(meta, allow_unicode=True, sort_keys=False)
+            + "---\n" + body,
+            encoding="utf-8")
+    except OSError:
+        pass
+
+
 def quarantine(kb_root: Path, card_path: Path, arch: str) -> Path:
     """把一张不过 lint 的卡片移出 agent 可读的那棵树。
 
@@ -1225,6 +1287,15 @@ def cmd_lint(args: argparse.Namespace) -> int:
                     Issue(issue.code, f"{path.name}: {issue.message}"))
             if card_issues:
                 offenders.append((path, str(meta.get("arch", ""))))
+            elif args.quarantine and meta.get(LINT_FAILURES_FIELD):
+                # 过检了就清掉计数。
+                #
+                # 不清的话，一张修好又改坏的卡片会带着历史计数直接被隔离 ——
+                # 而它这次只错了一处。计数衡量的是「连续不过检」，
+                # 不是「一辈子不过检过几次」。
+                clear_lint_failures(path)
+                print(f"已清除不过检计数: {path.name}（本次过检）",
+                      file=sys.stderr)
         # 解析不动的卡片要算成问题，不能跳过。
         #
         # lint 的职责是「库里没有参考实现的痕迹」。一个解析不动的文件没被
@@ -1245,14 +1316,41 @@ def cmd_lint(args: argparse.Namespace) -> int:
                     all_issues.append(issue)
 
         if getattr(args, "quarantine", False) and offenders:
+            moved_any: List[Tuple[str, str]] = []
+            bumped: List[Tuple[str, int]] = []
             for path, arch in offenders:
-                moved = quarantine(kb_root, path, arch)
-                print(f"已隔离: {path.name} -> {moved}", file=sys.stderr)
-            for arch in {a for _, a in offenders if a in ARCH_DIRS}:
-                write_index(kb_root, arch)
-            print(f"隔离了 {len(offenders)} 张卡片。它们已移出 query 的供给"
-                  "范围，但没有被删除 —— 修好之后用 add 重新入库。",
-                  file=sys.stderr)
+                count = bump_lint_failures(path)
+                if count is None:
+                    # 连 frontmatter 都读不动（L-PARSE 那一类）。计数写不进去，
+                    # 所以也没法给返修机会 —— 直接隔离。这类卡片最常见的成因
+                    # 恰恰是正文里粘了大段源码，把 frontmatter 撑坏了。
+                    target = quarantine(kb_root, path, arch)
+                    moved_any.append((path.name, str(target)))
+                    continue
+                if count >= QUARANTINE_AFTER_FAILURES:
+                    target = quarantine(kb_root, path, arch)
+                    moved_any.append((path.name, str(target)))
+                else:
+                    bumped.append((path.name, count))
+
+            for name, target in moved_any:
+                print(f"已隔离: {name} -> {target}", file=sys.stderr)
+            for name, count in bumped:
+                print(f"记一次不过检: {name}"
+                      f"（第 {count}/{QUARANTINE_AFTER_FAILURES} 次，"
+                      "再不过就隔离）", file=sys.stderr)
+            if moved_any:
+                for arch in {a for _, a in offenders if a in ARCH_DIRS}:
+                    write_index(kb_root, arch)
+                print(f"隔离了 {len(moved_any)} 张卡片。它们已移出 query 的"
+                      "供给范围，但没有被删除 —— 修好之后用 add 重新入库。",
+                      file=sys.stderr)
+            if bumped:
+                print(f"另有 {len(bumped)} 张记了一次不过检但**留在原处** ——"
+                      "第一次失败往往是形式问题（少个小节、kind 写错、"
+                      "归档指针拼错），", file=sys.stderr)
+                print("      改一行就好。直接隔离会让那条真经验也跟着离开"
+                      "agent 的视野。", file=sys.stderr)
         scope = f"{count} 张卡片"
 
     label = f"{scope} 满足边界与准入要求" + _coverage_suffix(notes)

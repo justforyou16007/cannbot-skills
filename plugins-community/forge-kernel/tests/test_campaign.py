@@ -4732,3 +4732,162 @@ def test_reason_says_what_to_do_about_it():
     assert verdict is not None
     assert "num_trials" in verdict["reason"]
     assert "不是同一件事" in verdict["reason"]
+
+
+# ---------------------------------------------------------------------------
+# 同一份代码的重测不能当做差基线
+#
+# 这一条是实跑一遍流程时发现的，场景很常见：忘了传 --fence-report，那一轮被
+# 判 accept_unverified（保留但不计入 best）；补上参数把**同一份结果**重跑一遍
+# —— 于是第二次拿第一次当做差基线，而两次是同一份代码，「字段有没有因本次
+# 改动而移动」必然答「没动」。
+#
+# 结果是一个完全合格的轮次被判成平凡通过，状态掉进 re-analyze，而人会以为是
+# 机制真的不成立。
+# ---------------------------------------------------------------------------
+
+def test_rerun_of_the_same_code_falls_back_to_the_earlier_baseline():
+    state = fresh_state(ref_stall=4.2)
+    doc = milestone()
+    first = apply(state, result(speedup=1.30), "D0.1", milestone_doc=doc,
+                  signature=signature(1.1), artifact_sha="same_sha")
+    assert first["verdict"] == campaign.VERDICT_ACCEPT
+
+    # 同一份代码再测一次（指纹相同）—— 基线要跳过上一条，退回参考
+    second = apply(state, result(speedup=1.30), "D0.1", milestone_doc=doc,
+                   signature=signature(1.1), artifact_sha="same_sha")
+    assert second["mechanism"]["compared_against"] == "参考实现"
+    assert second["mechanism"]["status"] == "verified"
+
+
+def test_a_genuinely_new_round_still_diffs_against_the_previous_one():
+    """修这条不能把正常的逐轮做差一起改掉。"""
+    state = fresh_state(ref_stall=10.0)
+    doc = milestone()
+    apply(state, result(speedup=1.20), "D0.1", milestone_doc=doc,
+          signature=signature(4.0), artifact_sha="sha_round1")
+    second = apply(state, result(speedup=1.30), "D0.2", milestone_doc=doc,
+                   signature=signature(1.0), artifact_sha="sha_round2")
+    assert "上一轮" in second["mechanism"]["compared_against"]
+
+
+def test_baseline_selection_without_fingerprints_is_unchanged():
+    """老台账没有 artifact_sha —— 那时的行为不能变。"""
+    state = fresh_state(ref_stall=10.0)
+    doc = milestone()
+    apply(state, result(speedup=1.20), "D0.1", milestone_doc=doc,
+          signature=signature(4.0))
+    second = apply(state, result(speedup=1.30), "D0.2", milestone_doc=doc,
+                   signature=signature(1.0))
+    assert "上一轮" in second["mechanism"]["compared_against"]
+
+
+def test_previous_snapshot_skips_only_the_matching_fingerprint():
+    state = fresh_state()
+    state["ledger"] = [
+        {"generation": 0, "decision": "D0.1", "verdict": "accept",
+         "artifact_sha": "old", "signature_snapshot": {CHANNEL: 9.0}},
+        {"generation": 0, "decision": "D0.2", "verdict": "accept",
+         "artifact_sha": "cur", "signature_snapshot": {CHANNEL: 3.0}},
+    ]
+    snapshot, label = campaign.previous_snapshot(state, "cur")
+    assert snapshot == {CHANNEL: 9.0}
+    assert "D0.1" in label
+
+
+# ---------------------------------------------------------------------------
+# confirm 的输出要和判据一致
+#
+# 改成中位数之后，输出里还留着「best 取最小值」「N 次读数全部达标」——
+# 读到它的人会以为判据还是取最小 + 每次都达标。代码里描述已不存在行为的
+# 文字，比没有描述更糟。
+# ---------------------------------------------------------------------------
+
+def _confirm_output(readings, capsys, target=1.05, noise=2.0):
+    state = fresh_state(target=target, noise=noise)
+    apply(state, result(speedup=readings[0]), "D0.1",
+          milestone_doc=milestone(), signature=signature(0.9))
+    for value in readings[1:]:
+        campaign.confirm_best(state, result(speedup=value), "D0.1")
+    capsys.readouterr()
+    return state
+
+
+def test_confirm_says_median_not_minimum(tmp_path, capsys):
+    import argparse  # noqa: PLC0415
+    state = _confirm_output([1.30, 1.29, 1.31], capsys)
+    state_file = tmp_path / "s.json"
+    campaign.save_state(state_file, state)
+    doc = tmp_path / "ev.json"
+    doc.write_text(json.dumps(result(speedup=1.30)), encoding="utf-8")
+    campaign.cmd_confirm(argparse.Namespace(
+        state=str(state_file), result=str(doc), decision="D0.1",
+        as_json=False))
+    out = capsys.readouterr().out
+    assert "中位数" in out
+    assert "取最小值" not in out
+
+
+def test_confirm_counts_down_the_remaining_readings(tmp_path, capsys):
+    import argparse  # noqa: PLC0415
+    state = fresh_state(target=1.05)
+    apply(state, result(speedup=1.30), "D0.1",
+          milestone_doc=milestone(), signature=signature(0.9))
+    state_file = tmp_path / "s.json"
+    campaign.save_state(state_file, state)
+    doc = tmp_path / "ev.json"
+    doc.write_text(json.dumps(result(speedup=1.29)), encoding="utf-8")
+    capsys.readouterr()
+    campaign.cmd_confirm(argparse.Namespace(
+        state=str(state_file), result=str(doc), decision="D0.1",
+        as_json=False))
+    assert "还差 1 次读数" in capsys.readouterr().out
+
+
+def test_scattered_readings_do_not_blame_a_high_sample(tmp_path, capsys):
+    """离散度不过时不该说「上次那个是偏高抽样」。
+
+    那是一个具体结论，而这里的事实是「这几次读数彼此都对不上」。说错方向
+    会把人引去改实现，而该做的是查环境。
+    """
+    import argparse  # noqa: PLC0415
+    state = fresh_state(target=1.05, noise=2.0)
+    apply(state, result(speedup=1.30), "D0.1",
+          milestone_doc=milestone(), signature=signature(0.9))
+    campaign.confirm_best(state, result(speedup=1.10), "D0.1")
+    state_file = tmp_path / "s.json"
+    campaign.save_state(state_file, state)
+    doc = tmp_path / "ev.json"
+    doc.write_text(json.dumps(result(speedup=1.60)), encoding="utf-8")
+    capsys.readouterr()
+    campaign.cmd_confirm(argparse.Namespace(
+        state=str(state_file), result=str(doc), decision="D0.1",
+        as_json=False))
+    out = capsys.readouterr().out
+    assert "先查环境" in out
+    assert "偏高抽样" not in out
+
+
+# ---------------------------------------------------------------------------
+# harvest 的清单要带着写卡片用的读数
+# ---------------------------------------------------------------------------
+
+def test_harvest_shows_the_anchor_and_the_before_after():
+    """台账里存的是**核验结果**（锚点被摊平成 expr/channel/actual/previous），
+    不是课程表里那个嵌套的 anchor 对象。
+
+    原来读 anchor.get("expr")，于是锚点永远是空的 —— 而锚点与前后读数正是
+    写卡片最需要的两样东西。少了它们，这张清单又变回「回去翻台账」。
+    """
+    debts = campaign.harvest_debt(_harvest_state([
+        {"decision": "D0.1", "verdict": "accept", "gain": 1.30,
+         "kb_admissible": True,
+         "mechanism": {"status": "verified", "reason": "r", "lines": [{
+             "id": "M1", "label": "SUPPLY_KEEPUP",
+             "expr": "msprof:ResourceConflictRatio.csv:aiv_mte2_wait_ratio < 4.2",
+             "channel": "msprof:ResourceConflictRatio.csv:aiv_mte2_wait_ratio",
+             "previous": 4.2, "actual": 1.1, "verified": True}]}},
+    ]))
+    text = campaign.render_harvest(debts)
+    assert "aiv_mte2_wait_ratio < 4.2" in text
+    assert "4.2 → 1.1" in text

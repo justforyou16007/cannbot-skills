@@ -953,3 +953,94 @@ def test_open_question_narrows_once_cores_are_measured(tmp_path):
     assert "启动开销与核间等待各占多少" in questions
     whys = " ".join(q["why_unresolvable"] for q in sig["open_questions"])
     assert "逐核分布已测" in whys
+
+
+# ---------------------------------------------------------------------------
+# 单元格解析的第三态
+#
+# safe_float 原来只有两态：有数，或 None。而 None 被当成「没采到」——
+# 这对 "N/A"（msprof 明确表示该指标不适用）是对的，对 "12.3abc" 就不对了。
+#
+# 两者该做的事完全不同，而它们在签名里长得一模一样（value=None、
+# present=false）。于是下游读到「这次没采到」，而真相是那一列的量纲或格式
+# 和本工具以为的不一样 —— 同一份 CSV 里别的列照样被读走了。
+# ---------------------------------------------------------------------------
+
+def test_parse_cell_three_states():
+    assert sp.parse_cell("3.14") == (3.14, None)
+    assert sp.parse_cell("N/A") == (None, None)
+    assert sp.parse_cell("") == (None, None)
+    assert sp.parse_cell(None) == (None, None)
+    value, problem = sp.parse_cell("12.3abc")
+    assert value is None
+    assert problem == sp.UNPARSEABLE
+
+
+def test_safe_float_keeps_its_two_state_contract():
+    """老调用点不关心第三态，行为不变。"""
+    assert sp.safe_float("3.14") == 3.14
+    assert sp.safe_float("N/A") is None
+    assert sp.safe_float("12.3abc") is None
+
+
+def test_reader_records_unparseable_columns():
+    reader = sp.Reader(
+        {"aiv_mte2_ratio": "<overflow>"},
+        {"aiv_mte2_ratio": "PipeUtilization"})
+    value, channel = reader.number("aiv_mte2_ratio")
+    assert value is None and channel is None
+    assert len(reader.unparseable) == 1
+    assert reader.unparseable[0]["column"] == "aiv_mte2_ratio"
+    assert "<overflow>" in reader.unparseable[0]["raw"]
+
+
+def test_reader_does_not_record_proper_missing_values():
+    """空值与 N/A 是正常的缺失标记，不该进异常清单。"""
+    reader = sp.Reader(
+        {"a": "N/A", "b": "", "c": "-"}, {"a": "X", "b": "X", "c": "X"})
+    reader.number("a", "b", "c")
+    assert reader.unparseable == []
+
+
+def test_reader_falls_through_to_the_next_candidate_column():
+    """一列读不动时继续试下一个候选列 —— 但那次失败仍要记下来。
+
+    列名在不同 msprof 版本下有前缀差异，所以每个逻辑量给一组候选。
+    读不动第一个就整条放弃会让一次版本差异变成一个缺失字段。
+    """
+    reader = sp.Reader(
+        {"aiv_x": "坏的", "aic_x": "7.5"},
+        {"aiv_x": "M", "aic_x": "M"})
+    value, channel = reader.number("aiv_x", "aic_x")
+    assert value == 7.5
+    assert channel is not None and "aic_x" in channel
+    assert len(reader.unparseable) == 1      # 失败仍被记下
+
+
+def test_unparseable_column_withholds_the_architecture_hypothesis():
+    """这一条要阻塞，不是告警。
+
+    解析不动的字段在签名里和「没采到」一模一样。放行等于让一个**读错了**
+    的字段伪装成一个缺失字段 —— 而探针的全部职责就是不让这种降级发生。
+    """
+    reader = sp.Reader(
+        {"aiv_mte2_ratio": "坏数据"}, {"aiv_mte2_ratio": "PipeUtilization"})
+    reader.number("aiv_mte2_ratio")
+    trust = sp.check_trust(reader, [], None, None,
+                                        assume_no_dvfs=True)
+    assert trust["trustworthy"] is False
+    names = [c["name"] for c in trust["checks"]]
+    assert "cell_parse" in names
+
+
+def test_cell_parse_detail_points_at_the_column_definition():
+    """报错要指向该查什么 —— 不然这条告警只会被读成「又缺数据」。"""
+    reader = sp.Reader(
+        {"aiv_mte2_ratio": "坏数据"}, {"aiv_mte2_ratio": "PipeUtilization"})
+    reader.number("aiv_mte2_ratio")
+    trust = sp.check_trust(reader, [], None, None,
+                                        assume_no_dvfs=True)
+    detail = next(c["detail"] for c in trust["checks"]
+                  if c["name"] == "cell_parse")
+    assert "不是「没采到」" in detail
+    assert "csv_fields_reference.md" in detail

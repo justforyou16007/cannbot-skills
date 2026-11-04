@@ -110,22 +110,52 @@ class ProbeError(Exception):
 # CSV 读取
 # ---------------------------------------------------------------------------
 
+#: 单元格解析不出数时的第三种情形。
+#:
+#: safe_float 原来只有两态：有数，或 None。而 None 被当成「没采到」—— 这对
+#: "N/A"（msprof 明确表示该指标不适用）是对的，对 `"12.3abc"`、
+#: `"<overflow>"`、半截写坏的行就不对了。
+#:
+#: 两者该做的事完全不同：
+#:   没采到   正常情形。换个采集组、或这个算子本来就没有这个单元
+#:   解析不动 **异常情形**。那一列的量纲或格式和我们以为的不一样，
+#:            而同一份 CSV 里别的列照样被读走了 —— 于是签名里混着
+#:            一个我们读错了的字段，而它看起来只是「没采到」
+#:
+#: 把后者说成前者，等于把一次「工具与数据不匹配」静默降级成「这次没采」。
+#: 而探针的全部职责就是不让这种降级发生（SKILL.md 那条贯穿原则）。
+UNPARSEABLE = "unparseable"
+
+
 def safe_float(value: Any) -> Optional[float]:
-    """把 CSV 单元格转成 float。
+    """把 CSV 单元格转成 float。两态版本，给不关心解析失败的调用点。
 
     转不出来返回 None 而不是 0.0。这一条是本探针最重要的设计：
     msprof 用 "N/A" 表示该指标不适用（比如非 Mix 算子的 Mix Block Dim），
     若折成 0 会和真实的 0 混在一起，后面所有判定都跟着错。
+
+    要区分「没采到」和「解析不动」时用 parse_cell。
+    """
+    value_or_none, _ = parse_cell(value)
+    return value_or_none
+
+
+def parse_cell(value: Any) -> Tuple[Optional[float], Optional[str]]:
+    """三态解析：(数值, 问题)。
+
+      (3.14, None)          正常
+      (None, None)          没采到 —— 空、"N/A"、"-" 这类明确的不适用标记
+      (None, UNPARSEABLE)   有内容但解析不动 —— 这是异常，调用方要响亮报出来
     """
     if value is None:
-        return None
+        return None, None
     text = str(value).strip().rstrip("\t ")
     if text in ("", "N/A", "NA", "-", "null", "None"):
-        return None
+        return None, None
     try:
-        return float(text)
+        return float(text), None
     except (ValueError, TypeError):
-        return None
+        return None, UNPARSEABLE
 
 
 def read_csv_rows(path: Path) -> List[Dict[str, str]]:
@@ -483,6 +513,8 @@ class Reader:
         self.merged = merged
         self.origin = origin
         self.ratio_scale, self.ratio_scale_basis = detect_ratio_scale(merged)
+        #: 有内容但解析不动的列。由 number() 累积，组装签名时进 trust 段。
+        self.unparseable: List[Dict[str, str]] = []
 
     def ratio(self, *columns: str) -> Tuple[Optional[float], Optional[str]]:
         """取一个比例列，统一换算成百分数。
@@ -496,9 +528,24 @@ class Reader:
         return value * self.ratio_scale, channel
 
     def number(self, *columns: str) -> Tuple[Optional[float], Optional[str]]:
+        """取一个数值字段。解析不动的列记进 self.unparseable。
+
+        为什么要记而不是就地报错：一列读不动不代表整份签名不可用，但它
+        **必须被说出来** —— 不然这个字段在签名里和「没采到」长得一样，
+        而两者该做的事完全不同（见 UNPARSEABLE 的注释）。
+        调用方在组装签名时把这份清单塞进 trust 段，由那里决定扣不扣留。
+        """
         for column in columns:
             if column in self.merged:
-                value = safe_float(self.merged[column])
+                value, problem = parse_cell(self.merged[column])
+                if problem is not None:
+                    metric = self.origin.get(column, "?")
+                    self.unparseable.append({
+                        "column": column,
+                        "channel": f"msprof:{metric}.csv:{column}",
+                        "raw": str(self.merged[column])[:80],
+                    })
+                    continue
                 if value is not None:
                     metric = self.origin.get(column, "?")
                     return value, f"msprof:{metric}.csv:{column}"
@@ -544,6 +591,37 @@ def check_trust(reader: Reader, missing_metrics: List[str],
     """
     checks: List[Dict[str, Any]] = []
     blocking = False
+
+    # 解析不动的列：阻塞。
+    #
+    # 这一条要阻塞而不是告警，理由在「这个字段在签名里长什么样」：它和
+    # 「没采到」一模一样（value=None、present=false）。于是下游读到的是
+    # 「这次没采到这个指标」，而真相是**那一列的量纲或格式和我们以为的
+    # 不一样**，同一份 CSV 里别的列照样被读走了。
+    #
+    # 也就是说，签名里混着一个我们读错了的字段，而它伪装成一个缺失字段。
+    # 这正是本探针反复要堵的那种失效：把「工具与数据不匹配」静默降级成
+    # 「这次没采」。
+    if reader.unparseable:
+        blocking = True
+        columns = [item["column"] for item in reader.unparseable]
+        samples = "; ".join(f"{i['column']}={i['raw']!r}"
+                            for i in reader.unparseable[:3])
+        checks.append({
+            "name": "cell_parse", "verdict": "fail",
+            "detail": (f"{len(columns)} 列有内容但解析不出数值（{columns}）。\n"
+                       f"  样本: {samples}\n"
+                       "  这不是「没采到」—— 空值与 N/A 会被正常识别成缺失。"
+                       "有内容而读不动，说明那一列的\n"
+                       "  量纲或格式和本工具以为的不一样，而同一份 CSV 里"
+                       "别的列照样被读走了。\n"
+                       "  于是签名里混着一个读错了的字段，它伪装成一个缺失"
+                       "字段 —— 所以这里扣留全部架构假设，\n"
+                       "  先确认 msprof 版本与列定义（见 ops/ops-profiling 的 "
+                       "csv_fields_reference.md）。"),
+            "channel": reader.unparseable[0]["channel"],
+            "unparseable": reader.unparseable,
+        })
 
     current, cur_ch = reader.number("Current Freq", "current_freq")
     rated, rated_ch = reader.number("Rated Freq", "rated_freq")
@@ -1480,13 +1558,21 @@ def build_signature(prof_dir: Optional[Path], archive_dir: Optional[Path],
     launch = extract_launch(reader)
     pipeline = extract_pipeline(reader)
     stalls = extract_stalls(reader)
-    # 可信度检查要看停顿列取到没有，所以必须排在 extract_stalls 之后
-    trust = check_trust(reader, all_missing, selection, stalls, assume_no_dvfs)
     memory = extract_memory(reader, min_gm_bytes)
     cache = extract_cache(reader)
     exposure = compute_exposure(launch)
     role_exposure = compute_role_exposure(launch, pipeline, exposure)
     core_balance = compute_core_balance(archive_dir)
+
+    # 可信度检查排在**全部**取数之后。
+    #
+    # 两个理由，后一个是这次挪位置的原因：
+    #   它要看停顿列取到没有          → 必须在 extract_stalls 之后
+    #   它要看哪些列解析不动          → 必须在**最后一次** reader.number()
+    #                                   之后，否则 memory / cache 两段里
+    #                                   读出的解析失败它看不见，而那正是
+    #                                   搬运量与命中率所在的两段
+    trust = check_trust(reader, all_missing, selection, stalls, assume_no_dvfs)
 
     resolved_name, name_channel = reader.text("Op Name", "op_name")
 

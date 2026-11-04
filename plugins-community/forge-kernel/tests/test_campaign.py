@@ -3858,3 +3858,293 @@ def test_structure_report_still_overrides_with_the_same_attribution():
                   structure_report=structure_report("fail"))
     assert entry["mechanism"]["attribution"] == "implementation"
     assert state["implementation_failures"]["consecutive"] == 1
+
+
+# ---------------------------------------------------------------------------
+# 围栏的第三态：阻断项为空，但有未说明的通道
+# ---------------------------------------------------------------------------
+
+def test_clean_with_channels_still_raises_best():
+    """通道项是「请说明」，不是「你转发了」。
+
+    把它当阻断项会让一批正当实现过不去，而人会反射性地整条豁免掉围栏 ——
+    那之后真正的转发也无人把守。
+    """
+    state = fresh_state()
+    entry = _verified_accept(state, fence_report={
+        "findings": [], "channels": [{"rule": "F-FFI"}], "files_scanned": 3})
+    assert entry["fence"]["status"] == "clean_with_channels"
+    assert entry["counts_toward_best"] is True
+
+
+def test_clean_with_channels_is_recorded_distinctly():
+    """「阻断项为空」和「围栏干净」不是一回事，台账要分得开。
+
+    读成 clean 等于让那条路永久免检 —— 而它正是按算子名写的规则看不见的
+    那条路。
+    """
+    verdict = campaign.judge_fence({
+        "findings": [], "channels": [{"rule": "F-DLOPEN"},
+                                     {"rule": "F-OPAPI-SO"}],
+        "files_scanned": 4})
+    assert verdict["status"] == "clean_with_channels"
+    assert verdict["rules"] == ["F-DLOPEN", "F-OPAPI-SO"]
+    assert "转发不需要写出名字" in verdict["reason"]
+
+
+def test_truly_clean_fence_has_no_channel_note():
+    verdict = campaign.judge_fence({"findings": [], "channels": [],
+                                    "files_scanned": 3})
+    assert verdict["status"] == "clean"
+
+
+def test_blocking_findings_win_over_channels():
+    """两者并存时按阻断处理 —— 阻断项是转发的标志，不是一条待说明的路。"""
+    verdict = campaign.judge_fence({
+        "findings": [{"rule": "F-ACLNN"}],
+        "channels": [{"rule": "F-FFI"}], "files_scanned": 3})
+    assert verdict["status"] == "violated"
+
+
+# ---------------------------------------------------------------------------
+# 课程表与台账对账
+#
+# 两份文件此前**从不互看**：课程表自己写 status: PASS，台账自己记
+# mechanism.status。于是会出现一个很具体的情形 ——
+#   课程表：M1 机制行 status=PASS
+#   台账：  那一轮的 mechanism.status=refuted
+# 读课程表的人得到「这条机制已经核实」，而唯一做过核验的那次说的是相反的话。
+# 课程表是三个产物里唯一会被下一轮当作**前提**的那个。
+# ---------------------------------------------------------------------------
+
+def test_pass_line_contradicting_a_refuted_mechanism_is_reported():
+    state, doc = misread_reference()
+    entry = apply(state, result(speedup=1.30), "D0.1",
+                  milestone_doc=doc, signature=signature(30.0))
+    assert entry["mechanism"]["status"] in ("refuted", "vacuous")
+    coupling = entry["gate_coupling"]
+    assert coupling["claimed_pass"] == ["M1"]
+    assert "说相反的话" in coupling["detail"]
+
+
+def test_verified_mechanism_produces_no_contradiction():
+    state = fresh_state()
+    entry = apply(state, result(speedup=1.30), "D0.1",
+                  milestone_doc=milestone(), signature=signature(0.1))
+    assert entry["mechanism"]["status"] == "verified"
+    assert entry.get("gate_coupling") is None
+
+
+def test_unknown_mechanism_is_not_a_contradiction():
+    """unknown 不构成「相反的话」—— 它只是没核验过。
+
+    把它也报成矛盾会让每一轮没带 --signature 的 record 都多一条告警，
+    而那条告警指不出任何该修的东西。
+    """
+    state = fresh_state()
+    entry = apply(state, result(speedup=1.30), "D0.1")
+    assert entry.get("gate_coupling") is None
+
+
+def test_contradiction_says_which_side_to_fix():
+    """报出矛盾而不说该修哪一侧，等于把判断又推回给人。
+
+    该修哪一侧完全由归因决定，而归因本轮已经算出来了。
+    """
+    state, doc = misread_reference()
+    entry = apply(state, result(speedup=1.30), "D0.1",
+                  milestone_doc=doc, signature=signature(30.0))
+    detail = entry["gate_coupling"]["detail"]
+    assert "reopen" in detail
+    assert "不要改课程表" in detail or "原样不动" in detail
+
+
+def test_contradiction_check_does_not_rewrite_the_milestone():
+    """record 不该去写课程表 —— 那是架构层的产物。
+
+    AGENTS.md 的禁止项里写着编排层与编码层都不许改 milestone。对账只报告。
+    """
+    import copy  # noqa: PLC0415
+    state, doc = misread_reference()
+    before = copy.deepcopy(doc)
+    apply(state, result(speedup=1.30), "D0.1",
+          milestone_doc=doc, signature=signature(30.0))
+    assert doc == before
+
+
+def test_milestone_without_pass_lines_has_nothing_to_contradict():
+    state, doc = misread_reference()
+    for m in doc["milestones"]:
+        for line in m["gate"]["mechanism_lines"]:
+            line["status"] = "OPEN"
+    entry = apply(state, result(speedup=1.30), "D0.1",
+                  milestone_doc=doc, signature=signature(30.0))
+    assert entry.get("gate_coupling") is None
+
+
+# ---------------------------------------------------------------------------
+# 课程表修订的台账与回退目标
+# ---------------------------------------------------------------------------
+
+def _reopen(state_file, milestone_file, **kw):
+    return campaign.cmd_reopen(reopen_args(state_file, milestone_file, **kw))
+
+
+def test_reopen_records_a_patch_entry(tmp_path):
+    """重开是一次课程表修订。不记成 patch，这件事在台账里完全无痕。"""
+    state_file, milestone_file = reopen_fixture(tmp_path)
+    assert _reopen(state_file, milestone_file, force=True,
+                   reason="分段切分轴判错了") == 0
+    state = json.loads(state_file.read_text())
+    patch = next(e["patch"] for e in state["ledger"] if e.get("patch"))
+    assert patch["locus"] == "D0.1"
+    assert patch["direction"] == "分段切分轴判错了"
+    assert patch["outcome"] == "pending"
+    assert patch["milestone_sha_before"]
+
+
+def test_patch_outcome_is_backfilled_when_the_reopen_pays_off(tmp_path):
+    """只记投入不记产出的账，用起来比没有更糟。
+
+    不回填的话 outcome 永远停在 pending，于是 status 会把一次**成功的**
+    修订也列进「已试过的方向」去劝退下一代。
+    """
+    state_file, milestone_file = reopen_fixture(tmp_path)
+    _reopen(state_file, milestone_file, force=True, reason="改拓扑")
+    state = campaign.load_state(state_file)
+    apply(state, result(speedup=1.40), "D0.1",
+          milestone_doc=milestone(), signature=signature(0.1))
+    patch = next(e["patch"] for e in state["ledger"] if e.get("patch"))
+    assert patch["outcome"] == "accepted"
+    assert patch["closed_by_gain"] == pytest.approx(1.40)
+
+
+def test_patch_outcome_stays_pending_without_a_new_lower_bound(tmp_path):
+    """没抬高 best 就不算这次修订成功 —— 它还在待观察。"""
+    state_file, milestone_file = reopen_fixture(tmp_path)
+    _reopen(state_file, milestone_file, force=True, reason="改拓扑")
+    state = campaign.load_state(state_file)
+    apply(state, result(speedup=1.001), "D0.1",
+          milestone_doc=milestone(), signature=signature(0.1))
+    patch = next(e["patch"] for e in state["ledger"] if e.get("patch"))
+    assert patch["outcome"] == "pending"
+
+
+def test_apply_result_returns_the_new_entry_not_a_ledger_row(tmp_path):
+    """回填那段用过 `for entry in ...`，把函数正在构造的 entry 遮蔽掉了。
+
+    这类遮蔽不报错，只是悄悄把返回值换成台账里的一条旧记录 —— 而调用方
+    拿它去读 mechanism / verdict。
+    """
+    state_file, milestone_file = reopen_fixture(tmp_path)
+    _reopen(state_file, milestone_file, force=True, reason="改拓扑")
+    state = campaign.load_state(state_file)
+    entry = apply(state, result(speedup=1.40), "D0.1",
+                  milestone_doc=milestone(), signature=signature(0.1))
+    assert entry["decision"] == "D0.1"
+    assert entry["verdict"] == campaign.VERDICT_ACCEPT
+    assert entry is state["ledger"][-1]
+
+
+def test_rollback_target_is_the_last_verified_artifact_outside_the_closure():
+    """重开把下游台账作废了，但**工作树还在原地**。
+
+    编码层如果从当前树接着改，它就是在一个已被判定建立在错假设上的实现
+    之上继续叠加，而归因会把后面的结果算到新架构假设头上。
+    """
+    state = fresh_state()
+    state["ledger"] = [
+        {"generation": 0, "decision": "D0.1", "verdict": "accept",
+         "gain": 1.10, "counts_toward_best": True, "artifact_sha": "aaa111"},
+        {"generation": 0, "decision": "D0.2", "verdict": "accept",
+         "gain": 1.20, "counts_toward_best": True, "artifact_sha": "bbb222"},
+    ]
+    target = campaign.rollback_target(state, {"D0.2"})
+    assert target is not None
+    assert target["artifact_sha"] == "aaa111"       # D0.2 在作废范围内
+
+
+def test_rollback_target_skips_unverified_rounds():
+    """只是变快了的产物自己就解释不清，不能当回退起点。"""
+    state = fresh_state()
+    state["ledger"] = [
+        {"generation": 0, "decision": "D0.1", "verdict": "accept_unverified",
+         "gain": 1.30, "counts_toward_best": False, "artifact_sha": "aaa111"},
+    ]
+    assert campaign.rollback_target(state, set()) is None
+
+
+def test_rollback_target_skips_rounds_without_a_code_identity():
+    """回退目标必须是一份能被找回来的东西。"""
+    state = fresh_state()
+    state["ledger"] = [
+        {"generation": 0, "decision": "D0.1", "verdict": "accept",
+         "gain": 1.10, "counts_toward_best": True},      # 没有 artifact_sha
+    ]
+    assert campaign.rollback_target(state, set()) is None
+
+
+def test_rollback_target_does_not_cross_generations():
+    state = fresh_state()
+    state["generation"] = 1
+    state["ledger"] = [
+        {"generation": 0, "decision": "D0.1", "verdict": "accept",
+         "gain": 1.10, "counts_toward_best": True, "artifact_sha": "aaa111"},
+    ]
+    assert campaign.rollback_target(state, set()) is None
+
+
+# ---------------------------------------------------------------------------
+# 墙钟预算
+#
+# 次数预算挡不住一种很常见的消耗：每轮都很快、但轮数没涨而时间在走
+# （构建失败重试、环境排障、等卡）。那些都不消耗 used。
+# ---------------------------------------------------------------------------
+
+def _state_started_hours_ago(hours, wall_cap=None):
+    from datetime import datetime, timedelta, timezone  # noqa: PLC0415
+    state = fresh_state()
+    state["created_at"] = (datetime.now(timezone.utc)
+                           - timedelta(hours=hours)).isoformat()
+    if wall_cap is not None:
+        state["budget"]["max_wall_hours"] = wall_cap
+    return state
+
+
+def test_elapsed_hours_is_computed_from_created_at():
+    state = _state_started_hours_ago(3.0)
+    elapsed = campaign._elapsed_hours(state)
+    assert elapsed is not None and 2.9 < elapsed < 3.1
+
+
+def test_elapsed_hours_is_none_when_the_timestamp_is_unusable():
+    """返回 0 会让这道闸静默失效，而失效时输出照样是「预算充裕」。"""
+    assert campaign._elapsed_hours({}) is None
+    assert campaign._elapsed_hours({"created_at": "前天"}) is None
+    assert campaign._elapsed_hours({"created_at": ""}) is None
+
+
+def test_wall_budget_stops_the_campaign():
+    state = _state_started_hours_ago(5.0, wall_cap=4.0)
+    campaign._advance_state(state, None)
+    assert state["state"] == campaign.STATE_STOPPED
+    assert "墙钟预算耗尽" in state["stop_reason"]
+
+
+def test_wall_budget_says_the_number_is_an_upper_bound():
+    """按 created_at 算差把停机时间也算进去了 —— 这件事要说出来。"""
+    state = _state_started_hours_ago(5.0, wall_cap=4.0)
+    campaign._advance_state(state, None)
+    assert "上界" in state["stop_reason"]
+
+
+def test_wall_budget_does_not_fire_below_the_cap():
+    state = _state_started_hours_ago(1.0, wall_cap=4.0)
+    campaign._advance_state(state, None)
+    assert state["state"] != campaign.STATE_STOPPED
+
+
+def test_no_wall_cap_means_no_wall_limit():
+    state = _state_started_hours_ago(1000.0)
+    campaign._advance_state(state, None)
+    assert state["state"] != campaign.STATE_STOPPED

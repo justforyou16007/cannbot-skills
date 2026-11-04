@@ -613,6 +613,84 @@ def collect_mechanism_lines(milestone_doc: Dict[str, Any],
     return []
 
 
+def milestone_of_decision(milestone_doc: Dict[str, Any],
+                          decision_id: str) -> Optional[Dict[str, Any]]:
+    """这条决策属于哪个 milestone。"""
+    for milestone in milestone_doc.get("milestones", []) or []:
+        if not isinstance(milestone, dict):
+            continue
+        ids = {d.get("id") for d in milestone.get("decisions", []) or []
+               if isinstance(d, dict)}
+        if decision_id in ids:
+            return milestone
+    return None
+
+
+def check_gate_coupling(milestone_doc: Optional[Dict[str, Any]],
+                        decision_id: str,
+                        mechanism: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """课程表里标 PASS 的机制行，和本轮实测的机制结论对不对得上。
+
+    此前这两份文件**从不对账**：课程表自己写 `status: PASS`，台账自己记
+    `mechanism.status`，两边各说各话。于是会出现一个很具体的情形 ——
+
+      课程表：M1 机制行 status=PASS，closed_by 指着 job 7
+      台账：  那一轮的 mechanism.status=refuted
+
+    读课程表的人（下一轮的编码层、做 harvest 的人、看 status 的人）得到的是
+    「这条机制已经核实」，而唯一做过核验的那次说的是相反的话。课程表是三个
+    产物里**唯一会被下一轮当作前提**的那个，所以这个不一致不是记错一笔账，
+    是让后续所有决策建立在一个假前提上。
+
+    这里只报告，不改文件 —— `record` 不该去写课程表（那是架构层的产物，
+    编码层与编排层都不许改，`AGENTS.md` 的禁止项里写着）。报告进台账，
+    `status` 据此提示该去修哪一侧。
+
+    返回 None 表示没有不一致（或无从对账）。
+    """
+    if milestone_doc is None:
+        return None
+    status = mechanism.get("status")
+    if status in (None, "verified"):
+        # verified 与课程表的 PASS 一致；unknown 不构成「相反的话」。
+        return None
+    if status == "unknown":
+        return None
+
+    milestone = milestone_of_decision(milestone_doc, decision_id)
+    if milestone is None:
+        return None
+    gate = milestone.get("gate") or {}
+    if not isinstance(gate, dict):
+        return None
+
+    claimed_pass = [
+        str(line.get("id"))
+        for line in gate.get("mechanism_lines", []) or []
+        if isinstance(line, dict) and str(line.get("status", "")).upper() == "PASS"
+    ]
+    if not claimed_pass:
+        return None
+
+    return {
+        "milestone": milestone.get("id", "<无 id>"),
+        "claimed_pass": claimed_pass,
+        "measured_status": status,
+        "detail": (
+            f"课程表的 {milestone.get('id')} 里机制行 {claimed_pass} 标着 "
+            f"PASS，而本轮实测把机制判为 {status}。\n"
+            "    两份文件在说相反的话，而课程表是唯一会被下一轮当作**前提**"
+            "的那个产物 ——\n"
+            "    读它的人会得到「这条机制已经核实」，于是后续决策建立在一个"
+            "假前提上。\n"
+            "    该修哪一侧取决于归因："
+            f"{mechanism.get('attribution') or '未分流'}。\n"
+            "      implementation → 修实现，课程表原样不动（那条 PASS 是"
+            "对参考的正确读法）\n"
+            "      curriculum     → reopen 那条决策，PASS 跟着一起作废"),
+    }
+
+
 def judge_structure(structure_report: Optional[Dict[str, Any]]
                     ) -> Dict[str, Any]:
     """结构核验的裁决：声称的结构在不在。
@@ -701,6 +779,31 @@ def judge_fence(fence_report: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             "reason": (f"围栏命中 {len(findings)} 处（规则 {rules}）。"
                        "候选转发给了参考实现或厂商实现 —— "
                        "这一轮的加速比不是它自己挣来的"),
+        }
+
+    # 「阻断项为空」和「围栏干净」不是一回事。
+    #
+    # 通道项（dlopen / ctypes / 子进程 / 动态 import / 任意 aclnn 接口）不自动
+    # 判不通过 —— 正当实现里也会出现。但它们是**按算子名写的那五条规则看不见
+    # 的那条路**：`ctypes.CDLL("libopapi.so").aclnnXxx` 里那个名字是运行时拼
+    # 出来的字符串，五条规则全绿而候选一行 kernel 都没写。
+    #
+    # 所以这里给第三态而不是直接 clean：裁决仍然放行（不压 best），但台账里
+    # 留下「这一轮有未说明的通道」。把它读成 clean 等于让那条路永久免检。
+    channels = fence_report.get("channels")
+    if isinstance(channels, list) and channels:
+        rules = sorted({str(f.get("rule")) for f in channels
+                        if isinstance(f, dict)})
+        return {
+            "status": "clean_with_channels",
+            "rules": rules,
+            "count": len(channels),
+            "reason": (f"围栏的阻断项为空，但有 {len(channels)} 处"
+                       f"**能通向**厂商实现的路（{rules}）。\n"
+                       "    这些构造在正当实现里也会出现，所以不判不通过；"
+                       "但按算子名写的规则看不见它们 ——\n"
+                       "    转发不需要写出名字。请在 milestone 或经验卡片里"
+                       "说明每条通道通向哪里"),
         }
     return {"status": "clean",
             "reason": f"围栏跑过且干净（扫了 "
@@ -1271,6 +1374,47 @@ def dependents_closure(milestone_doc: Dict[str, Any], root: str) -> Set[str]:
     return out
 
 
+def rollback_target(state: Dict[str, Any],
+                    invalidated: Set[str]) -> Optional[Dict[str, Any]]:
+    """重开之后，实现该从哪一份产物接着做。
+
+    为什么要指出来：重开把整条下游的台账作废了，但**工作树还在原地** ——
+    上面带着那些刚被作废的改动。编码层如果从当前树接着改，它就是在一个
+    已经被判定建立在错假设上的实现之上继续叠加，而归因会把后面的结果算到
+    新架构假设头上。
+
+    取「作废范围之外、最后一个机制已核实的产物」：
+      作废范围之外   在范围内的那些正是被判定不可信的
+      机制已核实     `counts_toward_best` 为真的那些 —— 只是变快了的不算，
+                     那种产物自己就解释不清
+      最后一个       时间上最近的，也就是走得最远的那个起点
+
+    找不到就返回 None，调用方据此说「从参考基线重新开始」。不要在这里编一个
+    看起来合理的回退点 —— 一个错的回退目标比没有目标更糟。
+    """
+    best_entry: Optional[Dict[str, Any]] = None
+    for entry in generation_entries(state):
+        if entry.get("invalidated"):
+            continue
+        if entry.get("decision") in invalidated:
+            continue
+        if not entry.get("counts_toward_best"):
+            continue
+        if not entry.get("artifact_sha"):
+            # 没有代码身份的记录指不出任何具体产物。它可以是个合格的读数，
+            # 但不能当回退目标 —— 回退目标必须是一份能被找回来的东西。
+            continue
+        best_entry = entry
+    if best_entry is None:
+        return None
+    return {
+        "decision": best_entry.get("decision"),
+        "artifact_sha": best_entry.get("artifact_sha"),
+        "gain": float(best_entry.get("gain") or 1.0),
+        "at": best_entry.get("at"),
+    }
+
+
 def graph_exhausted(state: Dict[str, Any],
                     milestone_doc: Optional[Dict[str, Any]]) -> bool:
     """决策图是否走穷：每条决策都试过，但还没达标。
@@ -1416,6 +1560,26 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _elapsed_hours(state: Dict[str, Any]) -> Optional[float]:
+    """自 init 起过了多少小时。算不出返回 None。
+
+    算不出的原因可以是老 state 没有 created_at、或者那个字段被手改坏了。
+    两种都返回 None 而不是 0 —— 返回 0 会让墙钟预算这道闸静默失效，
+    而失效时输出照样是「预算充裕」。
+    """
+    raw = state.get("created_at")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        started = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=timezone.utc)
+    delta = datetime.now(timezone.utc) - started
+    return delta.total_seconds() / 3600.0
+
+
 def load_state(path: Path) -> Dict[str, Any]:
     try:
         doc = json.loads(path.read_text(encoding="utf-8"))
@@ -1444,7 +1608,8 @@ def new_state(operator: str, input_shape: str, arch: str,
               target_gain: float, stagnation_threshold: int,
               budget: Optional[int] = None,
               reference_snapshot: Optional[Dict[str, float]] = None,
-              device: Optional[Dict[str, Any]] = None
+              device: Optional[Dict[str, Any]] = None,
+              wall_hours: Optional[float] = None
               ) -> Dict[str, Any]:
     """建立 campaign 状态。
 
@@ -1470,7 +1635,8 @@ def new_state(operator: str, input_shape: str, arch: str,
         # 不可比，而这些不可比是静默的 —— 数字照常产出，只是错了。
         "device": device or {"device_id": None},
         "target_gain": target_gain,
-        "budget": {"max_records": budget, "used": 0},
+        "budget": {"max_records": budget, "used": 0,
+                   "max_wall_hours": wall_hours},
         "state": STATE_ANALYZE,
         "cursor": {"milestone": None, "decision": None, "iteration": 0},
         "stagnation": {
@@ -1921,6 +2087,12 @@ def apply_result(state: Dict[str, Any], doc: Dict[str, Any], decision: str,
                 mechanism["compared_against"] = baseline_label
                 entry["mechanism"] = mechanism
 
+                # 课程表与台账对账。两份文件此前从不互看。
+                coupling = check_gate_coupling(
+                    milestone_doc, decision, mechanism)
+                if coupling is not None:
+                    entry["gate_coupling"] = coupling
+
                 # 围栏与设备占比：两道「这个数算不算数」的前置条件。
                 #
                 # 它们和机制核验是不同性质的东西。机制核验问「变快的原因是不是
@@ -1929,7 +2101,10 @@ def apply_result(state: Dict[str, Any], doc: Dict[str, Any], decision: str,
                 # accept_unverified 那条路（那条路的含义是「数是真的，解释
                 # 不清」），而是直接压住 counts_toward_best。
                 blockers: List[str] = []
-                if fence["status"] == "clean":
+                if fence["status"] in ("clean", "clean_with_channels"):
+                    # 通道项不压 best。它是「请说明」，不是「你转发了」——
+                    # 把它当阻断项会让一批正当实现过不去，而人会反射性地
+                    # 整条豁免掉围栏，那之后真正的转发也无人把守。
                     pass
                 elif fence["status"] == "violated":
                     # 转发是实现缺陷，不是课程表缺陷 —— 归因方向同结构核验。
@@ -2052,6 +2227,7 @@ def apply_result(state: Dict[str, Any], doc: Dict[str, Any], decision: str,
         # 只有机制核实过的改动才抬高 best。未核实的保留但不计入 ——
         # 否则 promote 时会把一个解释不清的结果封成下一代的参考。
         raised_best = False
+        entry_gain_for_patch = entry.get("gain")
         if entry["counts_toward_best"] and entry["gain"] is not None:
             best = state.setdefault("best", {})
             if entry["gain"] > float(best.get("gain", 1.0)):
@@ -2069,6 +2245,20 @@ def apply_result(state: Dict[str, Any], doc: Dict[str, Any], decision: str,
             stag["since_improvement"] = 0
             # 上一次重开带来了新下界 —— 它不是徒劳的。
             state.setdefault("reopen", {})["fruitless"] = 0
+            # 把那次课程表修订的结果回填。
+            #
+            # 不回填的话 outcome 永远停在 pending，于是 status 会把一次
+            # **成功的**修订也列进「已试过的方向」去劝退下一代 —— 一张
+            # 只记投入不记产出的账，用起来比没有更糟。
+            # 循环变量**不能**叫 entry —— 它会遮蔽本函数正在构造的那个
+            # entry，于是函数返回台账里的一条旧记录。这类遮蔽不报错，
+            # 只是悄悄换掉返回值。
+            for past in reversed(state.get("ledger", [])):
+                patch = past.get("patch")
+                if isinstance(patch, dict) and patch.get("outcome") == "pending":
+                    patch["outcome"] = "accepted"
+                    patch["closed_by_gain"] = entry_gain_for_patch
+                    break
         else:
             stag["since_improvement"] = int(stag.get("since_improvement", 0)) + 1
     elif measured:
@@ -2174,6 +2364,28 @@ def _advance_state(state: Dict[str, Any],
         state["stop_reason"] = (
             f"预算耗尽：已用 {budget['used']}/{cap} 次评测。"
             "继续请用 set-budget 提高上限")
+        return
+
+    # 墙钟预算。
+    #
+    # 次数预算挡不住一种很常见的消耗：每轮都很快、但轮数没涨而时间在走
+    # （构建失败重试、环境排障、等卡）。那些都不消耗 `used`，于是一个跑了
+    # 两天的 campaign 看起来预算还很充裕。
+    #
+    # 没有常驻进程，所以只能按 `created_at` 算差 —— 这是个近似：它把中间
+    # 停机的时间也算进去了。取这个近似而不是不做，理由是它的误差方向是
+    # **保守**的（报得比实际机时多，于是提前提醒），而反过来会漏。
+    elapsed = _elapsed_hours(state)
+    wall_cap = budget.get("max_wall_hours")
+    if (isinstance(wall_cap, (int, float)) and wall_cap > 0
+            and elapsed is not None and elapsed >= wall_cap):
+        state["state"] = STATE_STOPPED
+        state["stop_reason"] = (
+            f"墙钟预算耗尽：自 init 起已过 {elapsed:.1f} 小时"
+            f"（上限 {wall_cap}）。\n"
+            "  注意这个数按 created_at 算差，含中间停机的时间 —— "
+            "它是机时的上界，不是机时本身。\n"
+            "  继续请用 set-budget --max-wall-hours 提高上限")
         return
 
     reasons: List[Dict[str, str]] = []
@@ -2711,6 +2923,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         stagnation_threshold=args.stagnation_threshold, budget=args.budget,
         reference_snapshot=reference_snapshot,
         device={"device_id": args.device_id},
+        wall_hours=args.wall_hours,
     )
     if args.milestone_path:
         state["milestone_path"] = str(Path(args.milestone_path).resolve())
@@ -3250,6 +3463,21 @@ def cmd_record(args: argparse.Namespace) -> int:
             print("        **不要**改课程表：改措辞不会让一个「不在」"
                   "变成「在」。")
 
+    mech_for_attr = entry.get("mechanism")
+    if isinstance(mech_for_attr, dict) and mech_for_attr.get("attribution"):
+        labels = {"implementation": "实现没做到（课程表读对了参考）",
+                  "curriculum": "课程表读错了参考"}
+        attribution = mech_for_attr["attribution"]
+        print(f"\n  归因：{labels.get(attribution, attribution)}")
+        if attribution == "implementation":
+            print("        补一张经验卡片记下这个退化回退，不要改课程表。")
+        else:
+            print("        reopen 那条决策 —— 在一个错的前提底下调实现是白费。")
+
+    coupling = entry.get("gate_coupling")
+    if isinstance(coupling, dict):
+        print(f"\n  课程表对账：{coupling['detail']}", file=sys.stderr)
+
     mechanism = entry.get("mechanism")
     if isinstance(mechanism, dict) and mechanism.get("lines"):
         print(f"\n  机制核验（做差基线：{mechanism.get('compared_against', '无')}）:")
@@ -3390,18 +3618,33 @@ def cmd_reopen(args: argparse.Namespace) -> int:
     state.pop("stall_reason", None)
     state.pop("stall_reasons", None)
     state.pop("stall_detail", None)
+    rollback = rollback_target(state, invalidated)
     state.setdefault("ledger", []).append({
         "at": _now(),
         "generation": state.get("generation", 0),
         "input_shape": state.get("input_shape"),
         "decision": args.decision,
         "gain": None,
+        # 重开是一次**课程表修订**，所以记成 patch 类条目而不只是一行 reason。
+        # 不记的话，「这条决策被改过、从哪个课程表指纹改到哪个、结果如何」
+        # 在台账里完全无痕 —— 而 status 要据此把已证伪的课程表方向列出来，
+        # 否则下一代会把同一个方向原封不动再试一遍。
         "verdict": "reopen",
+        "patch": {
+            "locus": args.decision,
+            "direction": args.reason or "未填",
+            "milestone_sha_before": _milestone_fingerprint(milestone_doc),
+            "invalidated_decisions": sorted(invalidated),
+            "price": args.price or None,
+            # 结果留空，由下一次抬高 best 或下一次重开回填。
+            "outcome": "pending",
+        },
         "reason": (f"重开决策 {args.decision}；按 depends_on 反向闭包作废 "
                    f"{len(affected)} 条下游决策的 {count} 条台账记录。"
                    f"理由：{args.reason or '未填'}"),
         "invalidated_decisions": sorted(invalidated),
         "price": args.price or None,
+        "rollback_to": rollback,
         "counts_toward_best": False,
         "kb_admissible": False,
     })
@@ -3420,6 +3663,16 @@ def cmd_reopen(args: argparse.Namespace) -> int:
         print("  没有下游决策依赖它")
     print(f"  作废台账记录: {count} 条")
     print(f"  best 重算为: {best_gain:.4f}")
+    if rollback is not None:
+        print(f"\n  回退到: {rollback['artifact_sha']}"
+              f"（决策 {rollback['decision']}，增益 {rollback['gain']:.4f}）")
+        print("        这是作废范围之外、最后一个机制已核实的产物。")
+        print("        重开之后的实现应当从它开始，而不是从当前工作树 ——")
+        print("        当前树上带着那些刚被作废的改动。")
+    else:
+        print("\n  回退到: 没有可回退的产物（本代还没有机制已核实的记录，"
+              "或它们都在作废范围内）")
+        print("        从参考基线重新开始。")
     print("\n下一步: analyze — 这些决策的实现都建立在旧假设上，须重做")
     return 0
 
@@ -3460,13 +3713,26 @@ def cmd_set_budget(args: argparse.Namespace) -> int:
         print(f"错误: {exc}", file=sys.stderr)
         return 2
     budget = state.setdefault("budget", {"max_records": None, "used": 0})
-    budget["max_records"] = args.max_records
+    if args.max_records is not None:
+        budget["max_records"] = args.max_records
+    if args.max_wall_hours is not None:
+        budget["max_wall_hours"] = args.max_wall_hours
+    if args.max_records is None and args.max_wall_hours is None:
+        print("错误: 至少要给 --max-records 或 --max-wall-hours 之一",
+              file=sys.stderr)
+        return 2
     if state.get("state") == STATE_STOPPED and "预算耗尽" in str(
             state.get("stop_reason", "")):
         state["state"] = STATE_IMPLEMENT
         state.pop("stop_reason", None)
     save_state(path, state)
-    print(f"预算已设为 {args.max_records} 次评测（已用 {budget.get('used', 0)}）")
+    if args.max_records is not None:
+        print(f"预算已设为 {args.max_records} 次评测"
+              f"（已用 {budget.get('used', 0)}）")
+    if args.max_wall_hours is not None:
+        elapsed = _elapsed_hours(state)
+        used = f"{elapsed:.1f}" if elapsed is not None else "?"
+        print(f"墙钟预算已设为 {args.max_wall_hours} 小时（已过 {used}）")
     return 0
 
 
@@ -3794,10 +4060,38 @@ def cmd_status(args: argparse.Namespace) -> int:
           f"无法核验 {unver.get('streak_unknown', 0)}）")
     cap = budget.get("max_records")
     print(f"预算      {budget.get('used', 0)}/{cap if cap else '不限'}")
+    wall_cap = budget.get("max_wall_hours")
+    elapsed = _elapsed_hours(state)
+    if wall_cap or elapsed is not None:
+        used = f"{elapsed:.1f}" if elapsed is not None else "?"
+        print(f"墙钟      {used}/{wall_cap if wall_cap else '不限'} 小时"
+              + ("" if elapsed is None else
+                 "（按 created_at 算差，含停机时间 —— 是机时的上界）"))
     device = state.get("device") or {}
     if device.get("device_id") is not None:
         print(f"设备      device {device['device_id']}")
     print(f"台账条目  {len(state.get('ledger', []))}")
+
+    # 已证伪的课程表方向。
+    #
+    # 这些方向每一个都花掉了一次重开的代价（作废整条下游、best 归零）。
+    # 不列出来的话，下一代的架构层看不到它们，会把同一个方向原封不动再试
+    # 一遍 —— 而那一遍的代价和上一遍一样大。
+    refuted_patches = [
+        entry["patch"] for entry in state.get("ledger", [])
+        if isinstance(entry.get("patch"), dict)
+        and entry["patch"].get("outcome") != "accepted"
+    ]
+    if refuted_patches:
+        print(f"\n已试过的课程表修订（{len(refuted_patches)} 次）：")
+        for item in refuted_patches:
+            print(f"  · {item.get('locus')}: {item.get('direction')}"
+                  f"  [{item.get('outcome', 'pending')}]")
+            if item.get("price"):
+                print(f"      当时的定价: {item['price']}")
+        print("  这些方向每一个都花掉了一次重开的代价（作废整条下游、"
+              "best 归零）。")
+        print("  换方向之前先读一遍 —— 重试同一个方向的代价和上一次一样大。")
     print(f"\n下一步: {action['action']} — {action['reason']}")
     return 0
 
@@ -4084,6 +4378,11 @@ def build_parser() -> argparse.ArgumentParser:
                         default=DEFAULT_PHASE_TARGET_GAIN)
     p_init.add_argument("--stagnation-threshold", type=int,
                         default=DEFAULT_STAGNATION_THRESHOLD)
+    p_init.add_argument("--wall-hours", type=float, default=None,
+                        help="墙钟预算（小时，自 init 起算）。不给则不限。"
+                             "次数预算挡不住「每轮都很快但时间在走」那种"
+                             "消耗 —— 构建失败重试、环境排障、等卡都不"
+                             "消耗次数")
     p_init.add_argument("--budget", type=int, default=DEFAULT_BUDGET,
                         help=f"评测次数上限（默认 {DEFAULT_BUDGET}）。"
                              "传 0 表示不限 —— 但不限意味着循环没有任何出口，"
@@ -4228,7 +4527,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_bg = sub.add_parser("set-budget", help="设置或提高评测次数上限",
                           parents=[common])
-    p_bg.add_argument("--max-records", type=int, required=True)
+    p_bg.add_argument("--max-records", type=int, default=None)
+    p_bg.add_argument("--max-wall-hours", type=float, default=None,
+                      help="自 init 起的墙钟上限。次数预算挡不住"
+                           "「每轮都很快但时间在走」那种消耗 ——"
+                           "构建失败重试、环境排障、等卡都不消耗次数")
     p_bg.set_defaults(func=cmd_set_budget)
 
     p_promote = sub.add_parser("promote", help="封存本代产出为下一代参考",

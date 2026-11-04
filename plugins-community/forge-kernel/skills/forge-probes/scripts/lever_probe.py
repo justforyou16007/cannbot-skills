@@ -59,7 +59,7 @@ import json
 import math
 import sys
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 SCHEMA_VERSION = "1.0"
 
@@ -77,14 +77,18 @@ class LeverError(Exception):
 # ---------------------------------------------------------------------------
 
 def new_store(baseline_us: float, noise_floor_pct: float,
-              label: str = "baseline") -> Dict[str, Any]:
+              label: str = "baseline",
+              variant_hash: str = "") -> Dict[str, Any]:
     if baseline_us <= 0:
         raise LeverError("基线耗时必须为正")
     if noise_floor_pct < 0:
         raise LeverError("噪声底不能为负")
     return {
         "schema_version": SCHEMA_VERSION,
-        "baseline": {"label": label, "time_us": baseline_us},
+        # 基线的代码指纹。给了它，之后每个变体都能被核对「你真的改过吗」——
+        # 没改过的变体测出来的差值全是噪声，而那个差值会被当成价格用。
+        "baseline": {"label": label, "time_us": baseline_us,
+                     "variant_hash": variant_hash},
         "noise_floor_pct": noise_floor_pct,
         "probe_only": True,
         "warning": ("本文件记录的变体是**定价探针**，多数会产出错误结果"
@@ -116,28 +120,28 @@ def save_store(path: Path, store: Dict[str, Any]) -> None:
         raise LeverError(f"无法写入 {path}: {exc}") from exc
 
 
-def add_variant(store: Dict[str, Any], levers: List[str],
-                time_us: float, note: str = "") -> Dict[str, Any]:
-    if not levers:
-        raise LeverError("变体必须至少关联一个手段（--lever）")
-    if time_us <= 0:
-        raise LeverError("耗时必须为正")
+#: 手段的六种分类。
+#:
+#: 单项定价（「只删这一项」）只能回答「它单独值多少」。而优化循环实际要问
+#: 的是「全上之后，再动它还有没有收益」—— 这两个问题的答案可以相反。
+#:
+#: 关键的一类是 `coupled`：**单独删掉省不出时间，但别人依赖它**。只有单项
+#: 腿时，它的读数落在噪声里 → 被判「测不出来」→ 进 `not_worth_pursuing`
+#: → 工具主动告诉你不要在一个承重的方向上投入。这不是漏报，是反向报错。
+#:
+#: 分类要两条腿的读数才能给：
+#:   单项增益   只删这一项省下多少       → 它单独值多少
+#:   边际增益   全删 − 全删但留下这一项   → 别人都在的情况下它还值多少
+LEVER_CLASSES = {
+    "independent": "单独有用，全上时也仍有用 —— 可以独立规划",
+    "redundant": "单独有用，但别人已经吃掉了它的收益 —— 不要重复投入",
+    "coupled": "单独看不出收益，但别人依赖它 —— **必须保留**，"
+               "而且不能据单项读数把它判成无用",
+    "inert": "两条腿都看不出收益 —— 真的没有可测量的空间",
+    "harmful": "删掉它反而更慢 —— 它的存在改善了别的东西",
+    "unknown": "缺一条腿的测量，判不了",
+}
 
-    key = tuple(sorted(set(levers)))
-    for existing in store["variants"]:
-        if tuple(sorted(set(existing["levers"]))) == key:
-            existing["time_us"] = time_us
-            existing["note"] = note
-            return existing
-
-    entry = {"levers": sorted(set(levers)), "time_us": time_us, "note": note}
-    store["variants"].append(entry)
-    return entry
-
-
-# ---------------------------------------------------------------------------
-# 分析
-# ---------------------------------------------------------------------------
 
 def _gain_pct(baseline_us: float, time_us: float) -> float:
     """去掉某环节后省下的时间，占基线的百分比。"""
@@ -149,6 +153,137 @@ def _significant(value_pct: float, noise_pct: float) -> bool:
     if math.isclose(abs(value_pct), noise_pct, rel_tol=1e-9, abs_tol=FLOAT_TOL):
         return False
     return abs(value_pct) > noise_pct
+
+def _variant_key(levers: List[str]) -> Tuple[str, ...]:
+    return tuple(sorted(set(levers)))
+
+
+def classify_levers(store: Dict[str, Any]) -> Dict[str, Any]:
+    """两条腿合起来给分类。
+
+    `universe` 取全部变体里出现过的手段的并集 —— 也就是「这次定价一共考虑
+    了哪些环节」。边际读数需要两个变体：
+
+      V_all     手段集恰好等于 universe（「全删」）
+      V_minus_L 手段集等于 universe − {L}（「全删但留下 L」）
+
+    两者都在才算得出 L 的边际增益。缺哪个就说哪个缺，不拿单项读数顶替 ——
+    顶替正是 `coupled` 被判成 `inert` 的那条路。
+    """
+    baseline_us = float(store["baseline"]["time_us"])
+    noise = float(store["noise_floor_pct"])
+    variants = store.get("variants", [])
+
+    by_key: Dict[Tuple[str, ...], float] = {}
+    universe: Set[str] = set()
+    for entry in variants:
+        key = _variant_key(entry["levers"])
+        by_key[key] = float(entry["time_us"])
+        universe |= set(key)
+
+    all_key = tuple(sorted(universe))
+    all_gain = (_gain_pct(baseline_us, by_key[all_key])
+                if all_key in by_key else None)
+
+    out: Dict[str, Any] = {}
+    for lever in sorted(universe):
+        single_key = (lever,)
+        single_gain = (_gain_pct(baseline_us, by_key[single_key])
+                       if single_key in by_key else None)
+
+        minus_key = tuple(sorted(universe - {lever}))
+        minus_gain = (_gain_pct(baseline_us, by_key[minus_key])
+                      if minus_key in by_key else None)
+        marginal = (all_gain - minus_gain
+                    if all_gain is not None and minus_gain is not None
+                    else None)
+
+        if single_gain is not None and single_gain < 0 \
+                and _significant(single_gain, noise):
+            klass = "harmful"
+        elif single_gain is None or marginal is None:
+            klass = "unknown"
+        else:
+            single_ok = single_gain > 0 and _significant(single_gain, noise)
+            marginal_ok = marginal > 0 and _significant(marginal, noise)
+            if single_ok and marginal_ok:
+                klass = "independent"
+            elif single_ok:
+                klass = "redundant"
+            elif marginal_ok:
+                klass = "coupled"
+            else:
+                klass = "inert"
+
+        missing: List[str] = []
+        if single_gain is None:
+            missing.append(f"单项测量（--lever {lever}）")
+        if all_gain is None:
+            missing.append("全删测量（" + " ".join(
+                f"--lever {x}" for x in all_key) + "）")
+        if minus_gain is None and all_gain is not None:
+            missing.append("全删但留下它的测量（" + " ".join(
+                f"--lever {x}" for x in minus_key) + "）")
+
+        out[lever] = {
+            "lever": lever,
+            "class": klass,
+            "meaning": LEVER_CLASSES[klass],
+            "single_pct": single_gain,
+            "marginal_pct": marginal,
+            "missing_measurements": missing,
+        }
+    return {"universe": all_key, "all_pct": all_gain, "levers": out}
+
+
+def add_variant(store: Dict[str, Any], levers: List[str],
+                time_us: float, note: str = "",
+                variant_hash: str = "") -> Dict[str, Any]:
+    if not levers:
+        raise LeverError("变体必须至少关联一个手段（--lever）")
+    if time_us <= 0:
+        raise LeverError("耗时必须为正")
+
+    # 变体指纹必须与基线不同。
+    #
+    # 一个「删掉了某个环节」的变体，如果代码和基线一模一样，那它根本没被
+    # 改过 —— 测出来的差值全部是噪声。而那个差值会被当成这个环节的**价格**，
+    # 据此决定要不要在它上面投几轮迭代。
+    #
+    # 这件事在流程里很容易发生：改动写在一个没被编译进去的分支里、改完忘了
+    # 重新装 OPP、或者改的是另一个 shape 的路径。三种情形都会得到一个形状
+    # 完全正常的结果文件。
+    baseline_hash = str(store["baseline"].get("variant_hash") or "")
+    if variant_hash and baseline_hash and variant_hash == baseline_hash:
+        raise LeverError(
+            f"变体指纹与基线相同（{variant_hash[:12]}）—— 这个变体没有被真正改过。\n"
+            "  那么测出来的差值全部是噪声，而它会被当成这个环节的价格，"
+            "据此决定要不要\n"
+            "  在它上面投几轮迭代。\n"
+            "  常见原因：改动写在没被编译进去的分支里、改完忘了重装 OPP、"
+            "改的是另一个 shape 的路径。\n"
+            "  三种情形都会给出一个形状完全正常的结果文件。")
+
+    key = _variant_key(levers)
+    for existing in store["variants"]:
+        if _variant_key(existing["levers"]) == key:
+            existing["time_us"] = time_us
+            existing["note"] = note
+            if variant_hash:
+                existing["variant_hash"] = variant_hash
+            return existing
+
+    entry: Dict[str, Any] = {
+        "levers": sorted(set(levers)), "time_us": time_us, "note": note}
+    if variant_hash:
+        entry["variant_hash"] = variant_hash
+    store["variants"].append(entry)
+    return entry
+
+
+# ---------------------------------------------------------------------------
+# 分析
+# ---------------------------------------------------------------------------
 
 
 def price_levers(store: Dict[str, Any]) -> Dict[str, Any]:
@@ -238,14 +373,27 @@ def price_levers(store: Dict[str, Any]) -> Dict[str, Any]:
     dead = [s["lever"] for s in ranked
             if s["gain_pct"] <= 0 or not s["significant"]]
 
+    # 分类要两条腿，所以在这里合进来。
+    #
+    # not_worth_pursuing 据分类过滤：一个 coupled 的手段（单独看不出收益、
+    # 但别人依赖它）此前会落进这张「不要再投」的名单 —— 那不是漏报，是
+    # **反向报错**：工具主动告诉你不要在一个承重的方向上投入。
+    classes = classify_levers(store)
+    dead = [name for name in dead
+            if classes["levers"].get(name, {}).get("class") != "coupled"]
+    coupled = [name for name, info in classes["levers"].items()
+               if info["class"] == "coupled"]
+
     return {
         "baseline_us": baseline_us,
         "noise_floor_pct": noise,
         "levers": ranked,
         "couplings": couplings,
+        "classification": classes,
         "ceiling_pct": actionable[0]["gain_pct"] if actionable else 0.0,
         "actionable": [s["lever"] for s in actionable],
         "not_worth_pursuing": dead,
+        "must_keep": coupled,
         "probe_only": True,
     }
 
@@ -279,7 +427,8 @@ def cmd_add(args: argparse.Namespace) -> int:
                 print("错误: 建立基线时必须给 --noise-floor"
                       "（用 noise_floor.py 量出来的那个数）", file=sys.stderr)
                 return 2
-            store = new_store(args.baseline_us, args.noise_floor, args.label)
+            store = new_store(args.baseline_us, args.noise_floor, args.label,
+                              variant_hash=args.variant_hash or "")
             save_store(path, store)
             print(f"已建立基线 {args.baseline_us} us，噪声底 {args.noise_floor}%")
             print(f"提醒: {store['warning']}")
@@ -290,7 +439,8 @@ def cmd_add(args: argparse.Namespace) -> int:
             print("错误: 登记变体需要 --time-us", file=sys.stderr)
             return 2
         entry = add_variant(store, list(args.lever or []),
-                            args.time_us, args.note)
+                            args.time_us, args.note,
+                            variant_hash=args.variant_hash or "")
         save_store(path, store)
         gain = _gain_pct(float(store["baseline"]["time_us"]), args.time_us)
         print(f"已登记 {'+'.join(entry['levers'])}: "
@@ -330,7 +480,31 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             print(f"      {item['meaning']}")
         print()
 
+    classes = report["classification"]
+    if classes["levers"]:
+        print("— 两条腿合起来的分类 —")
+        if classes["all_pct"] is None:
+            print(f"  （缺「全删」那次测量，边际一列判不了。补：add "
+                  + " ".join(f"--lever {x}" for x in classes["universe"]) + "）")
+        for name in sorted(classes["levers"]):
+            info = classes["levers"][name]
+            single = ("   —  " if info["single_pct"] is None
+                      else f"{info['single_pct']:+6.2f}%")
+            marginal = ("   —  " if info["marginal_pct"] is None
+                        else f"{info['marginal_pct']:+6.2f}%")
+            print(f"  {name:<24} 单项 {single}  边际 {marginal}  "
+                  f"[{info['class']}]")
+            print(f"      {info['meaning']}")
+            for miss in info["missing_measurements"]:
+                print(f"      还缺: {miss}")
+        print()
+
     print("— 结论 —")
+    if report["must_keep"]:
+        print(f"  必须保留: {', '.join(report['must_keep'])}")
+        print("      单独删掉省不出时间，但别人依赖它。只看单项读数会把它")
+        print("      判成「测不出来」并列进「不要再投」—— 那不是漏报，")
+        print("      是工具主动告诉你不要在一个承重的方向上投入。")
     if report["actionable"]:
         print(f"  值得投入: {', '.join(report['actionable'])}")
         print(f"  最高上限: {report['ceiling_pct']:.2f}%"
@@ -372,6 +546,11 @@ def build_parser() -> argparse.ArgumentParser:
                        help="本变体关掉的手段，可重复给以表示组合")
     p_add.add_argument("--time-us", type=float, default=None)
     p_add.add_argument("--note", default="")
+    p_add.add_argument("--variant-hash", default=None,
+                       help="这个变体的代码指纹（campaign.py 的 "
+                            "directory_fingerprint，或 git sha）。"
+                            "与基线相同时拒绝登记 —— 没改过的变体测出来的"
+                            "差值全是噪声，而它会被当成这个环节的价格")
     p_add.add_argument("--force", action="store_true")
     p_add.set_defaults(func=cmd_add)
 

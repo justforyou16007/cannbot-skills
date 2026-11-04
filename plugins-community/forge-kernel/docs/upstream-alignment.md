@@ -124,11 +124,11 @@
 **差异性质：A（remove 腿、空操作检测、角色暴露账、第三态、采集前置）+ C（sass 静态普查、ramp/plateau/drain）**
 
 **待决策**：
-- [ ] `lever_probe` 补 `all` / `all-minus-L` 两类变体与 remove 腿，分类照抄上游六类
-- [ ] `lever_probe add` 增加必填 `--variant-hash`，与基线相同时拒绝登记
+- [x] 两条腿 + 六类分类（independent / redundant / **coupled** / inert / harmful / unknown）。`coupled` 从 `not_worth_pursuing` 剔除并单列进 `must_keep` —— 此前它会被列进「不要再投」，那不是漏报而是反向报错
+- [x] `--variant-hash`，与基线相同时拒绝登记。**没做成必填** —— 两侧任一没有指纹时不拒，否则会把老 store 与不传指纹的正当用法一起卡住
 - [x] `signature_probe` 新增 `role_exposure` 段：`exposed_us × wait_i / Σwait`，按最大项产出一条带通道的假设
 - [x] 读 `per_core_cycles.csv`，给出 `(max−min)/max` 与慢核 ID（**落在顶层 `core_balance` 键**，不在 `exposure` 段内）
-- [ ] `safe_float` 区分「字段不存在」与「解析失败」，后者响亮失败
+- [x] 新增 `parse_cell` 三态；解析不动的列**阻塞**架构假设。顺带把 `check_trust` 从「extract_stalls 之后」挪到**全部取数之后** —— 此前 memory / cache 两段里的解析失败它看不见，而那正是搬运量与命中率所在的两段
 - [ ] 新增 `probe_env` 子命令：用最小算子跑一次 msprof 并断言 `aiv_vec_bank_cflt_ratio` 这一列真的出现
 - [x] `instrument-map.md` 补 orchestration 一节，并把「没有时间线等价物」改写为「没有时间线，但有逐核 cycle」
 
@@ -176,8 +176,10 @@
 **差异性质：A（通道规则、代码身份字段）+ B（fence 进裁决、NEUTRAL）**
 
 **待决策**：
-- [ ] `fence_check` 补一组与算子名无关的通道规则（`dlopen|dlsym|ctypes|cffi|subprocess|importlib|libopapi\.so|\baclnn[A-Z]\w*`）
-- [ ] `third_party` 从 SKIP_DIRS 拿掉，或改成「不扫但禁止从它 import」
+- [x] 六条通道规则（`F-DLOPEN` / `F-FFI` / `F-OPAPI-SO` / `F-ACLNN-ANY` / `F-SUBPROCESS` / `F-DYNIMPORT`），**advisory 档**：报告但不自动判不通过。
+      分档的理由是误伤代价 —— 正当实现里也会出现这些构造（装载自己编的 .so、起子进程跑构建），
+      而一次误伤会让人 `--exempt` 整条关掉。`record` 据此给第三态 `clean_with_channels`：不压 best，但台账留痕
+- [x] `third_party` 已从 SKIP_DIRS 拿掉。它是围栏上最大的一个洞：把转发实现放进去再 import，整棵目录连扫都不扫
 - [x] `record` 新增 `--fence-report`：命中则回滚并归因实现；**没传则不抬高 best**。
       没做成硬必填 —— 硬拒会把一批正当用法一起卡住，而人会反射性地去加豁免参数，
       那和静默放行是同一件事。压住 best 既有牙齿、又不堵路：best 是 promote 封进
@@ -223,7 +225,8 @@
 **差异性质：B（裁决耦合、harness overlay）+ A（3 job 确认）**
 
 **待决策**：
-- [ ] 加裁决耦合：机制未核实时，`record` 拒绝把该 milestone 的门禁行标 PASS（现在是两份文件各说各话，从不对账）
+- [x] `check_gate_coupling`：机制判 refuted/vacuous 而课程表那条行标着 PASS 时，台账记一条 `gate_coupling` 并**说明该修哪一侧**（由归因决定）。
+      **只报告不改文件** —— record 不该去写课程表，那是架构层的产物
 - [ ] 确认复测从 2 次提到 3 次，取中位数
 - [ ] 保留两次（机时考虑）
 
@@ -276,14 +279,15 @@
 这一步 A 类最多，而且全是纯状态机逻辑。
 
 **待决策**：
-- [ ] 停滞递增判据改为「本轮没有抬高 best」，而不是「增益没超噪声底」
-- [ ] `reopen` 必填 `--price "<Δ%> via lever:<name>|probe:<path>"`，拿 `levers.json` 校验引用存在且 Δ 超噪声底
-- [ ] state 加 `reopen_fruitless` 计数，超 2 次拒绝重开（落盘，不随进程归零）
-- [ ] `dependents_closure` 的种子集加入同 `atomic_group` 成员
-- [ ] 台账加 `patch` 类条目（`locus / direction / milestone_sha_before / outcome`），`status` 把 `reverted` 的方向列为「已证伪的课程表方向」
-- [ ] `implementation_failures` 超阈值进独立的 `STATE_BLOCKED`（不走架构重入）
-- [ ] `reopen` 输出具体的回退目标（需要台账先记 artifact 哈希）
-- [ ] 墙钟预算：`record` 时按 `init` 时间戳算差（无常驻进程，只能这样近似）
+- [x] 停滞递增判据改为「本轮没有抬高 best」，而不是「增益没超噪声底」（此前已完成，勾选状态是旧的）
+- [x] `reopen` 必填 `--price "<Δ%> via lever:<name>|probe:<path>"`，拿 `levers.json` 校验引用存在且 Δ 超噪声底（此前已完成，勾选状态是旧的）
+- [x] state 加 `reopen_fruitless` 计数，超 2 次拒绝重开（落盘，不随进程归零）（此前已完成，勾选状态是旧的）
+- [x] `dependents_closure` 的种子集加入同 `atomic_group` 成员（此前已完成，勾选状态是旧的）
+- [x] `reopen` 记 `patch` 条目；`outcome` 在下一次抬高 best 时回填为 `accepted`。`status` 列出已试过的课程表方向。
+      回填是必须的：否则一次**成功的**修订也永远停在 pending，于是 status 拿它去劝退下一代 —— 只记投入不记产出的账比没有更糟
+- [x] `implementation_failures` 超阈值进独立的 `STATE_BLOCKED`（不走架构重入）（此前已完成，勾选状态是旧的）
+- [x] `rollback_target`：作废范围之外、最后一个机制已核实且有 `artifact_sha` 的产物。找不到就说「从参考基线重新开始」—— 不编一个看起来合理的回退点
+- [x] `--wall-hours` / `set-budget --max-wall-hours`，按 `created_at` 算差。明确标注「含停机时间，是机时的上界」—— 误差方向保守（提前提醒）而不是漏
 
 ---
 

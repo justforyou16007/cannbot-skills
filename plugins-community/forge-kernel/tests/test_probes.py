@@ -467,3 +467,243 @@ def test_missing_denylist_file_is_an_error_not_an_empty_list(tmp_path):
 
 def test_no_denylist_option_is_still_allowed():
     assert fc.load_denylist(None) == []
+
+
+# ---------------------------------------------------------------------------
+# 通道规则：与算子名无关的那一组
+#
+# 按算子名生成的五条规则只能抓住「照名字直接调」。而转发**不需要写出名字**
+# —— ctypes.CDLL("libopapi.so").aclnnAddLayerNorm 里那个名字是运行时拼出来
+# 的字符串，importlib.import_module(cfg.backend) 里连字符串都没有。
+# 于是五条全绿，而候选一行 kernel 都没写。
+#
+# #8 之后围栏能压住 best，也就是能决定一轮算不算数 —— 漏掉的那条路现在是
+# 「静默地让一个转发实现成为下一代参考」。
+# ---------------------------------------------------------------------------
+
+def _channel_rules(result):
+    return {f["rule"] for f in result["channels"]}
+
+
+def test_dlopen_is_reported_as_a_channel(tmp_path):
+    root = candidate(tmp_path, **{"op_kernel__k.cpp": (
+        'void *h = dlopen("libopapi.so", RTLD_LAZY);\n')})
+    result = run_fence(root)
+    assert "F-DLOPEN" in _channel_rules(result)
+    assert "F-OPAPI-SO" in _channel_rules(result)
+
+
+def test_ctypes_is_reported_as_a_channel(tmp_path):
+    root = candidate(tmp_path, **{"op_kernel__k.py": (
+        'lib = ctypes.CDLL("libopapi.so")\n')})
+    assert "F-FFI" in _channel_rules(run_fence(root))
+
+
+def test_dynamic_import_is_reported_as_a_channel(tmp_path):
+    root = candidate(tmp_path, **{"op_kernel__k.py": (
+        'm = importlib.import_module(cfg.backend)\n')})
+    assert "F-DYNIMPORT" in _channel_rules(run_fence(root))
+
+
+def test_subprocess_is_reported_as_a_channel(tmp_path):
+    root = candidate(tmp_path, **{"op_kernel__k.py": (
+        'subprocess.run([helper, "--run"])\n')})
+    assert "F-SUBPROCESS" in _channel_rules(run_fence(root))
+
+
+def test_another_operators_aclnn_is_a_channel_not_a_block(tmp_path):
+    """转发给**另一个**厂商算子同样不是自己实现，但判不了是不是正当。
+
+    这条用例原先断言「别的算子的 aclnn 调用与本次无关」。那句话对被测的
+    kernel 并不成立 —— 如果 kernel 体里调 aclnnSoftmax 去做一部分工作，
+    测到的时间就包含厂商代码。
+
+    但也不能直接判不通过：候选自己的测试代码、setup/teardown 里出现别的
+    aclnn 调用是正当的，而围栏的误伤代价高于漏判（一次误伤会让人整条
+    --exempt 关掉）。所以给 advisory 档：报出来，不压 best。
+    """
+    root = candidate(tmp_path, **{"op_kernel__k.cpp": "aclnnSoftmax(a);\n"})
+    result = run_fence(root, op_name="add_layer_norm")
+    assert result["passed"] is True          # 不判不通过
+    assert "F-ACLNN-ANY" in _channel_rules(result)   # 但要报出来
+
+
+def test_channels_do_not_flip_passed(tmp_path):
+    root = candidate(tmp_path, **{"op_kernel__k.py": (
+        'lib = ctypes.CDLL("./my_own_kernel.so")\n')})
+    result = run_fence(root)
+    assert result["passed"] is True
+    assert result["channels"]
+
+
+def test_blocking_rules_still_flip_passed(tmp_path):
+    """阻断档没有被这次改动放松。"""
+    root = candidate(tmp_path, **{"op_kernel__k.cpp": (
+        "aclnnAddLayerNorm(a, b);\n")})
+    result = run_fence(root)
+    assert result["passed"] is False
+    assert "F-ACLNN" in rules_of(result)
+
+
+def test_channel_rules_fire_even_with_a_wrong_op_name(tmp_path):
+    """这是通道规则存在的理由之一。
+
+    按算子名生成的五条规则只要算子名写错一个字母就**全体失效**，而那种
+    失效是静默的 —— 围栏报「通过」。通道规则不由算子名派生，所以照样响。
+    """
+    root = candidate(tmp_path, **{"op_kernel__k.cpp": (
+        'dlsym(h, "aclnnAddLayerNorm");\n')})
+    result = run_fence(root, op_name="完全不相干的算子名")
+    assert "F-DLOPEN" in _channel_rules(result)
+
+
+def test_third_party_is_scanned(tmp_path):
+    """third_party 曾在 SKIP_DIRS 里，那是围栏上最大的一个洞。
+
+    把一份转发实现放进 third_party/、再从候选 import 它，整棵目录连扫都不扫
+    —— 候选代码里只剩一行 import，没有任何 aclnn 字样。
+
+    「第三方代码不是候选的实现」这句话本身对，但它回答的不是围栏在问的问题。
+    围栏问的是「这次测到的加速比是不是这份 kernel 挣来的」—— 从哪个目录
+    转发出去，对这个问题没有区别。
+    """
+    root = tmp_path / "cand"
+    (root / "third_party" / "shim").mkdir(parents=True)
+    (root / "third_party" / "shim" / "fwd.cpp").write_text(
+        "aclnnAddLayerNorm(a, b);\n", encoding="utf-8")
+    (root / "op_kernel").mkdir(parents=True)
+    (root / "op_kernel" / "k.cpp").write_text(
+        "void run() {}\n", encoding="utf-8")
+    result = run_fence(root)
+    assert result["passed"] is False
+    assert "F-ACLNN" in rules_of(result)
+
+
+def test_build_dirs_are_still_skipped(tmp_path):
+    """构建产物仍然跳过 —— 拿掉 third_party 不等于什么都扫。"""
+    root = tmp_path / "cand"
+    (root / "build_out").mkdir(parents=True)
+    (root / "build_out" / "gen.cpp").write_text(
+        "aclnnAddLayerNorm(a);\n", encoding="utf-8")
+    (root / "k.cpp").write_text("void run() {}\n", encoding="utf-8")
+    assert run_fence(root)["passed"] is True
+
+
+# ---------------------------------------------------------------------------
+# 手段分类：两条腿
+#
+# 单项定价（「只删这一项」）只能回答「它单独值多少」。优化循环实际要问的是
+# 「全上之后，再动它还有没有收益」—— 这两个问题的答案可以相反。
+#
+# 关键的一类是 coupled：单独删掉省不出时间，但别人依赖它。只有单项腿时，
+# 它的读数落在噪声里 → 判「测不出来」→ 进 not_worth_pursuing → 工具主动
+# 告诉你不要在一个承重的方向上投入。这不是漏报，是反向报错。
+# ---------------------------------------------------------------------------
+
+def _store(noise=2.0, baseline=100.0, **variants):
+    """variants: {"a": 时间, "a|b": 时间} —— 竖线分隔多个手段。"""
+    store = lp.new_store(baseline, noise)
+    for key, time_us in variants.items():
+        lp.add_variant(store, key.split("|"), time_us)
+    return store
+
+
+def test_coupled_lever_is_found_only_with_both_legs():
+    """a 单独删没用（省 1%，噪声内），但把它从全删里拿掉就少省 20%。"""
+    # 三次测量就够了。注意「全删但留下 a」和「只删 b」是同一个变体
+    # （universe = {a, b}，所以 universe − {a} == {b}）——
+    # 两条腿在两个手段的情形下共用这一次测量。
+    store = _store(
+        **{"a": 99.0,        # 只删 a：省 1%，落在噪声内
+           "b": 80.0,        # 只删 b：省 20%（也就是「全删但留下 a」）
+           "a|b": 50.0})     # 全删：省 50%
+    classes = lp.classify_levers(store)
+    assert classes["levers"]["a"]["class"] == "coupled"
+    assert classes["levers"]["a"]["single_pct"] == pytest.approx(1.0)
+    assert classes["levers"]["a"]["marginal_pct"] == pytest.approx(30.0)
+
+
+def test_coupled_lever_is_not_listed_as_not_worth_pursuing():
+    """这是整条改动的要点 —— 此前它会被列进「不要再投」。"""
+    store = _store(**{"a": 99.0, "b": 80.0, "a|b": 50.0})
+    report = lp.price_levers(store)
+    assert "a" not in report["not_worth_pursuing"]
+    assert "a" in report["must_keep"]
+
+
+def test_independent_lever_pays_off_on_both_legs():
+    store = _store(**{"a": 80.0, "b": 75.0, "a|b": 55.0})
+    classes = lp.classify_levers(store)
+    assert classes["levers"]["a"]["class"] == "independent"
+
+
+def test_redundant_lever_pays_off_alone_but_not_at_the_margin():
+    """单独有用，但别人已经吃掉了它的收益 —— 不要重复投入。"""
+    store = _store(**{"a": 80.0, "b": 80.0, "a|b": 80.0})
+    classes = lp.classify_levers(store)
+    assert classes["levers"]["a"]["class"] == "redundant"
+
+
+def test_inert_lever_pays_off_on_neither_leg():
+    store = _store(**{"a": 99.5, "b": 80.0, "a|b": 80.0})
+    classes = lp.classify_levers(store)
+    assert classes["levers"]["a"]["class"] == "inert"
+    assert "a" in lp.price_levers(store)["not_worth_pursuing"]
+
+
+def test_harmful_lever_is_classified_before_the_margin_is_consulted():
+    """删掉它反而更慢 —— 这个结论不需要边际读数。"""
+    store = _store(**{"a": 130.0, "b": 80.0, "a|b": 110.0})
+    classes = lp.classify_levers(store)
+    assert classes["levers"]["a"]["class"] == "harmful"
+
+
+def test_missing_remove_leg_is_unknown_not_inert():
+    """缺一条腿时判不了。拿单项读数顶替，正是 coupled 被判成 inert 那条路。"""
+    store = _store(**{"a": 99.0, "b": 80.0})     # 没有「全删」那次
+    classes = lp.classify_levers(store)
+    assert classes["levers"]["a"]["class"] == "unknown"
+    assert classes["levers"]["a"]["marginal_pct"] is None
+
+
+def test_missing_measurement_hint_is_runnable():
+    """提示要说清补哪一次测量，否则这条分类永远停在 unknown。"""
+    store = _store(**{"a": 99.0, "b": 80.0})
+    info = lp.classify_levers(store)["levers"]["a"]
+    assert any("--lever" in m for m in info["missing_measurements"])
+
+
+# ---------------------------------------------------------------------------
+# 变体指纹
+# ---------------------------------------------------------------------------
+
+def test_variant_identical_to_baseline_is_refused():
+    """没改过的变体，测出来的差值全是噪声 —— 而它会被当成价格用。"""
+    store = lp.new_store(100.0, 2.0, variant_hash="deadbeef")
+    with pytest.raises(lp.LeverError, match="没有被真正改过"):
+        lp.add_variant(store, ["a"], 95.0, variant_hash="deadbeef")
+
+
+def test_variant_with_a_different_hash_is_accepted():
+    store = lp.new_store(100.0, 2.0, variant_hash="deadbeef")
+    entry = lp.add_variant(store, ["a"], 95.0, variant_hash="cafe")
+    assert entry["variant_hash"] == "cafe"
+
+
+def test_hash_check_is_skipped_when_either_side_is_absent():
+    """没有指纹时不能拒 —— 那会把老 store 与不传指纹的正当用法一起卡住。"""
+    store = lp.new_store(100.0, 2.0)          # 基线无指纹
+    assert lp.add_variant(store, ["a"], 95.0, variant_hash="x")
+    store2 = lp.new_store(100.0, 2.0, variant_hash="x")
+    assert lp.add_variant(store2, ["a"], 95.0)   # 变体无指纹
+
+
+def test_refusal_names_the_three_common_causes():
+    """报错要说清怎么发生的，否则会被当成工具挑剔而绕过去。"""
+    store = lp.new_store(100.0, 2.0, variant_hash="same")
+    try:
+        lp.add_variant(store, ["a"], 95.0, variant_hash="same")
+    except lp.LeverError as exc:
+        text = str(exc)
+    assert "没被编译进去" in text
+    assert "重装 OPP" in text

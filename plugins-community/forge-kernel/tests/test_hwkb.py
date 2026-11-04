@@ -832,23 +832,96 @@ def test_empty_arch_dir_needs_no_index(tmp_path):
 # 隔离区
 # ---------------------------------------------------------------------------
 
+def _lint(tmp_path, quarantine=True):
+    import argparse  # noqa: PLC0415
+    return hwkb.cmd_lint(argparse.Namespace(
+        kb_root=str(tmp_path), card=None, arch=None, quarantine=quarantine,
+        as_json=False))
+
+
+def test_first_lint_failure_leaves_the_card_in_place(tmp_path):
+    """第一次失败往往是形式问题 —— 少个小节、kind 写错、归档指针拼错。
+
+    这些改一行就好，而隔离会让这张卡片离开 agent 的视野，于是那条真经验
+    也跟着离开，直到有人想起来去 quarantine 目录里翻。
+    """
+    arch_dir = tmp_path / "dav2201"
+    arch_dir.mkdir(parents=True)
+    seed_archive(tmp_path)
+    card = arch_dir / "R-2201-900.md"
+    card.write_text(make_card(body="## 机制\n比参考实现快。\n"),
+                    encoding="utf-8")
+
+    assert _lint(tmp_path) == 1
+    assert card.exists()                       # 留在原处
+    meta, _ = hwkb.load_card(card)
+    assert meta[hwkb.LINT_FAILURES_FIELD] == 1
+
+
 def test_lint_quarantine_moves_the_card_out_of_the_readable_tree(tmp_path):
-    import argparse
     arch_dir = tmp_path / "dav2201"
     arch_dir.mkdir(parents=True)
     seed_archive(tmp_path)
     (arch_dir / "R-2201-900.md").write_text(
         make_card(body="## 机制\n比参考实现快。\n"), encoding="utf-8")
 
-    assert hwkb.cmd_lint(argparse.Namespace(
-        kb_root=str(tmp_path), card=None, arch=None, quarantine=True,
-        as_json=False)) == 1
+    # 第一次只记账，第二次才隔离
+    assert _lint(tmp_path) == 1
+    assert _lint(tmp_path) == 1
     # 移走，不是删掉 —— 越界的卡片里往往有真经验，只是写法不合规
     assert not (arch_dir / "R-2201-900.md").exists()
     assert (tmp_path / hwkb.QUARANTINE_DIRNAME / "dav2201"
             / "R-2201-900.md").is_file()
     # 移走之后 query 不再供给它
     assert [p.name for p, _, _ in hwkb.iter_cards(tmp_path, "DAV_2201")] == []
+
+
+def test_failure_count_survives_across_processes(tmp_path):
+    """计数记在 frontmatter 而不是内存里。
+
+    记在内存里的话，每次 lint 都是第一次，「返修两轮再隔离」这条规则
+    等于不存在。
+    """
+    arch_dir = tmp_path / "dav2201"
+    arch_dir.mkdir(parents=True)
+    seed_archive(tmp_path)
+    card = arch_dir / "R-2201-900.md"
+    card.write_text(make_card(body="## 机制\n比参考实现快。\n"),
+                    encoding="utf-8")
+    _lint(tmp_path)
+    text = card.read_text(encoding="utf-8")
+    assert hwkb.LINT_FAILURES_FIELD in text     # 落盘了
+
+
+def test_unparseable_card_is_quarantined_immediately(tmp_path):
+    """frontmatter 读不动时没处记计数，而这类卡片最常见的成因恰恰是
+    正文里粘了大段源码把 frontmatter 撑坏了。"""
+    arch_dir = tmp_path / "dav2201"
+    arch_dir.mkdir(parents=True)
+    (arch_dir / "R-2201-901.md").write_text(
+        "这不是 frontmatter\nvoid Kernel() {}\n", encoding="utf-8")
+    assert _lint(tmp_path) == 1
+    assert not (arch_dir / "R-2201-901.md").exists()
+
+
+def test_passing_lint_clears_the_failure_count(tmp_path):
+    """计数衡量的是「连续不过检」，不是「一辈子不过检过几次」。
+
+    不清的话，一张修好又改坏的卡片会带着历史计数直接被隔离 —— 而它这次
+    只错了一处。
+    """
+    arch_dir = tmp_path / "dav2201"
+    arch_dir.mkdir(parents=True)
+    seed_archive(tmp_path)
+    card = arch_dir / "R-2201-900.md"
+    card.write_text(make_card(body="## 机制\n比参考实现快。\n"),
+                    encoding="utf-8")
+    _lint(tmp_path)                                  # 记一次
+    hwkb.write_index(tmp_path, "DAV_2201")
+    card.write_text(make_card(), encoding="utf-8")   # 修好
+    _lint(tmp_path)
+    meta, _ = hwkb.load_card(card)
+    assert hwkb.LINT_FAILURES_FIELD not in meta
 
 
 def test_lint_without_quarantine_leaves_the_card_in_place(tmp_path):

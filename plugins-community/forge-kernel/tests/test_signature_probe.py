@@ -953,3 +953,180 @@ def test_open_question_narrows_once_cores_are_measured(tmp_path):
     assert "启动开销与核间等待各占多少" in questions
     whys = " ".join(q["why_unresolvable"] for q in sig["open_questions"])
     assert "逐核分布已测" in whys
+
+
+# ---------------------------------------------------------------------------
+# 单元格解析的第三态
+#
+# safe_float 原来只有两态：有数，或 None。而 None 被当成「没采到」——
+# 这对 "N/A"（msprof 明确表示该指标不适用）是对的，对 "12.3abc" 就不对了。
+#
+# 两者该做的事完全不同，而它们在签名里长得一模一样（value=None、
+# present=false）。于是下游读到「这次没采到」，而真相是那一列的量纲或格式
+# 和本工具以为的不一样 —— 同一份 CSV 里别的列照样被读走了。
+# ---------------------------------------------------------------------------
+
+def test_parse_cell_three_states():
+    assert sp.parse_cell("3.14") == (3.14, None)
+    assert sp.parse_cell("N/A") == (None, None)
+    assert sp.parse_cell("") == (None, None)
+    assert sp.parse_cell(None) == (None, None)
+    value, problem = sp.parse_cell("12.3abc")
+    assert value is None
+    assert problem == sp.UNPARSEABLE
+
+
+def test_safe_float_keeps_its_two_state_contract():
+    """老调用点不关心第三态，行为不变。"""
+    assert sp.safe_float("3.14") == 3.14
+    assert sp.safe_float("N/A") is None
+    assert sp.safe_float("12.3abc") is None
+
+
+def test_reader_records_unparseable_columns():
+    reader = sp.Reader(
+        {"aiv_mte2_ratio": "<overflow>"},
+        {"aiv_mte2_ratio": "PipeUtilization"})
+    value, channel = reader.number("aiv_mte2_ratio")
+    assert value is None and channel is None
+    assert len(reader.unparseable) == 1
+    assert reader.unparseable[0]["column"] == "aiv_mte2_ratio"
+    assert "<overflow>" in reader.unparseable[0]["raw"]
+
+
+def test_reader_does_not_record_proper_missing_values():
+    """空值与 N/A 是正常的缺失标记，不该进异常清单。"""
+    reader = sp.Reader(
+        {"a": "N/A", "b": "", "c": "-"}, {"a": "X", "b": "X", "c": "X"})
+    reader.number("a", "b", "c")
+    assert reader.unparseable == []
+
+
+def test_reader_falls_through_to_the_next_candidate_column():
+    """一列读不动时继续试下一个候选列 —— 但那次失败仍要记下来。
+
+    列名在不同 msprof 版本下有前缀差异，所以每个逻辑量给一组候选。
+    读不动第一个就整条放弃会让一次版本差异变成一个缺失字段。
+    """
+    reader = sp.Reader(
+        {"aiv_x": "坏的", "aic_x": "7.5"},
+        {"aiv_x": "M", "aic_x": "M"})
+    value, channel = reader.number("aiv_x", "aic_x")
+    assert value == 7.5
+    assert channel is not None and "aic_x" in channel
+    assert len(reader.unparseable) == 1      # 失败仍被记下
+
+
+def test_unparseable_column_withholds_the_architecture_hypothesis():
+    """这一条要阻塞，不是告警。
+
+    解析不动的字段在签名里和「没采到」一模一样。放行等于让一个**读错了**
+    的字段伪装成一个缺失字段 —— 而探针的全部职责就是不让这种降级发生。
+    """
+    reader = sp.Reader(
+        {"aiv_mte2_ratio": "坏数据"}, {"aiv_mte2_ratio": "PipeUtilization"})
+    reader.number("aiv_mte2_ratio")
+    trust = sp.check_trust(reader, [], None, None,
+                                        assume_no_dvfs=True)
+    assert trust["trustworthy"] is False
+    names = [c["name"] for c in trust["checks"]]
+    assert "cell_parse" in names
+
+
+def test_cell_parse_detail_points_at_the_column_definition():
+    """报错要指向该查什么 —— 不然这条告警只会被读成「又缺数据」。"""
+    reader = sp.Reader(
+        {"aiv_mte2_ratio": "坏数据"}, {"aiv_mte2_ratio": "PipeUtilization"})
+    reader.number("aiv_mte2_ratio")
+    trust = sp.check_trust(reader, [], None, None,
+                                        assume_no_dvfs=True)
+    detail = next(c["detail"] for c in trust["checks"]
+                  if c["name"] == "cell_parse")
+    assert "不是「没采到」" in detail
+    assert "csv_fields_reference.md" in detail
+
+
+# ---------------------------------------------------------------------------
+# --check-env：开跑之前确认探针依赖的列真的采到了
+#
+# 「某个 metric 组采到了」不等于「组里那几列都在」。列名在 CANN 版本之间
+# 改过（带不带 aiv_/aic_ 前缀、ratio 后缀），改过之后探针**不会报错** ——
+# 它只会在那个字段上返回「没采到」，而一个缺失字段看起来完全正常。
+#
+# 于是整条链上最危险的那种失效出现了：停顿分解里少了一项，而架构假设照样
+# 输出，读起来也合理。
+# ---------------------------------------------------------------------------
+
+def _archive(tmp_path, **metric_columns):
+    """造一个归档目录：{metric: [列名...]}。"""
+    root = tmp_path / "arch"
+    root.mkdir()
+    for metric, columns in metric_columns.items():
+        header = ",".join(["Op Name", "Task Duration(us)"] + list(columns))
+        values = ",".join(["demo", "100.0"] + ["1.0"] * len(columns))
+        (root / f"op_summary_{metric}.csv").write_text(
+            header + "\n" + values + "\n", encoding="utf-8")
+    return root
+
+
+def test_check_env_passes_when_every_required_column_is_there(tmp_path):
+    root = _archive(tmp_path, **{
+        metric: columns for metric, columns in sp.REQUIRED_COLUMNS.items()})
+    report = sp.check_environment(None, root)
+    assert report["passed"] is True
+    assert report["columns_absent"] == {}
+
+
+def test_check_env_names_the_missing_column(tmp_path):
+    required = dict(sp.REQUIRED_COLUMNS)
+    conflict = list(required["ResourceConflictRatio"])
+    conflict.remove("aiv_vec_bank_cflt_ratio")
+    required["ResourceConflictRatio"] = tuple(conflict)
+    root = _archive(tmp_path, **required)
+
+    report = sp.check_environment(None, root)
+    assert report["passed"] is False
+    assert "aiv_vec_bank_cflt_ratio" in \
+        report["columns_absent"]["ResourceConflictRatio"]
+
+
+def test_check_env_reports_a_missing_metric_group(tmp_path):
+    required = {m: c for m, c in sp.REQUIRED_COLUMNS.items()
+                if m != "ResourceConflictRatio"}
+    root = _archive(tmp_path, **required)
+    report = sp.check_environment(None, root)
+    assert "ResourceConflictRatio" in report["required_groups_missing"]
+    assert report["passed"] is False
+
+
+def test_check_env_explains_why_a_missing_column_is_dangerous(tmp_path):
+    """报告要说清后果，否则这条会被读成「又缺数据」。"""
+    required = dict(sp.REQUIRED_COLUMNS)
+    required["L2Cache"] = ()
+    root = _archive(tmp_path, **required)
+    report = sp.check_environment(None, root)
+    assert "不会让探针报错" in report["reason"]
+    assert "csv_fields_reference.md" in report["reason"]
+
+
+def test_check_env_refuses_to_run_without_a_collection(tmp_path):
+    """这个检查读一次**已有的**采集，它不自己起 msprof。
+
+    让它去起采集会把「探针」和「采集驱动」两件事混在一起，而采集参数在不同
+    环境下差别很大（ops-profiling 那边有专门的脚本）。
+    """
+    with pytest.raises(sp.ProbeError, match="已有的"):
+        sp.check_environment(None, tmp_path / "nope")
+
+
+def test_required_columns_are_a_subset_of_what_the_probe_reads():
+    """这张表要和探针实际读的列对得上。
+
+    对不上的话它就是一张装饰：查过的列探针不读，探针读的列没查过。
+    """
+    import inspect  # noqa: PLC0415
+    source = inspect.getsource(sp)
+    for metric, columns in sp.REQUIRED_COLUMNS.items():
+        for column in columns:
+            assert f'"{column}"' in source, \
+                f"{metric} 的 {column} 不在探针实际读的列里"

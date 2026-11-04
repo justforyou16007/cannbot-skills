@@ -668,3 +668,249 @@ def test_lint_says_so_when_denylist_is_not_in_effect(tmp_path, capsys):
     assert "未生效" in captured.out
     assert "这句话不覆盖它们" in captured.out
     assert "未生效" in captured.err
+
+
+# ---------------------------------------------------------------------------
+# 禁读清单要带真实父目录
+#
+# 清单原来只有「产物根目录」和「逐个文件」两种条目，而 hook 对 Grep / Glob
+# 这类递归工具的判据是「请求路径是不是某个被封条目的祖先」。产物根是软链、
+# 或源码散在产物之外（opp_install 那种来源很常见）时，真实父目录就既不等于
+# 产物根、也不在逐文件清单里 —— 于是 `grep -rn class /real/parent/` 从两边
+# 都漏掉。
+# ---------------------------------------------------------------------------
+
+def _sealed_lines(work_dir):
+    text = (work_dir / "sealed_paths.txt").read_text(encoding="utf-8")
+    return [ln for ln in text.splitlines() if ln and not ln.startswith("#")]
+
+
+def test_nested_parent_dirs_are_sealed(tmp_path):
+    artifact = tmp_path / "ref"
+    (artifact / "op_kernel" / "inner").mkdir(parents=True)
+    (artifact / "op_kernel" / "inner" / "k.cpp").write_text(
+        "class KernelSecret {};\n", encoding="utf-8")
+    work_dir = tmp_path / "w"
+    seal_reference.seal(artifact, "demo", work_dir,
+                        use_public_api_filter=False, kb_root=tmp_path / "kb")
+
+    lines = _sealed_lines(work_dir)
+    # 每一层都要在，漏掉中间任何一层，对那一层的递归请求就会放行
+    assert str((artifact / "op_kernel" / "inner").resolve()) in lines
+    assert str((artifact / "op_kernel").resolve()) in lines
+    assert str(artifact.resolve()) in lines
+
+
+def test_sealing_stops_at_the_artifact_root(tmp_path):
+    """不能一路封到公共目录去 —— 那会把无关路径一起拦住。"""
+    artifact = tmp_path / "ref"
+    artifact.mkdir()
+    (artifact / "k.cpp").write_text("class KernelSecret {};\n",
+                                    encoding="utf-8")
+    work_dir = tmp_path / "w"
+    seal_reference.seal(artifact, "demo", work_dir,
+                        use_public_api_filter=False, kb_root=tmp_path / "kb")
+    lines = _sealed_lines(work_dir)
+    assert str(tmp_path.resolve()) not in lines      # 产物的父目录不该被封
+    assert "/tmp" not in lines
+
+
+# ---------------------------------------------------------------------------
+# check-tree：明文搬运
+#
+# 封存 hook 拦的是「读」。它拦不住一次成功的读之后发生的事 —— 封存漏挑了
+# 一个文件（后缀不在 SOURCE_SUFFIXES 里）、或者在封存之前就已经读过。
+# 那之后源码进了候选，而围栏（比对符号名）只在名字没改时才抓得到。
+# ---------------------------------------------------------------------------
+
+def _sealed_pair(tmp_path, reference_body):
+    artifact = tmp_path / "ref"
+    artifact.mkdir()
+    (artifact / "kernel.cpp").write_text(reference_body, encoding="utf-8")
+    work_dir = tmp_path / "w"
+    seal_reference.seal(artifact, "demo", work_dir,
+                        use_public_api_filter=False, kb_root=tmp_path / "kb")
+    candidate = tmp_path / "cand"
+    candidate.mkdir()
+    return artifact, work_dir, candidate
+
+
+REF_BODY = (
+    "#include <cstdint>\n"
+    "class SecretRefKernel {\n"
+    "    __aicore__ inline void ProcessTileWithResidentBuffer(int32_t idx) {\n"
+    "        DataCopy(sharedLocal, sharedGm[idx * tileBytes], tileBytes);\n"
+    "    }\n"
+    "};\n")
+
+
+def test_clean_candidate_passes_check_tree(tmp_path):
+    _a, work_dir, candidate = _sealed_pair(tmp_path, REF_BODY)
+    (candidate / "mine.cpp").write_text(
+        "void MyOwnKernel() { int x = 1; }\n", encoding="utf-8")
+    report = seal_reference.check_tree(candidate, work_dir)
+    assert report["passed"] is True
+
+
+def test_byte_identical_file_is_caught(tmp_path):
+    _a, work_dir, candidate = _sealed_pair(tmp_path, REF_BODY)
+    (candidate / "copied.cpp").write_text(REF_BODY, encoding="utf-8")
+    report = seal_reference.check_tree(candidate, work_dir)
+    assert report["passed"] is False
+    assert "T-SAME-FILE" in {f["rule"] for f in report["findings"]}
+
+
+def test_single_distinctive_line_survives_reindentation(tmp_path):
+    """归一化要压掉空白 —— 否则改一下缩进就绕过去了。"""
+    _a, work_dir, candidate = _sealed_pair(tmp_path, REF_BODY)
+    (candidate / "partial.cpp").write_text(
+        "void f() {\n"
+        "            DataCopy(sharedLocal, sharedGm[idx * tileBytes], "
+        "tileBytes);\n"
+        "}\n", encoding="utf-8")
+    report = seal_reference.check_tree(candidate, work_dir)
+    assert "T-SAME-LINES" in {f["rule"] for f in report["findings"]}
+
+
+def test_short_lines_do_not_trigger(tmp_path):
+    """`};`、`return;` 在任何两份 C++ 里都会撞。
+
+    误报的代价是整条检查被豁免掉，所以短行必须丢。
+    """
+    _a, work_dir, candidate = _sealed_pair(tmp_path, REF_BODY)
+    (candidate / "mine.cpp").write_text(
+        "class Mine {\n};\n", encoding="utf-8")
+    assert seal_reference.check_tree(candidate, work_dir)["passed"] is True
+
+
+def test_comments_are_stripped_before_comparing(tmp_path):
+    """注释是说明不是实现，而两份独立实现完全可以有同样的说明
+    （都抄了同一份公开文档的措辞）。"""
+    body = ("// 这一段注释足够长，长到超过特征行的字符下限很多很多\n"
+            "void f() { int a = 1; }\n")
+    artifact = tmp_path / "ref"
+    artifact.mkdir()
+    (artifact / "kernel.cpp").write_text(body, encoding="utf-8")
+    work_dir = tmp_path / "w"
+    seal_reference.seal(artifact, "demo", work_dir,
+                        use_public_api_filter=False, kb_root=tmp_path / "kb")
+    candidate = tmp_path / "cand"
+    candidate.mkdir()
+    (candidate / "mine.cpp").write_text(
+        "// 这一段注释足够长，长到超过特征行的字符下限很多很多\n"
+        "void g() { int b = 2; }\n", encoding="utf-8")
+    assert seal_reference.check_tree(candidate, work_dir)["passed"] is True
+
+
+def test_build_output_is_skipped(tmp_path):
+    """构建产物里当然会有和参考相同的东西（同一套头文件生成），
+    拿它们报搬运是纯误报。"""
+    _a, work_dir, candidate = _sealed_pair(tmp_path, REF_BODY)
+    (candidate / "build_out").mkdir()
+    (candidate / "build_out" / "gen.cpp").write_text(REF_BODY,
+                                                     encoding="utf-8")
+    assert seal_reference.check_tree(candidate, work_dir)["passed"] is True
+
+
+def test_third_party_is_not_skipped(tmp_path):
+    """理由同 fence_check：被跳过的目录是漏过的那条路。"""
+    _a, work_dir, candidate = _sealed_pair(tmp_path, REF_BODY)
+    (candidate / "third_party").mkdir()
+    (candidate / "third_party" / "shim.cpp").write_text(REF_BODY,
+                                                        encoding="utf-8")
+    assert seal_reference.check_tree(candidate, work_dir)["passed"] is False
+
+
+def test_line_check_is_skipped_when_the_reference_is_gone(tmp_path):
+    """参考可能已经被清掉。整文件摘要那一级不受影响（只用 manifest），
+    而特征行那一级要读参考 —— 跳过时必须说出来，不能算成通过。"""
+    import shutil  # noqa: PLC0415
+    artifact, work_dir, candidate = _sealed_pair(
+        tmp_path, REF_BODY)
+    (candidate / "copied.cpp").write_text(REF_BODY, encoding="utf-8")
+    shutil.rmtree(artifact)
+    report = seal_reference.check_tree(candidate, work_dir)
+    assert report["line_check"]["performed"] is False
+    assert "跳过" in report["line_check"]["reason"]
+    # 摘要那一级照样抓到
+    assert "T-SAME-FILE" in {f["rule"] for f in report["findings"]}
+
+
+def test_report_says_what_it_cannot_catch(tmp_path):
+    """`findings` 为空不等于「没有搬运」—— 这句话要进报告，不能只写在文档里。"""
+    _a, work_dir, candidate = _sealed_pair(tmp_path, REF_BODY)
+    (candidate / "mine.cpp").write_text("void f() {}\n", encoding="utf-8")
+    report = seal_reference.check_tree(candidate, work_dir)
+    assert "不等于" in report["coverage_note"]
+
+
+def test_check_tree_needs_a_manifest(tmp_path):
+    candidate = tmp_path / "cand"
+    candidate.mkdir()
+    with pytest.raises(seal_reference.SealError, match="找不到封存清单"):
+        seal_reference.check_tree(candidate, tmp_path / "nope")
+
+
+# ---------------------------------------------------------------------------
+# 封存校验的第三个方向：新增文件
+#
+# 原来只查「已删除」和「内容变更」。新增那个方向不是「记录对不上」这么轻 ——
+# 新文件没进 manifest 就没进禁读清单，于是 hook **不会拦**对它的读取：
+# 参考树上多出一个 agent 可以随便读的源文件，而所有「比对已记录的那些」的
+# 校验全绿。
+# ---------------------------------------------------------------------------
+
+def _manifest_of(tmp_path, body="class KernelSecret {};\n"):
+    artifact = tmp_path / "ref"
+    artifact.mkdir()
+    (artifact / "kernel.cpp").write_text(body, encoding="utf-8")
+    work_dir = tmp_path / "w"
+    seal_reference.seal(artifact, "demo", work_dir,
+                        use_public_api_filter=False, kb_root=tmp_path / "kb")
+    manifest = json.loads(
+        (work_dir / "sealed_manifest.json").read_text(encoding="utf-8"))
+    return artifact, work_dir, manifest
+
+
+def test_unchanged_reference_verifies_clean(tmp_path):
+    _a, _w, manifest = _manifest_of(tmp_path)
+    assert seal_reference.verify_manifest(manifest) == []
+
+
+def test_deleted_file_is_detected(tmp_path):
+    artifact, _w, manifest = _manifest_of(tmp_path)
+    (artifact / "kernel.cpp").unlink()
+    drifted = seal_reference.verify_manifest(manifest)
+    assert any(d["reason"] == "已删除" for d in drifted)
+
+
+def test_modified_file_is_detected(tmp_path):
+    artifact, _w, manifest = _manifest_of(tmp_path)
+    (artifact / "kernel.cpp").write_text("class Other {};\n", encoding="utf-8")
+    drifted = seal_reference.verify_manifest(manifest)
+    assert any(d["reason"] == "内容已变更" for d in drifted)
+
+
+def test_added_file_is_detected(tmp_path):
+    """这是本轮补的方向。它在 opp_install 那类来源上很容易发生 ——
+    那是一个活的安装目录，另一个任务重装一次算子包就会往里加文件。"""
+    artifact, _w, manifest = _manifest_of(tmp_path)
+    (artifact / "extra.cpp").write_text("class Sneaky {};\n", encoding="utf-8")
+    drifted = seal_reference.verify_manifest(manifest)
+    assert any("新增" in d["reason"] for d in drifted)
+
+
+def test_added_file_message_says_the_hook_will_not_block_it(tmp_path):
+    """报错要说清后果，否则这条会被当成洁癖。"""
+    artifact, _w, manifest = _manifest_of(tmp_path)
+    (artifact / "extra.cpp").write_text("class Sneaky {};\n", encoding="utf-8")
+    drifted = seal_reference.verify_manifest(manifest)
+    message = next(d["reason"] for d in drifted if "新增" in d["reason"])
+    assert "hook 不会拦" in message
+
+
+def test_added_non_source_file_is_ignored(tmp_path):
+    """参考目录里多一个 .log / .so 不影响封闭性 —— 封的是可读的源与配置。"""
+    artifact, _w, manifest = _manifest_of(tmp_path)
+    (artifact / "build.log").write_text("ok\n", encoding="utf-8")
+    assert seal_reference.verify_manifest(manifest) == []

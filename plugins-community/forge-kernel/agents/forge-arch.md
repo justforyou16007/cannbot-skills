@@ -103,8 +103,11 @@ msprof 分辨不了 tile 形状、buffer 布局、double buffer 深度、同步�
                    → signature_probe.py 提成结构化签名
                    → 它同时是机制做差的第 0 轮基线，开 campaign 时
                      用 --reference-signature 传进去
-5. 查知识库        hwkb.py query --symptom <签名里的症状>
-6. 查死路表        hwkb.py nogo check --symptom <同上>
+5. 读症状密集表    cat <forge-hwkb>/references/<arch>/INDEX.md
+                   → **无条件读完**，不是「需要时去查」
+6. 查知识库        hwkb.py query --symptom <签名里的症状>
+   查死路表        hwkb.py nogo check --symptom <同上> --arch <arch>
+                                       --operator <算子> --input-shape <形状>
 7. 写 milestone    照 example-milestone.json 的结构
 8. 校验            milestone_validate.py
 9. 交给 coding agent 逐行实现
@@ -114,8 +117,27 @@ msprof 分辨不了 tile 形状、buffer 布局、double buffer 深度、同步�
                    set-noise-floor + set-reference-signature
 ```
 
-第 5、6 两步不要跳过。知识库是跨 campaign 存活的东西，
-前人踩过的坑没必要再踩一遍；死路表里的方向不要再试。
+## 第 5 步为什么是「无条件读完」而不是「需要时去查」
+
+`hwkb.py query` 是**拉取式**的：你得先怀疑「这个现象别人遇到过」才会去查。
+而实际情况是你通常不会怀疑 —— 一个没见过的停顿分布看起来就是一个新问题。
+
+`INDEX.md` 里那张表按**症状**排，一屏能看完。先读它，把这一步从「想起来」
+变成「看见」：
+
+| 触发症状 | 机制 | 卡片 |
+|---|---|---|
+| MTE2 占比显著高于 VEC，且同一份数据被反复从 GM 搬入 | UB 常驻复用 | R-2201-001.md |
+
+读完再按签名里的具体症状 `query` 一次 —— 两者不重复：表给的是「有哪些已知
+机制」，query 给的是「这一条的细节与反指征」。
+
+死路表那一步要带 `--arch` / `--operator` / `--input-shape`。不带形状时，
+一条记在别的形状上的死路会被当成仅参考（exit 0）而不是禁令 —— 那是对的，
+但你会错过「这个方向在**当前**形状上已经被证伪」这个信息。
+
+第 5、6 两步不要跳过。知识库是跨 campaign 存活的东西，前人踩过的坑没必要
+再踩一遍；死路表里的方向不要再试。
 
 ## 用探针，不要手搓 CSV
 

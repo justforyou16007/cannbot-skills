@@ -142,6 +142,21 @@ RE_C_COMMENT = re.compile(r"/\*.*?\*/|//[^\n]*", re.DOTALL)
 #: 单个文件读取上限，避免把超大文件整个读进内存。
 MAX_SCAN_BYTES = 2 * 1024 * 1024
 
+#: 注释。比对特征行之前要去掉 —— 注释是说明，不是实现，而且两份独立实现
+#: 完全可以有同样的说明（都抄了同一份公开文档的措辞）。
+RE_BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
+RE_LINE_COMMENT = re.compile(r"//[^\n]*")
+
+#: 扫候选时跳过的目录。构建产物里当然会有和参考相同的东西（它们由同一套
+#: 头文件生成），拿它们报搬运是纯误报。
+#:
+#: 注意 third_party **不在**这里 —— 理由同 fence_check：把一份搬运放进
+#: 被跳过的目录，是围栏与本检查共同漏过的那条路。
+SKIP_DIRS = {
+    "build", "build_out", "output", "__pycache__", ".git",
+    "node_modules", ".pytest_cache", "dist",
+}
+
 
 class SealError(Exception):
     """封存失败。"""
@@ -407,10 +422,46 @@ def seal(artifact: Path, op_name: str, work_dir: Path,
     # 禁读清单：源码与配置文件的绝对路径，外加产物根目录本身
     sealed_paths = [str(artifact.resolve())]
     sealed_paths += [e["path"] for e in entries if e["sealed"]]
+
+    # 再加上每个被封文件的**真实父目录**。
+    #
+    # 为什么需要：清单里原来只有「产物根目录」和「逐个文件」两种条目，而
+    # hook 对 Grep / Glob 这类递归工具的判据是「请求路径是不是某个被封条目
+    # 的祖先」。产物根目录是软链、或者源码散在产物之外（`opp_install` 那种
+    # 来源很常见）时，真实父目录就既不等于产物根、也不在逐文件清单里 ——
+    # 于是 `grep -rn class /real/parent/` 从两边都漏掉。
+    #
+    # 为什么不止加「直接父目录」而是一路加到产物根：漏掉中间任何一层，
+    # 对那一层的递归请求就会放行，而它底下照样有被封的文件。
+    parents: Set[str] = set()
+    artifact_real = artifact.resolve()
+    for entry in entries:
+        if not entry["sealed"]:
+            continue
+        current = Path(entry["path"]).resolve().parent
+        while True:
+            text = str(current)
+            if text in parents:
+                break   # 这一支已经加过，上面的层级也必然加过
+            parents.add(text)
+            if current == current.parent:
+                break   # 到根了
+            # 产物目录自己已经在清单里；再往上就是产物之外的公共目录
+            # （比如 /usr/local/Ascend），封它们会把无关路径一起拦住。
+            if current == artifact_real:
+                break
+            current = current.parent
+    sealed_paths += sorted(parents - set(sealed_paths))
+
     (work_dir / SEALED_PATHS_FILENAME).write_text(
         "# ForgeKernel 禁读清单（自动生成，勿手改）\n"
         "# PreToolUse hook 依据本清单拦截对参考实现源码与配置的读取。\n"
         "# 读了参考源码，就不是从硬件行为反推架构，而是抄。\n"
+        "#\n"
+        "# 三类条目：产物根目录、逐个被封文件、每个被封文件的真实父目录。\n"
+        "# 第三类是给 Grep / Glob 这类递归工具用的 —— 它们的判据是\n"
+        "# 「请求路径是不是某个被封条目的祖先」，而产物根是软链时，\n"
+        "# 真实父目录既不等于产物根、也不在逐文件清单里。\n"
         + "\n".join(sealed_paths) + "\n",
         encoding="utf-8",
     )
@@ -624,23 +675,67 @@ def cmd_manifest(args: argparse.Namespace) -> int:
           f"源码 {manifest.get('source_file_count')} 个，"
           f"配置 {manifest.get('config_file_count', 0)} 个\n")
 
-    drifted = []
-    for entry in manifest.get("files", []):
-        path_obj = Path(entry["path"])
-        if not path_obj.exists():
-            drifted.append((entry["relative"], "已删除"))
-            continue
-        if entry.get("sha256") and _sha256(path_obj) != entry["sha256"]:
-            drifted.append((entry["relative"], "内容已变更"))
-
+    drifted = verify_manifest(manifest)
     if drifted:
         print("封存内容发生变化：", file=sys.stderr)
-        for name, reason in drifted:
-            print(f"  {name}: {reason}", file=sys.stderr)
+        for item in drifted:
+            print(f"  {item['relative']}: {item['reason']}", file=sys.stderr)
         print("\n参考变了，之前所有相对它的加速比都不再可比。", file=sys.stderr)
         return 1
     print("校验通过：封存内容与记录一致。")
     return 0
+
+
+def verify_manifest(manifest: Dict[str, Any]) -> List[Dict[str, str]]:
+    """封存内容还和记录一致吗。返回漂移项，空表示一致。
+
+    三个方向，第三个是后补的：
+
+      已删除     参考少了文件
+      内容变更   参考的某个文件被改过
+      **新增**   参考多了文件，而它**不在 manifest 里**
+
+    第三个方向要紧，因为它不是「记录对不上」这么轻 —— 新文件没进 manifest，
+    就没进禁读清单，于是 hook **不会拦**对它的读取。也就是说参考树上多出
+    一个 agent 可以随便读的源文件，而所有校验（比对已记录的那些）全绿。
+
+    这件事在 `opp_install` 那类来源上很容易发生：那是一个活的安装目录，
+    另一个任务重装一次算子包就会往里加文件。
+    """
+    drifted: List[Dict[str, str]] = []
+    recorded: Set[str] = set()
+    for entry in manifest.get("files", []):
+        if not isinstance(entry, dict) or "path" not in entry:
+            continue
+        recorded.add(str(Path(entry["path"]).resolve()))
+        path_obj = Path(entry["path"])
+        if not path_obj.exists():
+            drifted.append({"relative": entry.get("relative", entry["path"]),
+                            "reason": "已删除"})
+            continue
+        if entry.get("sha256") and _sha256(path_obj) != entry["sha256"]:
+            drifted.append({"relative": entry.get("relative", entry["path"]),
+                            "reason": "内容已变更"})
+
+    raw_artifact = manifest.get("artifact")
+    if raw_artifact:
+        artifact = Path(raw_artifact)
+        if artifact.is_dir():
+            for path in sorted(artifact.rglob("*")):
+                if not path.is_file():
+                    continue
+                suffix = path.suffix.lower()
+                if suffix not in SOURCE_SUFFIXES and suffix not in CONFIG_SUFFIXES:
+                    continue
+                if str(path.resolve()) in recorded:
+                    continue
+                drifted.append({
+                    "relative": str(path.relative_to(artifact)),
+                    "reason": ("**新增**，且不在封存清单里 —— "
+                               "也就是说 hook 不会拦对它的读取。"
+                               "重新跑一次 seal"),
+                })
+    return drifted
 
 
 def cmd_check(args: argparse.Namespace) -> int:
@@ -667,6 +762,211 @@ def cmd_check(args: argparse.Namespace) -> int:
             return 1
     print(f"未越界：{args.path}")
     return 0
+
+
+#: 一行要有多少个「有信息的字符」才算得上一条可用于比对的特征行。
+#:
+#: 太短的行在任何两份 C++ 里都会撞：`}`、`};`、`return;`、`#include <cstdint>`。
+#: 拿它们比对会得到一堆误报，而误报的代价是整条检查被豁免掉。
+DISTINCTIVE_MIN_CHARS = 28
+
+#: 同一条特征行在参考里出现过多少次之后就不再算「特征」。
+#:
+#: 一份参考里重复十几次的行（常见的宏展开、模板样板）说明它是这份代码的
+#: 习惯写法，而习惯写法会被任何读过同类文档的人写出来。
+DISTINCTIVE_MAX_REPEATS = 3
+
+
+def distinctive_lines(text: str) -> Set[str]:
+    """从一段源码里抽出可用于比对的特征行。
+
+    归一化：去注释、压空白、丢掉太短的行。保留标识符与结构，所以「同一段
+    代码重排了缩进」仍然能对上，而「两份代码恰好都有一个 for 循环」对不上。
+    """
+    out: List[str] = []
+    text = RE_BLOCK_COMMENT.sub(" ", text)
+    for raw in text.splitlines():
+        line = RE_LINE_COMMENT.sub("", raw)
+        line = re.sub(r"\s+", " ", line).strip()
+        if len(line) < DISTINCTIVE_MIN_CHARS:
+            continue
+        out.append(line)
+    counts: Dict[str, int] = {}
+    for line in out:
+        counts[line] = counts.get(line, 0) + 1
+    return {line for line, n in counts.items()
+            if n <= DISTINCTIVE_MAX_REPEATS}
+
+
+def check_tree(candidate: Path, work_dir: Path,
+               artifact: Optional[Path] = None) -> Dict[str, Any]:
+    """候选里有没有参考源码的明文搬运。
+
+    两级判据，由强到弱：
+
+      整文件相同   候选某个文件的 sha256 等于参考某个文件的 sha256。
+                   manifest 里已经逐文件记了 sha256，所以这一级不需要再读
+                   参考 —— 比对的是两个摘要。
+      特征行命中   候选里出现了参考的特征行。这一级**需要读参考**，所以
+                   只有在参考路径仍可访问时才做，而且它跑在封存动作这一侧
+                   （不是 agent 那一侧）—— 工具读参考是允许的，agent 不行。
+
+    为什么要有这个检查：封存 hook 拦的是「读」。它拦不住一次成功的读之后
+    发生的事 —— 比如封存漏挑了一个文件（后缀不在 SOURCE_SUFFIXES 里）、
+    或者在封存之前就已经读过。那之后源码进了候选，而围栏（比对符号名）
+    只在名字没改时才抓得到。
+
+    返回的 `findings` 为空表示没发现搬运。**这不等于「没有搬运」** ——
+    改过名字、换过结构的搬运这两级都抓不到。结论里写明这一点。
+    """
+    manifest_path = work_dir / MANIFEST_FILENAME
+    if not manifest_path.is_file():
+        raise SealError(
+            f"找不到封存清单 {manifest_path}。check-tree 要拿它里面的逐文件 "
+            "sha256 做比对 —— 先跑一次 seal。")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SealError(f"封存清单读不出来: {exc}") from exc
+
+    sealed_entries = [e for e in manifest.get("files", [])
+                      if isinstance(e, dict) and e.get("sealed")]
+    by_hash = {e["sha256"]: e["path"] for e in sealed_entries if e.get("sha256")}
+
+    findings: List[Dict[str, Any]] = []
+    scanned = 0
+
+    # 第一级：整文件摘要相同。
+    candidate_files = ([candidate] if candidate.is_file()
+                       else [p for p in sorted(candidate.rglob("*"))
+                             if p.is_file()])
+    for path in candidate_files:
+        if any(part in SKIP_DIRS for part in path.parts):
+            continue
+        if path.suffix.lower() not in SOURCE_SUFFIXES:
+            continue
+        scanned += 1
+        digest = _sha256(path)
+        if digest in by_hash:
+            findings.append({
+                "rule": "T-SAME-FILE",
+                "candidate_file": str(path),
+                "reference_file": by_hash[digest],
+                "detail": ("候选这个文件与参考的某个文件逐字节相同。"
+                           "这不是「写得像」，是同一份文件"),
+            })
+
+    # 第二级：特征行命中。需要读参考，所以参考不可访问时跳过并说明。
+    reference_root = artifact
+    if reference_root is None:
+        raw = manifest.get("artifact")
+        reference_root = Path(raw) if raw else None
+    line_check: Dict[str, Any]
+    if reference_root is None or not reference_root.exists():
+        line_check = {
+            "performed": False,
+            "reason": (f"参考路径 {reference_root} 已不可访问，特征行这一级"
+                       "跳过。整文件摘要那一级不受影响（它只用 manifest）"),
+        }
+    else:
+        reference_lines: Set[str] = set()
+        for entry in sealed_entries:
+            ref_path = Path(entry["path"])
+            if not ref_path.is_file():
+                continue
+            if ref_path.suffix.lower() not in SOURCE_SUFFIXES:
+                continue
+            try:
+                reference_lines |= distinctive_lines(
+                    ref_path.read_text(encoding="utf-8", errors="ignore")
+                    [:MAX_SCAN_BYTES])
+            except OSError:
+                continue
+        hits_by_file: Dict[str, List[str]] = {}
+        for path in candidate_files:
+            if any(part in SKIP_DIRS for part in path.parts):
+                continue
+            if path.suffix.lower() not in SOURCE_SUFFIXES:
+                continue
+            try:
+                text = path.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            hits = sorted(distinctive_lines(text) & reference_lines)
+            if hits:
+                hits_by_file[str(path)] = hits[:5]
+        for file_path, hits in sorted(hits_by_file.items()):
+            findings.append({
+                "rule": "T-SAME-LINES",
+                "candidate_file": file_path,
+                "hit_count": len(hits),
+                "samples": hits,
+                "detail": ("候选里出现了参考的特征行（已去注释、压空白、"
+                           "丢掉过短与高重复的行）。\n"
+                           "    这些行在两份独立实现里同时出现的可能性很低"),
+            })
+        line_check = {"performed": True,
+                      "reference_line_count": len(reference_lines)}
+
+    return {
+        "schema_version": "1.0",
+        "candidate": str(candidate),
+        "files_scanned": scanned,
+        "sealed_file_count": len(sealed_entries),
+        "line_check": line_check,
+        "findings": findings,
+        "passed": not findings,
+        # 这句话要进报告，不能只写在文档里。
+        "coverage_note": ("两级判据都只抓**明文搬运**：逐字节相同的文件、"
+                          "以及未改动的特征行。\n"
+                          "改过名字、重排过结构的搬运两级都抓不到 —— "
+                          "`findings` 为空不等于「没有搬运」。\n"
+                          "这道检查补的是封存 hook 的一个具体缺口："
+                          "hook 拦「读」，拦不住一次成功的读之后发生的事"
+                          "（封存漏挑了文件、或在封存之前就已经读过）。"),
+    }
+
+
+def cmd_check_tree(args: argparse.Namespace) -> int:
+    try:
+        report = check_tree(
+            Path(args.candidate), Path(args.work_dir),
+            Path(args.artifact) if args.artifact else None)
+    except SealError as exc:
+        print(f"错误: {exc}", file=sys.stderr)
+        return 2
+
+    if args.as_json:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0 if report["passed"] else 1
+
+    print(f"候选      {report['candidate']}")
+    print(f"扫描      {report['files_scanned']} 个源文件 vs "
+          f"{report['sealed_file_count']} 个被封文件")
+    if not report["line_check"]["performed"]:
+        print(f"特征行    跳过：{report['line_check']['reason']}")
+    else:
+        print(f"特征行    参考侧 {report['line_check']['reference_line_count']} "
+              "条可比对的行")
+    print()
+    if report["passed"]:
+        print("未发现明文搬运。")
+        print()
+        print(f"注意: {report['coverage_note']}")
+        return 0
+    print(f"发现 {len(report['findings'])} 处疑似明文搬运：\n", file=sys.stderr)
+    for item in report["findings"]:
+        print(f"[{item['rule']}] {item['candidate_file']}", file=sys.stderr)
+        if item.get("reference_file"):
+            print(f"    与参考的 {item['reference_file']} 逐字节相同",
+                  file=sys.stderr)
+        for sample in item.get("samples", []):
+            print(f"    · {sample[:120]}", file=sys.stderr)
+        print(f"    {item['detail']}\n", file=sys.stderr)
+    print("参考只能测，不能读。源码进了候选，架构结论就不再是从硬件行为反推"
+          "出来的，", file=sys.stderr)
+    print("也就无法迁移到没有开源实现的算子上。", file=sys.stderr)
+    return 1
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -700,6 +1000,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_man = sub.add_parser("manifest", help="查看封存清单并校验是否被改动")
     p_man.add_argument("--work-dir", required=True)
     p_man.set_defaults(func=cmd_manifest)
+
+    p_tree = sub.add_parser(
+        "check-tree", help="查候选里有没有参考源码的明文搬运")
+    p_tree.add_argument("--candidate", required=True, help="候选目录或文件")
+    p_tree.add_argument("--work-dir", required=True,
+                        help="封存工作目录（里面有 sealed_manifest.json）")
+    p_tree.add_argument("--artifact", default=None,
+                        help="参考路径；不给则用 manifest 里记的那个。"
+                             "参考不可访问时只做整文件摘要比对，"
+                             "并在报告里说明特征行这一级跳过了")
+    p_tree.set_defaults(func=cmd_check_tree)
 
     p_check = sub.add_parser("check", help="查某路径是否越过封存边界")
     p_check.add_argument("--work-dir", required=True)

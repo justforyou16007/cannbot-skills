@@ -94,7 +94,10 @@ IR 在指令选择与寄存器分配**之前**，所以证不了「寄存器没�
 三个工具各自的做法：
 
 - `signature_probe.py` —— 缺失标 `present=false` 而非 0；停顿数据缺失时
-  **拒绝输出架构假设**
+  **拒绝输出架构假设**。另外区分「没采到」与「解析不动」：前者正常（空值、
+  `N/A` 是 msprof 明确的不适用标记），后者**阻塞** —— 有内容而读不动说明
+  那一列的量纲或格式和本工具以为的不一样，而同一份 CSV 里别的列照样被读走
+  了，于是签名里混着一个读错了的字段，**而它伪装成一个缺失字段**
 - `lever_probe.py` —— 缺单项测量时标 `incomplete`，不硬算耦合
 - `fence_check.py` —— 扫不到源文件时报错，不返回「通过」
 
@@ -191,6 +194,57 @@ python3 scripts/lever_probe.py analyze --store ./forge_work/levers.json
 
 反过来，一起上省了 14%，说明有协同，应作为 `atomic_group` 同批落地。
 
+### 两条腿：单项不够
+
+单项定价只能回答「它单独值多少」。优化循环实际要问的是「全上之后，再动它
+还有没有收益」—— 这两个问题的答案**可以相反**。
+
+| 腿 | 怎么测 | 回答什么 |
+|---|---|---|
+| 单项 | 只删这一项 | 它单独值多少 |
+| 边际 | 全删 − 全删但留下这一项 | 别人都在的情况下它还值多少 |
+
+两条腿合起来给六类：
+
+| 类 | 单项 | 边际 | 含义 |
+|---|---|---|---|
+| `independent` | 显著 | 显著 | 单独有用，全上时也仍有用 |
+| `redundant` | 显著 | 不显著 | 别人已经吃掉了它的收益，不要重复投入 |
+| `coupled` | 不显著 | 显著 | **单独看不出收益，但别人依赖它** |
+| `inert` | 不显著 | 不显著 | 真的没有可测量的空间 |
+| `harmful` | 负 | — | 删掉它反而更慢 |
+| `unknown` | 缺测量 | — | 判不了 |
+
+**`coupled` 是只有边际那条腿才能发现的那一类。** 只有单项腿时，它的读数
+落在噪声里 → 判「测不出来」→ 进 `not_worth_pursuing` → 工具主动告诉你
+不要在一个承重的方向上投入。这不是漏报，是**反向报错**。
+
+所以 `coupled` 的手段会被从 `not_worth_pursuing` 里剔掉，并单列进
+`must_keep`。
+
+缺一条腿时判 `unknown` 并说清补哪一次测量 —— 拿单项读数顶替，正是
+`coupled` 被判成 `inert` 的那条路。
+
+```bash
+# 全删（universe）
+python3 scripts/lever_probe.py add --store ./forge_work/levers.json \
+    --lever drop_output_store --lever relax_align --time-us 50.0 \
+    --variant-hash 7f3a9c1
+```
+
+### `--variant-hash`：这个变体真的改过吗
+
+一个「删掉了某个环节」的变体，如果代码和基线一模一样，那它根本没被改过 ——
+测出来的差值全部是噪声。而那个差值会被当成这个环节的**价格**，据此决定要不要
+在它上面投几轮迭代。
+
+这件事在流程里很容易发生：改动写在一个没被编译进去的分支里、改完忘了重新装
+OPP、或者改的是另一个 shape 的路径。三种情形都会得到一个形状完全正常的
+结果文件。
+
+指纹与基线相同时拒绝登记。两侧任一没有指纹时不拒 —— 那会把老 store 与
+不传指纹的正当用法一起卡住。
+
 ### 探针变体不是候选
 
 删掉输出写回的 kernel 算出来的结果是错的。工具把记录标为 `probe_only`，
@@ -217,15 +271,56 @@ python3 scripts/fence_check.py --candidate ./my_kernel \
 
 ### 规则
 
+围栏分两档，这一点要紧。
+
+### 阻断档：这是转发的**标志**
+
 | 规则 | 抓什么 |
 |---|---|
-| `F-ACLNN` | `aclnnXxxGetWorkspaceSize` / `aclnnXxx` 两段式调用 |
+| `F-ACLNN` | `aclnnXxxGetWorkspaceSize` / `aclnnXxx` 两段式调用（本算子） |
 | `F-TORCH-NPU` | `torch_npu.npu_<op>` |
 | `F-TORCH-FUNC` | `torch.nn.functional.<op>` |
 | `F-ATEN` | `torch.ops.aten.<op>` |
 | `F-OPP-SWITCH` | 候选自己改写 `ASCEND_CUSTOM_OPP_PATH`（只抓写，不抓读）|
 | `F-REF-PATH` | 引用封存的参考路径 |
 | `F-DENY` | 出现参考的专有符号 |
+
+命中即 `passed: false`，`record` 直接回滚并归因到实现。
+
+### 通道档：这是一条**能通向**厂商实现的路
+
+上面七条有一个共同的结构性弱点：**它们全部由算子名派生**。而转发不需要
+写出名字 —— `ctypes.CDLL("libopapi.so").aclnnAddLayerNorm` 里那个名字是
+运行时拼出来的字符串，`importlib.import_module(cfg.backend)` 里连字符串
+都没有。于是七条全绿，而候选一行 kernel 都没写。
+
+| 规则 | 抓什么 |
+|---|---|
+| `F-DLOPEN` | `dlopen` / `dlsym` |
+| `F-FFI` | `ctypes.CDLL` / `cffi` / `ffi.dlopen` |
+| `F-OPAPI-SO` | 指名 `libopapi.so` / `libaclnn*.so` / `libascendcl.so` |
+| `F-ACLNN-ANY` | 任意 aclnn 接口（不限本算子）—— 转发给另一个厂商算子同样不是自己实现 |
+| `F-SUBPROCESS` | 起子进程。子进程里跑什么，静态扫描看不到 |
+| `F-DYNIMPORT` | `importlib.import_module` / `__import__` |
+
+**命中不自动判不通过。** 正当实现里也会出现这些构造：装载自己编出来的
+`.so`、起子进程跑构建、动态 import 自己的后端模块。把「能通向」和「就是」
+混成一档，等于拿整条规则的存活去赌每一次命中都是真的 —— 而一次误伤会让人
+`--exempt` 整条关掉，之后真正的转发也无人把守。
+
+但它们**不等于可以不看**：报告里单列 `channels` 字段，`record` 据此把
+「围栏干净」与「有未说明的通道」区分开（第三态 `clean_with_channels`），
+而不是把两者都读成通过。请逐条说明每个通道通向哪里。
+
+### `third_party` 不再跳过
+
+它曾在 `SKIP_DIRS` 里，那是围栏上最大的一个洞：把一份转发实现放进
+`third_party/`、再从候选 import 它，整棵目录连扫都不扫 —— 候选代码里只剩
+一行 import，没有任何 aclnn 字样。
+
+「第三方代码不是候选的实现」这句话本身对，但它回答的不是围栏在问的问题。
+围栏问的是「这次测到的加速比是不是这份 kernel 挣来的」—— 从哪个目录转发
+出去，对这个问题没有区别。构建产物目录仍然跳过。
 
 ### 不误伤是硬要求
 

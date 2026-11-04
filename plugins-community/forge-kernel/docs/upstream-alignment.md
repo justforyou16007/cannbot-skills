@@ -51,8 +51,8 @@
 要替换的话，Claude Code 这边能做的是：hook 读 `CLAUDE_AGENT_NAME` 之类的上下文区分调用者（需确认 Claude Code 是否向 hook 传入 agent 身份；若不传，这条做不了）。
 
 **待决策**：
-- [ ] 引入 `source` / `blackbox` 两种模式，gen≥1 自动转 source（配合角色不对称）
-- [ ] 保留现状：所有代次、所有角色一律不可读
+- [~] 引入 `source` / `blackbox` 两种模式，gen≥1 自动转 source（配合角色不对称） — **未采纳**。它依赖「按角色区分读权限」，而 Claude Code 的 hook 拿不到调用方身份（已验证），做不出不对称。硬做只会得到一道看起来在、实际两边都拦不住的门。
+- [x] 保留现状：所有代次、所有角色一律不可读 （**已采纳**，见下一条为什么没选 source 模式）
 
 ---
 
@@ -73,10 +73,17 @@
 **差异性质：A（反向检查、改动检测挂门禁）+ B（sandbox、每回合重写）+ D（配置 json 一并封存是我们按昇腾实际加的，上游无对应物）**
 
 **待决策**：
-- [ ] `seal_reference.py check-tree <候选目录>`：按文件 sha256 + distinctive line 查参考明文搬运（manifest 里已有逐文件 sha256，只需补 line 集合）
-- [ ] `record` 前跑一遍 manifest 校验（含「新增文件」方向），不一致拒绝裁决
-- [ ] `sealed_paths.txt` 除逐文件路径外，再加每个文件的**真实父目录**
-- [ ] 保留 hook 作为唯一执行点（Claude Code 无 sandbox 等价物时只能如此）
+- [x] `check-tree` 两级判据：整文件 sha256（只用 manifest，不读参考）+ 特征行（去注释、压空白、丢掉过短与高重复的行）。
+      报告里写明**抓不到什么**：改过名字、重排过结构的搬运两级都抓不到 ——`findings` 为空不等于「没有搬运」。
+- [x] `record` 调 `verify_manifest`，三个方向（删除 / 变更 / **新增**）。
+      新增那个方向不是「记录对不上」这么轻：新文件没进清单就没进禁读清单，hook **不会拦**对它的读取 ——
+      参考树上多出一个 agent 能随便读的源文件，而比对已记录那些的校验全绿。`opp_install` 那类活的安装目录尤其容易碰上。
+      清单缺失时不硬拒（内置实现作参考、老 state 本来就没有），由调用方告警。
+- [x] 每个被封文件的真实父目录**一路加到产物根**。
+      hook 对 Grep / Glob 的判据是「请求路径是不是某个被封条目的祖先」，而产物根是软链、
+      或源码散在产物之外时，真实父目录既不等于产物根、也不在逐文件清单里。漏掉中间任何一层，
+      对那一层的递归请求就会放行，而它底下照样有被封的文件。到产物根为止 ——再往上是公共目录。
+- [x] 保留 hook 作为唯一执行点（Claude Code 无 sandbox 等价物时只能如此） （**已采纳**：Claude Code 无 sandbox 等价物）
 
 ---
 
@@ -97,12 +104,20 @@
 **差异性质：A（两窗口 + host-bound 审计 + 多工作负载 + 输入轮换）+ C（window.toml 的 asymmetry 对我们基本不适用）**
 
 **待决策**：
-- [ ] 评测加「不 sync 连发」入队循环与「一对 Event 套 N 次连发」摊销窗口，输出 `host_enqueue_us` / `device_median_us` / `host_bound_ratio`
+- [x] 第二个计量窗口：一对 Event 套 N 次连发（同步开销摊掉）+ 只下发不等的墙上时间。
+      输出 `device_amortized_us` / `host_enqueue_us` / `host_bound_ratio`，`record` 据此在 host 受限时不抬高 best。
+      **这段代码只能在真设备上验证**（本机无 torch_npu），所以包在 try 里：失败时记原因而不是让整次评测挂掉 ——
+      一个新加的诊断量不该有能力毁掉一次已经排到的机时窗口。判定逻辑在 campaign.py 一侧，已单测。
 - [x] `record` 对账 `signature.launch.task_duration_us` ÷ 结果 `time_us` ≥ 20%；不到则**不抬高 best**（而不是只告警 —— 告警会被读过就忘）
 - [~] 几何平均有了（`_geomean` 聚合**跨 shape** 的 speedup），但**每个 shape 只有一套输入**（单个 `manual_seed(42)`）；`host_bound_ratio` 这个量根本不存在，所以「取最差那个」无从谈起
-- [ ] 输入做 2-4 份轮换；计时前后对每个输入张量取 hash 比对
+- [x] `--input-rotation`（默认 2）+ 计时前后取摘要比对。
+      轮换破的是两件事：一份输入反复用会把缓存命中烘进**绝对耗时**（而绝对耗时是噪声底、设备占比、host 受限的分母）；
+      以及一个按输入身份 memoize 的实现会从第二个 trial 起直接返回上次结果（cv 极低、加速比极高、所有门禁都过）。
+      摘要比对抓的是「kernel 原地改了输入」—— 更隐蔽的那层后果是精度：比对拿改过之后的输入重算真值，
+      于是会改输入的实现在精度上也显得正确。`record` 见到 `inputs_mutated` 为真直接拒收。
+      摘要只取形状/dtype/若干采样点之和 —— 全量 hash 在大张量上太贵，而要查的是「变过没有」不是「变成了什么」。
 - [x] `record` 见到 `measurement.baseline_from_cache` 为真直接拒收，拒绝理由里带上 2.7% 这个可核对的量
-- [ ] 不引入 window.toml（两侧共用 call_spec，结构上不会不对称）
+- [x] 不引入 window.toml（两侧共用 call_spec，结构上不会不对称） （**已采纳**：两侧共用 call_spec，结构上不会不对称）
 
 ---
 
@@ -124,12 +139,15 @@
 **差异性质：A（remove 腿、空操作检测、角色暴露账、第三态、采集前置）+ C（sass 静态普查、ramp/plateau/drain）**
 
 **待决策**：
-- [ ] `lever_probe` 补 `all` / `all-minus-L` 两类变体与 remove 腿，分类照抄上游六类
-- [ ] `lever_probe add` 增加必填 `--variant-hash`，与基线相同时拒绝登记
+- [x] 两条腿 + 六类分类（independent / redundant / **coupled** / inert / harmful / unknown）。`coupled` 从 `not_worth_pursuing` 剔除并单列进 `must_keep` —— 此前它会被列进「不要再投」，那不是漏报而是反向报错
+- [x] `--variant-hash`，与基线相同时拒绝登记。**没做成必填** —— 两侧任一没有指纹时不拒，否则会把老 store 与不传指纹的正当用法一起卡住
 - [x] `signature_probe` 新增 `role_exposure` 段：`exposed_us × wait_i / Σwait`，按最大项产出一条带通道的假设
 - [x] 读 `per_core_cycles.csv`，给出 `(max−min)/max` 与慢核 ID（**落在顶层 `core_balance` 键**，不在 `exposure` 段内）
-- [ ] `safe_float` 区分「字段不存在」与「解析失败」，后者响亮失败
-- [ ] 新增 `probe_env` 子命令：用最小算子跑一次 msprof 并断言 `aiv_vec_bank_cflt_ratio` 这一列真的出现
+- [x] 新增 `parse_cell` 三态；解析不动的列**阻塞**架构假设。顺带把 `check_trust` 从「extract_stalls 之后」挪到**全部取数之后** —— 此前 memory / cache 两段里的解析失败它看不见，而那正是搬运量与命中率所在的两段
+- [x] `signature_probe.py --check-env`（扁平 parser，按仓里既有风格做成开关而非子命令）。
+      它**不自己起 msprof** —— 那会把「探针」和「采集驱动」混成一件事，而采集参数在不同环境下差别很大。
+      用法是先按 ops-profiling 采一次最小算子，再把目录交给它。
+      依赖列写进 `REQUIRED_COLUMNS`，并有一条用例钉住「这张表和探针实际读的列对得上」—— 对不上它就是一张装饰。
 - [x] `instrument-map.md` 补 orchestration 一节，并把「没有时间线等价物」改写为「没有时间线，但有逐核 cycle」
 
 ---
@@ -158,7 +176,7 @@
 - [x] milestone 顶层加必填 `adjudications`（闭合词汇表 + 显式 `none`），非 none 即要求对应标签的机制行
 - [~] V14 强制 `priced: {delta_pct, source}` 且校验 delta 为正、source 非空，但**不与 `levers.json` 对账**（价格仍是自述的数）；触发条件是「这行带 `structural_anchor`」而不是「这行属于结构类」，没带 anchor 的结构行逃得掉
 - [x] 校验器拒绝「指标 == 参考实测值」形状的门禁行（只允许上界/下界 + 配对的溢出行）
-- [ ] 保留 V0（上游无对应物：空文档/键名拼错/门禁行写成一句话）
+- [x] 保留 V0（上游无对应物：空文档/键名拼错/门禁行写成一句话） （**已采纳**：上游无对应物，但本仓实测踩过这三种）
 
 ---
 
@@ -176,14 +194,20 @@
 **差异性质：A（通道规则、代码身份字段）+ B（fence 进裁决、NEUTRAL）**
 
 **待决策**：
-- [ ] `fence_check` 补一组与算子名无关的通道规则（`dlopen|dlsym|ctypes|cffi|subprocess|importlib|libopapi\.so|\baclnn[A-Z]\w*`）
-- [ ] `third_party` 从 SKIP_DIRS 拿掉，或改成「不扫但禁止从它 import」
+- [x] 六条通道规则（`F-DLOPEN` / `F-FFI` / `F-OPAPI-SO` / `F-ACLNN-ANY` / `F-SUBPROCESS` / `F-DYNIMPORT`），**advisory 档**：报告但不自动判不通过。
+      分档的理由是误伤代价 —— 正当实现里也会出现这些构造（装载自己编的 .so、起子进程跑构建），
+      而一次误伤会让人 `--exempt` 整条关掉。`record` 据此给第三态 `clean_with_channels`：不压 best，但台账留痕
+- [x] `third_party` 已从 SKIP_DIRS 拿掉。它是围栏上最大的一个洞：把转发实现放进去再 import，整棵目录连扫都不扫
 - [x] `record` 新增 `--fence-report`：命中则回滚并归因实现；**没传则不抬高 best**。
       没做成硬必填 —— 硬拒会把一批正当用法一起卡住，而人会反射性地去加豁免参数，
       那和静默放行是同一件事。压住 best 既有牙齿、又不堵路：best 是 promote 封进
       下一代参考的那个东西，压住它就等于「这一轮不能成为下一代的起点」
 - [~] `artifact_sha` / `base_sha` / `milestone_sha256` 有了，`reading_of` 只在 confirm 条目上，`device_id` 只在 state 顶层（但有结果与 state 卡号的强制对账）；**`diff_signature` 完全没有**
-- [ ] 新增 `VERDICT_NEUTRAL` 与 `record --neutral`（不要 `--result`，要 `--sha`）
+- [x] 新增 `campaign.py neutral` 子命令（独立命令而非 `record --neutral` ——它不读结果文件，挂在 record 下会让那些必填参数失去意义）。
+      它解决的是：重命名、拆函数、提常量而取值不变这类改动仍然改变**代码身份**，而机制做差的前提是
+      「最后一条台账记录就是当前代码的样子」。没有这条路时只有两条选择 ——为必然无变化的改动花一次机时，
+      或者不记（而不记是免费的，所以它是会实际发生的那条）。
+      指纹与上一条相同时拒绝：那常常意味着改动没落到被测的产物上。
 
 ---
 
@@ -204,8 +228,13 @@
 **待决策**：
 - [x] 精度锚到不随代际移动的真值（CPU/fp64 重算，或仓内 `ops-precision-standard` 的 MARE/MERE 判据）
 - [x] 判据换成误差比 `e_cand > K·e_ref + floor`，K 与 floor 按昇腾 dtype 标定
-- [ ] 加三种 stress profile
-- [ ] 保留现状：继续用 1e-3 容差对 baseline（承认逐代漂移，并在 promote 时记录累计漂移次数）
+- [x] `--stress-profile normal|wide|extreme`。误差比判据是**检测**降精度的机制，压力分布是让它**触发**的条件 ——
+      一个用 bf16 累加的 kernel 在 randn 上完全可能过关（值都在 1 附近，累加误差没机会堆积）。
+      三种各针对一类：`wide` 量级跨 6 个数量级（大数吃小数暴露低精度累加器）、`extreme` 贴近 dtype 边界 + 0 + 极小值
+      （暴露中间量被砍精度后的溢出/下溢）。只动浮点 —— 整型没有「量级跨度」这回事，硬改只会测到错误处理。
+      **三种分布的实际效果未在硬件上标定**：构造方式有依据，但「它们确实能把降精度实现抓出来」需要一次标定，
+      做法同 `precision_gate` 的 `calibration_note`。
+- [~] 保留现状：继续用 1e-3 容差对 baseline（承认逐代漂移，并在 promote 时记录累计漂移次数） — **未采纳**，已换成对 float64 真值的误差比（见上一条）。
 
 ---
 
@@ -223,9 +252,16 @@
 **差异性质：B（裁决耦合、harness overlay）+ A（3 job 确认）**
 
 **待决策**：
-- [ ] 加裁决耦合：机制未核实时，`record` 拒绝把该 milestone 的门禁行标 PASS（现在是两份文件各说各话，从不对账）
-- [ ] 确认复测从 2 次提到 3 次，取中位数
-- [ ] 保留两次（机时考虑）
+- [x] `check_gate_coupling`：机制判 refuted/vacuous 而课程表那条行标着 PASS 时，台账记一条 `gate_coupling` 并**说明该修哪一侧**（由归因决定）。
+      **只报告不改文件** —— record 不该去写课程表，那是架构层的产物
+- [x] `CONFIRM_READINGS = 3`，best 取**中位数**。
+      从「每一次都达标」改成「中位达标」：前者对一次**偏低**抽样没有抵抗力，而偏低和偏高一样常见 ——
+      于是一个真达标的结果会被一次运气差的复测否掉，然后再测一次，机时反而更费。
+      **代价：每次确认多花一次机时**（2 → 3）。这是 A 类同步的直接后果，若机时更紧可把 CONFIRM_READINGS 改回 2。
+      上游在这个位置还查「三个样本是不是都落在同一台机器上」—— 那条**无法照搬**（本仓按设计单卡，
+      跨机采样会破坏可比性，样本必然同机）。换成查三读之间的离散度：差得比噪声底 ×3 还多，
+      说明它们不是同一个量的三次抽样，中位数对它们没有意义。
+- [~] 保留两次（机时考虑） — **未采纳**，已改 3 读取中位。若机时更紧，把 `CONFIRM_READINGS` 改回 2 即可退回这条。
 
 ---
 
@@ -253,8 +289,10 @@
       课程表写 `< 4.2`、参考实测正好 4.2（要求实现追平参考），`4.2 < 4.2` 为假，
       于是一条完全正当的行被判成「读错了参考」
 - [x] `mechanism-labels.md` 每个标签补可选 `structural_anchor`（候选源码里必须出现的构造），`record` 先验结构再验停顿
-- [ ] M0 的 `cursor` 未经 `audit` 不得推进到 M1（强制化）
-- [ ] 保留现状：`audit` 作为可选工具
+- [x] `audit` 把结果盖进 state（`m0_audit`），`next_action` 在本代没对过账或对账未通过时返回 `audit` 动作。
+      **没做成硬停机** —— 硬停会在本代还没有任何读数时就把流程卡住（那时没有签名可对账），
+      而一个在正当起点上就报错的门禁会被反射性绕过。所以条件是「本代已有机制已核实的读数」。
+- [~] 保留现状：`audit` 作为可选工具 — **未采纳**，已做成 `next_action` 会主动要求的一步（但不是硬停机，理由见上一条）。
 
 ---
 
@@ -276,14 +314,15 @@
 这一步 A 类最多，而且全是纯状态机逻辑。
 
 **待决策**：
-- [ ] 停滞递增判据改为「本轮没有抬高 best」，而不是「增益没超噪声底」
-- [ ] `reopen` 必填 `--price "<Δ%> via lever:<name>|probe:<path>"`，拿 `levers.json` 校验引用存在且 Δ 超噪声底
-- [ ] state 加 `reopen_fruitless` 计数，超 2 次拒绝重开（落盘，不随进程归零）
-- [ ] `dependents_closure` 的种子集加入同 `atomic_group` 成员
-- [ ] 台账加 `patch` 类条目（`locus / direction / milestone_sha_before / outcome`），`status` 把 `reverted` 的方向列为「已证伪的课程表方向」
-- [ ] `implementation_failures` 超阈值进独立的 `STATE_BLOCKED`（不走架构重入）
-- [ ] `reopen` 输出具体的回退目标（需要台账先记 artifact 哈希）
-- [ ] 墙钟预算：`record` 时按 `init` 时间戳算差（无常驻进程，只能这样近似）
+- [x] 停滞递增判据改为「本轮没有抬高 best」，而不是「增益没超噪声底」（此前已完成，勾选状态是旧的）
+- [x] `reopen` 必填 `--price "<Δ%> via lever:<name>|probe:<path>"`，拿 `levers.json` 校验引用存在且 Δ 超噪声底（此前已完成，勾选状态是旧的）
+- [x] state 加 `reopen_fruitless` 计数，超 2 次拒绝重开（落盘，不随进程归零）（此前已完成，勾选状态是旧的）
+- [x] `dependents_closure` 的种子集加入同 `atomic_group` 成员（此前已完成，勾选状态是旧的）
+- [x] `reopen` 记 `patch` 条目；`outcome` 在下一次抬高 best 时回填为 `accepted`。`status` 列出已试过的课程表方向。
+      回填是必须的：否则一次**成功的**修订也永远停在 pending，于是 status 拿它去劝退下一代 —— 只记投入不记产出的账比没有更糟
+- [x] `implementation_failures` 超阈值进独立的 `STATE_BLOCKED`（不走架构重入）（此前已完成，勾选状态是旧的）
+- [x] `rollback_target`：作废范围之外、最后一个机制已核实且有 `artifact_sha` 的产物。找不到就说「从参考基线重新开始」—— 不编一个看起来合理的回退点
+- [x] `--wall-hours` / `set-budget --max-wall-hours`，按 `created_at` 算差。明确标注「含停机时间，是机时的上界」—— 误差方向保守（提前提醒）而不是漏
 
 ---
 
@@ -301,8 +340,11 @@
 **差异性质：D（产物库）+ B（角色不对称）+ A（第二条停止条件显式化）**
 
 **待决策**：
-- [ ] 把「这一代没有确认过的 best」做成显式停止条件（现在是入库时才报错，时机太晚）
-- [ ] 保留产物库（上游无对应物，不要替换）
+- [x] 两处：停机原因里带上 `_unconfirmed_best_note`；以及**额度不足时直接停机**而不是要求补确认。
+      后者补的是一个闭死的局面：状态说「去补确认」而预算或墙钟已经不允许再跑 —— 那时这一代的产出是不可用的
+      （未经确认的 best 不能 promote），但状态看起来只是「还差一步」。
+      增益没超噪声底时不提这件事（收敛停机正好是这种情形），否则提示会变成纯噪声而被一起忽略。
+- [x] 保留产物库（上游无对应物，不要替换） （**已采纳**：上游无对应物）
 
 ---
 
@@ -346,9 +388,13 @@
       ≥ 声称的 Δ（「一条转述过来的处方不是价格」）
 
 **还没做**：
-- [ ] 把症状密集表直接渲染进架构 agent 的输入（现在要它自己去 `query` 或读 `INDEX.md`）
-- [ ] 启动门禁：每次 loop 启动对整棵树跑 lint，有命中就拒绝启动
-- [ ] 隔离前先返修两轮（现在是 `--quarantine` 一步到位）
+- [x] `forge-arch` 的步骤表里，读 `INDEX.md` 排在 `query` **之前**并写明「无条件读完」。
+      `query` 是拉取式的 —— agent 得先怀疑「这个现象别人遇到过」才会去查，而它通常不会怀疑。
+- [x] `init --kb-root` 开跑前把整棵树过一遍边界 lint，有命中就拒绝启动（`--allow-dirty-kb` 显式放过）。
+      放在 init 的理由：知识库被读的时机是架构层写课程表的时候，此时拦下来**还没花任何机时**；
+      跑到中途才发现，那张卡片已经参与过几轮决策，而哪几轮受了影响无从分辨。
+- [x] `QUARANTINE_AFTER_FAILURES = 2`，计数记在卡片 frontmatter 里（跨进程存活），过检后清零。
+      frontmatter 读不动的卡片直接隔离 —— 计数没处记，而那类卡片最常见的成因恰恰是正文里粘了源码。
 
 ---
 

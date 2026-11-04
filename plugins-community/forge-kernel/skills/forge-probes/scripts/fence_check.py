@@ -64,36 +64,121 @@ SCAN_SUFFIXES = {
 #: 单文件扫描上限，避免被超大文件拖住。
 MAX_FILE_BYTES = 4 * 1024 * 1024
 
-#: 跳过的目录：构建产物与第三方代码不是候选的实现。
+#: 跳过的目录：构建产物不是候选的实现。
+#:
+#: `third_party` **刻意不在**这个列表里。它曾经在，而那是围栏上最大的一个
+#: 洞：把一份转发实现放进 third_party/、再从候选 import 它，整棵目录连扫都
+#: 不扫 —— 候选代码里只剩一行 `from third_party.x import op`，没有任何
+#: aclnn 字样。
+#:
+#: 「第三方代码不是候选的实现」这句话本身是对的，但它回答的不是围栏在问的
+#: 问题。围栏问的是「这次测到的加速比是不是这份 kernel 挣来的」—— 从哪个
+#: 目录转发出去，对这个问题没有区别。
 SKIP_DIRS = {
     "build", "build_out", "output", "__pycache__", ".git",
-    "third_party", "node_modules", ".pytest_cache", "dist",
+    "node_modules", ".pytest_cache", "dist",
 }
+
+#: 动态装载与外部调用的通道。
+#:
+#: 这一组和下面 build_rules 里那五条的性质不同：**它们不由算子名派生**。
+#:
+#: 为什么必须有这一组：按算子名生成的规则只能抓住「照名字直接调」。而转发
+#: 不需要写出名字 —— `ctypes.CDLL("libopapi.so").aclnnAddLayerNorm` 里那个
+#: 名字是运行时拼出来的字符串，`importlib.import_module(cfg.backend)` 里连
+#: 字符串都没有。于是围栏五条全绿，而候选一行 kernel 都没写。
+#:
+#: #8 之后围栏能压住 `best`，也就是能决定一轮算不算数 —— 它的覆盖面因此比
+#: 以前重要得多：漏掉的那条路现在是「静默地让一个转发实现成为下一代参考」。
+#:
+#: 这一组**只报告、不等于判定**：动态装载在正当实现里也会出现（装载自己
+#: 编出来的 .so 就是）。所以规则措辞是「这里有一条能通向厂商实现的路，
+#: 请说明它通向哪里」，而不是「你转发了」。判定仍然在人/裁决那一侧。
+CHANNEL_RULES: List[Tuple[str, str, str]] = [
+    (
+        "F-DLOPEN",
+        r"\b(?:dlopen|dlsym)\s*\(",
+        "用 dlopen/dlsym 动态装载符号。符号名是运行时字符串，"
+        "按算子名写的围栏规则看不见它",
+    ),
+    (
+        "F-FFI",
+        r"\b(?:ctypes\s*\.\s*(?:CDLL|cdll|PyDLL|LibraryLoader)"
+        r"|cffi\b|ffi\s*\.\s*dlopen)",
+        "用 ctypes/cffi 调外部库。这条路上的函数名不出现在源码的标识符里",
+    ),
+    (
+        "F-OPAPI-SO",
+        r"libopapi\.so|libaclnn\w*\.so|libascendcl\.so",
+        "直接指名 CANN 的算子库 .so。那就是厂商实现本身",
+    ),
+    (
+        "F-ACLNN-ANY",
+        # 任意 aclnn 接口，不限本算子 —— 转发到「另一个」厂商算子同样是转发。
+        r"(?<![A-Za-z0-9_])aclnn[A-Z]\w*\s*\(",
+        "调用了某个 aclnn 接口（不限本算子）。转发给另一个厂商算子"
+        "同样不是自己实现",
+    ),
+    (
+        "F-SUBPROCESS",
+        r"\b(?:subprocess\s*\.\s*(?:run|call|Popen|check_output|check_call)"
+        r"|os\s*\.\s*(?:system|popen|exec[lv]p?e?))\s*\(",
+        "起子进程。子进程里跑什么，静态扫描看不到",
+    ),
+    (
+        "F-DYNIMPORT",
+        r"\b(?:importlib\s*\.\s*import_module|__import__)\s*\(",
+        "按字符串动态 import。被 import 的模块名不出现在源码的标识符里",
+    ),
+]
 
 
 class FenceError(Exception):
     """围栏无法完成检查。"""
 
 
+#: 两档严重度。
+#:
+#: blocking   这是转发的**标志**：照名字直接调厂商实现、引用封存路径、
+#:            出现参考专有符号名。命中即判不通过。
+#: advisory   这是一条**能通向**厂商实现的路，但正当实现里也会出现
+#:            （装载自己编出来的 .so、起子进程跑构建、动态 import 自己的
+#:            后端模块）。命中要报出来让人看，但不自动判不通过。
+#:
+#: 为什么要分：围栏的误伤代价高于漏判 —— 一次误伤会让人整条 `--exempt`
+#: 关掉，之后真正的转发也无人把守。把「能通向」和「就是」混成一档，等于拿
+#: 整条规则的存活去赌每一次命中都是真的。
+#:
+#: 但 advisory **不等于可以不看**：它进报告、进台账，裁决那一侧会把
+#: 「有未说明的通道」与「围栏干净」区分开。
+SEVERITY_BLOCKING = "blocking"
+SEVERITY_ADVISORY = "advisory"
+
+
 class Finding:
     """一处越界。file:line 让人能当场判断是不是误伤。"""
 
     def __init__(self, rule: str, path: Path, line_no: int,
-                 line: str, reason: str) -> None:
+                 line: str, reason: str,
+                 severity: str = SEVERITY_BLOCKING) -> None:
         self.rule = rule
         self.path = path
         self.line_no = line_no
         self.line = line.strip()[:200]
         self.reason = reason
+        self.severity = severity
 
     def as_dict(self) -> Dict[str, Any]:
         return {
             "rule": self.rule, "file": str(self.path), "line": self.line_no,
             "text": self.line, "reason": self.reason,
+            "severity": self.severity,
         }
 
     def __str__(self) -> str:
-        return f"[{self.rule}] {self.path}:{self.line_no}\n    {self.line}\n    {self.reason}"
+        mark = "" if self.severity == SEVERITY_BLOCKING else "（待说明）"
+        return (f"[{self.rule}]{mark} {self.path}:{self.line_no}\n"
+                f"    {self.line}\n    {self.reason}")
 
 
 # ---------------------------------------------------------------------------
@@ -133,9 +218,9 @@ def name_variants(op_name: str) -> Dict[str, str]:
     return {"snake": snake, "camel": camel, "raw": raw}
 
 
-def build_rules(op_name: str,
-                reference_paths: List[str]) -> List[Tuple[str, re.Pattern, str]]:
-    """构造围栏规则。每条都给出「为什么这是转发而不是实现」。"""
+def build_rules(op_name: str, reference_paths: List[str]
+                ) -> List[Tuple[str, re.Pattern, str, str]]:
+    """构造围栏规则。每条都给出「为什么这是转发而不是实现」与严重度。"""
     names = name_variants(op_name)
 
     # 两种写法各给一组候选，而不是只认推导出来的那一个。
@@ -152,27 +237,31 @@ def build_rules(op_name: str,
     snake = "(?:%s)" % "|".join(
         re.escape(v) for v in sorted(filter(None, snake_alts), key=len, reverse=True))
 
-    rules: List[Tuple[str, re.Pattern, str]] = [
+    rules: List[Tuple[str, re.Pattern, str, str]] = [
         (
             "F-ACLNN",
             re.compile(rf"\baclnn{camel}(?:GetWorkspaceSize)?\s*\("),
             ("调用了厂商 aclnn 接口。aclnn 的两段式调用是调用 CANN 算子库"
              "内置实现的标志 —— 这是转发，不是自己实现"),
+            SEVERITY_BLOCKING,
         ),
         (
             "F-TORCH-NPU",
             re.compile(rf"\btorch_npu\s*\.\s*npu_{snake}\b"),
             "调用了 torch_npu 提供的同名算子，它会派发到厂商实现",
+            SEVERITY_BLOCKING,
         ),
         (
             "F-TORCH-FUNC",
             re.compile(rf"\btorch\s*\.\s*(?:nn\s*\.\s*functional\s*\.\s*)?{snake}\s*\("),
             "调用了框架的同名实现，它最终派发到厂商 kernel",
+            SEVERITY_BLOCKING,
         ),
         (
             "F-ATEN",
             re.compile(rf"\btorch\s*\.\s*ops\s*\.\s*aten\s*\.\s*{snake}\b"),
             "调用了 aten 的同名算子，等同于使用框架内置实现",
+            SEVERITY_BLOCKING,
         ),
         (
             "F-OPP-SWITCH",
@@ -187,6 +276,7 @@ def build_rules(op_name: str,
             ),
             ("在候选代码里改写 ASCEND_CUSTOM_OPP_PATH。派发路径应由评测"
              "驱动统一控制；候选自己改它可以把调用导向参考实现"),
+            SEVERITY_BLOCKING,
         ),
     ]
 
@@ -198,7 +288,14 @@ def build_rules(op_name: str,
             "F-REF-PATH",
             re.compile(re.escape(cleaned)),
             f"引用了封存的参考路径 {cleaned}；候选不应依赖参考的任何产物",
+            SEVERITY_BLOCKING,
         ))
+
+    # 通道规则接在最后。它们与算子名无关，所以无论 op_name 给成什么都生效 ——
+    # 这正是它们存在的理由：上面五条只要算子名写错一个字母就全体失效，
+    # 而那种失效是静默的（围栏报「通过」）。
+    for name, pattern, reason in CHANNEL_RULES:
+        rules.append((name, re.compile(pattern), reason, SEVERITY_ADVISORY))
 
     return rules
 
@@ -270,7 +367,7 @@ def compile_denylist(denylist: Iterable[str]) -> Optional[re.Pattern]:
 
 
 def scan_file(path: Path,
-              rules: List[Tuple[str, re.Pattern, str]],
+              rules: List[Tuple[str, re.Pattern, str, str]],
               denylist_re: Optional[re.Pattern]) -> List[Finding]:
     try:
         if path.stat().st_size > MAX_FILE_BYTES:
@@ -307,9 +404,10 @@ def scan_file(path: Path,
         if not code.strip():
             continue
 
-        for rule, pattern, reason in rules:
+        for rule, pattern, reason, severity in rules:
             if pattern.search(code):
-                findings.append(Finding(rule, path, line_no, raw, reason))
+                findings.append(
+                    Finding(rule, path, line_no, raw, reason, severity))
 
         if denylist_re is not None:
             reported: Set[str] = set()
@@ -404,15 +502,26 @@ def check(candidate: Path, op_name: str, reference_paths: List[str],
             f"支持的后缀: {sorted(SCAN_SUFFIXES)}"
         )
 
+    # 只有 blocking 档决定 passed。
+    #
+    # advisory 档（动态装载、子进程、任意 aclnn 接口）不自动判不通过 ——
+    # 正当实现里也会出现这些构造。但它们**不是**可以不看：
+    # `channels` 字段单列出来，裁决那一侧据此把「围栏干净」与
+    # 「有未说明的通道」区分开，而不是把两者都读成通过。
+    blocking = [f for f in kept if f.severity == SEVERITY_BLOCKING]
+    advisory = [f for f in kept if f.severity == SEVERITY_ADVISORY]
+
     return {
-        "passed": not kept,
+        "passed": not blocking,
         "op_name": op_name,
         "candidate": str(candidate),
         "files_scanned": scanned,
-        "findings": [f.as_dict() for f in kept],
+        "findings": [f.as_dict() for f in blocking],
+        "channels": [f.as_dict() for f in advisory],
         "waived": [f.as_dict() for f in waived],
         "exempted_rules": sorted(exempt_set),
-        "_objects": kept,
+        "_objects": blocking,
+        "_channel_objects": advisory,
     }
 
 
@@ -461,16 +570,33 @@ def main() -> int:
         return 2
 
     objects: List[Finding] = result.pop("_objects")
+    channels: List[Finding] = result.pop("_channel_objects")
 
     if args.as_json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0 if result["passed"] else 1
+
+    def _print_channels(stream) -> None:
+        if not channels:
+            return
+        print(f"另有 {len(channels)} 条**能通向**厂商实现的路，"
+              "请逐条说明它通向哪里：\n", file=stream)
+        for item in channels:
+            print(f"{item}\n", file=stream)
+        print("这一组不自动判不通过 —— 正当实现里也会出现这些构造"
+              "（装载自己编出来的 .so、起子进程跑构建、\n"
+              "动态 import 自己的后端模块）。但它们也不等于可以不看：\n"
+              "按算子名写的那五条规则只能抓住「照名字直接调」，而转发"
+              "不需要写出名字 ——\n"
+              "`ctypes.CDLL(\"libopapi.so\").aclnnXxx` 里那个名字是运行时"
+              "拼出来的字符串。\n", file=stream)
 
     if result["passed"]:
         print(f"围栏通过：扫描 {result['files_scanned']} 个文件，未发现转发到参考实现。")
         if result["waived"]:
             print(f"（{len(result['waived'])} 处因豁免规则 "
                   f"{result['exempted_rules']} 未计入，请确认豁免是必要的）")
+        _print_channels(sys.stdout)
         return 0
 
     print(f"围栏拒绝：发现 {len(objects)} 处疑似转发到参考实现\n", file=sys.stderr)
@@ -485,6 +611,7 @@ def main() -> int:
         "可用 --exempt 豁免对应规则，但请在 milestone 里记录豁免理由。",
         file=sys.stderr,
     )
+    _print_channels(sys.stderr)
     return 1
 
 
